@@ -1,0 +1,12 @@
+# ninja log v7
+10	57	7719874077860620	CMakeFiles/MyProject.dir/src/main.c.obj	154e0936efb86a30
+58	123	7719874078346184	MyProject.exe	dc93a6762b5db33b
+1	196	7720120475880211	build.ninja	326754ae9567c383
+9	56	7720112730820569	CMakeFiles/ShowdownAI.dir/src/main.c.obj	9a1fe19db245f01e
+56	122	7720112731292920	ShowdownAI.exe	7cb413229b98a1c3
+14	58	7719882541119951	CMakeFiles/ShowdownAI.dir/src/side.c.obj	9a6def912280a925
+12	43	7720112363507243	CMakeFiles/ShowdownAI.dir/src/pokemon.c.obj	edcac3ef2f6f102d
+1	223	7720120475880211	build.ninja	326754ae9567c383
+13	48	7720120476170201	CMakeFiles/ShowdownAI.dir/src/pokemon.c.obj	edcac3ef2f6f102d
+11	57	7720120476150205	CMakeFiles/ShowdownAI.dir/src/main.c.obj	9a1fe19db245f01e
+57	125	7720120476610237	ShowdownAI.exe	7cb413229b98a1c3
