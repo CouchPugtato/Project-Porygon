@@ -18,7 +18,7 @@ typedef struct {
     int active2;
 } Team;
 
-typedef struct BattleState {
+typedef struct {
     Team self;
     Team opponent;
 } BattleState;

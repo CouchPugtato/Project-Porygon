@@ -12,7 +12,7 @@
 
 # =============================================================================
 # Project: ShowdownAI
-# Configurations: 
+# Configurations: Debug
 # =============================================================================
 
 #############################################
@@ -20,6 +20,11 @@
 
 ninja_required_version = 1.5
 
+
+#############################################
+# Set configuration variable for custom commands.
+
+CONFIGURATION = Debug
 # =============================================================================
 # Include auxiliary files.
 
@@ -44,15 +49,24 @@ cmake_ninja_workdir = F$:/Coding/Projects/ShowdownAI/build/
 
 build cmake_object_order_depends_target_ShowdownAI: phony || .
 
-build CMakeFiles/ShowdownAI.dir/src/main.c.obj: C_COMPILER__ShowdownAI_unscanned_ F$:/Coding/Projects/ShowdownAI/src/main.c || cmake_object_order_depends_target_ShowdownAI
+build CMakeFiles/ShowdownAI.dir/src/main.c.obj: C_COMPILER__ShowdownAI_unscanned_Debug F$:/Coding/Projects/ShowdownAI/src/main.c || cmake_object_order_depends_target_ShowdownAI
+  DEFINES = -D_CRT_RAND_S
   DEP_FILE = CMakeFiles\ShowdownAI.dir\src\main.c.obj.d
-  FLAGS = -std=gnu99
+  FLAGS = -g -std=gnu99
   OBJECT_DIR = CMakeFiles\ShowdownAI.dir
   OBJECT_FILE_DIR = CMakeFiles\ShowdownAI.dir\src
 
-build CMakeFiles/ShowdownAI.dir/src/pokemon.c.obj: C_COMPILER__ShowdownAI_unscanned_ F$:/Coding/Projects/ShowdownAI/src/pokemon.c || cmake_object_order_depends_target_ShowdownAI
+build CMakeFiles/ShowdownAI.dir/src/pokemon.c.obj: C_COMPILER__ShowdownAI_unscanned_Debug F$:/Coding/Projects/ShowdownAI/src/pokemon.c || cmake_object_order_depends_target_ShowdownAI
+  DEFINES = -D_CRT_RAND_S
   DEP_FILE = CMakeFiles\ShowdownAI.dir\src\pokemon.c.obj.d
-  FLAGS = -std=gnu99
+  FLAGS = -g -std=gnu99
+  OBJECT_DIR = CMakeFiles\ShowdownAI.dir
+  OBJECT_FILE_DIR = CMakeFiles\ShowdownAI.dir\src
+
+build CMakeFiles/ShowdownAI.dir/src/mongoose.c.obj: C_COMPILER__ShowdownAI_unscanned_Debug F$:/Coding/Projects/ShowdownAI/src/mongoose.c || cmake_object_order_depends_target_ShowdownAI
+  DEFINES = -D_CRT_RAND_S
+  DEP_FILE = CMakeFiles\ShowdownAI.dir\src\mongoose.c.obj.d
+  FLAGS = -g -std=gnu99
   OBJECT_DIR = CMakeFiles\ShowdownAI.dir
   OBJECT_FILE_DIR = CMakeFiles\ShowdownAI.dir\src
 
@@ -64,8 +78,9 @@ build CMakeFiles/ShowdownAI.dir/src/pokemon.c.obj: C_COMPILER__ShowdownAI_unscan
 #############################################
 # Link the executable ShowdownAI.exe
 
-build ShowdownAI.exe: C_EXECUTABLE_LINKER__ShowdownAI_ CMakeFiles/ShowdownAI.dir/src/main.c.obj CMakeFiles/ShowdownAI.dir/src/pokemon.c.obj
-  LINK_LIBRARIES = -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32
+build ShowdownAI.exe: C_EXECUTABLE_LINKER__ShowdownAI_Debug CMakeFiles/ShowdownAI.dir/src/main.c.obj CMakeFiles/ShowdownAI.dir/src/pokemon.c.obj CMakeFiles/ShowdownAI.dir/src/mongoose.c.obj
+  FLAGS = -g
+  LINK_LIBRARIES = -lws2_32  -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32
   OBJECT_DIR = CMakeFiles\ShowdownAI.dir
   POST_BUILD = cd .
   PRE_LINK = cd .

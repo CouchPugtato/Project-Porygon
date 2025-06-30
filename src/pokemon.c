@@ -15,7 +15,7 @@ typedef struct {
     int active2; // check if it is a doubles battle and if this is real
 } Team;
 
-typedef struct BattleState {
+typedef struct {
     Team self;
     Team opponent;
-};
+} BattleState;
