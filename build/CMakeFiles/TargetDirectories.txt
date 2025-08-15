@@ -1,3 +1,3 @@
-F:/Coding/Projects/ShowdownAI/build/CMakeFiles/ShowdownAI.dir
-F:/Coding/Projects/ShowdownAI/build/CMakeFiles/edit_cache.dir
-F:/Coding/Projects/ShowdownAI/build/CMakeFiles/rebuild_cache.dir
+/home/dylan/Projects/miscFolders/showdownAITest/build/CMakeFiles/showdown_client.dir
+/home/dylan/Projects/miscFolders/showdownAITest/build/CMakeFiles/edit_cache.dir
+/home/dylan/Projects/miscFolders/showdownAITest/build/CMakeFiles/rebuild_cache.dir

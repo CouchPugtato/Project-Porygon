@@ -1,14 +1,17 @@
-cmake_minimum_required(VERSION 3.10)
-project(ShowdownAI)
+cmake_minimum_required(VERSION 3.16)
+project(showdownAITest C)
 
-set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
+find_package(LibWebSockets REQUIRED)
 
-add_executable(ShowdownAI
-    src/main.c
-    src/pokemon.c
-    src/mongoose.c
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(showdown_client
+  src/main.c
+  src/showdown_client.c
 )
 
-target_link_libraries(ShowdownAI PRIVATE ws2_32)
-target_compile_definitions(ShowdownAI PRIVATE _CRT_RAND_S)
+target_link_libraries(showdown_client PRIVATE websockets)
+

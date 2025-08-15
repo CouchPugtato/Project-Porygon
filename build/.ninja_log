@@ -1,12 +1,4 @@
-# ninja log v7
-13	44	7729595336210216	CMakeFiles/ShowdownAI.dir/src/pokemon.c.obj	1fe759a977726a09
-11	442	7729595814836160	CMakeFiles/ShowdownAI.dir/src/main.c.obj	3c81bd5fc642126f
-902	978	7729595823750780	ShowdownAI.exe	a4a5d45d076447cb
-11	200	7729596258149122	build.ninja	326754ae9567c383
-13	751	7729589605249884	CMakeFiles/ShowdownAI.dir/src/mongoose/mongoose.c.obj	54dcf62d69a49a43
-13	901	7729595814856162	CMakeFiles/ShowdownAI.dir/src/mongoose.c.obj	98e4cda289b3b4f0
-9	200	7729596258149122	build.ninja	326754ae9567c383
-2	436	7729596327023943	CMakeFiles/ShowdownAI.dir/src/main.c.obj	3c81bd5fc642126f
-436	512	7729596331368569	ShowdownAI.exe	a4a5d45d076447cb
-12	450	7729596807214429	CMakeFiles/ShowdownAI.dir/src/main.c.obj	3c81bd5fc642126f
-451	528	7729596811609507	ShowdownAI.exe	a4a5d45d076447cb
+# ninja log v6
+2	58	1755235540250464555	CMakeFiles/showdown_client.dir/src/main.c.o	6a327c4307fd2a2b
+3	165	1755235540253797710	CMakeFiles/showdown_client.dir/src/showdown_client.c.o	23fabd1e26202bab
+165	218	1755235540413789113	showdown_client	80c66d691a067359
