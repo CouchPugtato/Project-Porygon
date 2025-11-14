@@ -12,6 +12,7 @@ add_executable(showdown_client
 	src/main.c
 	src/showdown_client.c
 	src/battle_ai.c
+	src/neural_net.c
 )
 
 target_link_libraries(showdown_client PRIVATE websockets)
