@@ -16,3 +16,8 @@ add_executable(showdown_client
 
 target_link_libraries(showdown_client PRIVATE websockets)
 
+# Link math library when building on Unix-like systems (required for log/cos/sqrt)
+if(UNIX)
+    target_link_libraries(showdown_client PRIVATE m)
+endif()
+
