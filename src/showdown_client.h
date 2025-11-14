@@ -3,13 +3,13 @@
 
 struct ShowdownClient;
 
-/* Create a client configured to connect to a given WS endpoint. */
+// Create a client configured to connect to a given WS endpoint
 struct ShowdownClient* showdown_client_create(const char* host, int port, const char* path);
 
-/* Run the event loop until disconnect or Ctrl-C. Returns 0 on clean exit. */
+// Run the event loop until disconnect or control c, returns 0 on clean exit
 int showdown_client_run(struct ShowdownClient* cli);
 
-/* Destroy and free resources. Safe to call with NULL. */
+// Destroy and free resources, safe to call with NULL
 void showdown_client_destroy(struct ShowdownClient* cli);
 
 #endif

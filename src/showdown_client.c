@@ -28,7 +28,7 @@ static void sigint_handler(int sig) { (void)sig; g_quit = 1; }
 static char* build_line(const char* room, const char* msg, size_t* out_len) {
     char tmp[MAX_LINE];
     int n = room && room[0] ? snprintf(tmp, sizeof tmp, "%s|%s", room, msg)
-                            : snprintf(tmp, sizeof tmp, "|%s", msg);
+        					: snprintf(tmp, sizeof tmp, "|%s", msg);
     if (n < 0 || (size_t)n >= sizeof tmp) return NULL;
     char* s = malloc((size_t)n);
     if (!s) return NULL;
@@ -38,7 +38,11 @@ static char* build_line(const char* room, const char* msg, size_t* out_len) {
 }
 
 static void queue_message(struct lws* wsi, struct scs* s, const char* room, const char* msg) {
-    if (s->out.data) { free(s->out.data); s->out.data = NULL; s->out.len = 0; }
+    if (s->out.data) { 
+	    free(s->out.data);
+	    s->out.data = NULL;
+	    s->out.len = 0; 
+    }
     s->out.data = build_line(room, msg, &s->out.len);
     if (s->out.data) lws_callback_on_writable(wsi);
 }
@@ -111,7 +115,10 @@ struct ShowdownClient* showdown_client_create(const char* host, int port, const 
     info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
     lws_set_log_level(LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE, NULL);
     cli->ctx = lws_create_context(&info);
-    if (!cli->ctx) { free(cli); return NULL; }
+    if (!cli->ctx) {
+	    free(cli);
+	    return NULL;
+    }
     memset(&cli->cc, 0, sizeof cli->cc);
     cli->cc.context = cli->ctx;
     cli->cc.address = host;
