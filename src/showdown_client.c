@@ -1,4 +1,5 @@
 #include "showdown_client.h"
+#include "game_state.h"
 #include <libwebsockets.h>
 #include <string.h>
 #include <stdlib.h>
@@ -14,6 +15,8 @@ struct scs {
         size_t len;
         char* data;
     } out;
+    struct BattleState bs;
+    char current_room[64];
 };
 
 struct ShowdownClient {
@@ -52,10 +55,20 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
     switch (reason) {
         case LWS_CALLBACK_CLIENT_ESTABLISHED:
             lwsl_user("[sc] connected; waiting for |challstr|\n");
+            battle_state_init(&s->bs);
             break;
         case LWS_CALLBACK_CLIENT_RECEIVE: {
             const char* data = (const char*)in;
             lwsl_user("[recv]\n%.*s\n", (int)len, data);
+            // track current room if present
+            if (len > 2 && ((const char*)in)[0] == '>' ) {
+                const char* nl = memchr(in, '\n', len);
+                size_t roomlen = nl ? (size_t)(nl - (const char*)in) - 1 : 0;
+                if (roomlen > 0 && roomlen < sizeof s->current_room) {
+                    memcpy(s->current_room, (const char*)in + 1, roomlen);
+                    s->current_room[roomlen] = '\0';
+                }
+            }
             if (!s->logged_in && memmem(data, len, "|challstr|", 10)) {
                 if (!s->username[0]) {
                     srand((unsigned)time(NULL));
@@ -71,6 +84,33 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
                 lwsl_user("[sc] logged in as %s — joining lobby\n", s->username);
                 queue_message(wsi, s, "", "/join lobby");
                 queue_message(wsi, s, "lobby", "/cmd rooms");
+            }
+            // parse request JSON if present
+            const char* req = memmem(data, len, "|request|", 9);
+            if (req) {
+                const char* json = req + 9;
+                // skip leading '|' if present
+                if (*json == '|') json++;
+                battle_state_update_from_request(&s->bs, json);
+                lwsl_user("[state] weather=%d terrain=%d\n", s->bs.weather, s->bs.terrain);
+            }
+            // split by lines and feed battle stream updates
+            {
+                const char* p = data;
+                const char* end = data + len;
+                while (p < end) {
+                    const char* nl = memchr(p, '\n', (size_t)(end - p));
+                    size_t linelen = nl ? (size_t)(nl - p) : (size_t)(end - p);
+                    if (linelen > 0 && p[0] == '|') {
+                        char tmp[256];
+                        size_t cpy = linelen < sizeof tmp - 1 ? linelen : sizeof tmp - 1;
+                        memcpy(tmp, p, cpy);
+                        tmp[cpy] = '\0';
+                        battle_state_update_from_line(&s->bs, tmp);
+                    }
+                    if (!nl) break;
+                    p = nl + 1;
+                }
             }
             break;
         }

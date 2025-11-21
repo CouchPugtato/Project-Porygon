@@ -11,8 +11,8 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_executable(showdown_client
 	src/main.c
 	src/showdown_client.c
-	src/battle_ai.c
 	src/neural_net.c
+	src/game_state.c
 )
 
 target_link_libraries(showdown_client PRIVATE websockets)
