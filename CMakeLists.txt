@@ -5,6 +5,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 find_package(LibWebSockets REQUIRED)
+find_package(CURL REQUIRED)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -16,6 +17,7 @@ add_executable(showdown_client
 )
 
 target_link_libraries(showdown_client PRIVATE websockets)
+target_link_libraries(showdown_client PRIVATE CURL::libcurl)
 
 # Link math library when building on Unix-like systems (required for log/cos/sqrt)
 if(UNIX)

@@ -1,6 +1,3 @@
-// Minimal RL-ready MLP with policy (softmax) and value heads.
-// Implementation focuses on clarity and correctness for small networks.
-
 #include "neural_net.h"
 #include <stdlib.h>
 #include <string.h>

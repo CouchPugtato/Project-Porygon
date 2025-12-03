@@ -1,25 +1,14 @@
-# syntax=docker/dockerfile:1
-
 FROM ubuntu:24.04
 
-ARG DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    ninja-build \
-    pkg-config \
-    libwebsockets-dev \
-    ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  build-essential cmake pkg-config \
+  libwebsockets-dev libcurl4-openssl-dev ca-certificates && \
+  rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
 COPY . .
 
-# Configure and build
-RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
- && cmake --build build --config Release
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 
-# Default command runs the built client
+ENV PS_USER="" PS_PASSWORD=""
 CMD ["./build/showdown_client"]
