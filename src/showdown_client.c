@@ -69,9 +69,51 @@ static void leave_room(struct lws* wsi, struct scs* s, const char* room) {
 }
 
 static void choose_default_move(struct lws* wsi, struct scs* s, const char* room) {
-    // Minimal policy: choose first move; refine later once parsing request fully
     (void)s;
     queue_message(wsi, s, room, "/choose move 1");
+}
+
+static void choose_from_request(struct lws* wsi, struct scs* s, const char* room, const char* request_json) {
+    const char* tp = strstr(request_json, "\"teamPreview\":true");
+    if (tp) {
+        const char* ms = strstr(request_json, "\"maxChosenTeamSize\":");
+        int msz = 0;
+        if (ms) msz = atoi(ms + 22);
+        if (msz <= 0) msz = 2;
+        char cmd[64];
+        if (msz >= 2) snprintf(cmd, sizeof cmd, "/choose team 1, 2"); else snprintf(cmd, sizeof cmd, "/choose team 1");
+        queue_message(wsi, s, room, cmd);
+        return;
+    }
+    int idxs[2] = {1, 1};
+    int found = 0;
+    const char* p = request_json;
+    for (int a = 0; a < 2; ++a) {
+        const char* m = strstr(p, "\"moves\"");
+        if (!m) break;
+        const char* arr = strchr(m, '[');
+        if (!arr) break;
+        const char* end = strchr(arr, ']');
+        if (!end) break;
+        int mi = 1;
+        const char* q = arr;
+        while (q && q < end) {
+            const char* dis = strstr(q, "\"disabled\":");
+            if (!dis || dis >= end) break;
+            const char* val = dis + 12;
+            if (!strncmp(val, "false", 5)) { idxs[a] = mi; found++; break; }
+            mi++;
+            q = strstr(dis + 12, "\"disabled\":");
+        }
+        p = end + 1;
+    }
+    char cmd[64];
+    if (found >= 2) {
+        snprintf(cmd, sizeof cmd, "/choose move %d, move %d", idxs[0], idxs[1]);
+    } else {
+        snprintf(cmd, sizeof cmd, "/choose move %d", idxs[0]);
+    }
+    queue_message(wsi, s, room, cmd);
 }
 
 static void gen_id_name(const char* prefix, char* out, size_t outsz) {
@@ -318,31 +360,47 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
                 s->sent_trn = 1;
                 if (cbuf) { free(cbuf); cbuf = NULL; }
             }
-            if (memmem(data, len, "|updateuser|", 11) && !s->logged_in) {
-                s->logged_in = 1;
-                lwsl_user("[sc] logged in as %s — joining lobby\n", s->username);
-                join_room(wsi, s, "lobby");
-                send_global(wsi, s, "/cmd rooms");
-                const char* rs = getenv("PS_ROOMS");
-                if (rs && *rs) {
-                    const char* p = rs;
-                    while (*p) {
-                        while (*p == ' ' || *p == ',') p++;
-                        if (!*p) break;
-                        char rbuf[64];
-                        size_t i = 0;
-                        while (p[i] && p[i] != ',' && i + 1 < sizeof rbuf) { rbuf[i] = p[i]; i++; }
-                        rbuf[i] = '\0';
-                        join_room(wsi, s, rbuf);
-                        p += i;
-                        while (*p && *p != ',') p++;
+            {
+                const char* up = memmem(data, len, "|updateuser|", 11);
+                if (up && !s->logged_in) {
+                    const char* p = up + 11;
+                    const char* bar1 = memchr(p, '|', (size_t)(data + len - p));
+                    if (bar1) {
+                        const char* bar2 = memchr(bar1 + 1, '|', (size_t)(data + len - (bar1 + 1)));
+                        if (bar2 && bar2 > bar1 + 1 && *(bar1 + 1) == '1') {
+                            s->logged_in = 1;
+                            lwsl_user("[sc] logged in as %s — joining lobby\n", s->username);
+                            join_room(wsi, s, "lobby");
+                            send_global(wsi, s, "/cmd rooms");
+                            const char* rs = getenv("PS_ROOMS");
+                            if (rs && *rs) {
+                                const char* rp = rs;
+                                while (*rp) {
+                                    while (*rp == ' ' || *rp == ',') rp++;
+                                    if (!*rp) break;
+                                    char rbuf[64];
+                                    size_t i = 0;
+                                    while (rp[i] && rp[i] != ',' && i + 1 < sizeof rbuf) { rbuf[i] = rp[i]; i++; }
+                                    rbuf[i] = '\0';
+                                    join_room(wsi, s, rbuf);
+                                    rp += i;
+                                    while (*rp && *rp != ',') rp++;
+                                }
+                            } else {
+                                const char* r1 = getenv("PS_ROOM");
+                                if (r1 && *r1) join_room(wsi, s, r1);
+                            }
+                            const char* ic = getenv("PS_INIT_CMD");
+                            if (ic && *ic) send_global(wsi, s, ic);
+                            const char* fmt = getenv("PS_SEARCH");
+                            if (fmt && *fmt) {
+                                char scmd[96];
+                                snprintf(scmd, sizeof scmd, "/search %s", fmt);
+                                send_global(wsi, s, scmd);
+                            }
+                        }
                     }
-                } else {
-                    const char* r1 = getenv("PS_ROOM");
-                    if (r1 && *r1) join_room(wsi, s, r1);
                 }
-                const char* ic = getenv("PS_INIT_CMD");
-                if (ic && *ic) send_global(wsi, s, ic);
             }
             // parse request JSON if present
             const char* req = memmem(data, len, "|request|", 9);
@@ -352,9 +410,8 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
                 if (*json == '|') json++;
                 battle_state_update_from_request(&s->bs, json);
                 lwsl_user("[state] weather=%d terrain=%d\n", s->bs.weather, s->bs.terrain);
-                // If this is a battle room, make a default choice
                 if (s->current_room[0] && !strncmp(s->current_room, "battle-", 7)) {
-                    choose_default_move(wsi, s, s->current_room);
+                    choose_from_request(wsi, s, s->current_room, json);
                 }
             }
             // split by lines and feed battle stream updates
