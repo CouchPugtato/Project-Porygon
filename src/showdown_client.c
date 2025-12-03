@@ -323,6 +323,26 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
                 lwsl_user("[sc] logged in as %s — joining lobby\n", s->username);
                 join_room(wsi, s, "lobby");
                 send_global(wsi, s, "/cmd rooms");
+                const char* rs = getenv("PS_ROOMS");
+                if (rs && *rs) {
+                    const char* p = rs;
+                    while (*p) {
+                        while (*p == ' ' || *p == ',') p++;
+                        if (!*p) break;
+                        char rbuf[64];
+                        size_t i = 0;
+                        while (p[i] && p[i] != ',' && i + 1 < sizeof rbuf) { rbuf[i] = p[i]; i++; }
+                        rbuf[i] = '\0';
+                        join_room(wsi, s, rbuf);
+                        p += i;
+                        while (*p && *p != ',') p++;
+                    }
+                } else {
+                    const char* r1 = getenv("PS_ROOM");
+                    if (r1 && *r1) join_room(wsi, s, r1);
+                }
+                const char* ic = getenv("PS_INIT_CMD");
+                if (ic && *ic) send_global(wsi, s, ic);
             }
             // parse request JSON if present
             const char* req = memmem(data, len, "|request|", 9);
@@ -430,4 +450,3 @@ void showdown_client_destroy(struct ShowdownClient* cli) {
     if (cli->ctx) lws_context_destroy(cli->ctx);
     free(cli);
 }
-
