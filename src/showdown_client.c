@@ -6,6 +6,8 @@
 #include <time.h>
 #include <signal.h>
 #include <curl/curl.h>
+#include <stdio.h>
+#include <sys/stat.h>
 
 #define MAX_LINE 4096
 
@@ -13,10 +15,11 @@ struct scs {
     int logged_in;
     int sent_trn;
     char username[32];
-    struct {
-        size_t len;
-        char* data;
-    } out;
+    struct { size_t len; char* data; } outq[16];
+    int out_head;
+    int out_tail;
+    int in_battle;
+    time_t last_search_retry;
     struct BattleState bs;
     char current_room[64];
 };
@@ -42,14 +45,32 @@ static char* build_line(const char* room, const char* msg, size_t* out_len) {
     return s;
 }
 
+static int outq_is_empty(struct scs* s) { return s->out_head == s->out_tail; }
+static int outq_is_full(struct scs* s) { return ((s->out_tail + 1) & 15) == s->out_head; }
+static void outq_push(struct scs* s, char* data, size_t len) {
+    if (!data) return;
+    int next = (s->out_tail + 1) & 15;
+    if (next == s->out_head) { free(data); return; }
+    s->outq[s->out_tail].data = data;
+    s->outq[s->out_tail].len = len;
+    s->out_tail = next;
+}
+static int outq_pop(struct scs* s, char** data, size_t* len) {
+    if (s->out_head == s->out_tail) return 0;
+    *data = s->outq[s->out_head].data;
+    *len = s->outq[s->out_head].len;
+    s->outq[s->out_head].data = NULL;
+    s->outq[s->out_head].len = 0;
+    s->out_head = (s->out_head + 1) & 15;
+    return 1;
+}
+
 static void queue_message(struct lws* wsi, struct scs* s, const char* room, const char* msg) {
-    if (s->out.data) { 
-	    free(s->out.data);
-	    s->out.data = NULL;
-	    s->out.len = 0; 
-    }
-    s->out.data = build_line(room, msg, &s->out.len);
-    if (s->out.data) lws_callback_on_writable(wsi);
+    size_t len = 0;
+    char* data = build_line(room, msg, &len);
+    if (data && len > 0) lwsl_user("[sc] queued: %.*s\n", (int)len, data);
+    outq_push(s, data, len);
+    lws_callback_on_writable(wsi);
 }
 
 static void send_global(struct lws* wsi, struct scs* s, const char* cmd) {
@@ -59,17 +80,20 @@ static void send_global(struct lws* wsi, struct scs* s, const char* cmd) {
 static void join_room(struct lws* wsi, struct scs* s, const char* room) {
     char cmd[96];
     snprintf(cmd, sizeof cmd, "/join %s", room);
+    lwsl_user("[sc] joining room: %s\n", room);
     send_global(wsi, s, cmd);
 }
 
 static void leave_room(struct lws* wsi, struct scs* s, const char* room) {
     char cmd[96];
     snprintf(cmd, sizeof cmd, "/leave %s", room);
+    lwsl_user("[sc] leaving room: %s\n", room);
     send_global(wsi, s, cmd);
 }
 
 static void choose_default_move(struct lws* wsi, struct scs* s, const char* room) {
     (void)s;
+    lwsl_user("[battle] choosing default move 1 in %s\n", room);
     queue_message(wsi, s, room, "/choose move 1");
 }
 
@@ -82,6 +106,18 @@ static void choose_from_request(struct lws* wsi, struct scs* s, const char* room
         if (msz <= 0) msz = 2;
         char cmd[64];
         if (msz >= 2) snprintf(cmd, sizeof cmd, "/choose team 1, 2"); else snprintf(cmd, sizeof cmd, "/choose team 1");
+        lwsl_user("[battle] choosing team: %s in %s\n", cmd, room);
+        queue_message(wsi, s, room, cmd);
+        return;
+    }
+    if (strstr(request_json, "\"forceSwitch\":true")) {
+        int switches = 0;
+        const char* p = request_json;
+        while ((p = strstr(p, "\"forceSwitch\":true"))) { switches++; p += 18; }
+        char cmd[64];
+        if (switches >= 2) snprintf(cmd, sizeof cmd, "/choose switch 1, switch 2");
+        else snprintf(cmd, sizeof cmd, "/choose switch 1");
+        lwsl_user("[battle] choosing switches: %s in %s\n", cmd, room);
         queue_message(wsi, s, room, cmd);
         return;
     }
@@ -113,7 +149,42 @@ static void choose_from_request(struct lws* wsi, struct scs* s, const char* room
     } else {
         snprintf(cmd, sizeof cmd, "/choose move %d", idxs[0]);
     }
+    lwsl_user("[battle] choosing moves: %s in %s\n", cmd, room);
     queue_message(wsi, s, room, cmd);
+}
+
+static void ensure_dir(const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        mkdir(path, 0777);
+    }
+}
+
+static void write_state_json(const char* room, const struct BattleState* bs) {
+    ensure_dir("matches");
+    char fname[256];
+    time_t t = time(NULL);
+    snprintf(fname, sizeof fname, "matches/%s_%ld.json", room && *room ? room : "global", (long)t);
+    FILE* f = fopen(fname, "w");
+    if (!f) return;
+    fprintf(f, "{\n");
+    fprintf(f, "\"room\":\"%s\",\n", room && *room ? room : "");
+    fprintf(f, "\"weather\":%d,\n", bs->weather);
+    fprintf(f, "\"terrain\":%d,\n", bs->terrain);
+    fprintf(f, "\"friendly\":[");
+    for (int i = 0; i < 6; i++) {
+        const struct Pokemon* p = &bs->friendly_pokemon[i];
+        fprintf(f, "{\"hp\":%d,\"max\":%d,\"status\":%d}", p->current_hp, p->max_hp, p->status_condition);
+        if (i != 5) fprintf(f, ",");
+    }
+    fprintf(f, "],\n\"opponent\":[");
+    for (int i = 0; i < 6; i++) {
+        const struct Pokemon* p = &bs->opponent_pokemon[i];
+        fprintf(f, "{\"hp\":%d,\"max\":%d,\"status\":%d}", p->current_hp, p->max_hp, p->status_condition);
+        if (i != 5) fprintf(f, ",");
+    }
+    fprintf(f, "]\n}\n");
+    fclose(f);
 }
 
 static void gen_id_name(const char* prefix, char* out, size_t outsz) {
@@ -305,10 +376,13 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
         case LWS_CALLBACK_CLIENT_ESTABLISHED:
             lwsl_user("[sc] connected; waiting for |challstr|\n");
             battle_state_init(&s->bs);
+            s->out_head = 0; s->out_tail = 0;
+            s->in_battle = 0;
+            s->last_search_retry = 0;
             break;
         case LWS_CALLBACK_CLIENT_RECEIVE: {
             const char* data = (const char*)in;
-            lwsl_user("[recv]\n%.*s\n", (int)len, data);
+            lwsl_user("SERVER - %.*s\n", (int)len, data);
             // track current room if present
             if (len > 2 && ((const char*)in)[0] == '>' ) {
                 const char* nl = memchr(in, '\n', len);
@@ -316,6 +390,10 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
                 if (roomlen > 0 && roomlen < sizeof s->current_room) {
                     memcpy(s->current_room, (const char*)in + 1, roomlen);
                     s->current_room[roomlen] = '\0';
+                    if (!strncmp(s->current_room, "battle-", 7) && !s->in_battle) {
+                        s->in_battle = 1;
+                        lwsl_user("[battle] entered match: %s\n", s->current_room);
+                    }
                 }
             }
             if (!s->sent_trn && memmem(data, len, "|challstr|", 10)) {
@@ -393,11 +471,11 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
                             const char* ic = getenv("PS_INIT_CMD");
                             if (ic && *ic) send_global(wsi, s, ic);
                             const char* fmt = getenv("PS_SEARCH");
-                            if (fmt && *fmt) {
-                                char scmd[96];
-                                snprintf(scmd, sizeof scmd, "/search %s", fmt);
-                                send_global(wsi, s, scmd);
-                            }
+                            char scmd[96];
+                            if (fmt && *fmt) snprintf(scmd, sizeof scmd, "/search %s", fmt);
+                            else snprintf(scmd, sizeof scmd, "/search %s", "gen9randomdoublesbattle");
+                            lwsl_user("[sc] sending search: %s\n", scmd);
+                            send_global(wsi, s, scmd);
                         }
                     }
                 }
@@ -408,8 +486,10 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
                 const char* json = req + 9;
                 // skip leading '|' if present
                 if (*json == '|') json++;
+                lwsl_user("SERVER REQUEST - %.*s\n", (int)(data + len - json), json);
                 battle_state_update_from_request(&s->bs, json);
                 lwsl_user("[state] weather=%d terrain=%d\n", s->bs.weather, s->bs.terrain);
+                if (s->current_room[0]) write_state_json(s->current_room, &s->bs);
                 if (s->current_room[0] && !strncmp(s->current_room, "battle-", 7)) {
                     choose_from_request(wsi, s, s->current_room, json);
                 }
@@ -426,6 +506,28 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
                         size_t cpy = linelen < sizeof tmp - 1 ? linelen : sizeof tmp - 1;
                         memcpy(tmp, p, cpy);
                         tmp[cpy] = '\0';
+                        lwsl_user("SERVER - %s\n", tmp);
+                        if (!strncmp(tmp, "|move|", 6)) {
+                            lwsl_user("[battle] move: %s\n", tmp);
+                        }
+                        if (!strncmp(tmp, "|popup|", 7) && strstr(tmp, "not ladderable")) {
+                            const char* fb = getenv("PS_SEARCH_FALLBACK");
+                            char scmd[96];
+                            snprintf(scmd, sizeof scmd, "/search %s", (fb && *fb) ? fb : "gen8randomdoubles");
+                            lwsl_user("[sc] fallback search due to popup: %s\n", scmd);
+                            send_global(wsi, s, scmd);
+                        }
+                        if (!strncmp(tmp, "|updatesearch|", 13) && s->logged_in && strstr(tmp, "\"searching\":[]")) {
+                            const char* fb = getenv("PS_SEARCH_FALLBACK");
+                            char scmd[96];
+                            time_t now = time(NULL);
+                            if (s->last_search_retry == 0 || (now - s->last_search_retry) >= 3) {
+                                snprintf(scmd, sizeof scmd, "/search %s", (fb && *fb) ? fb : "gen8randomdoubles");
+                                lwsl_user("[sc] updatesearch empty; retry with: %s\n", scmd);
+                                send_global(wsi, s, scmd);
+                                s->last_search_retry = now;
+                            }
+                        }
                         battle_state_update_from_line(&s->bs, tmp);
                     }
                     if (!nl) break;
@@ -435,17 +537,21 @@ static int callback_sc(struct lws* wsi, enum lws_callback_reasons reason, void* 
             break;
         }
         case LWS_CALLBACK_CLIENT_WRITEABLE: {
-            if (s->out.data && s->out.len > 0) {
-                unsigned char* buf = malloc(LWS_PRE + s->out.len);
+            char* data = NULL; size_t dlen = 0;
+            if (outq_pop(s, &data, &dlen) && data && dlen > 0) {
+                unsigned char* buf = malloc(LWS_PRE + dlen);
                 if (buf) {
-                    memcpy(buf + LWS_PRE, s->out.data, s->out.len);
-                    int n = lws_write(wsi, buf + LWS_PRE, s->out.len, LWS_WRITE_TEXT);
+                    memcpy(buf + LWS_PRE, data, dlen);
+                    lwsl_user("CLIENT - %.*s\n", (int)dlen, data);
+                    if (memmem(data, dlen, "/trn ", 5)) {
+                        lwsl_user("[sc] sending challenge: %.*s\n", (int)dlen, data);
+                    }
+                    int n = lws_write(wsi, buf + LWS_PRE, dlen, LWS_WRITE_TEXT);
                     free(buf);
                     if (n < 0) lwsl_err("[sc] write failed\n");
                 }
-                free(s->out.data);
-                s->out.data = NULL;
-                s->out.len = 0;
+                free(data);
+                if (!outq_is_empty(s)) lws_callback_on_writable(wsi);
             }
             break;
         }
