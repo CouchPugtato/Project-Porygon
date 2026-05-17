@@ -5,11 +5,14 @@
 #include "id_tables.h"
 #include "observation.h"
 #include "runtime_protocol.h"
-#include "showdown_client.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+#ifdef HAVE_NATIVE_SHOWDOWN_CLIENT
+#include "showdown_client.h"
+#endif
 
 static GruModel* create_default_model(void) {
     return gru_model_create(observation_flat_size(), 128, OBS_NUM_ACTIONS);
@@ -222,6 +225,7 @@ int main(int argc, char** argv) {
         return train_from_replay_file(argv[2], argv[3], 1);
     }
 
+#ifdef HAVE_NATIVE_SHOWDOWN_CLIENT
     const char* host = "sim3.psim.us"; // Showdown sim host (rotates)
     const int   port = 443; // TLS (wss://)
     const char* path = "/showdown/websocket"; // Raw WS endpoint
@@ -235,5 +239,15 @@ int main(int argc, char** argv) {
     int rc = showdown_client_run(cli);
     showdown_client_destroy(cli);
     return rc;
+#else
+    fprintf(stderr,
+        "Usage:\n"
+        "  showdown_client --runtime [checkpoint]\n"
+        "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin>\n"
+        "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin>\n"
+        "  Set PORYGON_DEMO_GRU=1 for the demo mode.\n"
+        "Legacy native websocket mode is disabled; use the Python communicator for live Showdown.\n");
+    return 1;
+#endif
 }
 

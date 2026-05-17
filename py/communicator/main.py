@@ -3,12 +3,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
-from .ipc import LearnerProcess
-from .protocol import battle_end, battle_start, event_message, request_message, terminal_message
-from .showdown_client import ShowdownGateway, default_showdown_uri
+if __package__ in (None, ""):
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    from communicator.ipc import LearnerProcess
+    from communicator.protocol import battle_end, battle_start, event_message, request_message, terminal_message
+    from communicator.showdown_client import ShowdownGateway, default_showdown_uri
+else:
+    from .ipc import LearnerProcess
+    from .protocol import battle_end, battle_start, event_message, request_message, terminal_message
+    from .showdown_client import ShowdownGateway, default_showdown_uri
 
 
 async def capture_mode(out_path: Path) -> None:
