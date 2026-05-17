@@ -1,0 +1,284 @@
+#include "request_parser.h"
+
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
+static const char* skip_ws(const char* p) {
+    while (p && *p && isspace((unsigned char)*p)) {
+        ++p;
+    }
+    return p;
+}
+
+static const char* find_after_key(const char* json, const char* key) {
+    char pattern[64];
+    size_t n;
+
+    if (!json || !key) {
+        return NULL;
+    }
+    n = strlen(key);
+    if (n + 4 >= sizeof(pattern)) {
+        return NULL;
+    }
+    pattern[0] = '"';
+    memcpy(pattern + 1, key, n);
+    pattern[n + 1] = '"';
+    pattern[n + 2] = ':';
+    pattern[n + 3] = '\0';
+    return strstr(json, pattern);
+}
+
+static int parse_int_after(const char* json, const char* key, int default_value) {
+    const char* p = find_after_key(json, key);
+    if (!p) {
+        return default_value;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return default_value;
+    }
+    p = skip_ws(p + 1);
+    return atoi(p);
+}
+
+static int parse_bool_after(const char* json, const char* key, int default_value) {
+    const char* p = find_after_key(json, key);
+    if (!p) {
+        return default_value;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return default_value;
+    }
+    p = skip_ws(p + 1);
+    if (strncmp(p, "true", 4) == 0) {
+        return 1;
+    }
+    if (strncmp(p, "false", 5) == 0) {
+        return 0;
+    }
+    return default_value;
+}
+
+static int extract_json_array(const char* start, char* out, size_t out_len) {
+    int depth = 0;
+    int in_string = 0;
+    size_t i = 0;
+    const char* p = start;
+
+    if (!p || *p != '[' || out_len == 0) {
+        return 0;
+    }
+    while (*p && i + 1 < out_len) {
+        char ch = *p;
+        out[i++] = ch;
+        if (ch == '"' && (p == start || p[-1] != '\\')) {
+            in_string = !in_string;
+        } else if (!in_string) {
+            if (ch == '[') {
+                depth++;
+            } else if (ch == ']') {
+                depth--;
+                if (depth == 0) {
+                    out[i] = '\0';
+                    return 1;
+                }
+            }
+        }
+        ++p;
+    }
+    if (i < out_len) {
+        out[i] = '\0';
+    }
+    return 0;
+}
+
+static int extract_json_object(const char* start, char* out, size_t out_len) {
+    int depth = 0;
+    int in_string = 0;
+    size_t i = 0;
+    const char* p = start;
+
+    if (!p || *p != '{' || out_len == 0) {
+        return 0;
+    }
+    while (*p && i + 1 < out_len) {
+        char ch = *p;
+        out[i++] = ch;
+        if (ch == '"' && (p == start || p[-1] != '\\')) {
+            in_string = !in_string;
+        } else if (!in_string) {
+            if (ch == '{') {
+                depth++;
+            } else if (ch == '}') {
+                depth--;
+                if (depth == 0) {
+                    out[i] = '\0';
+                    return 1;
+                }
+            }
+        }
+        ++p;
+    }
+    if (i < out_len) {
+        out[i] = '\0';
+    }
+    return 0;
+}
+
+static int hash_token_id(const char* text, int upper_bound) {
+    unsigned int hash = 2166136261u;
+    const unsigned char* p = (const unsigned char*)text;
+    if (!text || !*text || upper_bound <= 1) {
+        return 0;
+    }
+    while (*p) {
+        hash ^= (unsigned int)(*p++);
+        hash *= 16777619u;
+    }
+    return 1 + (int)(hash % (unsigned int)(upper_bound - 1));
+}
+
+static int parse_move_id_from_object(const char* obj) {
+    const char* p = strstr(obj, "\"id\":");
+    char token[64];
+    size_t i = 0;
+    if (!p) {
+        return 0;
+    }
+    p = strchr(p, '"');
+    if (!p) {
+        return 0;
+    }
+    p = strchr(p + 1, '"');
+    if (!p) {
+        return 0;
+    }
+    p = strchr(p + 1, '"');
+    if (!p) {
+        return 0;
+    }
+    ++p;
+    while (*p && *p != '"' && i + 1 < sizeof(token)) {
+        token[i++] = *p++;
+    }
+    token[i] = '\0';
+    return hash_token_id(token, 920);
+}
+
+void parsed_request_init(ParsedRequest* req) {
+    if (!req) {
+        return;
+    }
+    memset(req, 0, sizeof(*req));
+    req->max_chosen_team_size = 2;
+}
+
+int parse_request_payload(ParsedRequest* req, const char* json, int request_id, int is_doubles) {
+    const char* active_key;
+    const char* side_key;
+    char active_array[4096];
+    char side_obj[4096];
+    const char* p;
+    int slot = 0;
+
+    if (!req || !json) {
+        return 0;
+    }
+
+    parsed_request_init(req);
+    req->request_id = request_id;
+    req->is_doubles = is_doubles ? 1 : 0;
+    strncpy(req->raw_json, json, sizeof(req->raw_json) - 1);
+    req->team_preview = parse_bool_after(json, "teamPreview", 0);
+    req->max_chosen_team_size = parse_int_after(json, "maxChosenTeamSize", req->is_doubles ? 2 : 1);
+
+    active_key = find_after_key(json, "active");
+    if (active_key) {
+        p = strchr(active_key, '[');
+        if (p && extract_json_array(p, active_array, sizeof(active_array))) {
+            const char* cursor = active_array;
+            while ((cursor = strchr(cursor, '{')) != NULL && slot < PARSED_REQUEST_ACTIVE_SLOTS) {
+                char obj[1024];
+                const char* moves_key;
+                const char* move_cursor;
+                int move_slot = 0;
+
+                if (!extract_json_object(cursor, obj, sizeof(obj))) {
+                    break;
+                }
+                req->active[slot].can_tera = parse_bool_after(obj, "canTerastallize", 0);
+                req->active[slot].trapped = parse_bool_after(obj, "trapped", 0);
+                req->active[slot].fainted = parse_bool_after(obj, "fainted", 0);
+                req->active[slot].has_force_switch = parse_bool_after(obj, "forceSwitch", 0);
+                if (req->active[slot].has_force_switch) {
+                    req->forced_switch_any = 1;
+                }
+
+                moves_key = find_after_key(obj, "moves");
+                if (moves_key) {
+                    move_cursor = strchr(moves_key, '{');
+                    while (move_cursor && move_slot < PARSED_REQUEST_MOVE_SLOTS) {
+                        char move_obj[512];
+                        if (!extract_json_object(move_cursor, move_obj, sizeof(move_obj))) {
+                            break;
+                        }
+                        req->active[slot].move_id[move_slot] = parse_move_id_from_object(move_obj);
+                        req->active[slot].move_disabled[move_slot] = parse_bool_after(move_obj, "disabled", 0);
+                        req->active[slot].move_pp[move_slot] = parse_int_after(move_obj, "pp", 0);
+                        req->active[slot].move_max_pp[move_slot] = parse_int_after(move_obj, "maxpp", req->active[slot].move_pp[move_slot]);
+                        if (req->active[slot].can_tera && !req->active[slot].move_disabled[move_slot]) {
+                            req->can_tera = 1;
+                        }
+                        move_cursor = strchr(move_cursor + 1, '{');
+                        ++move_slot;
+                    }
+                }
+                req->active_count = slot + 1;
+                cursor = strchr(cursor + 1, '{');
+                ++slot;
+            }
+        }
+    }
+
+    side_key = find_after_key(json, "side");
+    if (side_key) {
+        p = strchr(side_key, '{');
+        if (p && extract_json_object(p, side_obj, sizeof(side_obj))) {
+            const char* poke_cursor = side_obj;
+            int team_idx = 0;
+            while ((poke_cursor = strstr(poke_cursor, "\"condition\":")) != NULL && team_idx < PARSED_REQUEST_TEAM_SIZE) {
+                const char* cond_val = strchr(poke_cursor + 11, '"');
+                const char* details_key;
+                char cond[64];
+                int fainted = 0;
+                size_t c = 0;
+
+                if (cond_val) {
+                    ++cond_val;
+                    while (cond_val[c] && cond_val[c] != '"' && c + 1 < sizeof(cond)) {
+                        cond[c] = cond_val[c];
+                        ++c;
+                    }
+                    cond[c] = '\0';
+                    if (strstr(cond, "fnt")) {
+                        fainted = 1;
+                    }
+                }
+
+                details_key = strstr(poke_cursor, "\"active\":");
+                req->switch_available[team_idx] = fainted ? 0 : 1;
+                req->switch_fainted[team_idx] = fainted;
+                if (details_key && parse_bool_after(details_key, "active", 0)) {
+                    req->switch_available[team_idx] = 0;
+                }
+                poke_cursor += 11;
+                ++team_idx;
+            }
+        }
+    }
+
+    return 1;
+}

@@ -1,0 +1,22 @@
+#ifndef ACTION_MAPPER_H
+#define ACTION_MAPPER_H
+
+#include "observation.h"
+#include "request_parser.h"
+
+#include <stddef.h>
+
+typedef struct {
+    unsigned char legal[OBS_NUM_ACTIONS];
+} ActionMask;
+
+void action_mask_init(ActionMask* mask);
+int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req);
+int action_to_showdown_command(
+    char* out,
+    size_t out_len,
+    enum ObsAction action,
+    const ParsedRequest* req
+);
+
+#endif

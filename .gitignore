@@ -13,3 +13,5 @@ build.ninja
 *.obj
 *.exe
 *.out
+*.pyc
+__pycache__/

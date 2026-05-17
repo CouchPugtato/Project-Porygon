@@ -1,0 +1,42 @@
+#ifndef ENV_SESSION_H
+#define ENV_SESSION_H
+
+#include "action_mapper.h"
+#include "episode.h"
+#include "gru_model.h"
+#include "observation.h"
+#include "raw_battle_state.h"
+#include "replay_io.h"
+#include "runtime_protocol.h"
+
+#include <stdio.h>
+
+typedef struct {
+    char battle_id[64];
+    RawBattleState raw_state;
+    Observation observation;
+    ActionMask action_mask;
+    ParsedRequest parsed_request;
+    Episode episode;
+    float* hidden_state;
+    float* flat_observation;
+    int last_request_id;
+    int terminal;
+    int ready_for_decision;
+} EnvSession;
+
+typedef struct {
+    EnvSession* sessions;
+    size_t count;
+    size_t capacity;
+    GruModel* model;
+    size_t obs_dim;
+    FILE* replay_file;
+    int replay_only;
+} EnvRuntime;
+
+int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, int replay_only);
+void env_runtime_free(EnvRuntime* runtime);
+int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);
+
+#endif
