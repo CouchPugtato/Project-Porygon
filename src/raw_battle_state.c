@@ -1,85 +1,87 @@
 #include "raw_battle_state.h"
 
-#include <ctype.h>
-#include <stdlib.h>
+#include "event_parser.h"
+
 #include <string.h>
 
-static int status_from_text(const char* text) {
-    if (!text || !*text) return 0;
-    if (strncmp(text, "brn", 3) == 0) return 1;
-    if (strncmp(text, "par", 3) == 0) return 2;
-    if (strncmp(text, "psn", 3) == 0) return 3;
-    if (strncmp(text, "tox", 3) == 0) return 4;
-    if (strncmp(text, "frz", 3) == 0) return 5;
-    if (strncmp(text, "slp", 3) == 0) return 6;
-    return 0;
-}
-
-static void parse_condition(const char* cond, int* hp, int* max_hp, int* status_id, int* fainted) {
-    const char* slash;
-    *hp = 0;
-    *max_hp = 0;
-    *status_id = 0;
-    *fainted = 0;
-    if (!cond) {
+static void raw_pokemon_init(RawPokemon* pokemon) {
+    int i;
+    if (!pokemon) {
         return;
     }
-    if (strstr(cond, "fnt")) {
-        *fainted = 1;
+    memset(pokemon, 0, sizeof(*pokemon));
+    tracked_int_reset(&pokemon->species_id);
+    tracked_int_reset(&pokemon->item_id);
+    tracked_int_reset(&pokemon->ability_id);
+    tracked_int_reset(&pokemon->tera_type_id);
+    tracked_int_reset(&pokemon->status_id);
+    for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
+        tracked_int_reset(&pokemon->move_ids[i]);
     }
-    slash = strchr(cond, '/');
-    if (slash) {
-        *hp = atoi(cond);
-        *max_hp = atoi(slash + 1);
-        while (*slash && !isspace((unsigned char)*slash)) ++slash;
-        while (*slash && isspace((unsigned char)*slash)) ++slash;
-        *status_id = status_from_text(slash);
-    }
+    pokemon->encore_move_slot = -1;
+    pokemon->disable_move_slot = -1;
 }
 
-static void clear_active_flags(RawPokemon* team) {
-    int i;
-    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
-        team[i].active = 0;
-        team[i].active_slot = 0;
+static void raw_side_init(RawSideState* side) {
+    if (!side) {
+        return;
     }
+    memset(side, 0, sizeof(*side));
+    side->remaining_pokemon = RAW_TEAM_SIZE;
 }
 
-static RawPokemon* ensure_team_slot(RawPokemon* team, int slot) {
-    if (slot < 0 || slot >= RAW_TEAM_SIZE) {
-        return NULL;
+static void clear_per_turn_flags(RawPokemon* pokemon) {
+    if (!pokemon) {
+        return;
     }
-    team[slot].known = 1;
-    return &team[slot];
+    pokemon->protect_active = 0;
+    pokemon->helping_hand_active = 0;
+    pokemon->flinch_active = 0;
+    pokemon->first_turn_on_field = 0;
 }
 
-static RawPokemon* find_or_allocate_by_ident(RawPokemon* team, const char* ident) {
-    int i;
-    int free_slot = -1;
-    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
-        if (team[i].ident[0] && strcmp(team[i].ident, ident) == 0) {
-            return &team[i];
-        }
-        if (free_slot < 0 && !team[i].ident[0]) {
-            free_slot = i;
-        }
+static void clear_on_switch(RawPokemon* pokemon) {
+    if (!pokemon) {
+        return;
     }
-    if (free_slot >= 0) {
-        strncpy(team[free_slot].ident, ident, RAW_IDENT_LEN - 1);
-        team[free_slot].known = 1;
-        return &team[free_slot];
-    }
-    return &team[0];
+    pokemon->active = 0;
+    pokemon->active_slot = 0;
+    pokemon->encore_active = 0;
+    pokemon->encore_turns = 0;
+    pokemon->disable_active = 0;
+    pokemon->disable_turns = 0;
+    pokemon->taunt_active = 0;
+    pokemon->taunt_turns = 0;
+    pokemon->torment_active = 0;
+    pokemon->torment_turns = 0;
+    pokemon->heal_block_active = 0;
+    pokemon->heal_block_turns = 0;
+    pokemon->embargo_active = 0;
+    pokemon->embargo_turns = 0;
+    pokemon->yawn_active = 0;
+    pokemon->yawn_turns = 0;
+    pokemon->confusion_active = 0;
+    pokemon->confusion_turns = 0;
+    pokemon->seed_active = 0;
+    pokemon->substitute_active = 0;
+    pokemon->charge_active = 0;
+    pokemon->charge_turns = 0;
+    pokemon->ability_triggered_on_switch_in = 0;
 }
 
 void raw_battle_state_init(RawBattleState* state, int is_doubles) {
+    int i;
     if (!state) {
         return;
     }
     memset(state, 0, sizeof(*state));
     state->is_doubles = is_doubles ? 1 : 0;
-    state->self_side.remaining_pokemon = RAW_TEAM_SIZE;
-    state->opp_side.remaining_pokemon = RAW_TEAM_SIZE;
+    raw_side_init(&state->self_side);
+    raw_side_init(&state->opp_side);
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        raw_pokemon_init(&state->self_team[i]);
+        raw_pokemon_init(&state->opp_team[i]);
+    }
 }
 
 void raw_battle_state_reset(RawBattleState* state) {
@@ -87,90 +89,132 @@ void raw_battle_state_reset(RawBattleState* state) {
     raw_battle_state_init(state, is_doubles);
 }
 
+void raw_battle_state_begin_turn(RawBattleState* state, int turn_number) {
+    int i;
+    if (!state) {
+        return;
+    }
+    state->turn_number = turn_number;
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        clear_per_turn_flags(&state->self_team[i]);
+        clear_per_turn_flags(&state->opp_team[i]);
+    }
+    state->self_side.quick_guard = 0;
+    state->self_side.wide_guard = 0;
+    state->self_side.crafty_shield = 0;
+    state->self_side.mat_block = 0;
+    state->opp_side.quick_guard = 0;
+    state->opp_side.wide_guard = 0;
+    state->opp_side.crafty_shield = 0;
+    state->opp_side.mat_block = 0;
+}
+
+static void decrement_duration(int* active, int* turns) {
+    if (*active && *turns > 0) {
+        --(*turns);
+        if (*turns <= 0) {
+            *active = 0;
+            *turns = 0;
+        }
+    }
+}
+
+void raw_battle_state_end_turn(RawBattleState* state) {
+    int i;
+    if (!state) {
+        return;
+    }
+    decrement_duration(&state->trick_room, &state->trick_room_turns_remaining);
+    decrement_duration(&state->magic_room, &state->magic_room_turns_remaining);
+    decrement_duration(&state->wonder_room, &state->wonder_room_turns_remaining);
+    decrement_duration(&state->gravity, &state->gravity_turns_remaining);
+    if (state->weather_turns_remaining > 0) {
+        --state->weather_turns_remaining;
+    }
+    if (state->terrain_turns_remaining > 0) {
+        --state->terrain_turns_remaining;
+    }
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        decrement_duration(&state->self_team[i].encore_active, &state->self_team[i].encore_turns);
+        decrement_duration(&state->self_team[i].disable_active, &state->self_team[i].disable_turns);
+        decrement_duration(&state->self_team[i].taunt_active, &state->self_team[i].taunt_turns);
+        decrement_duration(&state->self_team[i].torment_active, &state->self_team[i].torment_turns);
+        decrement_duration(&state->self_team[i].heal_block_active, &state->self_team[i].heal_block_turns);
+        decrement_duration(&state->self_team[i].embargo_active, &state->self_team[i].embargo_turns);
+        decrement_duration(&state->self_team[i].yawn_active, &state->self_team[i].yawn_turns);
+        decrement_duration(&state->self_team[i].confusion_active, &state->self_team[i].confusion_turns);
+        decrement_duration(&state->self_team[i].charge_active, &state->self_team[i].charge_turns);
+        decrement_duration(&state->opp_team[i].encore_active, &state->opp_team[i].encore_turns);
+        decrement_duration(&state->opp_team[i].disable_active, &state->opp_team[i].disable_turns);
+        decrement_duration(&state->opp_team[i].taunt_active, &state->opp_team[i].taunt_turns);
+        decrement_duration(&state->opp_team[i].torment_active, &state->opp_team[i].torment_turns);
+        decrement_duration(&state->opp_team[i].heal_block_active, &state->opp_team[i].heal_block_turns);
+        decrement_duration(&state->opp_team[i].embargo_active, &state->opp_team[i].embargo_turns);
+        decrement_duration(&state->opp_team[i].yawn_active, &state->opp_team[i].yawn_turns);
+        decrement_duration(&state->opp_team[i].confusion_active, &state->opp_team[i].confusion_turns);
+        decrement_duration(&state->opp_team[i].charge_active, &state->opp_team[i].charge_turns);
+    }
+    decrement_duration(&state->self_side.reflect, &state->self_side.reflect_turns);
+    decrement_duration(&state->self_side.light_screen, &state->self_side.light_screen_turns);
+    decrement_duration(&state->self_side.aurora_veil, &state->self_side.aurora_veil_turns);
+    decrement_duration(&state->self_side.tailwind, &state->self_side.tailwind_turns);
+    decrement_duration(&state->self_side.safeguard, &state->self_side.safeguard_turns);
+    decrement_duration(&state->self_side.mist, &state->self_side.mist_turns);
+    decrement_duration(&state->self_side.lucky_chant, &state->self_side.lucky_chant_turns);
+    decrement_duration(&state->opp_side.reflect, &state->opp_side.reflect_turns);
+    decrement_duration(&state->opp_side.light_screen, &state->opp_side.light_screen_turns);
+    decrement_duration(&state->opp_side.aurora_veil, &state->opp_side.aurora_veil_turns);
+    decrement_duration(&state->opp_side.tailwind, &state->opp_side.tailwind_turns);
+    decrement_duration(&state->opp_side.safeguard, &state->opp_side.safeguard_turns);
+    decrement_duration(&state->opp_side.mist, &state->opp_side.mist_turns);
+    decrement_duration(&state->opp_side.lucky_chant, &state->opp_side.lucky_chant_turns);
+}
+
 void raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequest* req) {
     int i;
     if (!state || !req) {
         return;
     }
-
     state->turn_number = req->request_id > 0 ? req->request_id : state->turn_number;
     state->can_tera = req->can_tera;
-    clear_active_flags(state->self_team);
-
+    state->self_active_count = req->active_count;
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        clear_on_switch(&state->self_team[i]);
+    }
     for (i = 0; i < req->active_count && i < RAW_TEAM_SIZE; ++i) {
-        RawPokemon* pokemon = ensure_team_slot(state->self_team, i);
         int m;
-        if (!pokemon) {
-            continue;
-        }
+        RawPokemon* pokemon = &state->self_team[i];
+        pokemon->known = 1;
         pokemon->active = 1;
         pokemon->active_slot = i + 1;
         pokemon->revealed = 1;
         pokemon->can_tera = req->active[i].can_tera;
         pokemon->fainted = req->active[i].fainted;
+        if (req->active[i].tera_type_id > 0) {
+            tracked_int_promote_confirmed(&pokemon->tera_type_id, req->active[i].tera_type_id);
+        }
         for (m = 0; m < RAW_MOVE_SLOTS; ++m) {
             if (req->active[i].move_id[m] > 0) {
-                pokemon->move_ids[m] = req->active[i].move_id[m];
+                tracked_int_promote_confirmed(&pokemon->move_ids[m], req->active[i].move_id[m]);
                 pokemon->move_known[m] = 1;
-                pokemon->move_pp[m] = req->active[i].move_pp[m];
-                pokemon->move_max_pp[m] = req->active[i].move_max_pp[m];
-                pokemon->move_disabled[m] = req->active[i].move_disabled[m];
             }
+            pokemon->move_pp[m] = req->active[i].move_pp[m];
+            pokemon->move_max_pp[m] = req->active[i].move_max_pp[m];
+            pokemon->move_disabled[m] = req->active[i].move_disabled[m];
+            pokemon->move_maybe_disabled[m] = req->active[i].move_maybe_disabled[m];
         }
     }
-
     for (i = 0; i < RAW_TEAM_SIZE; ++i) {
         state->self_team[i].fainted = req->switch_fainted[i];
+        if (req->side_species_id[i] > 0) {
+            tracked_int_promote_confirmed(&state->self_team[i].species_id, req->side_species_id[i]);
+        }
+        if (req->side_ident[i][0]) {
+            strncpy(state->self_team[i].ident, req->side_ident[i], RAW_IDENT_LEN - 1);
+        }
     }
 }
 
 void raw_battle_state_update_from_event_line(RawBattleState* state, const char* line) {
-    if (!state || !line || !*line) {
-        return;
-    }
-    if (strncmp(line, "|turn|", 6) == 0) {
-        state->turn_number = atoi(line + 6);
-        return;
-    }
-    if (strncmp(line, "|-weather|", 10) == 0) {
-        const char* w = line + 10;
-        if (strncmp(w, "Rain", 4) == 0) state->weather_id = 2;
-        else if (strncmp(w, "Sun", 3) == 0 || strncmp(w, "Drought", 8) == 0) state->weather_id = 1;
-        else if (strncmp(w, "Sandstorm", 9) == 0) state->weather_id = 3;
-        else if (strncmp(w, "Snow", 4) == 0) state->weather_id = 4;
-        else state->weather_id = 0;
-        return;
-    }
-    if (strncmp(line, "|-fieldstart|", 13) == 0) {
-        const char* t = line + 13;
-        if (strncmp(t, "Electric Terrain", 16) == 0) state->terrain_id = 1;
-        else if (strncmp(t, "Grassy Terrain", 14) == 0) state->terrain_id = 2;
-        else if (strncmp(t, "Misty Terrain", 13) == 0) state->terrain_id = 3;
-        else if (strncmp(t, "Psychic Terrain", 15) == 0) state->terrain_id = 4;
-        else if (strncmp(t, "move: Trick Room", 16) == 0) state->trick_room = 1;
-        return;
-    }
-    if (strncmp(line, "|-fieldend|move: Trick Room", 27) == 0) {
-        state->trick_room = 0;
-        return;
-    }
-    if (strncmp(line, "|-sidestart|", 12) == 0 || strncmp(line, "|-sideend|", 10) == 0) {
-        int starting = line[6] == 's';
-        const char* p = strchr(line + (starting ? 12 : 10), '|');
-        int is_self = strstr(line, "p1|") != NULL;
-        RawSideState* side = is_self ? &state->self_side : &state->opp_side;
-        if (!p) {
-            return;
-        }
-        ++p;
-        if (strncmp(p, "Stealth Rock", 12) == 0) side->stealth_rock = starting ? 1 : 0;
-        else if (strncmp(p, "Spikes", 6) == 0) side->spikes = starting ? side->spikes + 1 : 0;
-        else if (strncmp(p, "Toxic Spikes", 12) == 0) side->toxic_spikes = starting ? side->toxic_spikes + 1 : 0;
-        else if (strncmp(p, "Sticky Web", 10) == 0) side->sticky_web = starting ? 1 : 0;
-        else if (strncmp(p, "Reflect", 7) == 0) side->reflect = starting ? 1 : 0;
-        else if (strncmp(p, "Light Screen", 12) == 0) side->light_screen = starting ? 1 : 0;
-        else if (strncmp(p, "Aurora Veil", 11) == 0) side->aurora_veil = starting ? 1 : 0;
-        else if (strncmp(p, "Tailwind", 8) == 0) side->tailwind = starting ? 1 : 0;
-        return;
-    }
+    event_parser_apply_line(state, line);
 }

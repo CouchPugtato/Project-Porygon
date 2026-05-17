@@ -156,6 +156,29 @@ static int parse_move_id_from_object(const char* obj) {
     return move_id_from_name(token);
 }
 
+static int parse_string_id_after(const char* json, const char* key, int (*fn)(const char*)) {
+    const char* p = find_after_key(json, key);
+    char token[64];
+    size_t i = 0;
+    if (!p || !fn) {
+        return 0;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return 0;
+    }
+    p = skip_ws(p + 1);
+    if (*p != '"') {
+        return 0;
+    }
+    ++p;
+    while (*p && *p != '"' && i + 1 < sizeof(token)) {
+        token[i++] = *p++;
+    }
+    token[i] = '\0';
+    return fn(token);
+}
+
 void parsed_request_init(ParsedRequest* req) {
     if (!req) {
         return;
@@ -198,9 +221,12 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                     break;
                 }
                 req->active[slot].can_tera = parse_bool_after(obj, "canTerastallize", 0);
+                req->active[slot].tera_type_id = parse_string_id_after(obj, "teraType", species_id_from_name);
                 req->active[slot].trapped = parse_bool_after(obj, "trapped", 0);
+                req->active[slot].maybe_trapped = parse_bool_after(obj, "maybeTrapped", 0);
                 req->active[slot].fainted = parse_bool_after(obj, "fainted", 0);
                 req->active[slot].has_force_switch = parse_bool_after(obj, "forceSwitch", 0);
+                req->force_switch[slot] = req->active[slot].has_force_switch;
                 if (req->active[slot].has_force_switch) {
                     req->forced_switch_any = 1;
                 }
@@ -215,8 +241,10 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                         }
                         req->active[slot].move_id[move_slot] = parse_move_id_from_object(move_obj);
                         req->active[slot].move_disabled[move_slot] = parse_bool_after(move_obj, "disabled", 0);
+                        req->active[slot].move_maybe_disabled[move_slot] = parse_bool_after(move_obj, "maybeDisabled", 0);
                         req->active[slot].move_pp[move_slot] = parse_int_after(move_obj, "pp", 0);
                         req->active[slot].move_max_pp[move_slot] = parse_int_after(move_obj, "maxpp", req->active[slot].move_pp[move_slot]);
+                        req->active[slot].move_target[move_slot] = parse_int_after(move_obj, "target", 0);
                         if (req->active[slot].can_tera && !req->active[slot].move_disabled[move_slot]) {
                             req->can_tera = 1;
                         }
@@ -240,7 +268,9 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
             while ((poke_cursor = strstr(poke_cursor, "\"condition\":")) != NULL && team_idx < PARSED_REQUEST_TEAM_SIZE) {
                 const char* cond_val = strchr(poke_cursor + 11, '"');
                 const char* details_key;
+                const char* ident_key;
                 char cond[64];
+                char details[64];
                 int fainted = 0;
                 size_t c = 0;
 
@@ -259,6 +289,36 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                 details_key = strstr(poke_cursor, "\"active\":");
                 req->switch_available[team_idx] = fainted ? 0 : 1;
                 req->switch_fainted[team_idx] = fainted;
+                req->side_species_id[team_idx] = 0;
+                req->side_ident[team_idx][0] = '\0';
+                ident_key = strstr(poke_cursor, "\"ident\":");
+                if (ident_key) {
+                    const char* q = strchr(ident_key + 8, '"');
+                    size_t qi = 0;
+                    if (q) {
+                        ++q;
+                        while (q[qi] && q[qi] != '"' && qi + 1 < sizeof(req->side_ident[team_idx])) {
+                            req->side_ident[team_idx][qi] = q[qi];
+                            ++qi;
+                        }
+                        req->side_ident[team_idx][qi] = '\0';
+                    }
+                }
+                details[0] = '\0';
+                details_key = strstr(poke_cursor, "\"details\":");
+                if (details_key) {
+                    const char* q = strchr(details_key + 10, '"');
+                    size_t qi = 0;
+                    if (q) {
+                        ++q;
+                        while (q[qi] && q[qi] != '"' && q[qi] != ',' && qi + 1 < sizeof(details)) {
+                            details[qi] = q[qi];
+                            ++qi;
+                        }
+                        details[qi] = '\0';
+                        req->side_species_id[team_idx] = species_id_from_name(details);
+                    }
+                }
                 if (details_key && parse_bool_after(details_key, "active", 0)) {
                     req->switch_available[team_idx] = 0;
                 }

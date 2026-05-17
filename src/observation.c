@@ -24,15 +24,24 @@ static size_t write_one_hot(float* out, size_t idx, int value, int count) {
     return idx + (size_t)count;
 }
 
+static size_t write_knowledge(float* out, size_t idx, uint8_t mode) {
+    int mapped = (mode <= 2) ? mode : 0;
+    return write_one_hot(out, idx, mapped, 3);
+}
+
 static size_t flatten_side(float* out, size_t idx, const ObsSide* side) {
     idx = write_flag(out, idx, side->stealth_rock);
     idx = write_scalar(out, idx, (float)side->spikes / 3.0f);
     idx = write_scalar(out, idx, (float)side->toxic_spikes / 2.0f);
     idx = write_flag(out, idx, side->sticky_web);
     idx = write_flag(out, idx, side->reflect);
+    idx = write_scalar(out, idx, side->reflect_turns / 8.0f);
     idx = write_flag(out, idx, side->light_screen);
+    idx = write_scalar(out, idx, side->light_screen_turns / 8.0f);
     idx = write_flag(out, idx, side->aurora_veil);
+    idx = write_scalar(out, idx, side->aurora_veil_turns / 8.0f);
     idx = write_flag(out, idx, side->tailwind);
+    idx = write_scalar(out, idx, side->tailwind_turns / 8.0f);
     return idx;
 }
 
@@ -49,17 +58,35 @@ static size_t flatten_pokemon(float* out, size_t idx, const ObsPokemon* p) {
     idx = write_one_hot(out, idx, p->type1_id, OBS_NUM_TYPES);
     idx = write_one_hot(out, idx, p->type2_id, OBS_NUM_TYPES);
     idx = write_one_hot(out, idx, p->species_id, OBS_NUM_SPECIES);
+    idx = write_knowledge(out, idx, p->species_known_mode);
     idx = write_one_hot(out, idx, p->item_id, OBS_NUM_ITEMS);
+    idx = write_knowledge(out, idx, p->item_known_mode);
     idx = write_one_hot(out, idx, p->ability_id, OBS_NUM_ABILITIES);
+    idx = write_knowledge(out, idx, p->ability_known_mode);
     idx = write_one_hot(out, idx, p->tera_type_id, OBS_NUM_TYPES);
+    idx = write_knowledge(out, idx, p->tera_type_known_mode);
 
     for (i = 0; i < OBS_BOOST_SLOTS; ++i) {
         idx = write_scalar(out, idx, p->boosts[i] / 6.0f);
     }
+    idx = write_flag(out, idx, p->encore_active);
+    idx = write_scalar(out, idx, p->encore_turns / 5.0f);
+    idx = write_flag(out, idx, p->disable_active);
+    idx = write_scalar(out, idx, p->disable_turns / 5.0f);
+    idx = write_flag(out, idx, p->taunt_active);
+    idx = write_scalar(out, idx, p->taunt_turns / 5.0f);
+    idx = write_flag(out, idx, p->protect_active);
+    idx = write_scalar(out, idx, p->protect_chain_count / 5.0f);
+    idx = write_flag(out, idx, p->confusion_active);
+    idx = write_scalar(out, idx, p->confusion_turns / 5.0f);
+    idx = write_flag(out, idx, p->substitute_active);
+    idx = write_scalar(out, idx, p->toxic_counter / 15.0f);
+    idx = write_scalar(out, idx, p->sleep_turns / 5.0f);
 
     for (i = 0; i < OBS_MOVE_SLOTS; ++i) {
         idx = write_flag(out, idx, p->move_known[i]);
         idx = write_flag(out, idx, p->move_disabled[i]);
+        idx = write_knowledge(out, idx, p->move_known_mode[i]);
         idx = write_scalar(out, idx, p->move_pp_frac[i]);
         idx = write_one_hot(out, idx, p->move_id[i], OBS_NUM_MOVES);
     }
@@ -119,6 +146,7 @@ size_t observation_flatten(float* out, size_t out_len, const Observation* obs) {
     idx = write_scalar(out, idx, obs->turn_norm);
 
     idx = write_flag(out, idx, obs->trick_room);
+    idx = write_scalar(out, idx, obs->trick_room_turns / 8.0f);
     idx = write_flag(out, idx, obs->forced_switch);
     idx = write_flag(out, idx, obs->team_preview);
     idx = write_flag(out, idx, obs->can_tera);

@@ -2,15 +2,25 @@
 
 #include <string.h>
 
+static uint8_t knowledge_to_mode(KnowledgeLevel level) {
+    if (level == KNOW_CONFIRMED) return 2;
+    if (level == KNOW_INFERRED) return 1;
+    return 0;
+}
+
 static void copy_side(ObsSide* out, const RawSideState* in) {
     out->stealth_rock = (unsigned char)in->stealth_rock;
     out->spikes = (unsigned char)in->spikes;
     out->toxic_spikes = (unsigned char)in->toxic_spikes;
     out->sticky_web = (unsigned char)in->sticky_web;
     out->reflect = (unsigned char)in->reflect;
+    out->reflect_turns = (float)in->reflect_turns;
     out->light_screen = (unsigned char)in->light_screen;
+    out->light_screen_turns = (float)in->light_screen_turns;
     out->aurora_veil = (unsigned char)in->aurora_veil;
+    out->aurora_veil_turns = (float)in->aurora_veil_turns;
     out->tailwind = (unsigned char)in->tailwind;
+    out->tailwind_turns = (float)in->tailwind_turns;
 }
 
 static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
@@ -20,21 +30,39 @@ static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
     out->fainted = (unsigned char)in->fainted;
     out->revealed = (unsigned char)in->revealed;
     out->hp_frac = (in->max_hp > 0) ? ((float)in->current_hp / (float)in->max_hp) : 0.0f;
-    out->status_id = in->status_id;
+    out->status_id = in->status_id.value;
     out->type1_id = in->type1_id;
     out->type2_id = in->type2_id;
-    out->species_id = in->species_id;
-    out->item_id = in->item_id;
-    out->ability_id = in->ability_id;
-    out->tera_type_id = in->tera_type_id;
+    out->species_id = in->species_id.value;
+    out->species_known_mode = knowledge_to_mode(in->species_id.knowledge);
+    out->item_id = in->item_id.value;
+    out->item_known_mode = knowledge_to_mode(in->item_id.knowledge);
+    out->ability_id = in->ability_id.value;
+    out->ability_known_mode = knowledge_to_mode(in->ability_id.knowledge);
+    out->tera_type_id = in->tera_type_id.value;
+    out->tera_type_known_mode = knowledge_to_mode(in->tera_type_id.knowledge);
     for (i = 0; i < OBS_BOOST_SLOTS; ++i) {
         out->boosts[i] = (float)in->boosts[i];
     }
+    out->encore_active = (unsigned char)in->encore_active;
+    out->encore_turns = (float)in->encore_turns;
+    out->disable_active = (unsigned char)in->disable_active;
+    out->disable_turns = (float)in->disable_turns;
+    out->taunt_active = (unsigned char)in->taunt_active;
+    out->taunt_turns = (float)in->taunt_turns;
+    out->protect_active = (unsigned char)in->protect_active;
+    out->protect_chain_count = (float)in->protect_chain_count;
+    out->confusion_active = (unsigned char)in->confusion_active;
+    out->confusion_turns = (float)in->confusion_turns;
+    out->substitute_active = (unsigned char)in->substitute_active;
+    out->toxic_counter = (float)in->toxic_counter;
+    out->sleep_turns = (float)in->sleep_turns;
     for (i = 0; i < OBS_MOVE_SLOTS; ++i) {
         out->move_known[i] = (unsigned char)in->move_known[i];
         out->move_disabled[i] = (unsigned char)in->move_disabled[i];
+        out->move_known_mode[i] = knowledge_to_mode(in->move_ids[i].knowledge);
         out->move_pp_frac[i] = in->move_max_pp[i] > 0 ? ((float)in->move_pp[i] / (float)in->move_max_pp[i]) : 0.0f;
-        out->move_id[i] = in->move_ids[i];
+        out->move_id[i] = in->move_ids[i].value;
     }
 }
 
@@ -50,10 +78,11 @@ void observation_from_raw_state(
     observation_init(out);
     out->weather_id = state->weather_id;
     out->terrain_id = state->terrain_id;
-    out->weather_turns = (float)state->weather_turns;
-    out->terrain_turns = (float)state->terrain_turns;
+    out->weather_turns = (float)state->weather_turns_remaining;
+    out->terrain_turns = (float)state->terrain_turns_remaining;
     out->turn_norm = (float)state->turn_number / 100.0f;
     out->trick_room = (unsigned char)state->trick_room;
+    out->trick_room_turns = (float)state->trick_room_turns_remaining;
     out->forced_switch = 0;
     out->team_preview = 0;
     out->can_tera = (unsigned char)state->can_tera;

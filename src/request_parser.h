@@ -11,10 +11,14 @@
 typedef struct {
     int move_id[PARSED_REQUEST_MOVE_SLOTS];
     int move_disabled[PARSED_REQUEST_MOVE_SLOTS];
+    int move_maybe_disabled[PARSED_REQUEST_MOVE_SLOTS];
     int move_pp[PARSED_REQUEST_MOVE_SLOTS];
     int move_max_pp[PARSED_REQUEST_MOVE_SLOTS];
+    int move_target[PARSED_REQUEST_MOVE_SLOTS];
     int can_tera;
+    int tera_type_id;
     int trapped;
+    int maybe_trapped;
     int fainted;
     int has_force_switch;
 } ParsedActive;
@@ -27,8 +31,11 @@ typedef struct {
     int active_count;
     int switch_available[PARSED_REQUEST_TEAM_SIZE];
     int switch_fainted[PARSED_REQUEST_TEAM_SIZE];
+    int force_switch[PARSED_REQUEST_ACTIVE_SLOTS];
     int can_tera;
     int forced_switch_any;
+    char side_ident[PARSED_REQUEST_TEAM_SIZE][32];
+    int side_species_id[PARSED_REQUEST_TEAM_SIZE];
     ParsedActive active[PARSED_REQUEST_ACTIVE_SLOTS];
     char raw_json[PARSED_REQUEST_MAX_JSON];
 } ParsedRequest;

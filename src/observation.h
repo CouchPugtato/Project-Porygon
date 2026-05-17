@@ -62,14 +62,33 @@ typedef struct {
     int type1_id;
     int type2_id;
     int species_id;
+    uint8_t species_known_mode;
     int item_id;
+    uint8_t item_known_mode;
     int ability_id;
+    uint8_t ability_known_mode;
     int tera_type_id;
+    uint8_t tera_type_known_mode;
 
     float boosts[OBS_BOOST_SLOTS];
 
+    uint8_t encore_active;
+    float encore_turns;
+    uint8_t disable_active;
+    float disable_turns;
+    uint8_t taunt_active;
+    float taunt_turns;
+    uint8_t protect_active;
+    float protect_chain_count;
+    uint8_t confusion_active;
+    float confusion_turns;
+    uint8_t substitute_active;
+    float toxic_counter;
+    float sleep_turns;
+
     uint8_t move_known[OBS_MOVE_SLOTS];
     uint8_t move_disabled[OBS_MOVE_SLOTS];
+    uint8_t move_known_mode[OBS_MOVE_SLOTS];
     float move_pp_frac[OBS_MOVE_SLOTS];
     int move_id[OBS_MOVE_SLOTS];
 } ObsPokemon;
@@ -80,9 +99,13 @@ typedef struct {
     uint8_t toxic_spikes;
     uint8_t sticky_web;
     uint8_t reflect;
+    float reflect_turns;
     uint8_t light_screen;
+    float light_screen_turns;
     uint8_t aurora_veil;
+    float aurora_veil_turns;
     uint8_t tailwind;
+    float tailwind_turns;
 } ObsSide;
 
 typedef struct {
@@ -93,6 +116,7 @@ typedef struct {
     float turn_norm;
 
     uint8_t trick_room;
+    float trick_room_turns;
     uint8_t forced_switch;
     uint8_t team_preview;
     uint8_t can_tera;
@@ -114,20 +138,25 @@ typedef struct {
     OBS_NUM_TYPES + \
     OBS_NUM_TYPES + \
     OBS_NUM_SPECIES + \
+    3 + \
     OBS_NUM_ITEMS + \
+    3 + \
     OBS_NUM_ABILITIES + \
+    3 + \
     OBS_NUM_TYPES + \
+    3 + \
     OBS_BOOST_SLOTS + \
-    OBS_MOVE_SLOTS * (2 + 1 + OBS_NUM_MOVES) \
+    12 + \
+    OBS_MOVE_SLOTS * (3 + 1 + OBS_NUM_MOVES) \
 )
 
-#define OBS_SIDE_FEATURES 8
+#define OBS_SIDE_FEATURES 12
 
 #define OBS_GLOBAL_FEATURES ( \
     OBS_NUM_WEATHER + \
     OBS_NUM_TERRAIN + \
     2 + \
-    1 + \
+    2 + \
     5 \
 )
 

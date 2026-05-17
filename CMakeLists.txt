@@ -18,9 +18,12 @@ add_executable(showdown_client
 	src/episode.c
 	src/gru_model.c
 	src/id_tables.c
+	src/state_value.c
 	src/request_parser.c
 	src/action_mapper.c
 	src/raw_battle_state.c
+	src/event_parser.c
+	src/inference_engine.c
 	src/observation_builder.c
 	src/runtime_protocol.c
 	src/replay_io.c
