@@ -17,6 +17,7 @@ add_executable(showdown_client
 	src/observation.c
 	src/episode.c
 	src/gru_model.c
+	src/id_tables.c
 	src/request_parser.c
 	src/action_mapper.c
 	src/raw_battle_state.c

@@ -2,6 +2,7 @@
 #include "env_session.h"
 #include "gru_model.h"
 #include "gru_trainer.h"
+#include "id_tables.h"
 #include "observation.h"
 #include "runtime_protocol.h"
 #include "showdown_client.h"
@@ -204,6 +205,10 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
 }
 
 int main(int argc, char** argv) {
+    if (!id_tables_init()) {
+        fprintf(stderr, "Failed to initialize ID tables\n");
+        return 1;
+    }
     if (getenv("PORYGON_DEMO_GRU")) {
         return run_demo_gru();
     }

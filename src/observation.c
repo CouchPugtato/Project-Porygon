@@ -1,4 +1,5 @@
 #include "observation.h"
+#include "id_tables.h"
 
 #include <string.h>
 
@@ -165,9 +166,9 @@ void observation_fill_demo(Observation* obs) {
     obs->self_team[0].status_id = 0;
     obs->self_team[0].type1_id = 3;
     obs->self_team[0].type2_id = 8;
-    obs->self_team[0].species_id = 445;
-    obs->self_team[0].item_id = 117;
-    obs->self_team[0].ability_id = 24;
+    obs->self_team[0].species_id = species_id_from_name("garchomp");
+    obs->self_team[0].item_id = item_id_from_name("clearamulet");
+    obs->self_team[0].ability_id = ability_id_from_name("roughskin");
     obs->self_team[0].tera_type_id = 2;
     obs->self_team[0].move_known[0] = 1;
     obs->self_team[0].move_known[1] = 1;
@@ -177,16 +178,16 @@ void observation_fill_demo(Observation* obs) {
     obs->self_team[0].move_pp_frac[1] = 0.80f;
     obs->self_team[0].move_pp_frac[2] = 1.00f;
     obs->self_team[0].move_pp_frac[3] = 0.60f;
-    obs->self_team[0].move_id[0] = 53;
-    obs->self_team[0].move_id[1] = 89;
-    obs->self_team[0].move_id[2] = 242;
-    obs->self_team[0].move_id[3] = 337;
+    obs->self_team[0].move_id[0] = move_id_from_name("protect");
+    obs->self_team[0].move_id[1] = move_id_from_name("earthquake");
+    obs->self_team[0].move_id[2] = move_id_from_name("rockslide");
+    obs->self_team[0].move_id[3] = move_id_from_name("dragonclaw");
 
     obs->self_team[1].known = 1;
     obs->self_team[1].revealed = 1;
     obs->self_team[1].hp_frac = 1.00f;
     obs->self_team[1].type1_id = 11;
-    obs->self_team[1].species_id = 25;
+    obs->self_team[1].species_id = species_id_from_name("amoonguss");
 
     obs->opp_team[0].known = 1;
     obs->opp_team[0].active = 1;
@@ -194,10 +195,10 @@ void observation_fill_demo(Observation* obs) {
     obs->opp_team[0].hp_frac = 0.66f;
     obs->opp_team[0].status_id = 2;
     obs->opp_team[0].type1_id = 10;
-    obs->opp_team[0].species_id = 130;
+    obs->opp_team[0].species_id = species_id_from_name("gyarados");
     obs->opp_team[0].move_known[0] = 1;
     obs->opp_team[0].move_pp_frac[0] = 0.9f;
-    obs->opp_team[0].move_id[0] = 56;
+    obs->opp_team[0].move_id[0] = move_id_from_name("thunderbolt");
 
     obs->legal_mask[OBS_A1_MOVE1] = 1;
     obs->legal_mask[OBS_A1_MOVE2] = 1;

@@ -1,4 +1,5 @@
 #include "request_parser.h"
+#include "id_tables.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -128,19 +129,6 @@ static int extract_json_object(const char* start, char* out, size_t out_len) {
     return 0;
 }
 
-static int hash_token_id(const char* text, int upper_bound) {
-    unsigned int hash = 2166136261u;
-    const unsigned char* p = (const unsigned char*)text;
-    if (!text || !*text || upper_bound <= 1) {
-        return 0;
-    }
-    while (*p) {
-        hash ^= (unsigned int)(*p++);
-        hash *= 16777619u;
-    }
-    return 1 + (int)(hash % (unsigned int)(upper_bound - 1));
-}
-
 static int parse_move_id_from_object(const char* obj) {
     const char* p = strstr(obj, "\"id\":");
     char token[64];
@@ -165,7 +153,7 @@ static int parse_move_id_from_object(const char* obj) {
         token[i++] = *p++;
     }
     token[i] = '\0';
-    return hash_token_id(token, 920);
+    return move_id_from_name(token);
 }
 
 void parsed_request_init(ParsedRequest* req) {

@@ -4,19 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int hash_token_id(const char* text, int upper_bound) {
-    unsigned int hash = 2166136261u;
-    const unsigned char* p = (const unsigned char*)text;
-    if (!text || !*text || upper_bound <= 1) {
-        return 0;
-    }
-    while (*p) {
-        hash ^= (unsigned int)(*p++);
-        hash *= 16777619u;
-    }
-    return 1 + (int)(hash % (unsigned int)(upper_bound - 1));
-}
-
 static int status_from_text(const char* text) {
     if (!text || !*text) return 0;
     if (strncmp(text, "brn", 3) == 0) return 1;
