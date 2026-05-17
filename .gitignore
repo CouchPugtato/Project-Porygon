@@ -1,0 +1,15 @@
+build-local/
+build/
+matches/
+
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+
+*.o
+*.obj
+*.exe
+*.out

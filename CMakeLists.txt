@@ -14,6 +14,9 @@ add_executable(showdown_client
 	src/showdown_client.c
 	src/neural_net.c
 	src/game_state.c
+	src/observation.c
+	src/episode.c
+	src/gru_model.c
 )
 
 target_link_libraries(showdown_client PRIVATE websockets)
@@ -23,4 +26,3 @@ target_link_libraries(showdown_client PRIVATE CURL::libcurl)
 if(UNIX)
     target_link_libraries(showdown_client PRIVATE m)
 endif()
-
