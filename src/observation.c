@@ -164,7 +164,7 @@ size_t observation_flatten(float* out, size_t out_len, const Observation* obs) {
     for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
         idx = write_flag(out, idx, obs->legal_mask[i]);
     }
-    return idx;
+    return idx == OBSERVATION_FLAT_SIZE ? idx : 0;
 }
 
 void observation_fill_demo(Observation* obs) {

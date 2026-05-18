@@ -8,13 +8,27 @@
 #define PARSED_REQUEST_MOVE_SLOTS 4
 #define PARSED_REQUEST_TEAM_SIZE 6
 
+typedef enum {
+    REQUEST_TARGET_UNKNOWN = 0,
+    REQUEST_TARGET_NORMAL,
+    REQUEST_TARGET_ADJACENT_FOE,
+    REQUEST_TARGET_ANY,
+    REQUEST_TARGET_ADJACENT_ALLY,
+    REQUEST_TARGET_ADJACENT_ALLY_OR_SELF,
+    REQUEST_TARGET_SELF,
+    REQUEST_TARGET_ALL_ADJACENT_FOES,
+    REQUEST_TARGET_ALL,
+    REQUEST_TARGET_ALLY_SIDE,
+    REQUEST_TARGET_FOE_SIDE
+} ParsedMoveTarget;
+
 typedef struct {
     int move_id[PARSED_REQUEST_MOVE_SLOTS];
     int move_disabled[PARSED_REQUEST_MOVE_SLOTS];
     int move_maybe_disabled[PARSED_REQUEST_MOVE_SLOTS];
     int move_pp[PARSED_REQUEST_MOVE_SLOTS];
     int move_max_pp[PARSED_REQUEST_MOVE_SLOTS];
-    int move_target[PARSED_REQUEST_MOVE_SLOTS];
+    ParsedMoveTarget move_target[PARSED_REQUEST_MOVE_SLOTS];
     int can_tera;
     int tera_type_id;
     int trapped;
@@ -31,6 +45,7 @@ typedef struct {
     int active_count;
     int switch_available[PARSED_REQUEST_TEAM_SIZE];
     int switch_fainted[PARSED_REQUEST_TEAM_SIZE];
+    int switch_active[PARSED_REQUEST_TEAM_SIZE];
     int force_switch[PARSED_REQUEST_ACTIVE_SLOTS];
     int can_tera;
     int forced_switch_any;

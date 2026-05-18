@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 
-#define RUNTIME_BATTLE_ID_LEN 64
+#define RUNTIME_BATTLE_ID_LEN 192
 #define RUNTIME_FORMAT_LEN 64
 #define RUNTIME_RESULT_LEN 16
 #define RUNTIME_LINE_LEN 2048

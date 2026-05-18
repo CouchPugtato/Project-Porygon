@@ -90,8 +90,11 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     float* policy;
     float value;
     int action;
+    int action2 = -1;
+    int legal_count = 0;
     char command[256];
     char json[512];
+    int i;
     if (!runtime || !session || !out || runtime->replay_only) {
         return 1;
     }
@@ -99,16 +102,45 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     if (!policy) {
         return 0;
     }
-    gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, policy, &value);
-    action = gru_model_select_action(policy, session->observation.legal_mask, OBS_NUM_ACTIONS);
-    free(policy);
-    if (action < 0 || !action_to_showdown_command(command, sizeof(command), (enum ObsAction)action, &session->parsed_request)) {
-        runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map action");
+    for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
+        if (session->observation.legal_mask[i]) {
+            ++legal_count;
+        }
+    }
+    if (legal_count == 0) {
+        runtime_emit_error_json(json, sizeof(json), session->battle_id, "no legal actions available");
         fputs(json, out);
         fputc('\n', out);
         fflush(out);
+        free(policy);
         return 0;
     }
+    gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, policy, &value);
+    if (session->parsed_request.is_doubles && session->parsed_request.active_count > 1 && !session->parsed_request.team_preview) {
+        action = gru_model_select_action_range(policy, session->observation.legal_mask, OBS_A1_MOVE1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS);
+        action2 = gru_model_select_action_range(policy, session->observation.legal_mask, OBS_A2_MOVE1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS);
+        if (action < 0 || action2 < 0 ||
+            !doubles_actions_to_showdown_command(command, sizeof(command),
+                (enum ObsAction)action, (enum ObsAction)action2, &session->parsed_request)) {
+            free(policy);
+            runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map doubles actions");
+            fputs(json, out);
+            fputc('\n', out);
+            fflush(out);
+            return 0;
+        }
+    } else {
+        action = gru_model_select_action(policy, session->observation.legal_mask, OBS_NUM_ACTIONS);
+        if (action < 0 || !action_to_showdown_command(command, sizeof(command), (enum ObsAction)action, &session->parsed_request)) {
+            free(policy);
+            runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map action");
+            fputs(json, out);
+            fputc('\n', out);
+            fflush(out);
+            return 0;
+        }
+    }
+    free(policy);
     session->episode.actions[session->episode.count - 1] = action;
     if (runtime->replay_file) {
         replay_write_decision(runtime->replay_file, session->battle_id, session->last_request_id, action, command);
@@ -122,6 +154,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
 
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out) {
     EnvSession* session;
+    char json[512];
     if (!runtime || !msg) {
         return 0;
     }
@@ -139,18 +172,52 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
             return 1;
         case RUNTIME_MSG_REQUEST:
             session = ensure_session(runtime, msg->battle_id, 1);
-            if (!session) return 0;
+            if (!session) {
+                if (out) {
+                    runtime_emit_error_json(json, sizeof(json), msg->battle_id, "failed to create or find session");
+                    fputs(json, out);
+                    fputc('\n', out);
+                    fflush(out);
+                }
+                return 0;
+            }
             session->last_request_id = msg->request_id;
             if (!parse_request_payload(&session->parsed_request, msg->payload, msg->request_id, 1)) {
+                if (out) {
+                    runtime_emit_error_json(json, sizeof(json), msg->battle_id, "parse_request_payload failed");
+                    fputs(json, out);
+                    fputc('\n', out);
+                    fflush(out);
+                }
                 return 0;
             }
             raw_battle_state_update_from_request(&session->raw_state, &session->parsed_request);
-            build_action_mask_from_request(&session->action_mask, &session->parsed_request);
+            if (!build_action_mask_from_request(&session->action_mask, &session->parsed_request)) {
+                if (out) {
+                    runtime_emit_error_json(json, sizeof(json), msg->battle_id, "build_action_mask_from_request failed");
+                    fputs(json, out);
+                    fputc('\n', out);
+                    fflush(out);
+                }
+                return 0;
+            }
             observation_from_raw_state(&session->observation, &session->raw_state, &session->action_mask);
             if (observation_flatten(session->flat_observation, runtime->obs_dim, &session->observation) != runtime->obs_dim) {
+                if (out) {
+                    runtime_emit_error_json(json, sizeof(json), msg->battle_id, "observation_flatten failed");
+                    fputs(json, out);
+                    fputc('\n', out);
+                    fflush(out);
+                }
                 return 0;
             }
             if (!episode_append(&session->episode, session->flat_observation, -1, 0.0f, 0)) {
+                if (out) {
+                    runtime_emit_error_json(json, sizeof(json), msg->battle_id, "episode_append failed");
+                    fputs(json, out);
+                    fputc('\n', out);
+                    fflush(out);
+                }
                 return 0;
             }
             session->ready_for_decision = 1;

@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
 import sys
+from itertools import product
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -49,7 +51,153 @@ def event_summary(event: ShowdownEvent) -> str | None:
         return f"[battle] {battle_label(event.room_id)} winner: {parts[2]}"
     if tag == "tie":
         return f"[battle] {battle_label(event.room_id)} result: tie"
+    if tag == "error" and len(parts) >= 3:
+        return f"[battle] {battle_label(event.room_id)} error: {parts[2]}"
     return None
+
+
+def is_fainted_condition(condition: str) -> bool:
+    return "fnt" in condition.lower()
+
+
+def target_options(target: str, slot_index: int) -> list[str]:
+    if target in {"normal", "adjacentFoe", "any"}:
+        return [" 1", " 2"]
+    if target == "adjacentAlly":
+        return [" -2" if slot_index == 0 else " -1"]
+    if target == "adjacentAllyOrSelf":
+        return [" -1" if slot_index == 0 else " -2", " -2" if slot_index == 0 else " -1"]
+    return [""]
+
+
+def legal_switch_indices(request_payload: dict) -> list[int]:
+    side = request_payload.get("side", {})
+    pokemon = side.get("pokemon", [])
+    legal: list[int] = []
+    for idx, mon in enumerate(pokemon, start=1):
+        if mon.get("active"):
+            continue
+        if is_fainted_condition(str(mon.get("condition", ""))):
+            continue
+        legal.append(idx)
+    return legal
+
+
+def force_switch_flags(request_payload: dict, active_count: int) -> list[bool]:
+    raw = request_payload.get("forceSwitch")
+    flags = [False] * max(active_count, 1)
+    if isinstance(raw, list):
+        for idx, value in enumerate(raw[: len(flags)]):
+            flags[idx] = bool(value)
+    return flags
+
+
+def slot_action_options(request_payload: dict, slot_index: int) -> list[str]:
+    active = request_payload.get("active", [])
+    if slot_index >= len(active):
+        return []
+
+    slot = active[slot_index]
+    options: list[str] = []
+    force_switch = False
+    force_switch_arr = request_payload.get("forceSwitch")
+    if isinstance(force_switch_arr, list) and slot_index < len(force_switch_arr):
+        force_switch = bool(force_switch_arr[slot_index])
+    force_switch = force_switch or bool(slot.get("forceSwitch"))
+
+    switches = legal_switch_indices(request_payload)
+    trapped = bool(slot.get("trapped"))
+
+    if not force_switch:
+        for move_index, move in enumerate(slot.get("moves", []), start=1):
+            if move.get("disabled"):
+                continue
+            suffixes = target_options(str(move.get("target", "")), slot_index)
+            for suffix in suffixes:
+                options.append(f"move {move_index}{suffix}")
+
+    if force_switch or not trapped:
+        for switch_index in switches:
+            options.append(f"switch {switch_index}")
+
+    return options
+
+
+def fallback_commands_for_request(request_payload: dict) -> list[str]:
+    if request_payload.get("teamPreview"):
+        switches = legal_switch_indices(request_payload)
+        return [f"/choose team {idx}" for idx in switches]
+
+    active = request_payload.get("active", [])
+    inferred_slots = len(active)
+    raw_force_switch = request_payload.get("forceSwitch")
+    if isinstance(raw_force_switch, list) and len(raw_force_switch) > inferred_slots:
+        inferred_slots = len(raw_force_switch)
+    if inferred_slots <= 0:
+        inferred_slots = 1
+
+    force_flags = force_switch_flags(request_payload, inferred_slots)
+    if any(force_flags):
+        switches = legal_switch_indices(request_payload)
+        if inferred_slots == 1:
+            return [f"/choose switch {idx}" for idx in switches]
+        if force_flags == [True, False]:
+            commands: list[str] = []
+            for idx in switches:
+                commands.append(f"/choose switch {idx}")
+                commands.append(f"/choose switch {idx}, pass")
+            return commands
+        if force_flags == [False, True]:
+            commands = []
+            for idx in switches:
+                commands.append(f"/choose pass, switch {idx}")
+                commands.append(f"/choose switch {idx}")
+            return commands
+        commands: list[str] = []
+        for first, second in product(switches, switches):
+            if first == second:
+                continue
+            commands.append(f"/choose switch {first}, switch {second}")
+        return commands
+
+    if not active:
+        return []
+
+    slot1 = slot_action_options(request_payload, 0)
+    if len(active) == 1:
+        return [f"/choose {part}" for part in slot1]
+
+    slot2 = slot_action_options(request_payload, 1)
+    commands: list[str] = []
+    for part1, part2 in product(slot1, slot2):
+        if part1.startswith("switch ") and part2.startswith("switch ") and part1 == part2:
+            continue
+        commands.append(f"/choose {part1}, {part2}")
+    return commands
+
+
+def next_fallback_command(
+    request_payload: dict,
+    attempted: set[str],
+) -> str | None:
+    candidates = fallback_commands_for_request(request_payload)
+    random.shuffle(candidates)
+    for candidate in candidates:
+        if candidate in attempted:
+            continue
+        attempted.add(candidate)
+        return candidate
+    return None
+
+
+def parse_player_line(line: str) -> tuple[str, str] | None:
+    parts = line.split("|")
+    if len(parts) >= 4 and parts[1] == "player":
+        return parts[2], parts[3]
+    return None
+
+
+MAX_INVALID_RETRIES_PER_REQUEST = 24
 
 
 class ReplayWriter:
@@ -98,6 +246,7 @@ async def capture_mode(out_path: Path, fmt: str, username: str) -> None:
             writer.append(battle_end(event.room_id).to_json())
             finished_battles += 1
             print(f"[capture] finished {event.room_id} result={result} total_matches_captured={finished_battles}")
+            await gateway.search_next_battle()
         else:
             writer.append(event_message(event.room_id, seq, event.line).to_json())
 
@@ -113,22 +262,66 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
     await learner.start()
     print(f"[live] started learner: {' '.join(learner_command)}")
     seq = 0
+    latest_requests: dict[str, dict] = {}
+    attempted_commands: dict[str, set[str]] = {}
+    latest_request_seq: dict[str, int] = {}
+    request_open: dict[str, bool] = {}
+    invalid_retry_count: dict[str, int] = {}
+    battle_players: dict[str, dict[str, str]] = {}
+    announced_matchups: set[str] = set()
 
     async def on_event(event: ShowdownEvent) -> None:
         nonlocal seq
         summary = event_summary(event)
         if summary:
             print(summary)
+        player_info = parse_player_line(event.line)
+        if player_info is not None:
+            side, username_found = player_info
+            players = battle_players.setdefault(event.room_id, {})
+            players[side] = username_found
+            if event.room_id not in announced_matchups and "p1" in players and "p2" in players:
+                print(f"[matchup] {players['p1']} vs {players['p2']}")
+                announced_matchups.add(event.room_id)
         if event.line.startswith("|request|"):
             payload = event.line.split("|request|", 1)[1]
-            await learner.send(request_message(event.room_id, seq, json.loads(payload)).payload)
+            request_payload = json.loads(payload)
+            latest_requests[event.room_id] = request_payload
+            attempted_commands[event.room_id] = set()
+            latest_request_seq[event.room_id] = seq
+            request_open[event.room_id] = True
+            invalid_retry_count[event.room_id] = 0
+            print(f"[live] sending request {seq} to learner for {battle_label(event.room_id)}")
+            await learner.send(request_message(event.room_id, seq, request_payload).payload)
             print(f"[live] request {seq} for {battle_label(event.room_id)}")
+        elif event.line.startswith("|error|") and "Invalid choice" in event.line:
+            if "There's nothing to choose" in event.line:
+                request_open[event.room_id] = False
+                print(f"[live] request closed for {battle_label(event.room_id)} after stale choice rejection")
+                return
+            request_payload = latest_requests.get(event.room_id)
+            if request_payload is not None and request_open.get(event.room_id, False):
+                invalid_retry_count[event.room_id] = invalid_retry_count.get(event.room_id, 0) + 1
+                if invalid_retry_count[event.room_id] > MAX_INVALID_RETRIES_PER_REQUEST:
+                    request_open[event.room_id] = False
+                    print(f"[live] request closed for {battle_label(event.room_id)} after too many invalid retries")
+                    return
+                tried = attempted_commands.setdefault(event.room_id, set())
+                candidate = next_fallback_command(request_payload, tried)
+                if candidate is not None:
+                    print(f"[live] retrying with fallback for {battle_label(event.room_id)}: {candidate}")
+                    await gateway.send_room_command(event.room_id, candidate)
+                else:
+                    print(f"[live] fallback debug for {battle_label(event.room_id)} forceSwitch={request_payload.get('forceSwitch')} legal_switches={legal_switch_indices(request_payload)}")
+                    print(f"[live] no fallback candidates left for {battle_label(event.room_id)}")
         elif event.line.startswith("|win|") or event.line.startswith("|tie|"):
             result = "win" if event.line.startswith("|win|") else "draw"
             reward = 1.0 if result == "win" else 0.0
             await learner.send(terminal_message(event.room_id, result, reward).payload)
             await learner.send(battle_end(event.room_id).payload)
             print(f"[live] battle ended {event.room_id} result={result}")
+            request_open[event.room_id] = False
+            await gateway.search_next_battle()
         else:
             if event.room_id.startswith("battle-") and event.line.startswith("|init|battle"):
                 await learner.send(
@@ -151,28 +344,45 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                 print(f"[live] learner ready: {msg}")
             elif msg.get("type") == "action":
                 battle_id = msg["battle_id"]
+                if not request_open.get(battle_id, False):
+                    print(f"[live] ignoring stale learner action for closed request {battle_id}: {msg['command']}")
+                    continue
                 print(f"[live] action for {battle_id}: {msg['command']}")
+                attempted_commands.setdefault(battle_id, set()).add(msg["command"])
                 await gateway.send_room_command(battle_id, msg["command"])
             elif msg.get("type") == "error":
                 print(f"[live] learner error: {msg}")
 
+    async def stderr_loop() -> None:
+        while True:
+            line = await learner.read_stderr_line()
+            if line is None:
+                return
+            if line:
+                print(f"[learner-stderr] {line}")
+
     await gateway.connect()
-    await asyncio.gather(gateway.run(on_event), action_loop())
+    await asyncio.gather(gateway.run(on_event), action_loop(), stderr_loop())
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["live", "capture"], default="live")
     parser.add_argument("--replay-path", default="matches/runtime_capture.jsonl")
-    parser.add_argument("--learner-command", nargs="+", default=["./showdown_client", "--runtime"])
+    parser.add_argument("--learner-command", default="./showdown_client")
+    parser.add_argument("--learner-args", nargs="*", default=[])
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--username", default="")
-    args = parser.parse_args()
+    args, learner_passthrough = parser.parse_known_args()
 
     if args.mode == "capture":
         asyncio.run(capture_mode(Path(args.replay_path), args.format, args.username))
     else:
-        asyncio.run(live_mode(args.learner_command, Path(args.replay_path), args.format, args.username))
+        learner_args = list(args.learner_args) + list(learner_passthrough)
+        if not learner_args:
+            learner_args = ["--runtime"]
+        learner_command = [args.learner_command] + learner_args
+        asyncio.run(live_mode(learner_command, Path(args.replay_path), args.format, args.username))
 
 
 if __name__ == "__main__":

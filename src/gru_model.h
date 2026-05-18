@@ -30,6 +30,13 @@ void gru_model_forward_sequence(
     float* value_out
 );
 int gru_model_select_action(const float* policy, const unsigned char* legal_mask, size_t num_actions);
+int gru_model_select_action_range(
+    const float* policy,
+    const unsigned char* legal_mask,
+    size_t start_index,
+    size_t end_index,
+    size_t num_actions
+);
 void gru_model_evaluate_hidden(
     const GruModel* model,
     const float* hidden_state,

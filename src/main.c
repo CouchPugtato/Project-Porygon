@@ -125,7 +125,15 @@ static int run_runtime_mode(const char* checkpoint_path) {
             fflush(stdout);
             continue;
         }
-        env_runtime_handle_message(&runtime, &msg, stdout);
+        if (!env_runtime_handle_message(&runtime, &msg, stdout)) {
+            char errbuf[256];
+            snprintf(errbuf, sizeof(errbuf), "failed to handle runtime message type=%d request_id=%d",
+                (int)msg.type, msg.request_id);
+            runtime_emit_error_json(json, sizeof(json), msg.battle_id, errbuf);
+            puts(json);
+            fflush(stdout);
+            fprintf(stderr, "%s\n", errbuf);
+        }
     }
     env_runtime_free(&runtime);
     fclose(replay_file);

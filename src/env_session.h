@@ -12,7 +12,7 @@
 #include <stdio.h>
 
 typedef struct {
-    char battle_id[64];
+    char battle_id[RUNTIME_BATTLE_ID_LEN];
     RawBattleState raw_state;
     Observation observation;
     ActionMask action_mask;

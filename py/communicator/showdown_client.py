@@ -38,6 +38,7 @@ class ShowdownGateway:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._named = False
         self._search_sent = False
+        self._seen_battle_rooms: set[str] = set()
 
     async def connect(self) -> None:
         print(f"[communicator] connecting to {self.uri}")
@@ -65,6 +66,10 @@ class ShowdownGateway:
         await self.send("|/utm null")
         await self.send(f"|/search {self.format}")
         self._search_sent = True
+
+    async def search_next_battle(self) -> None:
+        self._search_sent = False
+        await self.search_battle()
 
     async def handle_control_line(self, line: str) -> None:
         if line.startswith("|challstr|"):
@@ -106,7 +111,8 @@ class ShowdownGateway:
                     continue
                 if raw_line.startswith(">"):
                     current_room = raw_line[1:]
-                    if current_room.startswith("battle-"):
+                    if current_room.startswith("battle-") and current_room not in self._seen_battle_rooms:
+                        self._seen_battle_rooms.add(current_room)
                         print(f"[communicator] joined battle room {current_room}")
                     continue
 

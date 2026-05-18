@@ -52,6 +52,37 @@ static int is_switch_action(enum ObsAction action, int* active_slot, int* switch
     return 0;
 }
 
+static int move_target_suffix(const ParsedRequest* req, int active_slot, int move_slot, char* out, size_t out_len) {
+    ParsedMoveTarget target;
+    if (!req || !out || out_len == 0 || active_slot < 0 || active_slot >= PARSED_REQUEST_ACTIVE_SLOTS ||
+        move_slot < 0 || move_slot >= PARSED_REQUEST_MOVE_SLOTS) {
+        return 0;
+    }
+    out[0] = '\0';
+    target = req->active[active_slot].move_target[move_slot];
+    switch (target) {
+        case REQUEST_TARGET_NORMAL:
+        case REQUEST_TARGET_ADJACENT_FOE:
+        case REQUEST_TARGET_ANY:
+            snprintf(out, out_len, " 1");
+            return 1;
+        case REQUEST_TARGET_ADJACENT_ALLY:
+            snprintf(out, out_len, active_slot == 0 ? " -2" : " -1");
+            return 1;
+        case REQUEST_TARGET_ADJACENT_ALLY_OR_SELF:
+            snprintf(out, out_len, active_slot == 0 ? " -1" : " -2");
+            return 1;
+        case REQUEST_TARGET_SELF:
+        case REQUEST_TARGET_ALL_ADJACENT_FOES:
+        case REQUEST_TARGET_ALL:
+        case REQUEST_TARGET_ALLY_SIDE:
+        case REQUEST_TARGET_FOE_SIDE:
+        case REQUEST_TARGET_UNKNOWN:
+        default:
+            return 1;
+    }
+}
+
 int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
     int i;
     if (!out || !req) {
@@ -84,9 +115,14 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
     }
 
     for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
-        if (req->switch_available[i]) {
-            out->legal[OBS_A1_SWITCH1 + i] = 1;
-            out->legal[OBS_A2_SWITCH1 + i] = 1;
+        int bench_switch_legal = req->switch_available[i] && !req->switch_fainted[i] && !req->switch_active[i];
+        if (bench_switch_legal) {
+            if (req->team_preview || !req->active[0].trapped) {
+                out->legal[OBS_A1_SWITCH1 + i] = 1;
+            }
+            if ((req->active_count < 2 && !req->is_doubles) || req->team_preview || !req->active[1].trapped) {
+                out->legal[OBS_A2_SWITCH1 + i] = 1;
+            }
         }
     }
 
@@ -94,6 +130,11 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
         for (i = 0; i < 8; ++i) {
             out->legal[OBS_A1_MOVE1 + i] = 0;
             out->legal[OBS_A2_MOVE1 + i] = 0;
+        }
+        for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
+            int bench_switch_legal = req->switch_available[i] && !req->switch_fainted[i] && !req->switch_active[i];
+            out->legal[OBS_A1_SWITCH1 + i] = bench_switch_legal ? 1 : 0;
+            out->legal[OBS_A2_SWITCH1 + i] = bench_switch_legal ? 1 : 0;
         }
     }
 
@@ -106,12 +147,31 @@ int action_to_showdown_command(
     enum ObsAction action,
     const ParsedRequest* req
 ) {
+    char part[64];
+    if (!out || out_len == 0 || !req) {
+        return 0;
+    }
+    if (req->team_preview) {
+        return action_to_showdown_part(out, out_len, action, req);
+    }
+    if (!action_to_showdown_part(part, sizeof(part), action, req)) {
+        return 0;
+    }
+    snprintf(out, out_len, "/choose %s", part);
+    return 1;
+}
+
+int action_to_showdown_part(
+    char* out,
+    size_t out_len,
+    enum ObsAction action,
+    const ParsedRequest* req
+) {
     int active_slot;
     int move_slot;
     int switch_slot;
     int tera;
-    char part1[64] = {0};
-    char part2[64] = {0};
+    char target_suffix[16] = {0};
 
     if (!out || out_len == 0 || !req) {
         return 0;
@@ -127,23 +187,36 @@ int action_to_showdown_command(
     }
 
     if (is_move_action(action, &active_slot, &move_slot, &tera)) {
-        snprintf(active_slot == 0 ? part1 : part2, sizeof(part1), "move %d%s", move_slot + 1, tera ? " terastallize" : "");
+        if (!move_target_suffix(req, active_slot, move_slot, target_suffix, sizeof(target_suffix))) {
+            return 0;
+        }
+        snprintf(out, out_len, "move %d%s%s",
+            move_slot + 1, tera ? " terastallize" : "", target_suffix);
     } else if (is_switch_action(action, &active_slot, &switch_slot)) {
-        snprintf(active_slot == 0 ? part1 : part2, sizeof(part1), "switch %d", switch_slot + 1);
+        snprintf(out, out_len, "switch %d", switch_slot + 1);
     } else {
         return 0;
     }
+    return 1;
+}
 
-    if (!req->is_doubles || req->active_count <= 1) {
-        snprintf(out, out_len, "/choose %s", part1[0] ? part1 : part2);
-        return 1;
+int doubles_actions_to_showdown_command(
+    char* out,
+    size_t out_len,
+    enum ObsAction action1,
+    enum ObsAction action2,
+    const ParsedRequest* req
+) {
+    char part1[64];
+    char part2[64];
+    if (!out || out_len == 0 || !req) {
+        return 0;
     }
-
-    if (!part1[0]) {
-        snprintf(part1, sizeof(part1), "move 1");
+    if (!action_to_showdown_part(part1, sizeof(part1), action1, req)) {
+        return 0;
     }
-    if (!part2[0]) {
-        snprintf(part2, sizeof(part2), "move 1");
+    if (!action_to_showdown_part(part2, sizeof(part2), action2, req)) {
+        return 0;
     }
     snprintf(out, out_len, "/choose %s, %s", part1, part2);
     return 1;

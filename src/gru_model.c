@@ -349,6 +349,33 @@ int gru_model_select_action(const float* policy, const unsigned char* legal_mask
     return best_index;
 }
 
+int gru_model_select_action_range(
+    const float* policy,
+    const unsigned char* legal_mask,
+    size_t start_index,
+    size_t end_index,
+    size_t num_actions
+) {
+    size_t i;
+    int best_index = -1;
+    float best_value = -1.0f;
+
+    if (!policy || start_index >= num_actions || end_index >= num_actions || start_index > end_index) {
+        return -1;
+    }
+
+    for (i = start_index; i <= end_index; ++i) {
+        if (legal_mask && !legal_mask[i]) {
+            continue;
+        }
+        if (best_index < 0 || policy[i] > best_value) {
+            best_index = (int)i;
+            best_value = policy[i];
+        }
+    }
+    return best_index;
+}
+
 void gru_model_evaluate_hidden(
     const GruModel* model,
     const float* hidden_state,

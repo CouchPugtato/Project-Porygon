@@ -146,8 +146,8 @@ typedef struct {
     OBS_NUM_TYPES + \
     3 + \
     OBS_BOOST_SLOTS + \
-    12 + \
-    OBS_MOVE_SLOTS * (3 + 1 + OBS_NUM_MOVES) \
+    13 + \
+    OBS_MOVE_SLOTS * (2 + 3 + 1 + OBS_NUM_MOVES) \
 )
 
 #define OBS_SIDE_FEATURES 12

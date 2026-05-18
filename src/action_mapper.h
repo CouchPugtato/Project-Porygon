@@ -18,5 +18,18 @@ int action_to_showdown_command(
     enum ObsAction action,
     const ParsedRequest* req
 );
+int action_to_showdown_part(
+    char* out,
+    size_t out_len,
+    enum ObsAction action,
+    const ParsedRequest* req
+);
+int doubles_actions_to_showdown_command(
+    char* out,
+    size_t out_len,
+    enum ObsAction action1,
+    enum ObsAction action2,
+    const ParsedRequest* req
+);
 
 #endif
