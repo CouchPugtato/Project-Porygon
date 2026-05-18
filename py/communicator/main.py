@@ -167,6 +167,12 @@ def fallback_commands_for_request(request_payload: dict) -> list[str]:
                 commands.append(f"/choose switch {idx}")
             return commands
         commands: list[str] = []
+        if len(switches) == 1:
+            only = switches[0]
+            commands.append(f"/choose switch {only}")
+            commands.append(f"/choose switch {only}, pass")
+            commands.append(f"/choose pass, switch {only}")
+            return commands
         for first, second in product(switches, switches):
             if first == second:
                 continue
