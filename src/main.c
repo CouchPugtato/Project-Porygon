@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #ifdef HAVE_NATIVE_SHOWDOWN_CLIENT
 #include "showdown_client.h"
@@ -216,6 +217,7 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
 }
 
 int main(int argc, char** argv) {
+    srand((unsigned int)time(NULL));
     if (!id_tables_init()) {
         fprintf(stderr, "Failed to initialize ID tables\n");
         return 1;

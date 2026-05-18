@@ -83,6 +83,19 @@ def legal_switch_indices(request_payload: dict) -> list[int]:
     return legal
 
 
+def unfainted_active_slots(request_payload: dict) -> list[int]:
+    side = request_payload.get("side", {})
+    pokemon = side.get("pokemon", [])
+    living: list[int] = []
+    for idx, mon in enumerate(pokemon):
+        if not mon.get("active"):
+            continue
+        if is_fainted_condition(str(mon.get("condition", ""))):
+            continue
+        living.append(idx)
+    return living
+
+
 def force_switch_flags(request_payload: dict, active_count: int) -> list[bool]:
     raw = request_payload.get("forceSwitch")
     flags = [False] * max(active_count, 1)
@@ -162,6 +175,11 @@ def fallback_commands_for_request(request_payload: dict) -> list[str]:
 
     if not active:
         return []
+
+    living_active_count = len(unfainted_active_slots(request_payload))
+    if living_active_count <= 1:
+        slot1 = slot_action_options(request_payload, 0)
+        return [f"/choose {part}" for part in slot1]
 
     slot1 = slot_action_options(request_payload, 0)
     if len(active) == 1:
@@ -349,6 +367,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
     latest_request_seq: dict[str, int] = {}
     request_open: dict[str, bool] = {}
     invalid_retry_count: dict[str, int] = {}
+    learner_rerolls: dict[str, int] = {}
     battle_players: dict[str, dict[str, str]] = {}
     battle_ratings: dict[str, dict[str, int | None]] = {}
     announced_matchups: set[str] = set()
@@ -381,6 +400,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
             latest_request_seq[event.room_id] = seq
             request_open[event.room_id] = True
             invalid_retry_count[event.room_id] = 0
+            learner_rerolls[event.room_id] = 0
             print(f"[live] sending request {seq} to learner for {battle_label(event.room_id)}")
             await learner.send(request_message(event.room_id, seq, request_payload).payload)
             print(f"[live] request {seq} for {battle_label(event.room_id)}")
@@ -397,13 +417,24 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                     print(f"[live] request closed for {battle_label(event.room_id)} after too many invalid retries")
                     return
                 tried = attempted_commands.setdefault(event.room_id, set())
-                candidate = next_fallback_command(request_payload, tried)
-                if candidate is not None:
-                    print(f"[live] retrying with fallback for {battle_label(event.room_id)}: {candidate}")
-                    await gateway.send_room_command(event.room_id, candidate)
+                if learner_rerolls.get(event.room_id, 0) < 3 and random.random() < 0.35:
+                    learner_rerolls[event.room_id] = learner_rerolls.get(event.room_id, 0) + 1
+                    retry_seq = latest_request_seq.get(event.room_id, seq)
+                    print(f"[live] rerolling learner choice for {battle_label(event.room_id)}")
+                    await learner.send(request_message(event.room_id, retry_seq, request_payload).payload)
                 else:
-                    print(f"[live] fallback debug for {battle_label(event.room_id)} forceSwitch={request_payload.get('forceSwitch')} legal_switches={legal_switch_indices(request_payload)}")
-                    print(f"[live] no fallback candidates left for {battle_label(event.room_id)}")
+                    candidate = next_fallback_command(request_payload, tried)
+                    if candidate is not None:
+                        print(f"[live] retrying with fallback for {battle_label(event.room_id)}: {candidate}")
+                        await gateway.send_room_command(event.room_id, candidate)
+                    else:
+                        print(
+                            f"[live] fallback debug for {battle_label(event.room_id)} "
+                            f"forceSwitch={request_payload.get('forceSwitch')} "
+                            f"legal_switches={legal_switch_indices(request_payload)} "
+                            f"living_active={unfainted_active_slots(request_payload)}"
+                        )
+                        print(f"[live] no fallback candidates left for {battle_label(event.room_id)}")
         elif event.line.startswith("|win|") or event.line.startswith("|tie|"):
             result = "win" if event.line.startswith("|win|") else "draw"
             reward = 1.0 if result == "win" else 0.0

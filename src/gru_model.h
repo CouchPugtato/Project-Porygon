@@ -37,6 +37,18 @@ int gru_model_select_action_range(
     size_t end_index,
     size_t num_actions
 );
+int gru_model_sample_action(
+    const float* policy,
+    const unsigned char* legal_mask,
+    size_t num_actions
+);
+int gru_model_sample_action_range(
+    const float* policy,
+    const unsigned char* legal_mask,
+    size_t start_index,
+    size_t end_index,
+    size_t num_actions
+);
 void gru_model_evaluate_hidden(
     const GruModel* model,
     const float* hidden_state,

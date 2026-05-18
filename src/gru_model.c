@@ -376,6 +376,74 @@ int gru_model_select_action_range(
     return best_index;
 }
 
+int gru_model_sample_action(
+    const float* policy,
+    const unsigned char* legal_mask,
+    size_t num_actions
+) {
+    size_t i;
+    float total = 0.0f;
+    float draw;
+    if (!policy || num_actions == 0) {
+        return -1;
+    }
+    for (i = 0; i < num_actions; ++i) {
+        if (legal_mask && !legal_mask[i]) {
+            continue;
+        }
+        total += policy[i];
+    }
+    if (total <= 0.0f) {
+        return gru_model_select_action(policy, legal_mask, num_actions);
+    }
+    draw = ((float)rand() / (float)RAND_MAX) * total;
+    for (i = 0; i < num_actions; ++i) {
+        if (legal_mask && !legal_mask[i]) {
+            continue;
+        }
+        draw -= policy[i];
+        if (draw <= 0.0f) {
+            return (int)i;
+        }
+    }
+    return gru_model_select_action(policy, legal_mask, num_actions);
+}
+
+int gru_model_sample_action_range(
+    const float* policy,
+    const unsigned char* legal_mask,
+    size_t start_index,
+    size_t end_index,
+    size_t num_actions
+) {
+    size_t i;
+    float total = 0.0f;
+    float draw;
+    if (!policy || start_index >= num_actions || end_index >= num_actions || start_index > end_index) {
+        return -1;
+    }
+    for (i = start_index; i <= end_index; ++i) {
+        if (legal_mask && !legal_mask[i]) {
+            continue;
+        }
+        total += policy[i];
+    }
+    if (total <= 0.0f) {
+        return gru_model_select_action_range(policy, legal_mask, start_index, end_index, num_actions);
+    }
+    draw = ((float)rand() / (float)RAND_MAX) * total;
+    for (i = start_index; i <= end_index; ++i) {
+        if (legal_mask && !legal_mask[i]) {
+            continue;
+        }
+        draw -= policy[i];
+        if (draw <= 0.0f) {
+            return (int)i;
+        }
+    }
+    return gru_model_select_action_range(policy, legal_mask, start_index, end_index, num_actions);
+}
+
 void gru_model_evaluate_hidden(
     const GruModel* model,
     const float* hidden_state,

@@ -117,8 +117,8 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     }
     gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, policy, &value);
     if (session->parsed_request.is_doubles && session->parsed_request.active_count > 1 && !session->parsed_request.team_preview) {
-        action = gru_model_select_action_range(policy, session->observation.legal_mask, OBS_A1_MOVE1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS);
-        action2 = gru_model_select_action_range(policy, session->observation.legal_mask, OBS_A2_MOVE1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS);
+        action = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A1_MOVE1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS);
+        action2 = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A2_MOVE1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS);
         if (action < 0 || action2 < 0 ||
             !doubles_actions_to_showdown_command(command, sizeof(command),
                 (enum ObsAction)action, (enum ObsAction)action2, &session->parsed_request)) {
@@ -130,7 +130,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             return 0;
         }
     } else {
-        action = gru_model_select_action(policy, session->observation.legal_mask, OBS_NUM_ACTIONS);
+        action = gru_model_sample_action(policy, session->observation.legal_mask, OBS_NUM_ACTIONS);
         if (action < 0 || !action_to_showdown_command(command, sizeof(command), (enum ObsAction)action, &session->parsed_request)) {
             free(policy);
             runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map action");
