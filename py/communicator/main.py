@@ -197,6 +197,85 @@ def parse_player_line(line: str) -> tuple[str, str] | None:
     return None
 
 
+def parse_player_metadata(line: str) -> tuple[str, str, int | None] | None:
+    parts = line.split("|")
+    if len(parts) >= 4 and parts[1] == "player":
+        rating = None
+        if len(parts) >= 6:
+            try:
+                rating = int(parts[5])
+            except ValueError:
+                rating = None
+        return parts[2], parts[3], rating
+    return None
+
+
+class MatchStats:
+    def __init__(self, replay_path: Path) -> None:
+        self._stats_path = replay_path.with_suffix(".stats.txt")
+        self.matches_played = 0
+        self.wins = 0
+        self.losses = 0
+        self.draws = 0
+        self.max_rating = 0
+        self._load()
+
+    @property
+    def record(self) -> str:
+        return f"{self.wins}-{self.losses}-{self.draws}"
+
+    def _load(self) -> None:
+        if not self._stats_path.exists():
+            return
+        for line in self._stats_path.read_text(encoding="utf-8").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            try:
+                parsed = int(value.strip())
+            except ValueError:
+                continue
+            if key == "matches_played":
+                self.matches_played = parsed
+            elif key == "wins":
+                self.wins = parsed
+            elif key == "losses":
+                self.losses = parsed
+            elif key == "draws":
+                self.draws = parsed
+            elif key == "max_rating":
+                self.max_rating = parsed
+
+    def save(self) -> None:
+        self._stats_path.parent.mkdir(parents=True, exist_ok=True)
+        self._stats_path.write_text(
+            "\n".join(
+                [
+                    f"matches_played={self.matches_played}",
+                    f"record={self.record}",
+                    f"wins={self.wins}",
+                    f"losses={self.losses}",
+                    f"draws={self.draws}",
+                    f"max_rating={self.max_rating}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def note_battle(self, result: str, bot_rating: int | None) -> None:
+        self.matches_played += 1
+        if result == "win":
+            self.wins += 1
+        elif result == "draw":
+            self.draws += 1
+        else:
+            self.losses += 1
+        if bot_rating is not None:
+            self.max_rating = max(self.max_rating, bot_rating)
+        self.save()
+
+
 MAX_INVALID_RETRIES_PER_REQUEST = 24
 
 
@@ -213,6 +292,7 @@ class ReplayWriter:
 async def capture_mode(out_path: Path, fmt: str, username: str) -> None:
     gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
     writer = ReplayWriter(out_path)
+    stats = MatchStats(out_path)
     started_battles: set[str] = set()
     finished_battles = 0
     seq = 0
@@ -245,6 +325,7 @@ async def capture_mode(out_path: Path, fmt: str, username: str) -> None:
             writer.append(terminal_message(event.room_id, result, reward).to_json())
             writer.append(battle_end(event.room_id).to_json())
             finished_battles += 1
+            stats.note_battle(result, None)
             print(f"[capture] finished {event.room_id} result={result} total_matches_captured={finished_battles}")
             await gateway.search_next_battle()
         else:
@@ -261,6 +342,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
     learner = LearnerProcess(learner_command, replay_path)
     await learner.start()
     print(f"[live] started learner: {' '.join(learner_command)}")
+    stats = MatchStats(replay_path or Path("matches/runtime_capture.jsonl"))
     seq = 0
     latest_requests: dict[str, dict] = {}
     attempted_commands: dict[str, set[str]] = {}
@@ -268,6 +350,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
     request_open: dict[str, bool] = {}
     invalid_retry_count: dict[str, int] = {}
     battle_players: dict[str, dict[str, str]] = {}
+    battle_ratings: dict[str, dict[str, int | None]] = {}
     announced_matchups: set[str] = set()
 
     async def on_event(event: ShowdownEvent) -> None:
@@ -275,13 +358,20 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
         summary = event_summary(event)
         if summary:
             print(summary)
-        player_info = parse_player_line(event.line)
+        player_info = parse_player_metadata(event.line)
         if player_info is not None:
-            side, username_found = player_info
+            side, username_found, rating = player_info
             players = battle_players.setdefault(event.room_id, {})
+            ratings = battle_ratings.setdefault(event.room_id, {})
             players[side] = username_found
+            ratings[side] = rating
             if event.room_id not in announced_matchups and "p1" in players and "p2" in players:
-                print(f"[matchup] {players['p1']} vs {players['p2']}")
+                print()
+                print(f"[stats] matches={stats.matches_played} record={stats.record} max_rating={stats.max_rating}")
+                print(
+                    f"[matchup] {players['p1']} ({ratings.get('p1', '?') if ratings.get('p1') is not None else '?'}) vs "
+                    f"{players['p2']} ({ratings.get('p2', '?') if ratings.get('p2') is not None else '?'})"
+                )
                 announced_matchups.add(event.room_id)
         if event.line.startswith("|request|"):
             payload = event.line.split("|request|", 1)[1]
@@ -319,6 +409,16 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
             reward = 1.0 if result == "win" else 0.0
             await learner.send(terminal_message(event.room_id, result, reward).payload)
             await learner.send(battle_end(event.room_id).payload)
+            players = battle_players.get(event.room_id, {})
+            ratings = battle_ratings.get(event.room_id, {})
+            bot_side = "p2" if players.get("p2", "").startswith("Guest") or players.get("p2") == username or not username else "p1"
+            bot_rating = ratings.get(bot_side)
+            final_result = result
+            if result == "win":
+                winner_name = event.line.split("|", 2)[2] if "|" in event.line else ""
+                if players.get(bot_side) != winner_name:
+                    final_result = "loss"
+            stats.note_battle(final_result, bot_rating)
             print(f"[live] battle ended {event.room_id} result={result}")
             request_open[event.room_id] = False
             await gateway.search_next_battle()
