@@ -177,7 +177,7 @@ void raw_battle_state_update_from_request(RawBattleState* state, const ParsedReq
     }
     state->turn_number = req->request_id > 0 ? req->request_id : state->turn_number;
     state->can_tera = req->can_tera;
-    state->self_active_count = req->active_count;
+    state->self_active_count = req->living_active_count > 0 ? req->living_active_count : req->active_count;
     for (i = 0; i < RAW_TEAM_SIZE; ++i) {
         clear_on_switch(&state->self_team[i]);
     }

@@ -89,12 +89,16 @@ void env_runtime_free(EnvRuntime* runtime) {
 static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     float* policy;
     float value;
-    int action;
+    int action = -1;
     int action2 = -1;
     int legal_count = 0;
     char command[256];
     char json[512];
     int i;
+    int living_slots[PARSED_REQUEST_ACTIVE_SLOTS] = {0};
+    int living_count = 0;
+    int slot0_needs_action;
+    int slot1_needs_action;
     if (!runtime || !session || !out || runtime->replay_only) {
         return 1;
     }
@@ -116,18 +120,68 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         return 0;
     }
     gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, policy, &value);
-    if (session->parsed_request.is_doubles && session->parsed_request.active_count > 1 && !session->parsed_request.team_preview) {
+    for (i = 0; i < session->parsed_request.active_count && i < PARSED_REQUEST_ACTIVE_SLOTS; ++i) {
+        if (!session->parsed_request.active[i].fainted) {
+            living_slots[living_count++] = i;
+        }
+    }
+    slot0_needs_action = session->parsed_request.force_switch[0] ||
+        (!session->parsed_request.forced_switch_any && session->parsed_request.active_count > 0 && !session->parsed_request.active[0].fainted);
+    slot1_needs_action = session->parsed_request.force_switch[1] ||
+        (!session->parsed_request.forced_switch_any && session->parsed_request.active_count > 1 && !session->parsed_request.active[1].fainted);
+
+    if (!session->parsed_request.team_preview && session->parsed_request.forced_switch_any) {
+        if (slot0_needs_action) {
+            action = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A1_SWITCH1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS);
+        }
+        if (slot1_needs_action) {
+            action2 = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A2_SWITCH1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS);
+        }
+        if ((slot0_needs_action && action < 0) || (slot1_needs_action && action2 < 0) ||
+            !request_actions_to_showdown_command(command, sizeof(command), &session->parsed_request,
+                slot0_needs_action, (enum ObsAction)action,
+                slot1_needs_action, (enum ObsAction)action2)) {
+            free(policy);
+            runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map forced-switch action");
+            fputs(json, out);
+            fputc('\n', out);
+            fflush(out);
+            return 0;
+        }
+    } else if (session->parsed_request.is_doubles && living_count > 1 && !session->parsed_request.team_preview) {
         action = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A1_MOVE1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS);
         action2 = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A2_MOVE1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS);
         if (action < 0 || action2 < 0 ||
-            !doubles_actions_to_showdown_command(command, sizeof(command),
-                (enum ObsAction)action, (enum ObsAction)action2, &session->parsed_request)) {
+            !request_actions_to_showdown_command(command, sizeof(command), &session->parsed_request, 1, (enum ObsAction)action, 1, (enum ObsAction)action2)) {
             free(policy);
             runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map doubles actions");
             fputs(json, out);
             fputc('\n', out);
             fflush(out);
             return 0;
+        }
+    } else if (!session->parsed_request.team_preview && living_count == 1 && session->parsed_request.is_doubles) {
+        int living_slot = living_slots[0];
+        if (living_slot == 0) {
+            action = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A1_MOVE1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS);
+            if (action < 0 || !request_actions_to_showdown_command(command, sizeof(command), &session->parsed_request, 1, (enum ObsAction)action, 0, OBS_A2_MOVE1)) {
+                free(policy);
+                runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map single-living doubles action");
+                fputs(json, out);
+                fputc('\n', out);
+                fflush(out);
+                return 0;
+            }
+        } else {
+            action = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A2_MOVE1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS);
+            if (action < 0 || !request_actions_to_showdown_command(command, sizeof(command), &session->parsed_request, 0, OBS_A1_MOVE1, 1, (enum ObsAction)action)) {
+                free(policy);
+                runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map single-living doubles action");
+                fputs(json, out);
+                fputc('\n', out);
+                fflush(out);
+                return 0;
+            }
         }
     } else {
         action = gru_model_sample_action(policy, session->observation.legal_mask, OBS_NUM_ACTIONS);

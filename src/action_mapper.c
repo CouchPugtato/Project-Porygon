@@ -133,8 +133,8 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
         }
         for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
             int bench_switch_legal = req->switch_available[i] && !req->switch_fainted[i] && !req->switch_active[i];
-            out->legal[OBS_A1_SWITCH1 + i] = bench_switch_legal ? 1 : 0;
-            out->legal[OBS_A2_SWITCH1 + i] = bench_switch_legal ? 1 : 0;
+            out->legal[OBS_A1_SWITCH1 + i] = (req->force_switch[0] && bench_switch_legal) ? 1 : 0;
+            out->legal[OBS_A2_SWITCH1 + i] = (req->force_switch[1] && bench_switch_legal) ? 1 : 0;
         }
     }
 
@@ -220,4 +220,55 @@ int doubles_actions_to_showdown_command(
     }
     snprintf(out, out_len, "/choose %s, %s", part1, part2);
     return 1;
+}
+
+int request_actions_to_showdown_command(
+    char* out,
+    size_t out_len,
+    const ParsedRequest* req,
+    int slot0_has_action,
+    enum ObsAction action0,
+    int slot1_has_action,
+    enum ObsAction action1
+) {
+    char part0[64];
+    char part1[64];
+
+    if (!out || out_len == 0 || !req) {
+        return 0;
+    }
+    out[0] = '\0';
+
+    if (slot0_has_action) {
+        if (!action_to_showdown_part(part0, sizeof(part0), action0, req)) {
+            return 0;
+        }
+    }
+    if (slot1_has_action) {
+        if (!action_to_showdown_part(part1, sizeof(part1), action1, req)) {
+            return 0;
+        }
+    }
+
+    if (slot0_has_action && slot1_has_action) {
+        snprintf(out, out_len, "/choose %s, %s", part0, part1);
+        return 1;
+    }
+    if (slot0_has_action) {
+        if (req->forced_switch_any && req->force_switch[1]) {
+            snprintf(out, out_len, "/choose %s, pass", part0);
+        } else {
+            snprintf(out, out_len, "/choose %s", part0);
+        }
+        return 1;
+    }
+    if (slot1_has_action) {
+        if (req->forced_switch_any && req->force_switch[1]) {
+            snprintf(out, out_len, "/choose pass, %s", part1);
+        } else {
+            snprintf(out, out_len, "/choose %s", part1);
+        }
+        return 1;
+    }
+    return 0;
 }

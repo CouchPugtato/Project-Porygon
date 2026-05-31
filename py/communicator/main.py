@@ -96,6 +96,16 @@ def unfainted_active_slots(request_payload: dict) -> list[int]:
     return living
 
 
+def living_active_request_slots(request_payload: dict) -> list[int]:
+    active = request_payload.get("active", [])
+    living: list[int] = []
+    for idx, slot in enumerate(active):
+        if slot.get("fainted"):
+            continue
+        living.append(idx)
+    return living
+
+
 def force_switch_flags(request_payload: dict, active_count: int) -> list[bool]:
     raw = request_payload.get("forceSwitch")
     flags = [False] * max(active_count, 1)
@@ -182,9 +192,11 @@ def fallback_commands_for_request(request_payload: dict) -> list[str]:
     if not active:
         return []
 
-    living_active_count = len(unfainted_active_slots(request_payload))
+    living_request_slots = living_active_request_slots(request_payload)
+    living_active_count = len(living_request_slots) or len(unfainted_active_slots(request_payload))
     if living_active_count <= 1:
-        slot1 = slot_action_options(request_payload, 0)
+        slot_index = living_request_slots[0] if living_request_slots else 0
+        slot1 = slot_action_options(request_payload, slot_index)
         return [f"/choose {part}" for part in slot1]
 
     slot1 = slot_action_options(request_payload, 0)

@@ -43,6 +43,7 @@ typedef struct {
     int team_preview;
     int max_chosen_team_size;
     int active_count;
+    int living_active_count;
     int switch_available[PARSED_REQUEST_TEAM_SIZE];
     int switch_fainted[PARSED_REQUEST_TEAM_SIZE];
     int switch_active[PARSED_REQUEST_TEAM_SIZE];

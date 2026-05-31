@@ -63,6 +63,64 @@ static RawSideState* side_for_ident(RawBattleState* state, const char* ident) {
     return strstr(ident, "p1") == ident ? &state->self_side : &state->opp_side;
 }
 
+static RawPokemon* active_switch_source_for_side(RawBattleState* state, int self_side) {
+    RawPokemon* team;
+    int i;
+    if (!state) {
+        return NULL;
+    }
+    team = self_side ? state->self_team : state->opp_team;
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        if (team[i].active && team[i].switched_in_turn == state->turn_number && !team[i].ability_triggered_on_switch_in) {
+            return &team[i];
+        }
+    }
+    return NULL;
+}
+
+static int type_id_from_name_local(const char* name) {
+    static const char* kTypeNames[] = {
+        "", "normal", "fire", "water", "electric", "grass", "ice", "fighting", "poison",
+        "ground", "flying", "psychic", "bug", "rock", "ghost", "dragon", "dark", "steel", "fairy"
+    };
+    char normalized[32];
+    size_t i = 0;
+    if (!name) {
+        return 0;
+    }
+    while (*name && i + 1 < sizeof(normalized)) {
+        unsigned char ch = (unsigned char)*name++;
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
+            normalized[i++] = (char)((ch >= 'A' && ch <= 'Z') ? (ch - 'A' + 'a') : ch);
+        }
+    }
+    normalized[i] = '\0';
+    for (i = 1; i < sizeof(kTypeNames) / sizeof(kTypeNames[0]); ++i) {
+        if (strcmp(normalized, kTypeNames[i]) == 0) {
+            return (int)i;
+        }
+    }
+    return 0;
+}
+
+static void clear_existing_active_slot(RawBattleState* state, const char* ident) {
+    RawPokemon* team;
+    int slot;
+    int i;
+    if (!state || !ident) {
+        return;
+    }
+    team = strstr(ident, "p1") == ident ? state->self_team : state->opp_team;
+    slot = strstr(ident, "b:") ? 2 : 1;
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        if (team[i].active && team[i].active_slot == slot) {
+            team[i].active = 0;
+            team[i].active_slot = 0;
+            team[i].first_turn_on_field = 0;
+        }
+    }
+}
+
 static void parse_condition(const char* cond, int* hp, int* max_hp, int* status_id, int* fainted) {
     const char* slash;
     *hp = 0;
@@ -170,6 +228,7 @@ static void handle_switch_like(RawBattleState* state, const char* ident, const c
     char species[64];
     size_t i = 0;
     if (!pokemon) return;
+    clear_existing_active_slot(state, ident);
     while (details[i] && details[i] != ',' && i + 1 < sizeof(species)) {
         species[i] = details[i];
         ++i;
@@ -262,16 +321,58 @@ void event_parser_apply_line(RawBattleState* state, const char* line) {
     if (parts.count <= 0 || !parts.parts[0]) return;
 
     if (strcmp(parts.parts[0], "turn") == 0 && parts.count > 1) handle_turn(state, parts.parts[1]);
-    else if (strcmp(parts.parts[0], "-weather") == 0 && parts.count > 1) handle_weather(state, parts.parts[1]);
-    else if (strcmp(parts.parts[0], "-fieldstart") == 0 && parts.count > 1) handle_field_start(state, parts.parts[1]);
+    else if (strcmp(parts.parts[0], "-weather") == 0 && parts.count > 1) {
+        handle_weather(state, parts.parts[1]);
+        if (state->weather_id > 0) {
+            RawPokemon* source = active_switch_source_for_side(state, 0);
+            if (!source) {
+                source = active_switch_source_for_side(state, 1);
+            }
+            if (source) {
+                inference_engine_infer_weather_ability(source, state->weather_id);
+                source->ability_triggered_on_switch_in = 1;
+            }
+        }
+    }
+    else if (strcmp(parts.parts[0], "-fieldstart") == 0 && parts.count > 1) {
+        handle_field_start(state, parts.parts[1]);
+        if (strstr(parts.parts[1], "Terrain")) {
+            RawPokemon* source = active_switch_source_for_side(state, 0);
+            if (!source) {
+                source = active_switch_source_for_side(state, 1);
+            }
+            if (source) {
+                inference_engine_infer_terrain_ability(source, state->terrain_id);
+                source->ability_triggered_on_switch_in = 1;
+            }
+        }
+    }
     else if (strcmp(parts.parts[0], "-fieldend") == 0 && parts.count > 1) handle_field_end(state, parts.parts[1]);
     else if (strcmp(parts.parts[0], "-sidestart") == 0 && parts.count > 2) handle_side_effect(state, parts.parts[1], parts.parts[2], 1);
     else if (strcmp(parts.parts[0], "-sideend") == 0 && parts.count > 2) handle_side_effect(state, parts.parts[1], parts.parts[2], 0);
     else if ((strcmp(parts.parts[0], "switch") == 0 || strcmp(parts.parts[0], "drag") == 0 || strcmp(parts.parts[0], "replace") == 0) && parts.count > 3) handle_switch_like(state, parts.parts[1], parts.parts[2], parts.parts[3]);
     else if (strcmp(parts.parts[0], "-status") == 0 && parts.count > 2) handle_status_line(state, parts.parts[1], parts.parts[2]);
-    else if (strcmp(parts.parts[0], "-curestatus") == 0 && parts.count > 1) tracked_int_set_confirmed(&pokemon_for_ident(state, parts.parts[1])->status_id, 0);
+    else if (strcmp(parts.parts[0], "-curestatus") == 0 && parts.count > 1) {
+        RawPokemon* p = pokemon_for_ident(state, parts.parts[1]);
+        if (p) {
+            tracked_int_set_confirmed(&p->status_id, 0);
+            p->sleep_turns = 0;
+            p->toxic_counter = 0;
+        }
+    }
     else if (strcmp(parts.parts[0], "-boost") == 0 && parts.count > 3) handle_boost(state, parts.parts[1], parts.parts[2], atoi(parts.parts[3]), 0);
-    else if (strcmp(parts.parts[0], "-unboost") == 0 && parts.count > 3) handle_boost(state, parts.parts[1], parts.parts[2], atoi(parts.parts[3]), 1);
+    else if (strcmp(parts.parts[0], "-unboost") == 0 && parts.count > 3) {
+        handle_boost(state, parts.parts[1], parts.parts[2], atoi(parts.parts[3]), 1);
+        if (strcmp(parts.parts[2], "atk") == 0) {
+            RawPokemon* source = strstr(parts.parts[1], "p1") == parts.parts[1]
+                ? active_switch_source_for_side(state, 0)
+                : active_switch_source_for_side(state, 1);
+            if (source && source->ability_id.knowledge != KNOW_CONFIRMED) {
+                tracked_int_set_inferred(&source->ability_id, ability_id_from_name("intimidate"));
+                source->ability_triggered_on_switch_in = 1;
+            }
+        }
+    }
     else if (strcmp(parts.parts[0], "-setboost") == 0 && parts.count > 3) handle_boost(state, parts.parts[1], parts.parts[2], atoi(parts.parts[3]), 2);
     else if (strcmp(parts.parts[0], "-clearallboost") == 0) { int i,j; for (i = 0; i < RAW_TEAM_SIZE; ++i) for (j = 0; j < 7; ++j) { state->self_team[i].boosts[j] = 0; state->opp_team[i].boosts[j] = 0; } }
     else if (strcmp(parts.parts[0], "-clearboost") == 0 && parts.count > 1) { int j; RawPokemon* p = pokemon_for_ident(state, parts.parts[1]); if (p) for (j = 0; j < 7; ++j) p->boosts[j] = 0; }
@@ -307,7 +408,7 @@ void event_parser_apply_line(RawBattleState* state, const char* line) {
         RawPokemon* p = pokemon_for_ident(state, parts.parts[1]); if (p) tracked_int_set_confirmed(&p->item_id, 0);
     }
     else if (strcmp(parts.parts[0], "-terastallize") == 0 && parts.count > 2) {
-        RawPokemon* p = pokemon_for_ident(state, parts.parts[1]); if (p) { p->tera_used = 1; tracked_int_set_confirmed(&p->tera_type_id, atoi(parts.parts[2])); }
+        RawPokemon* p = pokemon_for_ident(state, parts.parts[1]); if (p) { p->tera_used = 1; tracked_int_set_confirmed(&p->tera_type_id, type_id_from_name_local(parts.parts[2])); }
     }
     else if (strcmp(parts.parts[0], "move") == 0 && parts.count > 2) {
         RawPokemon* p = pokemon_for_ident(state, parts.parts[1]); if (p) inference_engine_note_move(p, move_id_from_name(parts.parts[2]), state->turn_number);

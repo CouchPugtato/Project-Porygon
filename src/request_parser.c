@@ -262,6 +262,36 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
     req->team_preview = parse_bool_after(json, "teamPreview", 0);
     req->max_chosen_team_size = parse_int_after(json, "maxChosenTeamSize", req->is_doubles ? 2 : 1);
 
+    {
+        const char* force_switch_key = find_after_key(json, "forceSwitch");
+        if (force_switch_key) {
+            const char* force_arr = strchr(force_switch_key, '[');
+            if (force_arr) {
+                char force_array[128];
+                const char* cursor;
+                int idx = 0;
+                if (extract_json_array(force_arr, force_array, sizeof(force_array))) {
+                    cursor = force_array;
+                    while (*cursor && idx < PARSED_REQUEST_ACTIVE_SLOTS) {
+                        if (strncmp(cursor, "true", 4) == 0) {
+                            req->force_switch[idx++] = 1;
+                            req->forced_switch_any = 1;
+                            cursor += 4;
+                        } else if (strncmp(cursor, "false", 5) == 0) {
+                            req->force_switch[idx++] = 0;
+                            cursor += 5;
+                        } else {
+                            ++cursor;
+                        }
+                    }
+                    if (idx > req->active_count) {
+                        req->active_count = idx;
+                    }
+                }
+            }
+        }
+    }
+
     active_key = find_after_key(json, "active");
     if (active_key) {
         p = strchr(active_key, '[');
@@ -365,6 +395,9 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                     is_active = parse_bool_after(poke_obj, "active", 0);
                     req->switch_active[team_idx] = is_active;
                     if (is_active) {
+                        if (!fainted) {
+                            req->living_active_count += 1;
+                        }
                         req->switch_available[team_idx] = 0;
                     }
 
@@ -373,6 +406,12 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                 }
             }
         }
+    }
+
+    if (req->force_switch[1] && req->active_count < 2) {
+        req->active_count = 2;
+    } else if (req->force_switch[0] && req->active_count < 1) {
+        req->active_count = 1;
     }
 
     return 1;
