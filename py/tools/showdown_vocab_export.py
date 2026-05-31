@@ -14,6 +14,7 @@ FILE_MAP = {
     "move_ids.txt": "moves.ts",
     "item_ids.txt": "items.ts",
     "ability_ids.txt": "abilities.ts",
+    "conditions_ids.txt": "conditions.ts",
 }
 
 
@@ -147,7 +148,7 @@ def main() -> int:
         "--out-dir",
         type=Path,
         default=Path("data"),
-        help="Directory to write species_ids.txt, move_ids.txt, item_ids.txt, and ability_ids.txt.",
+        help="Directory to write species_ids.txt, move_ids.txt, item_ids.txt, ability_ids.txt, and conditions_ids.txt.",
     )
     args = parser.parse_args()
 
