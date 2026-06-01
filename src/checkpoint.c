@@ -4,6 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#define MKDIR(path) _mkdir(path)
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#define MKDIR(path) mkdir(path, 0777)
+#endif
+
 typedef struct {
     char magic[8];
     unsigned int version;
@@ -14,6 +23,32 @@ typedef struct {
     TrainerCheckpointState trainer;
 } CheckpointHeader;
 
+static int ensure_parent_directory(const char* path) {
+    char buffer[1024];
+    size_t len;
+    size_t i;
+
+    if (!path) {
+        return 0;
+    }
+    len = strlen(path);
+    if (len == 0 || len >= sizeof(buffer)) {
+        return 0;
+    }
+    memcpy(buffer, path, len + 1);
+    for (i = 0; i < len; ++i) {
+        if (buffer[i] == '/' || buffer[i] == '\\') {
+            char saved = buffer[i];
+            if (i > 0) {
+                buffer[i] = '\0';
+                MKDIR(buffer);
+                buffer[i] = saved;
+            }
+        }
+    }
+    return 1;
+}
+
 int checkpoint_save(const char* path, const GruModel* model, const TrainerCheckpointState* state) {
     FILE* f;
     CheckpointHeader header;
@@ -21,6 +56,9 @@ int checkpoint_save(const char* path, const GruModel* model, const TrainerCheckp
     size_t count;
 
     if (!path || !model || !state) {
+        return 0;
+    }
+    if (!ensure_parent_directory(path)) {
         return 0;
     }
     f = fopen(path, "wb");

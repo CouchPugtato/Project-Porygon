@@ -19,6 +19,70 @@ static GruModel* create_default_model(void) {
     return gru_model_create(observation_flat_size(), 128, OBS_NUM_ACTIONS);
 }
 
+static int has_path_separator(const char* path) {
+    return path && (strchr(path, '/') != NULL || strchr(path, '\\') != NULL);
+}
+
+static char* resolve_checkpoint_path(const char* checkpoint_arg) {
+    const char* default_name = "model.chk";
+    const char* name = checkpoint_arg && *checkpoint_arg ? checkpoint_arg : default_name;
+    char* resolved;
+    int needed;
+
+    if (has_path_separator(name)) {
+        resolved = (char*)malloc(strlen(name) + 1);
+        if (!resolved) {
+            return NULL;
+        }
+        strcpy(resolved, name);
+        return resolved;
+    }
+
+    needed = snprintf(NULL, 0, "models/%s", name);
+    if (needed <= 0) {
+        return NULL;
+    }
+    resolved = (char*)malloc((size_t)needed + 1);
+    if (!resolved) {
+        return NULL;
+    }
+    snprintf(resolved, (size_t)needed + 1, "models/%s", name);
+    return resolved;
+}
+
+static char* make_periodic_checkpoint_path(const char* base_path, size_t episodes_done) {
+    const char* dot;
+    size_t stem_len;
+    int needed;
+    char* out;
+
+    if (!base_path || !*base_path) {
+        return NULL;
+    }
+    dot = strrchr(base_path, '.');
+    stem_len = dot ? (size_t)(dot - base_path) : strlen(base_path);
+    needed = dot
+        ? snprintf(NULL, 0, "%.*s_ep%zu%s", (int)stem_len, base_path, episodes_done, dot)
+        : snprintf(NULL, 0, "%s_ep%zu", base_path, episodes_done);
+    if (needed <= 0) {
+        return NULL;
+    }
+    out = (char*)malloc((size_t)needed + 1);
+    if (!out) {
+        return NULL;
+    }
+    if (dot) {
+        snprintf(out, (size_t)needed + 1, "%.*s_ep%zu%s", (int)stem_len, base_path, episodes_done, dot);
+    } else {
+        snprintf(out, (size_t)needed + 1, "%s_ep%zu", base_path, episodes_done);
+    }
+    return out;
+}
+
+static double elapsed_seconds_since(clock_t start_clock) {
+    return (double)(clock() - start_clock) / (double)CLOCKS_PER_SEC;
+}
+
 static int run_demo_gru(void) {
         Observation obs;
         size_t obs_dim = observation_flat_size();
@@ -90,12 +154,14 @@ static int run_runtime_mode(const char* checkpoint_path) {
     EnvRuntime runtime;
     char line[16384];
     char json[512];
+    char* resolved_checkpoint_path = NULL;
     FILE* replay_file = NULL;
     const char* replay_path = getenv("PORYGON_REPLAY_PATH");
 
     memset(&state, 0, sizeof(state));
     if (checkpoint_path) {
-        model = checkpoint_load(checkpoint_path, &state);
+        resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path);
+        model = checkpoint_load(resolved_checkpoint_path, &state);
     }
     if (!model) {
         model = create_default_model();
@@ -139,17 +205,24 @@ static int run_runtime_mode(const char* checkpoint_path) {
     env_runtime_free(&runtime);
     fclose(replay_file);
     gru_model_destroy(model);
+    free(resolved_checkpoint_path);
     return 0;
 }
 
 static int train_from_replay_file(const char* replay_path, const char* checkpoint_path, int rl_mode) {
     FILE* f;
     char line[16384];
+    char* resolved_checkpoint_path = NULL;
     GruModel* model = NULL;
     GruTrainer trainer;
     EnvRuntime runtime;
     TrainerCheckpointState checkpoint_state;
     size_t i;
+    size_t lines_read = 0;
+    size_t parsed_messages = 0;
+    size_t invalid_lines = 0;
+    clock_t train_start_clock;
+    clock_t train_loop_start_clock;
 
     if (!replay_path || !checkpoint_path) {
         return 1;
@@ -159,13 +232,23 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         fprintf(stderr, "Failed to open replay file '%s': %s\n", replay_path, strerror(errno));
         return 1;
     }
+    resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path);
+    if (!resolved_checkpoint_path) {
+        fclose(f);
+        fprintf(stderr, "Failed to resolve checkpoint path\n");
+        return 1;
+    }
     memset(&checkpoint_state, 0, sizeof(checkpoint_state));
-    model = checkpoint_load(checkpoint_path, &checkpoint_state);
+    model = checkpoint_load(resolved_checkpoint_path, &checkpoint_state);
     if (!model) {
         model = create_default_model();
+        printf("[train] starting fresh model -> %s\n", resolved_checkpoint_path);
+    } else {
+        printf("[train] loaded checkpoint %s step=%zu\n", resolved_checkpoint_path, checkpoint_state.step);
     }
     if (!model) {
         fclose(f);
+        free(resolved_checkpoint_path);
         return 1;
     }
     gru_trainer_init(&trainer,
@@ -178,17 +261,32 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
     if (!env_runtime_init(&runtime, model, NULL, 1)) {
         fclose(f);
         gru_model_destroy(model);
+        free(resolved_checkpoint_path);
         return 1;
     }
+    train_start_clock = clock();
     while (fgets(line, sizeof(line), f)) {
         RuntimeMessage msg;
+        ++lines_read;
         runtime_message_init(&msg);
         if (!runtime_message_parse(&msg, line)) {
+            ++invalid_lines;
             continue;
         }
+        ++parsed_messages;
         env_runtime_handle_message(&runtime, &msg, NULL);
+        if ((lines_read % 50000u) == 0u) {
+            double elapsed = elapsed_seconds_since(train_start_clock);
+            double lines_per_sec = elapsed > 0.0 ? (double)lines_read / elapsed : 0.0;
+            printf("[train] ingest lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
+                lines_read, parsed_messages, invalid_lines, runtime.count);
+            printf("[train] ingest elapsed=%.1fs lines_per_sec=%.1f\n", elapsed, lines_per_sec);
+        }
     }
     fclose(f);
+    printf("[train] ingest complete lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
+        lines_read, parsed_messages, invalid_lines, runtime.count);
+    train_loop_start_clock = clock();
 
     for (i = 0; i < runtime.count; ++i) {
         if (rl_mode) {
@@ -196,12 +294,41 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         } else {
             gru_trainer_supervised_episode(&trainer, model, &runtime.sessions[i].episode);
         }
+        if (((i + 1u) % 1u) == 0u || (i + 1u) == runtime.count) {
+            double elapsed = elapsed_seconds_since(train_loop_start_clock);
+            double episodes_per_sec = elapsed > 0.0 ? (double)(i + 1u) / elapsed : 0.0;
+            double eta = episodes_per_sec > 0.0 ? (double)(runtime.count - (i + 1u)) / episodes_per_sec : 0.0;
+            printf("[train] episodes=%zu/%zu step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f\n",
+                i + 1u,
+                runtime.count,
+                trainer.step,
+                trainer.last_action_loss,
+                trainer.last_value_loss,
+                trainer.last_accuracy);
+            printf("[train] elapsed=%.1fs episodes_per_sec=%.2f eta=%.1fs\n",
+                elapsed,
+                episodes_per_sec,
+                eta);
+        }
+        if (((i + 1u) % 500u) == 0u || (i + 1u) == runtime.count) {
+            TrainerCheckpointState periodic_state = gru_trainer_checkpoint_state(&trainer);
+            char* periodic_path = make_periodic_checkpoint_path(resolved_checkpoint_path, i + 1u);
+            if (periodic_path) {
+                if (checkpoint_save(periodic_path, model, &periodic_state)) {
+                    printf("[train] saved periodic checkpoint %s\n", periodic_path);
+                } else {
+                    printf("[train] failed periodic checkpoint %s\n", periodic_path);
+                }
+                free(periodic_path);
+            }
+        }
     }
     checkpoint_state = gru_trainer_checkpoint_state(&trainer);
-    if (!checkpoint_save(checkpoint_path, model, &checkpoint_state)) {
-        fprintf(stderr, "Failed to save checkpoint '%s'\n", checkpoint_path);
+    if (!checkpoint_save(resolved_checkpoint_path, model, &checkpoint_state)) {
+        fprintf(stderr, "Failed to save checkpoint '%s'\n", resolved_checkpoint_path);
         env_runtime_free(&runtime);
         gru_model_destroy(model);
+        free(resolved_checkpoint_path);
         return 1;
     }
     printf("trained mode=%s step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f sessions=%zu\n",
@@ -211,8 +338,10 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         trainer.last_value_loss,
         trainer.last_accuracy,
         runtime.count);
+    printf("[train] saved checkpoint %s\n", resolved_checkpoint_path);
     env_runtime_free(&runtime);
     gru_model_destroy(model);
+    free(resolved_checkpoint_path);
     return 0;
 }
 
