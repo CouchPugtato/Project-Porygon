@@ -434,6 +434,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                         event.room_id,
                         pending["request_id"],
                         pending["action"],
+                        pending.get("action2", -1),
                         pending["command"],
                         accepted=True,
                     ).payload
@@ -457,6 +458,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                         event.room_id,
                         pending["request_id"],
                         pending["action"],
+                        pending.get("action2", -1),
                         pending["command"],
                         accepted=False,
                         reason=event.line,
@@ -486,12 +488,14 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                         pending_decisions[event.room_id] = {
                             "request_id": latest_request_seq.get(event.room_id, seq),
                             "action": -1,
+                            "action2": -1,
                             "command": candidate,
                         }
                         await learner.send(
                             decision_message(
                                 event.room_id,
                                 latest_request_seq.get(event.room_id, seq),
+                                -1,
                                 -1,
                                 candidate,
                             ).payload
@@ -553,6 +557,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                 pending_decisions[battle_id] = {
                     "request_id": msg["request_id"],
                     "action": msg.get("action", -1),
+                    "action2": msg.get("action2", -1),
                     "command": msg["command"],
                 }
                 await learner.send(
@@ -560,6 +565,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                         battle_id,
                         msg["request_id"],
                         msg.get("action", -1),
+                        msg.get("action2", -1),
                         msg["command"],
                     ).payload
                 )

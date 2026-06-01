@@ -24,6 +24,7 @@ typedef struct {
     int terminal;
     int ready_for_decision;
     int pending_action;
+    int pending_action2;
     char pending_command[RUNTIME_COMMAND_LEN];
 } EnvSession;
 

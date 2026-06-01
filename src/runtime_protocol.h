@@ -32,6 +32,7 @@ typedef struct {
     int seq;
     float reward;
     int action;
+    int action2;
     int accepted;
     char result[RUNTIME_RESULT_LEN];
     char line[RUNTIME_LINE_LEN];
@@ -43,7 +44,7 @@ typedef struct {
 void runtime_message_init(RuntimeMessage* msg);
 int runtime_message_parse(RuntimeMessage* msg, const char* json_line);
 int runtime_emit_ready_json(char* out, size_t out_len);
-int runtime_emit_action_json(char* out, size_t out_len, const char* battle_id, int request_id, int action, const char* command);
+int runtime_emit_action_json(char* out, size_t out_len, const char* battle_id, int request_id, int action, int action2, const char* command);
 int runtime_emit_log_json(char* out, size_t out_len, const char* message);
 int runtime_emit_error_json(char* out, size_t out_len, const char* battle_id, const char* message);
 

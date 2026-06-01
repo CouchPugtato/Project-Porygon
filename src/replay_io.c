@@ -28,14 +28,14 @@ int replay_write_runtime_message(FILE* out, const RuntimeMessage* msg) {
             return 1;
         case RUNTIME_MSG_DECISION:
             if (msg->accepted > 0) {
-                fprintf(out, "{\"type\":\"decision_accepted\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"command\":\"%s\"}\n",
-                    msg->battle_id, msg->request_id, msg->action, msg->command);
+                fprintf(out, "{\"type\":\"decision_accepted\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"action2\":%d,\"command\":\"%s\"}\n",
+                    msg->battle_id, msg->request_id, msg->action, msg->action2, msg->command);
             } else if (msg->accepted == 0) {
-                fprintf(out, "{\"type\":\"decision_rejected\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"command\":\"%s\",\"reason\":\"%s\"}\n",
-                    msg->battle_id, msg->request_id, msg->action, msg->command, msg->message);
+                fprintf(out, "{\"type\":\"decision_rejected\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"action2\":%d,\"command\":\"%s\",\"reason\":\"%s\"}\n",
+                    msg->battle_id, msg->request_id, msg->action, msg->action2, msg->command, msg->message);
             } else {
-                fprintf(out, "{\"type\":\"decision_proposed\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"command\":\"%s\"}\n",
-                    msg->battle_id, msg->request_id, msg->action, msg->command);
+                fprintf(out, "{\"type\":\"decision_proposed\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"action2\":%d,\"command\":\"%s\"}\n",
+                    msg->battle_id, msg->request_id, msg->action, msg->action2, msg->command);
             }
             return 1;
         default:
@@ -43,29 +43,29 @@ int replay_write_runtime_message(FILE* out, const RuntimeMessage* msg) {
     }
 }
 
-int replay_write_decision_proposed(FILE* out, const char* battle_id, int request_id, int action, const char* command) {
+int replay_write_decision_proposed(FILE* out, const char* battle_id, int request_id, int action, int action2, const char* command) {
     if (!out) {
         return 0;
     }
-    fprintf(out, "{\"type\":\"decision_proposed\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"command\":\"%s\"}\n",
-        battle_id ? battle_id : "", request_id, action, command ? command : "");
+    fprintf(out, "{\"type\":\"decision_proposed\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"action2\":%d,\"command\":\"%s\"}\n",
+        battle_id ? battle_id : "", request_id, action, action2, command ? command : "");
     return 1;
 }
 
-int replay_write_decision_accepted(FILE* out, const char* battle_id, int request_id, int action, const char* command) {
+int replay_write_decision_accepted(FILE* out, const char* battle_id, int request_id, int action, int action2, const char* command) {
     if (!out) {
         return 0;
     }
-    fprintf(out, "{\"type\":\"decision_accepted\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"command\":\"%s\"}\n",
-        battle_id ? battle_id : "", request_id, action, command ? command : "");
+    fprintf(out, "{\"type\":\"decision_accepted\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"action2\":%d,\"command\":\"%s\"}\n",
+        battle_id ? battle_id : "", request_id, action, action2, command ? command : "");
     return 1;
 }
 
-int replay_write_decision_rejected(FILE* out, const char* battle_id, int request_id, int action, const char* command, const char* reason) {
+int replay_write_decision_rejected(FILE* out, const char* battle_id, int request_id, int action, int action2, const char* command, const char* reason) {
     if (!out) {
         return 0;
     }
-    fprintf(out, "{\"type\":\"decision_rejected\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"command\":\"%s\",\"reason\":\"%s\"}\n",
-        battle_id ? battle_id : "", request_id, action, command ? command : "", reason ? reason : "");
+    fprintf(out, "{\"type\":\"decision_rejected\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"action2\":%d,\"command\":\"%s\",\"reason\":\"%s\"}\n",
+        battle_id ? battle_id : "", request_id, action, action2, command ? command : "", reason ? reason : "");
     return 1;
 }

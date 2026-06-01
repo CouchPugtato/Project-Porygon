@@ -7,6 +7,7 @@
 typedef struct {
     float* observations;
     int* actions;
+    int* actions2;
     float* rewards;
     uint8_t* dones;
     size_t count;

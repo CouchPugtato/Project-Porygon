@@ -41,6 +41,7 @@ def decision_message(
     battle_id: str,
     request_id: int,
     action: int,
+    action2: int,
     command: str,
     accepted: bool | None = None,
     reason: str = "",
@@ -55,6 +56,7 @@ def decision_message(
         "battle_id": battle_id,
         "request_id": request_id,
         "action": action,
+        "action2": action2,
         "command": command,
     }
     if reason:

@@ -136,6 +136,7 @@ void runtime_message_init(RuntimeMessage* msg) {
     memset(msg, 0, sizeof(*msg));
     msg->accepted = -1;
     msg->action = -1;
+    msg->action2 = -1;
 }
 
 int runtime_message_parse(RuntimeMessage* msg, const char* json_line) {
@@ -167,6 +168,7 @@ int runtime_message_parse(RuntimeMessage* msg, const char* json_line) {
     msg->seq = extract_json_number(json_line, "seq", 0);
     msg->reward = extract_json_float(json_line, "reward", 0.0f);
     msg->action = extract_json_number(json_line, "action", -1);
+    msg->action2 = extract_json_number(json_line, "action2", -1);
     if (msg->accepted == 0 && strcmp(type, "decision_rejected") == 0) {
         /* keep explicit rejected marker */
     } else if (msg->accepted == 1 && strcmp(type, "decision_accepted") == 0) {
@@ -188,9 +190,9 @@ int runtime_emit_ready_json(char* out, size_t out_len) {
     return snprintf(out, out_len, "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":true}}") > 0;
 }
 
-int runtime_emit_action_json(char* out, size_t out_len, const char* battle_id, int request_id, int action, const char* command) {
-    return snprintf(out, out_len, "{\"type\":\"action\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"command\":\"%s\"}",
-        battle_id ? battle_id : "", request_id, action, command ? command : "") > 0;
+int runtime_emit_action_json(char* out, size_t out_len, const char* battle_id, int request_id, int action, int action2, const char* command) {
+    return snprintf(out, out_len, "{\"type\":\"action\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"action2\":%d,\"command\":\"%s\"}",
+        battle_id ? battle_id : "", request_id, action, action2, command ? command : "") > 0;
 }
 
 int runtime_emit_log_json(char* out, size_t out_len, const char* message) {

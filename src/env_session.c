@@ -42,6 +42,7 @@ static EnvSession* ensure_session(EnvRuntime* runtime, const char* battle_id, in
     action_mask_init(&session->action_mask);
     parsed_request_init(&session->parsed_request);
     session->pending_action = -1;
+    session->pending_action2 = -1;
     if (!episode_init(&session->episode, 32, runtime->obs_dim)) {
         return NULL;
     }
@@ -195,9 +196,10 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     }
     free(policy);
     session->pending_action = action;
+    session->pending_action2 = action2;
     strncpy(session->pending_command, command, sizeof(session->pending_command) - 1);
     session->pending_command[sizeof(session->pending_command) - 1] = '\0';
-    runtime_emit_action_json(json, sizeof(json), session->battle_id, session->last_request_id, action, command);
+    runtime_emit_action_json(json, sizeof(json), session->battle_id, session->last_request_id, action, action2, command);
     fputs(json, out);
     fputc('\n', out);
     fflush(out);
@@ -288,10 +290,13 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
             if (!session) return 0;
             if (msg->accepted > 0 && session->episode.count > 0) {
                 session->episode.actions[session->episode.count - 1] = msg->action;
+                session->episode.actions2[session->episode.count - 1] = msg->action2;
                 session->pending_action = -1;
+                session->pending_action2 = -1;
                 session->pending_command[0] = '\0';
             } else if (msg->accepted == 0) {
                 session->pending_action = -1;
+                session->pending_action2 = -1;
                 session->pending_command[0] = '\0';
             }
             return 1;

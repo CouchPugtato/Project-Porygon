@@ -15,22 +15,10 @@ static int train_prefix(
     float* value_loss,
     float* accuracy
 ) {
-    float* hidden;
-    float* policy;
-    float value;
-    hidden = (float*)malloc(gru_model_hidden_dim(model) * sizeof(float));
-    policy = (float*)malloc(gru_model_num_actions(model) * sizeof(float));
-    if (!hidden || !policy) {
-        free(hidden);
-        free(policy);
+    if (!gru_model_supervised_update_sequence(model, observations, steps, target_action, target_value,
+        trainer->learning_rate, action_loss, value_loss, accuracy)) {
         return 0;
     }
-    gru_model_zero_state(model, hidden);
-    gru_model_forward_sequence(model, observations, steps, hidden, policy, &value);
-    gru_model_supervised_update_heads(model, hidden, NULL, target_action, target_value,
-        trainer->learning_rate, action_loss, value_loss, accuracy);
-    free(hidden);
-    free(policy);
     (void)obs_dim;
     return 1;
 }
@@ -93,6 +81,27 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         accuracy_sum += accuracy;
         ++trained;
         ++trainer->step;
+        if (episode->actions2[t] >= 0) {
+            action_loss = 0.0f;
+            value_loss = 0.0f;
+            accuracy = 0.0f;
+            if (!train_prefix(trainer, model,
+                    episode->observations + (start * episode->obs_dim),
+                    episode->obs_dim,
+                    steps,
+                    episode->actions2[t],
+                    episode->rewards[t],
+                    &action_loss,
+                    &value_loss,
+                    &accuracy)) {
+                return 0;
+            }
+            action_loss_sum += action_loss;
+            value_loss_sum += value_loss;
+            accuracy_sum += accuracy;
+            ++trained;
+            ++trainer->step;
+        }
     }
     if (trained > 0) {
         trainer->last_action_loss = action_loss_sum / (float)trained;
@@ -109,27 +118,35 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
         return 0;
     }
     for (t = episode->count; t-- > 0;) {
-        float* hidden;
-        float* policy;
-        float value;
         size_t start = (t + 1 > trainer->bptt_window) ? (t + 1 - trainer->bptt_window) : 0;
         size_t steps = (t - start) + 1;
         if (episode->actions[t] < 0) {
             continue;
         }
         running_return += episode->rewards[t];
-        hidden = (float*)malloc(gru_model_hidden_dim(model) * sizeof(float));
-        policy = (float*)malloc(gru_model_num_actions(model) * sizeof(float));
-        if (!hidden || !policy) {
-            free(hidden);
-            free(policy);
+        if (!gru_model_policy_gradient_update_sequence(model,
+                episode->observations + (start * episode->obs_dim),
+                steps,
+                episode->actions[t],
+                running_return,
+                running_return,
+                0.0f,
+                trainer->learning_rate)) {
             return 0;
         }
-        gru_model_zero_state(model, hidden);
-        gru_model_forward_sequence(model, episode->observations + (start * episode->obs_dim), steps, hidden, policy, &value);
-        gru_model_policy_gradient_update_heads(model, hidden, NULL, episode->actions[t], running_return - value, running_return, 0.0f, trainer->learning_rate);
-        free(hidden);
-        free(policy);
+        if (episode->actions2[t] >= 0) {
+            if (!gru_model_policy_gradient_update_sequence(model,
+                    episode->observations + (start * episode->obs_dim),
+                    steps,
+                    episode->actions2[t],
+                    running_return,
+                    running_return,
+                    0.0f,
+                    trainer->learning_rate)) {
+                return 0;
+            }
+            ++trainer->step;
+        }
         ++trainer->step;
     }
     return 1;

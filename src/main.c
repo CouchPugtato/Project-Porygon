@@ -345,6 +345,53 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
     return 0;
 }
 
+static int clean_replay_file(const char* input_path, const char* output_path) {
+    FILE* in;
+    FILE* out;
+    char line[16384];
+    size_t kept = 0;
+    size_t skipped = 0;
+
+    if (!input_path || !output_path) {
+        return 1;
+    }
+    in = fopen(input_path, "r");
+    if (!in) {
+        fprintf(stderr, "Failed to open replay file '%s': %s\n", input_path, strerror(errno));
+        return 1;
+    }
+    out = fopen(output_path, "w");
+    if (!out) {
+        fclose(in);
+        fprintf(stderr, "Failed to open clean replay output '%s': %s\n", output_path, strerror(errno));
+        return 1;
+    }
+
+    while (fgets(line, sizeof(line), in)) {
+        RuntimeMessage msg;
+        runtime_message_init(&msg);
+        if (!runtime_message_parse(&msg, line)) {
+            ++skipped;
+            continue;
+        }
+        if (msg.type == RUNTIME_MSG_DECISION && msg.accepted == 0) {
+            ++skipped;
+            continue;
+        }
+        if (strstr(line, "\"type\":\"decision_proposed\"")) {
+            ++skipped;
+            continue;
+        }
+        fputs(line, out);
+        ++kept;
+    }
+
+    fclose(in);
+    fclose(out);
+    printf("[clean] input=%s output=%s kept=%zu skipped=%zu\n", input_path, output_path, kept, skipped);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     srand((unsigned int)time(NULL));
     if (!id_tables_init()) {
@@ -362,6 +409,9 @@ int main(int argc, char** argv) {
     }
     if (argc >= 4 && strcmp(argv[1], "--train-rl") == 0) {
         return train_from_replay_file(argv[2], argv[3], 1);
+    }
+    if (argc >= 4 && strcmp(argv[1], "--clean-replay") == 0) {
+        return clean_replay_file(argv[2], argv[3]);
     }
 
 #ifdef HAVE_NATIVE_SHOWDOWN_CLIENT
@@ -384,6 +434,7 @@ int main(int argc, char** argv) {
         "  showdown_client --runtime [checkpoint]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin>\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin>\n"
+        "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
         "  Set PORYGON_DEMO_GRU=1 for the demo mode.\n"
         "Legacy native websocket mode is disabled; use the Python communicator for live Showdown.\n");
     return 1;

@@ -98,6 +98,27 @@ static void matrix_vec_mul_accum(const Matrix* matrix, const float* vec, float* 
     }
 }
 
+static void matrix_transpose_vec_mul_accum(const Matrix* matrix, const float* vec, float* out) {
+    size_t r;
+    size_t c;
+    for (r = 0; r < matrix->rows; ++r) {
+        const float* row = matrix->data + (r * matrix->cols);
+        for (c = 0; c < matrix->cols; ++c) {
+            out[c] += row[c] * vec[r];
+        }
+    }
+}
+
+static void outer_product_accum(float* dst, size_t rows, size_t cols, const float* lhs, const float* rhs) {
+    size_t r;
+    size_t c;
+    for (r = 0; r < rows; ++r) {
+        for (c = 0; c < cols; ++c) {
+            dst[r * cols + c] += lhs[r] * rhs[c];
+        }
+    }
+}
+
 static void softmax(const float* logits, size_t n, float* out) {
     size_t i;
     float max_logit = logits[0];
@@ -463,6 +484,231 @@ void gru_model_evaluate_hidden(
     free(logits);
 }
 
+static int recurrent_update_sequence(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    int target_action,
+    float policy_scale,
+    float target_value,
+    float entropy_coef,
+    float learning_rate,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out
+) {
+    size_t hdim;
+    size_t xdim;
+    size_t adim;
+    size_t t;
+    size_t h;
+    size_t a;
+    float* h_states = NULL;
+    float* z_cache = NULL;
+    float* r_cache = NULL;
+    float* n_cache = NULL;
+    float* gated_cache = NULL;
+    float* zero_hidden = NULL;
+    float* logits = NULL;
+    float* policy = NULL;
+    float* grad_h = NULL;
+    float* next_grad_h = NULL;
+    float* grad_logits = NULL;
+    float* d_gated = NULL;
+    float* d_pre_z = NULL;
+    float* d_pre_r = NULL;
+    float* d_pre_n = NULL;
+    float* grad_wzx = NULL; float* grad_wzh = NULL; float* grad_bz = NULL;
+    float* grad_wrx = NULL; float* grad_wrh = NULL; float* grad_br = NULL;
+    float* grad_wnx = NULL; float* grad_wnh = NULL; float* grad_bn = NULL;
+    float* grad_policy_head = NULL; float* grad_policy_bias = NULL;
+    float* grad_value_head = NULL;
+    float grad_value_bias = 0.0f;
+    float value = 0.0f;
+    float dv;
+
+    if (!model || !sequence || steps == 0 || target_action < 0 || (size_t)target_action >= model->num_actions) {
+        return 0;
+    }
+    hdim = model->hidden_dim;
+    xdim = model->input_dim;
+    adim = model->num_actions;
+
+    h_states = (float*)calloc(steps * hdim, sizeof(float));
+    z_cache = (float*)calloc(steps * hdim, sizeof(float));
+    r_cache = (float*)calloc(steps * hdim, sizeof(float));
+    n_cache = (float*)calloc(steps * hdim, sizeof(float));
+    gated_cache = (float*)calloc(steps * hdim, sizeof(float));
+    zero_hidden = (float*)calloc(hdim, sizeof(float));
+    logits = (float*)malloc(adim * sizeof(float));
+    policy = (float*)malloc(adim * sizeof(float));
+    grad_h = (float*)calloc(hdim, sizeof(float));
+    next_grad_h = (float*)calloc(hdim, sizeof(float));
+    grad_logits = (float*)calloc(adim, sizeof(float));
+    d_gated = (float*)calloc(hdim, sizeof(float));
+    d_pre_z = (float*)calloc(hdim, sizeof(float));
+    d_pre_r = (float*)calloc(hdim, sizeof(float));
+    d_pre_n = (float*)calloc(hdim, sizeof(float));
+    grad_wzx = (float*)calloc(model->wzx.rows * model->wzx.cols, sizeof(float));
+    grad_wzh = (float*)calloc(model->wzh.rows * model->wzh.cols, sizeof(float));
+    grad_bz = (float*)calloc(hdim, sizeof(float));
+    grad_wrx = (float*)calloc(model->wrx.rows * model->wrx.cols, sizeof(float));
+    grad_wrh = (float*)calloc(model->wrh.rows * model->wrh.cols, sizeof(float));
+    grad_br = (float*)calloc(hdim, sizeof(float));
+    grad_wnx = (float*)calloc(model->wnx.rows * model->wnx.cols, sizeof(float));
+    grad_wnh = (float*)calloc(model->wnh.rows * model->wnh.cols, sizeof(float));
+    grad_bn = (float*)calloc(hdim, sizeof(float));
+    grad_policy_head = (float*)calloc(model->policy_head.rows * model->policy_head.cols, sizeof(float));
+    grad_policy_bias = (float*)calloc(adim, sizeof(float));
+    grad_value_head = (float*)calloc(hdim, sizeof(float));
+    if (!h_states || !z_cache || !r_cache || !n_cache || !gated_cache || !zero_hidden || !logits || !policy ||
+        !grad_h || !next_grad_h || !grad_logits || !d_gated || !d_pre_z || !d_pre_r || !d_pre_n ||
+        !grad_wzx || !grad_wzh || !grad_bz || !grad_wrx || !grad_wrh || !grad_br ||
+        !grad_wnx || !grad_wnh || !grad_bn || !grad_policy_head || !grad_policy_bias || !grad_value_head) {
+        free(h_states); free(z_cache); free(r_cache); free(n_cache); free(gated_cache); free(zero_hidden);
+        free(logits); free(policy); free(grad_h); free(next_grad_h); free(grad_logits); free(d_gated);
+        free(d_pre_z); free(d_pre_r); free(d_pre_n);
+        free(grad_wzx); free(grad_wzh); free(grad_bz); free(grad_wrx); free(grad_wrh); free(grad_br);
+        free(grad_wnx); free(grad_wnh); free(grad_bn); free(grad_policy_head); free(grad_policy_bias); free(grad_value_head);
+        return 0;
+    }
+
+    for (t = 0; t < steps; ++t) {
+        const float* input = sequence + (t * xdim);
+        const float* prev_h = (t > 0) ? (h_states + ((t - 1) * hdim)) : zero_hidden;
+        float* z_t = z_cache + (t * hdim);
+        float* r_t = r_cache + (t * hdim);
+        float* n_t = n_cache + (t * hdim);
+        float* g_t = gated_cache + (t * hdim);
+        float* h_t = h_states + (t * hdim);
+        memcpy(z_t, model->bz, hdim * sizeof(float));
+        memcpy(r_t, model->br, hdim * sizeof(float));
+        matrix_vec_mul_accum(&model->wzx, input, z_t);
+        matrix_vec_mul_accum(&model->wzh, prev_h, z_t);
+        matrix_vec_mul_accum(&model->wrx, input, r_t);
+        matrix_vec_mul_accum(&model->wrh, prev_h, r_t);
+        for (h = 0; h < hdim; ++h) {
+            z_t[h] = sigmoidf_approx(z_t[h]);
+            r_t[h] = sigmoidf_approx(r_t[h]);
+            g_t[h] = r_t[h] * prev_h[h];
+        }
+        memcpy(n_t, model->bn, hdim * sizeof(float));
+        matrix_vec_mul_accum(&model->wnx, input, n_t);
+        matrix_vec_mul_accum(&model->wnh, g_t, n_t);
+        for (h = 0; h < hdim; ++h) {
+            n_t[h] = tanhf(n_t[h]);
+            h_t[h] = (1.0f - z_t[h]) * n_t[h] + z_t[h] * prev_h[h];
+        }
+    }
+
+    evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), NULL, logits, policy, &value);
+    if (action_loss_out) {
+        *action_loss_out = -logf(policy[target_action] > 1.0e-8f ? policy[target_action] : 1.0e-8f);
+    }
+    if (value_loss_out) {
+        float err = value - target_value;
+        *value_loss_out = 0.5f * err * err;
+    }
+    if (accuracy_out) {
+        *accuracy_out = (gru_model_select_action(policy, NULL, adim) == target_action) ? 1.0f : 0.0f;
+    }
+
+    for (a = 0; a < adim; ++a) {
+        grad_logits[a] = (policy[a] - ((int)a == target_action ? 1.0f : 0.0f)) * policy_scale;
+        if (entropy_coef != 0.0f) {
+            grad_logits[a] += entropy_coef * policy[a] * logf(policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f);
+        }
+        grad_policy_bias[a] += grad_logits[a];
+        for (h = 0; h < hdim; ++h) {
+            grad_policy_head[a * hdim + h] += grad_logits[a] * h_states[(steps - 1) * hdim + h];
+        }
+    }
+    matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
+
+    dv = value - target_value;
+    grad_value_bias += dv;
+    for (h = 0; h < hdim; ++h) {
+        grad_value_head[h] += dv * h_states[(steps - 1) * hdim + h];
+        grad_h[h] += model->value_head[h] * dv;
+    }
+
+    for (t = steps; t-- > 0;) {
+        const float* input = sequence + (t * xdim);
+        const float* prev_h = (t > 0) ? (h_states + ((t - 1) * hdim)) : zero_hidden;
+        const float* z_t = z_cache + (t * hdim);
+        const float* r_t = r_cache + (t * hdim);
+        const float* n_t = n_cache + (t * hdim);
+        const float* g_t = gated_cache + (t * hdim);
+        memset(next_grad_h, 0, hdim * sizeof(float));
+        memset(d_gated, 0, hdim * sizeof(float));
+        for (h = 0; h < hdim; ++h) {
+            float d_n = grad_h[h] * (1.0f - z_t[h]);
+            float d_z = grad_h[h] * (prev_h[h] - n_t[h]);
+            next_grad_h[h] += grad_h[h] * z_t[h];
+            d_pre_n[h] = d_n * (1.0f - n_t[h] * n_t[h]);
+            d_pre_z[h] = d_z * z_t[h] * (1.0f - z_t[h]);
+        }
+        outer_product_accum(grad_wnx, hdim, xdim, d_pre_n, input);
+        outer_product_accum(grad_wnh, hdim, hdim, d_pre_n, g_t);
+        for (h = 0; h < hdim; ++h) {
+            grad_bn[h] += d_pre_n[h];
+        }
+        matrix_transpose_vec_mul_accum(&model->wnh, d_pre_n, d_gated);
+        for (h = 0; h < hdim; ++h) {
+            float d_r = d_gated[h] * prev_h[h];
+            next_grad_h[h] += d_gated[h] * r_t[h];
+            d_pre_r[h] = d_r * r_t[h] * (1.0f - r_t[h]);
+        }
+        outer_product_accum(grad_wrx, hdim, xdim, d_pre_r, input);
+        outer_product_accum(grad_wrh, hdim, hdim, d_pre_r, prev_h);
+        for (h = 0; h < hdim; ++h) {
+            grad_br[h] += d_pre_r[h];
+            grad_bz[h] += d_pre_z[h];
+        }
+        outer_product_accum(grad_wzx, hdim, xdim, d_pre_z, input);
+        outer_product_accum(grad_wzh, hdim, hdim, d_pre_z, prev_h);
+        matrix_transpose_vec_mul_accum(&model->wrh, d_pre_r, next_grad_h);
+        matrix_transpose_vec_mul_accum(&model->wzh, d_pre_z, next_grad_h);
+        memcpy(grad_h, next_grad_h, hdim * sizeof(float));
+    }
+
+    for (h = 0; h < model->wzx.rows * model->wzx.cols; ++h) model->wzx.data[h] -= learning_rate * grad_wzx[h];
+    for (h = 0; h < model->wzh.rows * model->wzh.cols; ++h) model->wzh.data[h] -= learning_rate * grad_wzh[h];
+    for (h = 0; h < hdim; ++h) model->bz[h] -= learning_rate * grad_bz[h];
+    for (h = 0; h < model->wrx.rows * model->wrx.cols; ++h) model->wrx.data[h] -= learning_rate * grad_wrx[h];
+    for (h = 0; h < model->wrh.rows * model->wrh.cols; ++h) model->wrh.data[h] -= learning_rate * grad_wrh[h];
+    for (h = 0; h < hdim; ++h) model->br[h] -= learning_rate * grad_br[h];
+    for (h = 0; h < model->wnx.rows * model->wnx.cols; ++h) model->wnx.data[h] -= learning_rate * grad_wnx[h];
+    for (h = 0; h < model->wnh.rows * model->wnh.cols; ++h) model->wnh.data[h] -= learning_rate * grad_wnh[h];
+    for (h = 0; h < hdim; ++h) model->bn[h] -= learning_rate * grad_bn[h];
+    for (a = 0; a < model->policy_head.rows * model->policy_head.cols; ++a) model->policy_head.data[a] -= learning_rate * grad_policy_head[a];
+    for (a = 0; a < adim; ++a) model->policy_bias[a] -= learning_rate * grad_policy_bias[a];
+    for (h = 0; h < hdim; ++h) model->value_head[h] -= learning_rate * grad_value_head[h];
+    model->value_bias -= learning_rate * grad_value_bias;
+
+    free(h_states); free(z_cache); free(r_cache); free(n_cache); free(gated_cache); free(zero_hidden);
+    free(logits); free(policy); free(grad_h); free(next_grad_h); free(grad_logits); free(d_gated);
+    free(d_pre_z); free(d_pre_r); free(d_pre_n);
+    free(grad_wzx); free(grad_wzh); free(grad_bz); free(grad_wrx); free(grad_wrh); free(grad_br);
+    free(grad_wnx); free(grad_wnh); free(grad_bn); free(grad_policy_head); free(grad_policy_bias); free(grad_value_head);
+    return 1;
+}
+
+int gru_model_supervised_update_sequence(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    int target_action,
+    float target_value,
+    float learning_rate,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out
+) {
+    return recurrent_update_sequence(model, sequence, steps, target_action, 1.0f, target_value, 0.0f,
+        learning_rate, action_loss_out, value_loss_out, accuracy_out);
+}
+
 int gru_model_supervised_update_heads(
     GruModel* model,
     const float* hidden_state,
@@ -578,6 +824,20 @@ int gru_model_policy_gradient_update_heads(
     free(logits);
     free(policy);
     return 1;
+}
+
+int gru_model_policy_gradient_update_sequence(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    int action,
+    float advantage,
+    float target_value,
+    float entropy_coef,
+    float learning_rate
+) {
+    return recurrent_update_sequence(model, sequence, steps, action, advantage, target_value, entropy_coef,
+        learning_rate, NULL, NULL, NULL);
 }
 
 size_t gru_model_parameter_count(const GruModel* model) {
