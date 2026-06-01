@@ -134,6 +134,8 @@ void runtime_message_init(RuntimeMessage* msg) {
         return;
     }
     memset(msg, 0, sizeof(*msg));
+    msg->accepted = -1;
+    msg->action = -1;
 }
 
 int runtime_message_parse(RuntimeMessage* msg, const char* json_line) {
@@ -152,7 +154,10 @@ int runtime_message_parse(RuntimeMessage* msg, const char* json_line) {
     else if (strcmp(type, "battle_end") == 0) msg->type = RUNTIME_MSG_BATTLE_END;
     else if (strcmp(type, "error") == 0) msg->type = RUNTIME_MSG_ERROR;
     else if (strcmp(type, "heartbeat") == 0) msg->type = RUNTIME_MSG_HEARTBEAT;
-    else if (strcmp(type, "decision") == 0) msg->type = RUNTIME_MSG_DECISION;
+    else if (strcmp(type, "decision") == 0) { msg->type = RUNTIME_MSG_DECISION; msg->accepted = 1; }
+    else if (strcmp(type, "decision_proposed") == 0) { msg->type = RUNTIME_MSG_DECISION; msg->accepted = -1; }
+    else if (strcmp(type, "decision_accepted") == 0) { msg->type = RUNTIME_MSG_DECISION; msg->accepted = 1; }
+    else if (strcmp(type, "decision_rejected") == 0) { msg->type = RUNTIME_MSG_DECISION; msg->accepted = 0; }
     else msg->type = RUNTIME_MSG_UNKNOWN;
 
     extract_json_string(json_line, "battle_id", msg->battle_id, sizeof(msg->battle_id));
@@ -162,9 +167,19 @@ int runtime_message_parse(RuntimeMessage* msg, const char* json_line) {
     msg->seq = extract_json_number(json_line, "seq", 0);
     msg->reward = extract_json_float(json_line, "reward", 0.0f);
     msg->action = extract_json_number(json_line, "action", -1);
+    if (msg->accepted == 0 && strcmp(type, "decision_rejected") == 0) {
+        /* keep explicit rejected marker */
+    } else if (msg->accepted == 1 && strcmp(type, "decision_accepted") == 0) {
+        /* keep explicit accepted marker */
+    } else if (msg->accepted == -1 && strcmp(type, "decision_proposed") == 0) {
+        /* keep explicit proposed marker */
+    } else {
+        msg->accepted = extract_json_bool(json_line, "accepted", msg->accepted);
+    }
     extract_json_string(json_line, "result", msg->result, sizeof(msg->result));
     extract_json_string(json_line, "line", msg->line, sizeof(msg->line));
     extract_json_string(json_line, "message", msg->message, sizeof(msg->message));
+    extract_json_string(json_line, "command", msg->command, sizeof(msg->command));
     extract_json_block(json_line, "payload", '{', '}', msg->payload, sizeof(msg->payload));
     return msg->type != RUNTIME_MSG_UNKNOWN;
 }
@@ -173,9 +188,9 @@ int runtime_emit_ready_json(char* out, size_t out_len) {
     return snprintf(out, out_len, "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":true}}") > 0;
 }
 
-int runtime_emit_action_json(char* out, size_t out_len, const char* battle_id, int request_id, const char* command) {
-    return snprintf(out, out_len, "{\"type\":\"action\",\"battle_id\":\"%s\",\"request_id\":%d,\"command\":\"%s\"}",
-        battle_id ? battle_id : "", request_id, command ? command : "") > 0;
+int runtime_emit_action_json(char* out, size_t out_len, const char* battle_id, int request_id, int action, const char* command) {
+    return snprintf(out, out_len, "{\"type\":\"action\",\"battle_id\":\"%s\",\"request_id\":%d,\"action\":%d,\"command\":\"%s\"}",
+        battle_id ? battle_id : "", request_id, action, command ? command : "") > 0;
 }
 
 int runtime_emit_log_json(char* out, size_t out_len, const char* message) {

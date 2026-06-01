@@ -58,5 +58,8 @@ typedef struct {
 
 void parsed_request_init(ParsedRequest* req);
 int parse_request_payload(ParsedRequest* req, const char* json, int request_id, int is_doubles);
+int parsed_request_slot_needs_choice(const ParsedRequest* req, int slot);
+int parsed_request_slot_can_move(const ParsedRequest* req, int slot);
+int parsed_request_slot_can_switch(const ParsedRequest* req, int slot);
 
 #endif

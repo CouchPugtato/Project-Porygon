@@ -9,6 +9,7 @@
 #define RUNTIME_LINE_LEN 2048
 #define RUNTIME_PAYLOAD_LEN 8192
 #define RUNTIME_MESSAGE_LEN 256
+#define RUNTIME_COMMAND_LEN 256
 
 typedef enum {
     RUNTIME_MSG_UNKNOWN = 0,
@@ -31,16 +32,18 @@ typedef struct {
     int seq;
     float reward;
     int action;
+    int accepted;
     char result[RUNTIME_RESULT_LEN];
     char line[RUNTIME_LINE_LEN];
     char payload[RUNTIME_PAYLOAD_LEN];
     char message[RUNTIME_MESSAGE_LEN];
+    char command[RUNTIME_COMMAND_LEN];
 } RuntimeMessage;
 
 void runtime_message_init(RuntimeMessage* msg);
 int runtime_message_parse(RuntimeMessage* msg, const char* json_line);
 int runtime_emit_ready_json(char* out, size_t out_len);
-int runtime_emit_action_json(char* out, size_t out_len, const char* battle_id, int request_id, const char* command);
+int runtime_emit_action_json(char* out, size_t out_len, const char* battle_id, int request_id, int action, const char* command);
 int runtime_emit_log_json(char* out, size_t out_len, const char* message);
 int runtime_emit_error_json(char* out, size_t out_len, const char* battle_id, const char* message);
 

@@ -23,6 +23,8 @@ typedef struct {
     int last_request_id;
     int terminal;
     int ready_for_decision;
+    int pending_action;
+    char pending_command[RUNTIME_COMMAND_LEN];
 } EnvSession;
 
 typedef struct {

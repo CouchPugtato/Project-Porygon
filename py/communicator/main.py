@@ -11,11 +11,11 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[1]))
     from communicator.ipc import LearnerProcess
-    from communicator.protocol import battle_end, battle_start, event_message, request_message, terminal_message
+    from communicator.protocol import battle_end, battle_start, decision_message, event_message, request_message, terminal_message
     from communicator.showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
 else:
     from .ipc import LearnerProcess
-    from .protocol import battle_end, battle_start, event_message, request_message, terminal_message
+    from .protocol import battle_end, battle_start, decision_message, event_message, request_message, terminal_message
     from .showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
 
 
@@ -386,6 +386,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
     request_open: dict[str, bool] = {}
     invalid_retry_count: dict[str, int] = {}
     learner_rerolls: dict[str, int] = {}
+    pending_decisions: dict[str, dict] = {}
     battle_players: dict[str, dict[str, str]] = {}
     battle_ratings: dict[str, dict[str, int | None]] = {}
     announced_matchups: set[str] = set()
@@ -410,7 +411,33 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                     f"{players['p2']} ({ratings.get('p2', '?') if ratings.get('p2') is not None else '?'})"
                 )
                 announced_matchups.add(event.room_id)
+        if (
+            event.room_id in pending_decisions
+            and not event.line.startswith("|error|")
+            and not event.line.startswith("|request|")
+        ):
+            pending = pending_decisions.pop(event.room_id)
+            await learner.send(
+                decision_message(
+                    event.room_id,
+                    pending["request_id"],
+                    pending["action"],
+                    pending["command"],
+                    accepted=True,
+                ).payload
+            )
         if event.line.startswith("|request|"):
+            pending = pending_decisions.pop(event.room_id, None)
+            if pending is not None:
+                await learner.send(
+                    decision_message(
+                        event.room_id,
+                        pending["request_id"],
+                        pending["action"],
+                        pending["command"],
+                        accepted=True,
+                    ).payload
+                )
             payload = event.line.split("|request|", 1)[1]
             request_payload = json.loads(payload)
             latest_requests[event.room_id] = request_payload
@@ -423,6 +450,18 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
             await learner.send(request_message(event.room_id, seq, request_payload).payload)
             print(f"[live] request {seq} for {battle_label(event.room_id)}")
         elif event.line.startswith("|error|") and "Invalid choice" in event.line:
+            pending = pending_decisions.pop(event.room_id, None)
+            if pending is not None:
+                await learner.send(
+                    decision_message(
+                        event.room_id,
+                        pending["request_id"],
+                        pending["action"],
+                        pending["command"],
+                        accepted=False,
+                        reason=event.line,
+                    ).payload
+                )
             if "There's nothing to choose" in event.line:
                 request_open[event.room_id] = False
                 print(f"[live] request closed for {battle_label(event.room_id)} after stale choice rejection")
@@ -444,6 +483,19 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                     candidate = next_fallback_command(request_payload, tried)
                     if candidate is not None:
                         print(f"[live] retrying with fallback for {battle_label(event.room_id)}: {candidate}")
+                        pending_decisions[event.room_id] = {
+                            "request_id": latest_request_seq.get(event.room_id, seq),
+                            "action": -1,
+                            "command": candidate,
+                        }
+                        await learner.send(
+                            decision_message(
+                                event.room_id,
+                                latest_request_seq.get(event.room_id, seq),
+                                -1,
+                                candidate,
+                            ).payload
+                        )
                         await gateway.send_room_command(event.room_id, candidate)
                     else:
                         print(
@@ -498,6 +550,19 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                     continue
                 print(f"[live] action for {battle_id}: {msg['command']}")
                 attempted_commands.setdefault(battle_id, set()).add(msg["command"])
+                pending_decisions[battle_id] = {
+                    "request_id": msg["request_id"],
+                    "action": msg.get("action", -1),
+                    "command": msg["command"],
+                }
+                await learner.send(
+                    decision_message(
+                        battle_id,
+                        msg["request_id"],
+                        msg.get("action", -1),
+                        msg["command"],
+                    ).payload
+                )
                 await gateway.send_room_command(battle_id, msg["command"])
             elif msg.get("type") == "error":
                 print(f"[live] learner error: {msg}")

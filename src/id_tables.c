@@ -15,6 +15,7 @@ static IdTable g_species_table = {0};
 static IdTable g_move_table = {0};
 static IdTable g_item_table = {0};
 static IdTable g_ability_table = {0};
+static IdTable g_condition_table = {0};
 
 static void normalize_token(const char* in, char* out, size_t out_len) {
     size_t i = 0;
@@ -143,11 +144,16 @@ int id_tables_init(void) {
     if (g_species_table.count > 0) {
         return 1;
     }
-    return
+    if (!(
         load_table_file(&g_species_table, "data/species_ids.txt") &&
         load_table_file(&g_move_table, "data/move_ids.txt") &&
         load_table_file(&g_item_table, "data/item_ids.txt") &&
-        load_table_file(&g_ability_table, "data/ability_ids.txt");
+        load_table_file(&g_ability_table, "data/ability_ids.txt"))) {
+        return 0;
+    }
+    /* Optional until all environments regenerate vocab files. */
+    load_table_file(&g_condition_table, "data/conditions_ids.txt");
+    return 1;
 }
 
 int species_id_from_name(const char* name) {
@@ -166,6 +172,10 @@ int ability_id_from_name(const char* name) {
     return lookup_id(&g_ability_table, name);
 }
 
+int condition_id_from_name(const char* name) {
+    return lookup_id(&g_condition_table, name);
+}
+
 const char* species_name_from_id(int id) {
     return lookup_name(&g_species_table, id);
 }
@@ -180,4 +190,8 @@ const char* item_name_from_id(int id) {
 
 const char* ability_name_from_id(int id) {
     return lookup_name(&g_ability_table, id);
+}
+
+const char* condition_name_from_id(int id) {
+    return lookup_name(&g_condition_table, id);
 }

@@ -103,7 +103,7 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
     for (i = 0; i < req->active_count && i < PARSED_REQUEST_ACTIVE_SLOTS; ++i) {
         int m;
         for (m = 0; m < PARSED_REQUEST_MOVE_SLOTS; ++m) {
-            int legal = req->active[i].move_id[m] > 0 && !req->active[i].move_disabled[m] && !req->active[i].fainted;
+            int legal = parsed_request_slot_can_move(req, i) && req->active[i].move_id[m] > 0 && !req->active[i].move_disabled[m];
             if (i == 0) {
                 out->legal[OBS_A1_MOVE1 + m] = (unsigned char)legal;
                 out->legal[OBS_A1_MOVE1_TERA + m] = (unsigned char)(legal && req->active[i].can_tera);
@@ -117,10 +117,10 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
     for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
         int bench_switch_legal = req->switch_available[i] && !req->switch_fainted[i] && !req->switch_active[i];
         if (bench_switch_legal) {
-            if (req->team_preview || !req->active[0].trapped) {
+            if (parsed_request_slot_can_switch(req, 0)) {
                 out->legal[OBS_A1_SWITCH1 + i] = 1;
             }
-            if ((req->active_count < 2 && !req->is_doubles) || req->team_preview || !req->active[1].trapped) {
+            if (parsed_request_slot_can_switch(req, 1)) {
                 out->legal[OBS_A2_SWITCH1 + i] = 1;
             }
         }

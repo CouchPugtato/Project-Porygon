@@ -35,3 +35,28 @@ def terminal_message(battle_id: str, result: str, reward: float) -> RuntimeMessa
 
 def battle_end(battle_id: str) -> RuntimeMessage:
     return RuntimeMessage({"type": "battle_end", "battle_id": battle_id})
+
+
+def decision_message(
+    battle_id: str,
+    request_id: int,
+    action: int,
+    command: str,
+    accepted: bool | None = None,
+    reason: str = "",
+) -> RuntimeMessage:
+    msg_type = "decision_proposed"
+    if accepted is True:
+        msg_type = "decision_accepted"
+    elif accepted is False:
+        msg_type = "decision_rejected"
+    payload: Dict[str, Any] = {
+        "type": msg_type,
+        "battle_id": battle_id,
+        "request_id": request_id,
+        "action": action,
+        "command": command,
+    }
+    if reason:
+        payload["message"] = reason
+    return RuntimeMessage(payload)

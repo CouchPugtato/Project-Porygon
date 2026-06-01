@@ -41,6 +41,7 @@ static EnvSession* ensure_session(EnvRuntime* runtime, const char* battle_id, in
     observation_init(&session->observation);
     action_mask_init(&session->action_mask);
     parsed_request_init(&session->parsed_request);
+    session->pending_action = -1;
     if (!episode_init(&session->episode, 32, runtime->obs_dim)) {
         return NULL;
     }
@@ -125,10 +126,8 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             living_slots[living_count++] = i;
         }
     }
-    slot0_needs_action = session->parsed_request.force_switch[0] ||
-        (!session->parsed_request.forced_switch_any && session->parsed_request.active_count > 0 && !session->parsed_request.active[0].fainted);
-    slot1_needs_action = session->parsed_request.force_switch[1] ||
-        (!session->parsed_request.forced_switch_any && session->parsed_request.active_count > 1 && !session->parsed_request.active[1].fainted);
+    slot0_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 0);
+    slot1_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 1);
 
     if (!session->parsed_request.team_preview && session->parsed_request.forced_switch_any) {
         if (slot0_needs_action) {
@@ -195,11 +194,10 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         }
     }
     free(policy);
-    session->episode.actions[session->episode.count - 1] = action;
-    if (runtime->replay_file) {
-        replay_write_decision(runtime->replay_file, session->battle_id, session->last_request_id, action, command);
-    }
-    runtime_emit_action_json(json, sizeof(json), session->battle_id, session->last_request_id, command);
+    session->pending_action = action;
+    strncpy(session->pending_command, command, sizeof(session->pending_command) - 1);
+    session->pending_command[sizeof(session->pending_command) - 1] = '\0';
+    runtime_emit_action_json(json, sizeof(json), session->battle_id, session->last_request_id, action, command);
     fputs(json, out);
     fputc('\n', out);
     fflush(out);
@@ -288,8 +286,13 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
         case RUNTIME_MSG_DECISION:
             session = ensure_session(runtime, msg->battle_id, 1);
             if (!session) return 0;
-            if (session->episode.count > 0) {
+            if (msg->accepted > 0 && session->episode.count > 0) {
                 session->episode.actions[session->episode.count - 1] = msg->action;
+                session->pending_action = -1;
+                session->pending_command[0] = '\0';
+            } else if (msg->accepted == 0) {
+                session->pending_action = -1;
+                session->pending_command[0] = '\0';
             }
             return 1;
         case RUNTIME_MSG_BATTLE_END:
