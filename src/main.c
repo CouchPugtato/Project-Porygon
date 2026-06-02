@@ -109,6 +109,35 @@ static char* make_epoch_checkpoint_path(const char* base_path, size_t epoch_numb
     return out;
 }
 
+static char* make_best_checkpoint_path(const char* base_path) {
+    const char* dot;
+    size_t stem_len;
+    int needed;
+    char* out;
+
+    if (!base_path || !*base_path) {
+        return NULL;
+    }
+    dot = strrchr(base_path, '.');
+    stem_len = dot ? (size_t)(dot - base_path) : strlen(base_path);
+    needed = dot
+        ? snprintf(NULL, 0, "%.*s_best%s", (int)stem_len, base_path, dot)
+        : snprintf(NULL, 0, "%s_best", base_path);
+    if (needed <= 0) {
+        return NULL;
+    }
+    out = (char*)malloc((size_t)needed + 1);
+    if (!out) {
+        return NULL;
+    }
+    if (dot) {
+        snprintf(out, (size_t)needed + 1, "%.*s_best%s", (int)stem_len, base_path, dot);
+    } else {
+        snprintf(out, (size_t)needed + 1, "%s_best", base_path);
+    }
+    return out;
+}
+
 static double elapsed_seconds_since(clock_t start_clock) {
     return (double)(clock() - start_clock) / (double)CLOCKS_PER_SEC;
 }
@@ -129,6 +158,59 @@ static int is_validation_session(size_t index, size_t total_sessions) {
         return 0;
     }
     return (index % 10u) == 0u;
+}
+
+static void shuffle_indices(size_t* indices, size_t count) {
+    size_t i;
+    if (!indices || count < 2) {
+        return;
+    }
+    for (i = count - 1; i > 0; --i) {
+        size_t j = (size_t)(rand() % (int)(i + 1));
+        size_t tmp = indices[i];
+        indices[i] = indices[j];
+        indices[j] = tmp;
+    }
+}
+
+static int build_split_indices(
+    size_t total_sessions,
+    size_t** train_indices_out,
+    size_t* train_count_out,
+    size_t** val_indices_out,
+    size_t* val_count_out
+) {
+    size_t* train_indices = NULL;
+    size_t* val_indices = NULL;
+    size_t train_count = 0;
+    size_t val_count = 0;
+    size_t i;
+
+    if (!train_indices_out || !train_count_out || !val_indices_out || !val_count_out) {
+        return 0;
+    }
+
+    train_indices = (size_t*)malloc((total_sessions > 0 ? total_sessions : 1) * sizeof(size_t));
+    val_indices = (size_t*)malloc((total_sessions > 0 ? total_sessions : 1) * sizeof(size_t));
+    if (!train_indices || !val_indices) {
+        free(train_indices);
+        free(val_indices);
+        return 0;
+    }
+
+    for (i = 0; i < total_sessions; ++i) {
+        if (is_validation_session(i, total_sessions)) {
+            val_indices[val_count++] = i;
+        } else {
+            train_indices[train_count++] = i;
+        }
+    }
+
+    *train_indices_out = train_indices;
+    *train_count_out = train_count;
+    *val_indices_out = val_indices;
+    *val_count_out = val_count;
+    return 1;
 }
 
 static int evaluate_supervised_episode(
@@ -213,6 +295,176 @@ static int evaluate_supervised_episode(
     if (accuracy_out) *accuracy_out = accuracy_sum / (float)trained;
     if (labels_out) *labels_out = trained;
     return 1;
+}
+
+static int evaluate_supervised_split(
+    const GruTrainer* trainer,
+    const GruModel* model,
+    const EnvRuntime* runtime,
+    const size_t* indices,
+    size_t index_count,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out,
+    size_t* labels_out,
+    size_t* sessions_out
+) {
+    size_t i;
+    float action_loss_sum = 0.0f;
+    float value_loss_sum = 0.0f;
+    float accuracy_sum = 0.0f;
+    size_t total_labels = 0;
+    size_t total_sessions = 0;
+
+    if (!trainer || !model || !runtime) {
+        return 0;
+    }
+    for (i = 0; i < index_count; ++i) {
+        float action_loss = 0.0f;
+        float value_loss = 0.0f;
+        float accuracy = 0.0f;
+        size_t labels = 0;
+        size_t session_index = indices[i];
+        ++total_sessions;
+        if (!evaluate_supervised_episode(trainer, model, &runtime->sessions[session_index].episode,
+                &action_loss, &value_loss, &accuracy, &labels)) {
+            return 0;
+        }
+        action_loss_sum += action_loss * (float)labels;
+        value_loss_sum += value_loss * (float)labels;
+        accuracy_sum += accuracy * (float)labels;
+        total_labels += labels;
+    }
+
+    if (action_loss_out) *action_loss_out = total_labels > 0 ? action_loss_sum / (float)total_labels : 0.0f;
+    if (value_loss_out) *value_loss_out = total_labels > 0 ? value_loss_sum / (float)total_labels : 0.0f;
+    if (accuracy_out) *accuracy_out = total_labels > 0 ? accuracy_sum / (float)total_labels : 0.0f;
+    if (labels_out) *labels_out = total_labels;
+    if (sessions_out) *sessions_out = total_sessions;
+    return 1;
+}
+
+static int load_runtime_from_replay_file(const char* replay_path, GruModel* model, EnvRuntime* runtime) {
+    FILE* f;
+    char line[16384];
+    size_t lines_read = 0;
+    size_t parsed_messages = 0;
+    size_t invalid_lines = 0;
+    clock_t ingest_start_clock;
+
+    if (!replay_path || !model || !runtime) {
+        return 0;
+    }
+    f = fopen(replay_path, "r");
+    if (!f) {
+        fprintf(stderr, "Failed to open replay file '%s': %s\n", replay_path, strerror(errno));
+        return 0;
+    }
+    if (!env_runtime_init(runtime, model, NULL, 1)) {
+        fclose(f);
+        return 0;
+    }
+
+    ingest_start_clock = clock();
+    while (fgets(line, sizeof(line), f)) {
+        RuntimeMessage msg;
+        ++lines_read;
+        runtime_message_init(&msg);
+        if (!runtime_message_parse(&msg, line)) {
+            ++invalid_lines;
+            continue;
+        }
+        ++parsed_messages;
+        env_runtime_handle_message(runtime, &msg, NULL);
+        if ((lines_read % 50000u) == 0u) {
+            double elapsed = elapsed_seconds_since(ingest_start_clock);
+            double lines_per_sec = elapsed > 0.0 ? (double)lines_read / elapsed : 0.0;
+            printf("[train] ingest lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
+                lines_read, parsed_messages, invalid_lines, runtime->count);
+            printf("[train] ingest elapsed=%.1fs lines_per_sec=%.1f\n", elapsed, lines_per_sec);
+        }
+    }
+    fclose(f);
+    printf("[train] ingest complete lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
+        lines_read, parsed_messages, invalid_lines, runtime->count);
+    return 1;
+}
+
+static int evaluate_checkpoint_on_replay_file(const char* replay_path, const char* checkpoint_path) {
+    char* resolved_checkpoint_path = NULL;
+    GruModel* model = NULL;
+    GruTrainer trainer;
+    EnvRuntime runtime;
+    TrainerCheckpointState checkpoint_state;
+    size_t* train_indices = NULL;
+    size_t* val_indices = NULL;
+    size_t train_sessions = 0;
+    size_t val_sessions = 0;
+    float val_action_loss = 0.0f;
+    float val_value_loss = 0.0f;
+    float val_accuracy = 0.0f;
+    size_t val_labels = 0;
+    size_t evaluated_sessions = 0;
+
+    if (!replay_path || !checkpoint_path) {
+        return 1;
+    }
+    resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path);
+    if (!resolved_checkpoint_path) {
+        fprintf(stderr, "Failed to resolve checkpoint path\n");
+        return 1;
+    }
+    memset(&checkpoint_state, 0, sizeof(checkpoint_state));
+    model = checkpoint_load(resolved_checkpoint_path, &checkpoint_state);
+    if (!model) {
+        fprintf(stderr, "Failed to load checkpoint '%s'\n", resolved_checkpoint_path);
+        free(resolved_checkpoint_path);
+        return 1;
+    }
+    gru_trainer_init(&trainer,
+        checkpoint_state.learning_rate > 0.0f ? checkpoint_state.learning_rate : 0.01f,
+        checkpoint_state.bptt_window ? checkpoint_state.bptt_window : 16,
+        checkpoint_state.gradient_clip,
+        checkpoint_state.seed);
+    trainer.step = checkpoint_state.step;
+
+    if (!load_runtime_from_replay_file(replay_path, model, &runtime)) {
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
+        return 1;
+    }
+    if (!build_split_indices(runtime.count, &train_indices, &train_sessions, &val_indices, &val_sessions)) {
+        fprintf(stderr, "Failed to build held-out split indices\n");
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
+        return 1;
+    }
+
+    printf("[eval] checkpoint=%s train_sessions=%zu val_sessions=%zu\n",
+        resolved_checkpoint_path, train_sessions, val_sessions);
+    if (val_sessions == 0) {
+        printf("[eval] no held-out validation sessions available\n");
+    } else if (!evaluate_supervised_split(&trainer, model, &runtime, val_indices, val_sessions,
+            &val_action_loss, &val_value_loss, &val_accuracy, &val_labels, &evaluated_sessions)) {
+        fprintf(stderr, "Failed to evaluate held-out split\n");
+        free(train_indices);
+        free(val_indices);
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
+        return 1;
+    } else {
+        printf("[eval] validation action_loss=%.4f value_loss=%.4f accuracy=%.4f labels=%zu sessions=%zu\n",
+            val_action_loss, val_value_loss, val_accuracy, val_labels, evaluated_sessions);
+    }
+
+    free(train_indices);
+    free(val_indices);
+    env_runtime_free(&runtime);
+    gru_model_destroy(model);
+    free(resolved_checkpoint_path);
+    return 0;
 }
 
 static int run_demo_gru(void) {
@@ -342,34 +594,25 @@ static int run_runtime_mode(const char* checkpoint_path) {
 }
 
 static int train_from_replay_file(const char* replay_path, const char* checkpoint_path, int rl_mode, int epochs) {
-    FILE* f;
-    char line[16384];
     char* resolved_checkpoint_path = NULL;
     GruModel* model = NULL;
     GruTrainer trainer;
     EnvRuntime runtime;
     TrainerCheckpointState checkpoint_state;
-    size_t i;
-    size_t lines_read = 0;
-    size_t parsed_messages = 0;
-    size_t invalid_lines = 0;
-    clock_t train_start_clock;
+    size_t* train_indices = NULL;
+    size_t* val_indices = NULL;
     clock_t train_loop_start_clock;
     size_t train_sessions = 0;
     size_t val_sessions = 0;
+    float best_val_action_loss = 0.0f;
+    int has_best_val = 0;
     int epoch;
 
     if (!replay_path || !checkpoint_path || epochs <= 0) {
         return 1;
     }
-    f = fopen(replay_path, "r");
-    if (!f) {
-        fprintf(stderr, "Failed to open replay file '%s': %s\n", replay_path, strerror(errno));
-        return 1;
-    }
     resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path);
     if (!resolved_checkpoint_path) {
-        fclose(f);
         fprintf(stderr, "Failed to resolve checkpoint path\n");
         return 1;
     }
@@ -382,7 +625,6 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         printf("[train] loaded checkpoint %s step=%zu\n", resolved_checkpoint_path, checkpoint_state.step);
     }
     if (!model) {
-        fclose(f);
         free(resolved_checkpoint_path);
         return 1;
     }
@@ -393,61 +635,38 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         checkpoint_state.seed);
     trainer.step = checkpoint_state.step;
 
-    if (!env_runtime_init(&runtime, model, NULL, 1)) {
-        fclose(f);
+    if (!load_runtime_from_replay_file(replay_path, model, &runtime)) {
         gru_model_destroy(model);
         free(resolved_checkpoint_path);
         return 1;
     }
-    train_start_clock = clock();
-    while (fgets(line, sizeof(line), f)) {
-        RuntimeMessage msg;
-        ++lines_read;
-        runtime_message_init(&msg);
-        if (!runtime_message_parse(&msg, line)) {
-            ++invalid_lines;
-            continue;
-        }
-        ++parsed_messages;
-        env_runtime_handle_message(&runtime, &msg, NULL);
-        if ((lines_read % 50000u) == 0u) {
-            double elapsed = elapsed_seconds_since(train_start_clock);
-            double lines_per_sec = elapsed > 0.0 ? (double)lines_read / elapsed : 0.0;
-            printf("[train] ingest lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
-                lines_read, parsed_messages, invalid_lines, runtime.count);
-            printf("[train] ingest elapsed=%.1fs lines_per_sec=%.1f\n", elapsed, lines_per_sec);
-        }
-    }
-    fclose(f);
-    printf("[train] ingest complete lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
-        lines_read, parsed_messages, invalid_lines, runtime.count);
-    for (i = 0; i < runtime.count; ++i) {
-        if (is_validation_session(i, runtime.count)) {
-            ++val_sessions;
-        } else {
-            ++train_sessions;
-        }
+    if (!build_split_indices(runtime.count, &train_indices, &train_sessions, &val_indices, &val_sessions)) {
+        fprintf(stderr, "Failed to build train/validation split indices\n");
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
+        return 1;
     }
     printf("[train] split train_sessions=%zu val_sessions=%zu epochs=%d\n", train_sessions, val_sessions, epochs);
 
     for (epoch = 1; epoch <= epochs; ++epoch) {
         size_t trained_in_epoch = 0;
-        float val_action_loss_sum = 0.0f;
-        float val_value_loss_sum = 0.0f;
-        float val_accuracy_sum = 0.0f;
+        float val_action_loss = 0.0f;
+        float val_value_loss = 0.0f;
+        float val_accuracy = 0.0f;
         size_t val_labels = 0;
+        size_t evaluated_sessions = 0;
 
         printf("[train] epoch %d/%d start\n", epoch, epochs);
         train_loop_start_clock = clock();
+        shuffle_indices(train_indices, train_sessions);
 
-        for (i = 0; i < runtime.count; ++i) {
-            if (is_validation_session(i, runtime.count)) {
-                continue;
-            }
+        for (size_t order_i = 0; order_i < train_sessions; ++order_i) {
+            size_t session_index = train_indices[order_i];
             if (rl_mode) {
-                gru_trainer_policy_gradient_episode(&trainer, model, &runtime.sessions[i].episode);
+                gru_trainer_policy_gradient_episode(&trainer, model, &runtime.sessions[session_index].episode);
             } else {
-                gru_trainer_supervised_episode(&trainer, model, &runtime.sessions[i].episode);
+                gru_trainer_supervised_episode(&trainer, model, &runtime.sessions[session_index].episode);
             }
             ++trained_in_epoch;
             {
@@ -483,34 +702,40 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         }
 
         if (val_sessions > 0 && !rl_mode) {
-            for (i = 0; i < runtime.count; ++i) {
-                float action_loss = 0.0f;
-                float value_loss = 0.0f;
-                float accuracy = 0.0f;
-                size_t labels = 0;
-                if (!is_validation_session(i, runtime.count)) {
-                    continue;
-                }
-                if (!evaluate_supervised_episode(&trainer, model, &runtime.sessions[i].episode,
-                        &action_loss, &value_loss, &accuracy, &labels)) {
-                    fprintf(stderr, "Failed validation evaluation on session %zu\n", i);
-                    env_runtime_free(&runtime);
-                    gru_model_destroy(model);
-                    free(resolved_checkpoint_path);
-                    return 1;
-                }
-                val_action_loss_sum += action_loss * (float)labels;
-                val_value_loss_sum += value_loss * (float)labels;
-                val_accuracy_sum += accuracy * (float)labels;
-                val_labels += labels;
+            TrainerCheckpointState best_state;
+            char* best_path = NULL;
+            if (!evaluate_supervised_split(&trainer, model, &runtime, val_indices, val_sessions,
+                    &val_action_loss, &val_value_loss, &val_accuracy, &val_labels, &evaluated_sessions)) {
+                fprintf(stderr, "Failed held-out validation evaluation\n");
+                free(train_indices);
+                free(val_indices);
+                env_runtime_free(&runtime);
+                gru_model_destroy(model);
+                free(resolved_checkpoint_path);
+                return 1;
             }
             if (val_labels > 0) {
                 printf("[train] epoch=%d validation action_loss=%.4f value_loss=%.4f accuracy=%.4f labels=%zu\n",
                     epoch,
-                    val_action_loss_sum / (float)val_labels,
-                    val_value_loss_sum / (float)val_labels,
-                    val_accuracy_sum / (float)val_labels,
+                    val_action_loss,
+                    val_value_loss,
+                    val_accuracy,
                     val_labels);
+                if (!has_best_val || val_action_loss < best_val_action_loss) {
+                    has_best_val = 1;
+                    best_val_action_loss = val_action_loss;
+                    best_state = gru_trainer_checkpoint_state(&trainer);
+                    best_path = make_best_checkpoint_path(resolved_checkpoint_path);
+                    if (best_path) {
+                        if (checkpoint_save(best_path, model, &best_state)) {
+                            printf("[train] saved best validation checkpoint %s action_loss=%.4f\n",
+                                best_path, best_val_action_loss);
+                        } else {
+                            printf("[train] failed best validation checkpoint %s\n", best_path);
+                        }
+                        free(best_path);
+                    }
+                }
             } else {
                 printf("[train] epoch=%d validation skipped no labels\n", epoch);
             }
@@ -533,6 +758,8 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
     checkpoint_state = gru_trainer_checkpoint_state(&trainer);
     if (!checkpoint_save(resolved_checkpoint_path, model, &checkpoint_state)) {
         fprintf(stderr, "Failed to save checkpoint '%s'\n", resolved_checkpoint_path);
+        free(train_indices);
+        free(val_indices);
         env_runtime_free(&runtime);
         gru_model_destroy(model);
         free(resolved_checkpoint_path);
@@ -546,6 +773,8 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         trainer.last_accuracy,
         runtime.count);
     printf("[train] saved checkpoint %s\n", resolved_checkpoint_path);
+    free(train_indices);
+    free(val_indices);
     env_runtime_free(&runtime);
     gru_model_destroy(model);
     free(resolved_checkpoint_path);
@@ -618,6 +847,9 @@ int main(int argc, char** argv) {
     if (argc >= 4 && strcmp(argv[1], "--train-rl") == 0) {
         return train_from_replay_file(argv[2], argv[3], 1, epochs);
     }
+    if (argc >= 4 && strcmp(argv[1], "--eval-supervised") == 0) {
+        return evaluate_checkpoint_on_replay_file(argv[2], argv[3]);
+    }
     if (argc >= 4 && strcmp(argv[1], "--clean-replay") == 0) {
         return clean_replay_file(argv[2], argv[3]);
     }
@@ -642,6 +874,7 @@ int main(int argc, char** argv) {
         "  showdown_client --runtime [checkpoint]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N]\n"
+        "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
         "  Set PORYGON_DEMO_GRU=1 for the demo mode.\n"
         "Legacy native websocket mode is disabled; use the Python communicator for live Showdown.\n");
