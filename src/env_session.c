@@ -289,8 +289,30 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
             session = ensure_session(runtime, msg->battle_id, 1);
             if (!session) return 0;
             if (msg->accepted > 0 && session->episode.count > 0) {
-                session->episode.actions[session->episode.count - 1] = msg->action;
-                session->episode.actions2[session->episode.count - 1] = msg->action2;
+                int accepted_action = msg->action;
+                int accepted_action2 = msg->action2;
+                if ((accepted_action < 0 || accepted_action2 < 0) && msg->command[0] != '\0') {
+                    int slot0_has_action = 0;
+                    int slot1_has_action = 0;
+                    enum ObsAction inferred_action0 = OBS_A1_MOVE1;
+                    enum ObsAction inferred_action1 = OBS_A2_MOVE1;
+                    if (showdown_command_to_request_actions(msg->command, &session->parsed_request,
+                            &slot0_has_action, &inferred_action0, &slot1_has_action, &inferred_action1)) {
+                        if (accepted_action < 0 && slot0_has_action) {
+                            accepted_action = (int)inferred_action0;
+                        }
+                        if (accepted_action2 < 0 && slot1_has_action) {
+                            accepted_action2 = (int)inferred_action1;
+                        }
+                        if (!slot0_has_action && slot1_has_action &&
+                                accepted_action2 >= 0 &&
+                                accepted_action == accepted_action2) {
+                            accepted_action = -1;
+                        }
+                    }
+                }
+                session->episode.actions[session->episode.count - 1] = accepted_action;
+                session->episode.actions2[session->episode.count - 1] = accepted_action2;
                 session->pending_action = -1;
                 session->pending_action2 = -1;
                 session->pending_command[0] = '\0';

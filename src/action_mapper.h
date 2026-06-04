@@ -40,5 +40,13 @@ int request_actions_to_showdown_command(
     int slot1_has_action,
     enum ObsAction action1
 );
+int showdown_command_to_request_actions(
+    const char* command,
+    const ParsedRequest* req,
+    int* slot0_has_action,
+    enum ObsAction* action0,
+    int* slot1_has_action,
+    enum ObsAction* action1
+);
 
 #endif

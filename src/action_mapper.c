@@ -272,3 +272,83 @@ int request_actions_to_showdown_command(
     }
     return 0;
 }
+
+int showdown_command_to_request_actions(
+    const char* command,
+    const ParsedRequest* req,
+    int* slot0_has_action,
+    enum ObsAction* action0,
+    int* slot1_has_action,
+    enum ObsAction* action1
+) {
+    ActionMask mask;
+    char candidate[128];
+    int need0;
+    int need1;
+    int has0_options[2];
+    int has1_options[2];
+    int i;
+    int j;
+    int k;
+    int l;
+
+    if (!command || !req || !slot0_has_action || !action0 || !slot1_has_action || !action1) {
+        return 0;
+    }
+
+    need0 = parsed_request_slot_needs_choice(req, 0);
+    need1 = parsed_request_slot_needs_choice(req, 1);
+    has0_options[0] = need0 ? 1 : 0;
+    has0_options[1] = 0;
+    has1_options[0] = need1 ? 1 : 0;
+    has1_options[1] = 0;
+    if (!req->team_preview) {
+        if (!need0) {
+            has0_options[1] = 1;
+        }
+        if (!need1) {
+            has1_options[1] = 1;
+        }
+    }
+
+    if (!build_action_mask_from_request(&mask, req)) {
+        return 0;
+    }
+
+    for (i = 0; i < 2; ++i) {
+        int has0 = has0_options[i];
+        int start0 = has0 ? 0 : -1;
+        int end0 = has0 ? OBS_NUM_ACTIONS : -1;
+        for (j = 0; j < 2; ++j) {
+            int has1 = has1_options[j];
+            int start1 = has1 ? 0 : -1;
+            int end1 = has1 ? OBS_NUM_ACTIONS : -1;
+            if (!has0 && !has1) {
+                continue;
+            }
+            for (k = start0; k < end0; ++k) {
+                enum ObsAction a0 = has0 ? (enum ObsAction)k : OBS_A1_MOVE1;
+                if (has0 && !mask.legal[k]) {
+                    continue;
+                }
+                for (l = start1; l < end1; ++l) {
+                    enum ObsAction a1 = has1 ? (enum ObsAction)l : OBS_A2_MOVE1;
+                    if (has1 && !mask.legal[l]) {
+                        continue;
+                    }
+                    if (!request_actions_to_showdown_command(candidate, sizeof(candidate), req, has0, a0, has1, a1)) {
+                        continue;
+                    }
+                    if (strcmp(candidate, command) == 0) {
+                        *slot0_has_action = has0;
+                        *action0 = a0;
+                        *slot1_has_action = has1;
+                        *action1 = a1;
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
