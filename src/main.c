@@ -220,13 +220,25 @@ static int evaluate_supervised_episode(
     float* action_loss_out,
     float* value_loss_out,
     float* accuracy_out,
-    size_t* labels_out
+    size_t* labels_out,
+    float* top3_accuracy_out,
+    float* action1_accuracy_out,
+    float* action2_accuracy_out,
+    size_t* action1_labels_out,
+    size_t* action2_labels_out,
+    size_t* skipped_steps_out
 ) {
     size_t t;
     size_t trained = 0;
     float action_loss_sum = 0.0f;
     float value_loss_sum = 0.0f;
     float accuracy_sum = 0.0f;
+    float top3_accuracy_sum = 0.0f;
+    float action1_accuracy_sum = 0.0f;
+    float action2_accuracy_sum = 0.0f;
+    size_t action1_labels = 0;
+    size_t action2_labels = 0;
+    size_t skipped_steps = 0;
     size_t hidden_dim;
     size_t action_dim;
     float* hidden;
@@ -257,6 +269,7 @@ static int evaluate_supervised_episode(
         labels[1] = episode->actions2[t];
 
         if (labels[0] < 0 && labels[1] < 0) {
+            ++skipped_steps;
             continue;
         }
 
@@ -268,6 +281,8 @@ static int evaluate_supervised_episode(
             int label = labels[li];
             float prob;
             float err;
+            int top_hits = 0;
+            size_t k;
             if (label < 0) {
                 continue;
             }
@@ -276,6 +291,22 @@ static int evaluate_supervised_episode(
             err = value - episode->rewards[t];
             value_loss_sum += 0.5f * err * err;
             accuracy_sum += (predicted_action == label) ? 1.0f : 0.0f;
+            for (k = 0; k < action_dim; ++k) {
+                if (policy[k] > prob) {
+                    ++top_hits;
+                    if (top_hits >= 3) {
+                        break;
+                    }
+                }
+            }
+            top3_accuracy_sum += (top_hits < 3) ? 1.0f : 0.0f;
+            if (li == 0) {
+                action1_accuracy_sum += (predicted_action == label) ? 1.0f : 0.0f;
+                ++action1_labels;
+            } else {
+                action2_accuracy_sum += (predicted_action == label) ? 1.0f : 0.0f;
+                ++action2_labels;
+            }
             ++trained;
         }
     }
@@ -288,12 +319,24 @@ static int evaluate_supervised_episode(
         if (value_loss_out) *value_loss_out = 0.0f;
         if (accuracy_out) *accuracy_out = 0.0f;
         if (labels_out) *labels_out = 0;
+        if (top3_accuracy_out) *top3_accuracy_out = 0.0f;
+        if (action1_accuracy_out) *action1_accuracy_out = 0.0f;
+        if (action2_accuracy_out) *action2_accuracy_out = 0.0f;
+        if (action1_labels_out) *action1_labels_out = 0;
+        if (action2_labels_out) *action2_labels_out = 0;
+        if (skipped_steps_out) *skipped_steps_out = skipped_steps;
         return 1;
     }
     if (action_loss_out) *action_loss_out = action_loss_sum / (float)trained;
     if (value_loss_out) *value_loss_out = value_loss_sum / (float)trained;
     if (accuracy_out) *accuracy_out = accuracy_sum / (float)trained;
     if (labels_out) *labels_out = trained;
+    if (top3_accuracy_out) *top3_accuracy_out = top3_accuracy_sum / (float)trained;
+    if (action1_accuracy_out) *action1_accuracy_out = action1_labels > 0 ? action1_accuracy_sum / (float)action1_labels : 0.0f;
+    if (action2_accuracy_out) *action2_accuracy_out = action2_labels > 0 ? action2_accuracy_sum / (float)action2_labels : 0.0f;
+    if (action1_labels_out) *action1_labels_out = action1_labels;
+    if (action2_labels_out) *action2_labels_out = action2_labels;
+    if (skipped_steps_out) *skipped_steps_out = skipped_steps;
     return 1;
 }
 
@@ -307,14 +350,26 @@ static int evaluate_supervised_split(
     float* value_loss_out,
     float* accuracy_out,
     size_t* labels_out,
-    size_t* sessions_out
+    size_t* sessions_out,
+    float* top3_accuracy_out,
+    float* action1_accuracy_out,
+    float* action2_accuracy_out,
+    size_t* action1_labels_out,
+    size_t* action2_labels_out,
+    size_t* skipped_steps_out
 ) {
     size_t i;
     float action_loss_sum = 0.0f;
     float value_loss_sum = 0.0f;
     float accuracy_sum = 0.0f;
+    float top3_accuracy_sum = 0.0f;
+    float action1_accuracy_sum = 0.0f;
+    float action2_accuracy_sum = 0.0f;
     size_t total_labels = 0;
     size_t total_sessions = 0;
+    size_t total_action1_labels = 0;
+    size_t total_action2_labels = 0;
+    size_t total_skipped_steps = 0;
 
     if (!trainer || !model || !runtime) {
         return 0;
@@ -323,17 +378,31 @@ static int evaluate_supervised_split(
         float action_loss = 0.0f;
         float value_loss = 0.0f;
         float accuracy = 0.0f;
+        float top3_accuracy = 0.0f;
+        float action1_accuracy = 0.0f;
+        float action2_accuracy = 0.0f;
         size_t labels = 0;
+        size_t action1_labels = 0;
+        size_t action2_labels = 0;
+        size_t skipped_steps = 0;
         size_t session_index = indices[i];
         ++total_sessions;
         if (!evaluate_supervised_episode(trainer, model, &runtime->sessions[session_index].episode,
-                &action_loss, &value_loss, &accuracy, &labels)) {
+                &action_loss, &value_loss, &accuracy, &labels,
+                &top3_accuracy, &action1_accuracy, &action2_accuracy,
+                &action1_labels, &action2_labels, &skipped_steps)) {
             return 0;
         }
         action_loss_sum += action_loss * (float)labels;
         value_loss_sum += value_loss * (float)labels;
         accuracy_sum += accuracy * (float)labels;
+        top3_accuracy_sum += top3_accuracy * (float)labels;
+        action1_accuracy_sum += action1_accuracy * (float)action1_labels;
+        action2_accuracy_sum += action2_accuracy * (float)action2_labels;
         total_labels += labels;
+        total_action1_labels += action1_labels;
+        total_action2_labels += action2_labels;
+        total_skipped_steps += skipped_steps;
     }
 
     if (action_loss_out) *action_loss_out = total_labels > 0 ? action_loss_sum / (float)total_labels : 0.0f;
@@ -341,6 +410,12 @@ static int evaluate_supervised_split(
     if (accuracy_out) *accuracy_out = total_labels > 0 ? accuracy_sum / (float)total_labels : 0.0f;
     if (labels_out) *labels_out = total_labels;
     if (sessions_out) *sessions_out = total_sessions;
+    if (top3_accuracy_out) *top3_accuracy_out = total_labels > 0 ? top3_accuracy_sum / (float)total_labels : 0.0f;
+    if (action1_accuracy_out) *action1_accuracy_out = total_action1_labels > 0 ? action1_accuracy_sum / (float)total_action1_labels : 0.0f;
+    if (action2_accuracy_out) *action2_accuracy_out = total_action2_labels > 0 ? action2_accuracy_sum / (float)total_action2_labels : 0.0f;
+    if (action1_labels_out) *action1_labels_out = total_action1_labels;
+    if (action2_labels_out) *action2_labels_out = total_action2_labels;
+    if (skipped_steps_out) *skipped_steps_out = total_skipped_steps;
     return 1;
 }
 
@@ -403,8 +478,15 @@ static int evaluate_checkpoint_on_replay_file(const char* replay_path, const cha
     float val_action_loss = 0.0f;
     float val_value_loss = 0.0f;
     float val_accuracy = 0.0f;
+    float val_top3_accuracy = 0.0f;
+    float val_action1_accuracy = 0.0f;
+    float val_action2_accuracy = 0.0f;
     size_t val_labels = 0;
     size_t evaluated_sessions = 0;
+    size_t val_action1_labels = 0;
+    size_t val_action2_labels = 0;
+    size_t val_skipped_steps = 0;
+    clock_t eval_start_clock;
 
     if (!replay_path || !checkpoint_path) {
         return 1;
@@ -445,8 +527,15 @@ static int evaluate_checkpoint_on_replay_file(const char* replay_path, const cha
         resolved_checkpoint_path, train_sessions, val_sessions);
     if (val_sessions == 0) {
         printf("[eval] no held-out validation sessions available\n");
-    } else if (!evaluate_supervised_split(&trainer, model, &runtime, val_indices, val_sessions,
-            &val_action_loss, &val_value_loss, &val_accuracy, &val_labels, &evaluated_sessions)) {
+    } else {
+        double elapsed;
+        double sessions_per_sec;
+        double labels_per_sec;
+        eval_start_clock = clock();
+        if (!evaluate_supervised_split(&trainer, model, &runtime, val_indices, val_sessions,
+                &val_action_loss, &val_value_loss, &val_accuracy, &val_labels, &evaluated_sessions,
+                &val_top3_accuracy, &val_action1_accuracy, &val_action2_accuracy,
+                &val_action1_labels, &val_action2_labels, &val_skipped_steps)) {
         fprintf(stderr, "Failed to evaluate held-out split\n");
         free(train_indices);
         free(val_indices);
@@ -454,9 +543,17 @@ static int evaluate_checkpoint_on_replay_file(const char* replay_path, const cha
         gru_model_destroy(model);
         free(resolved_checkpoint_path);
         return 1;
-    } else {
+        }
+        elapsed = elapsed_seconds_since(eval_start_clock);
+        sessions_per_sec = elapsed > 0.0 ? (double)evaluated_sessions / elapsed : 0.0;
+        labels_per_sec = elapsed > 0.0 ? (double)val_labels / elapsed : 0.0;
         printf("[eval] validation action_loss=%.4f value_loss=%.4f accuracy=%.4f labels=%zu sessions=%zu\n",
             val_action_loss, val_value_loss, val_accuracy, val_labels, evaluated_sessions);
+        printf("[eval] validation top3_accuracy=%.4f action1_accuracy=%.4f action2_accuracy=%.4f action1_labels=%zu action2_labels=%zu skipped_steps=%zu\n",
+            val_top3_accuracy, val_action1_accuracy, val_action2_accuracy,
+            val_action1_labels, val_action2_labels, val_skipped_steps);
+        printf("[eval] elapsed=%.1fs sessions_per_sec=%.2f labels_per_sec=%.2f\n",
+            elapsed, sessions_per_sec, labels_per_sec);
     }
 
     free(train_indices);
@@ -654,8 +751,15 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         float val_action_loss = 0.0f;
         float val_value_loss = 0.0f;
         float val_accuracy = 0.0f;
+        float val_top3_accuracy = 0.0f;
+        float val_action1_accuracy = 0.0f;
+        float val_action2_accuracy = 0.0f;
         size_t val_labels = 0;
         size_t evaluated_sessions = 0;
+        size_t val_action1_labels = 0;
+        size_t val_action2_labels = 0;
+        size_t val_skipped_steps = 0;
+        clock_t val_eval_start_clock = 0;
 
         printf("[train] epoch %d/%d start\n", epoch, epochs);
         train_loop_start_clock = clock();
@@ -704,8 +808,14 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         if (val_sessions > 0 && !rl_mode) {
             TrainerCheckpointState best_state;
             char* best_path = NULL;
+            double val_elapsed;
+            double val_sessions_per_sec;
+            double val_labels_per_sec;
+            val_eval_start_clock = clock();
             if (!evaluate_supervised_split(&trainer, model, &runtime, val_indices, val_sessions,
-                    &val_action_loss, &val_value_loss, &val_accuracy, &val_labels, &evaluated_sessions)) {
+                    &val_action_loss, &val_value_loss, &val_accuracy, &val_labels, &evaluated_sessions,
+                    &val_top3_accuracy, &val_action1_accuracy, &val_action2_accuracy,
+                    &val_action1_labels, &val_action2_labels, &val_skipped_steps)) {
                 fprintf(stderr, "Failed held-out validation evaluation\n");
                 free(train_indices);
                 free(val_indices);
@@ -714,6 +824,9 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
                 free(resolved_checkpoint_path);
                 return 1;
             }
+            val_elapsed = elapsed_seconds_since(val_eval_start_clock);
+            val_sessions_per_sec = val_elapsed > 0.0 ? (double)evaluated_sessions / val_elapsed : 0.0;
+            val_labels_per_sec = val_elapsed > 0.0 ? (double)val_labels / val_elapsed : 0.0;
             if (val_labels > 0) {
                 printf("[train] epoch=%d validation action_loss=%.4f value_loss=%.4f accuracy=%.4f labels=%zu\n",
                     epoch,
@@ -721,6 +834,19 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
                     val_value_loss,
                     val_accuracy,
                     val_labels);
+                printf("[train] epoch=%d validation top3_accuracy=%.4f action1_accuracy=%.4f action2_accuracy=%.4f action1_labels=%zu action2_labels=%zu skipped_steps=%zu\n",
+                    epoch,
+                    val_top3_accuracy,
+                    val_action1_accuracy,
+                    val_action2_accuracy,
+                    val_action1_labels,
+                    val_action2_labels,
+                    val_skipped_steps);
+                printf("[train] epoch=%d validation elapsed=%.1fs sessions_per_sec=%.2f labels_per_sec=%.2f\n",
+                    epoch,
+                    val_elapsed,
+                    val_sessions_per_sec,
+                    val_labels_per_sec);
                 if (!has_best_val || val_action_loss < best_val_action_loss) {
                     has_best_val = 1;
                     best_val_action_loss = val_action_loss;
