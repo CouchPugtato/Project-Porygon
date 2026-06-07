@@ -422,6 +422,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                     event.room_id,
                     pending["request_id"],
                     pending["action"],
+                    pending.get("action2", -1),
                     pending["command"],
                     accepted=True,
                 ).payload
