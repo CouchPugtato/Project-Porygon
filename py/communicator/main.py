@@ -15,12 +15,24 @@ if __package__ in (None, ""):
     from communicator.showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
 else:
     from .ipc import LearnerProcess
-    from .protocol import battle_end, battle_start, decision_message, event_message, request_message, terminal_message
-    from .showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
+from .protocol import battle_end, battle_start, decision_message, event_message, request_message, terminal_message
+from .showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
+
+THINK_DELAY_MIN_SECONDS = 0.8
+THINK_DELAY_MAX_SECONDS = 5.0
+FALLBACK_DELAY_MIN_SECONDS = 0.4
+FALLBACK_DELAY_MAX_SECONDS = 1.2
 
 
 def battle_label(battle_id: str) -> str:
     return battle_id if battle_id else "unknown-battle"
+
+
+async def randomized_send_delay(min_seconds: float, max_seconds: float) -> None:
+    if max_seconds <= 0.0:
+        return
+    delay = random.uniform(min_seconds, max_seconds)
+    await asyncio.sleep(delay)
 
 
 def event_summary(event: ShowdownEvent) -> str | None:
@@ -510,6 +522,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                                 candidate,
                             ).payload
                         )
+                        await randomized_send_delay(FALLBACK_DELAY_MIN_SECONDS, FALLBACK_DELAY_MAX_SECONDS)
                         await gateway.send_room_command(event.room_id, candidate)
                     else:
                         print(
@@ -582,6 +595,7 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                         msg["command"],
                     ).payload
                 )
+                await randomized_send_delay(THINK_DELAY_MIN_SECONDS, THINK_DELAY_MAX_SECONDS)
                 await gateway.send_room_command(battle_id, msg["command"])
             elif msg.get("type") == "error":
                 print(f"[live] learner error: {msg}")
