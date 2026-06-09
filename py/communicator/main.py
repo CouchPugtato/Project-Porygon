@@ -246,6 +246,15 @@ def parse_player_metadata(line: str) -> tuple[str, str, int | None] | None:
     return None
 
 
+def identify_bot_side(players: dict[str, str], current_username: str) -> str | None:
+    if not current_username:
+        return None
+    for side in ("p1", "p2"):
+        if players.get(side) == current_username:
+            return side
+    return None
+
+
 class MatchStats:
     def __init__(self, replay_path: Path) -> None:
         self._stats_path = replay_path.with_suffix(".stats.txt")
@@ -511,21 +520,24 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                         )
                         print(f"[live] no fallback candidates left for {battle_label(event.room_id)}")
         elif event.line.startswith("|win|") or event.line.startswith("|tie|"):
-            result = "win" if event.line.startswith("|win|") else "draw"
-            reward = 1.0 if result == "win" else 0.0
-            await learner.send(terminal_message(event.room_id, result, reward).payload)
-            await learner.send(battle_end(event.room_id).payload)
             players = battle_players.get(event.room_id, {})
             ratings = battle_ratings.get(event.room_id, {})
-            bot_side = "p2" if players.get("p2", "").startswith("Guest") or players.get("p2") == username or not username else "p1"
+            winner_name = event.line.split("|", 2)[2] if event.line.startswith("|win|") and "|" in event.line else ""
+            bot_side = identify_bot_side(players, gateway.current_username)
             bot_rating = ratings.get(bot_side)
-            final_result = result
-            if result == "win":
-                winner_name = event.line.split("|", 2)[2] if "|" in event.line else ""
-                if players.get(bot_side) != winner_name:
-                    final_result = "loss"
+            if event.line.startswith("|tie|"):
+                final_result = "draw"
+                reward = 0.0
+            elif bot_side is not None and players.get(bot_side) == winner_name:
+                final_result = "win"
+                reward = 1.0
+            else:
+                final_result = "loss"
+                reward = -1.0
+            await learner.send(terminal_message(event.room_id, final_result, reward).payload)
+            await learner.send(battle_end(event.room_id).payload)
             stats.note_battle(final_result, bot_rating)
-            print(f"[live] battle ended {event.room_id} result={result}")
+            print(f"[live] battle ended {event.room_id} result={final_result}")
             request_open[event.room_id] = False
             await gateway.search_next_battle()
         else:

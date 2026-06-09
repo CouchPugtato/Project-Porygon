@@ -35,6 +35,7 @@ class ShowdownGateway:
         self.uri = uri
         self.username = username
         self.format = fmt
+        self.current_username = ""
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._named = False
         self._search_sent = False
@@ -82,6 +83,7 @@ class ShowdownGateway:
             if len(parts) >= 4:
                 username = parts[2]
                 named = parts[3] == "1"
+                self.current_username = username
                 self._named = named
                 print(f"[communicator] logged in as {username} (named={named})")
                 if self.username:
