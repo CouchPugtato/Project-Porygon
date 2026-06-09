@@ -1,0 +1,3 @@
+run_id=run_0002_live_eval_epoch1
+purpose=live_eval_and_capture_from_epoch1_checkpoint
+expected_primary_checkpoint=run_0002_live_eval_epoch1_model_supervised_clean_v1.chk
