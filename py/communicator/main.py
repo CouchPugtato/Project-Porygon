@@ -15,8 +15,8 @@ if __package__ in (None, ""):
     from communicator.showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
 else:
     from .ipc import LearnerProcess
-from .protocol import battle_end, battle_start, decision_message, event_message, request_message, terminal_message
-from .showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
+    from .protocol import battle_end, battle_start, decision_message, event_message, request_message, terminal_message
+    from .showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
 
 THINK_DELAY_MIN_SECONDS = 0.8
 THINK_DELAY_MAX_SECONDS = 5.0
