@@ -551,6 +551,7 @@ async def live_mode(
     stats = MatchStats(replay_path or Path("matches/runtime_capture.jsonl"))
     seq = 0
     latest_requests: dict[str, dict] = {}
+    latest_request_identity: dict[str, tuple[int | None, str]] = {}
     attempted_commands: dict[str, set[str]] = {}
     latest_request_seq: dict[str, int] = {}
     request_open: dict[str, bool] = {}
@@ -609,6 +610,15 @@ async def live_mode(
                 ).payload
             )
         if event.line.startswith("|request|"):
+            payload = event.line.split("|request|", 1)[1]
+            request_payload = json.loads(payload)
+            request_identity = (
+                request_payload.get("rqid") if isinstance(request_payload, dict) else None,
+                json.dumps(request_payload, sort_keys=True, separators=(",", ":")),
+            )
+            if request_open.get(event.room_id, False) and latest_request_identity.get(event.room_id) == request_identity:
+                print(f"[live] duplicate request ignored for {battle_label(event.room_id)}")
+                return
             pending = pending_decisions.pop(event.room_id, None)
             if pending is not None:
                 learner_proposal_accepted_count += 1
@@ -623,9 +633,8 @@ async def live_mode(
                         accepted=True,
                     ).payload
                 )
-            payload = event.line.split("|request|", 1)[1]
-            request_payload = json.loads(payload)
             latest_requests[event.room_id] = request_payload
+            latest_request_identity[event.room_id] = request_identity
             attempted_commands[event.room_id] = set()
             latest_request_seq[event.room_id] = seq
             request_open[event.room_id] = True
@@ -743,6 +752,7 @@ async def live_mode(
                 f"{format_action_counts('total_', total_action_counts)}"
             )
             request_open[event.room_id] = False
+            latest_request_identity.pop(event.room_id, None)
             finished_battles += 1
             if max_games is not None and finished_battles >= max_games:
                 print(f"[live] reached max games ({max_games}), stopping")
