@@ -81,7 +81,7 @@ class ShowdownGateway:
         if line.startswith("|updateuser|"):
             parts = line.split("|")
             if len(parts) >= 4:
-                username = parts[2]
+                username = parts[2].strip()
                 named = parts[3] == "1"
                 self.current_username = username
                 self._named = named

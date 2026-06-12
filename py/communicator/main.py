@@ -108,13 +108,29 @@ def unfainted_active_slots(request_payload: dict) -> list[int]:
     return living
 
 
+def active_request_slots(request_payload: dict) -> list[int]:
+    side = request_payload.get("side", {})
+    pokemon = side.get("pokemon", [])
+    request_slots: list[int] = []
+    for idx, mon in enumerate(pokemon):
+        if mon.get("active"):
+            request_slots.append(idx)
+            if len(request_slots) >= 2:
+                break
+    return request_slots
+
+
 def living_active_request_slots(request_payload: dict) -> list[int]:
-    active = request_payload.get("active", [])
+    active_slots = active_request_slots(request_payload)
     living: list[int] = []
-    for idx, slot in enumerate(active):
-        if slot.get("fainted"):
+    for request_slot, team_slot in enumerate(active_slots):
+        side = request_payload.get("side", {})
+        pokemon = side.get("pokemon", [])
+        if team_slot >= len(pokemon):
             continue
-        living.append(idx)
+        if is_fainted_condition(str(pokemon[team_slot].get("condition", ""))):
+            continue
+        living.append(request_slot)
     return living
 
 
@@ -131,11 +147,16 @@ def slot_action_options(request_payload: dict, slot_index: int) -> list[str]:
     active = request_payload.get("active", [])
     if slot_index >= len(active):
         return []
+    living_slots = living_active_request_slots(request_payload)
+    force_switch_arr = request_payload.get("forceSwitch")
+    if slot_index not in living_slots and not (
+        isinstance(force_switch_arr, list) and slot_index < len(force_switch_arr) and bool(force_switch_arr[slot_index])
+    ):
+        return []
 
     slot = active[slot_index]
     options: list[str] = []
     force_switch = False
-    force_switch_arr = request_payload.get("forceSwitch")
     if isinstance(force_switch_arr, list) and slot_index < len(force_switch_arr):
         force_switch = bool(force_switch_arr[slot_index])
     force_switch = force_switch or bool(slot.get("forceSwitch"))
@@ -211,11 +232,16 @@ def fallback_commands_for_request(request_payload: dict) -> list[str]:
         slot1 = slot_action_options(request_payload, slot_index)
         return [f"/choose {part}" for part in slot1]
 
-    slot1 = slot_action_options(request_payload, 0)
-    if len(active) == 1:
+    if len(living_request_slots) >= 2:
+        slot_indices = living_request_slots[:2]
+    else:
+        slot_indices = [0, 1]
+
+    slot1 = slot_action_options(request_payload, slot_indices[0])
+    if len(active) == 1 or len(slot_indices) == 1:
         return [f"/choose {part}" for part in slot1]
 
-    slot2 = slot_action_options(request_payload, 1)
+    slot2 = slot_action_options(request_payload, slot_indices[1])
     commands: list[str] = []
     for part1, part2 in product(slot1, slot2):
         if part1.startswith("switch ") and part2.startswith("switch ") and part1 == part2:
@@ -241,7 +267,7 @@ def next_fallback_command(
 def parse_player_line(line: str) -> tuple[str, str] | None:
     parts = line.split("|")
     if len(parts) >= 4 and parts[1] == "player":
-        return parts[2], parts[3]
+        return parts[2], parts[3].strip()
     return None
 
 
@@ -254,7 +280,7 @@ def parse_player_metadata(line: str) -> tuple[str, str, int | None] | None:
                 rating = int(parts[5])
             except ValueError:
                 rating = None
-        return parts[2], parts[3], rating
+        return parts[2], parts[3].strip(), rating
     return None
 
 
@@ -411,9 +437,15 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
     battle_players: dict[str, dict[str, str]] = {}
     battle_ratings: dict[str, dict[str, int | None]] = {}
     announced_matchups: set[str] = set()
+    invalid_choice_count = 0
+    fallback_used_count = 0
+    learner_proposal_accepted_count = 0
+    battle_invalid_choice_count: dict[str, int] = {}
+    battle_fallback_used_count: dict[str, int] = {}
+    battle_accepted_proposal_count: dict[str, int] = {}
 
     async def on_event(event: ShowdownEvent) -> None:
-        nonlocal seq
+        nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count
         summary = event_summary(event)
         if summary:
             print(summary)
@@ -438,6 +470,8 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
             and not event.line.startswith("|request|")
         ):
             pending = pending_decisions.pop(event.room_id)
+            learner_proposal_accepted_count += 1
+            battle_accepted_proposal_count[event.room_id] = battle_accepted_proposal_count.get(event.room_id, 0) + 1
             await learner.send(
                 decision_message(
                     event.room_id,
@@ -451,6 +485,8 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
         if event.line.startswith("|request|"):
             pending = pending_decisions.pop(event.room_id, None)
             if pending is not None:
+                learner_proposal_accepted_count += 1
+                battle_accepted_proposal_count[event.room_id] = battle_accepted_proposal_count.get(event.room_id, 0) + 1
                 await learner.send(
                     decision_message(
                         event.room_id,
@@ -473,6 +509,8 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
             await learner.send(request_message(event.room_id, seq, request_payload).payload)
             print(f"[live] request {seq} for {battle_label(event.room_id)}")
         elif event.line.startswith("|error|") and "Invalid choice" in event.line:
+            invalid_choice_count += 1
+            battle_invalid_choice_count[event.room_id] = battle_invalid_choice_count.get(event.room_id, 0) + 1
             pending = pending_decisions.pop(event.room_id, None)
             if pending is not None:
                 await learner.send(
@@ -506,6 +544,8 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                 else:
                     candidate = next_fallback_command(request_payload, tried)
                     if candidate is not None:
+                        fallback_used_count += 1
+                        battle_fallback_used_count[event.room_id] = battle_fallback_used_count.get(event.room_id, 0) + 1
                         print(f"[live] retrying with fallback for {battle_label(event.room_id)}: {candidate}")
                         pending_decisions[event.room_id] = {
                             "request_id": latest_request_seq.get(event.room_id, seq),
@@ -551,10 +591,27 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
             await learner.send(battle_end(event.room_id).payload)
             stats.note_battle(final_result, bot_rating)
             print(f"[live] battle ended {event.room_id} result={final_result}")
+            battle_invalid = battle_invalid_choice_count.pop(event.room_id, 0)
+            battle_fallbacks = battle_fallback_used_count.pop(event.room_id, 0)
+            battle_accepted = battle_accepted_proposal_count.pop(event.room_id, 0)
+            total_resolved = learner_proposal_accepted_count + fallback_used_count
+            accept_rate = (learner_proposal_accepted_count / total_resolved) if total_resolved > 0 else 0.0
+            battle_total_resolved = battle_accepted + battle_fallbacks
+            battle_accept_rate = (battle_accepted / battle_total_resolved) if battle_total_resolved > 0 else 0.0
+            print(
+                f"[live] legality battle_invalid_choices={battle_invalid} "
+                f"battle_fallbacks={battle_fallbacks} battle_accepted_proposals={battle_accepted} "
+                f"battle_accept_rate={battle_accept_rate:.3f} "
+                f"total_invalid_choices={invalid_choice_count} total_fallbacks={fallback_used_count} "
+                f"total_accepted_proposals={learner_proposal_accepted_count} total_accept_rate={accept_rate:.3f}"
+            )
             request_open[event.room_id] = False
             await gateway.search_next_battle()
         else:
             if event.room_id.startswith("battle-") and event.line.startswith("|init|battle"):
+                battle_invalid_choice_count[event.room_id] = 0
+                battle_fallback_used_count[event.room_id] = 0
+                battle_accepted_proposal_count[event.room_id] = 0
                 await learner.send(
                     battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).payload
                 )

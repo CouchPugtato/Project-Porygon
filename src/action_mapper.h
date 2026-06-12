@@ -10,6 +10,14 @@ typedef struct {
     unsigned char legal[OBS_NUM_ACTIONS];
 } ActionMask;
 
+typedef struct {
+    int slot0_has_action;
+    enum ObsAction action0;
+    int slot1_has_action;
+    enum ObsAction action1;
+    char command[256];
+} ValidatedRequestChoice;
+
 void action_mask_init(ActionMask* mask);
 int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req);
 int action_to_showdown_command(
@@ -40,13 +48,39 @@ int request_actions_to_showdown_command(
     int slot1_has_action,
     enum ObsAction action1
 );
-int showdown_command_to_request_actions(
+int request_choice_to_command(
+    const ParsedRequest* req,
+    int slot0_has_action,
+    enum ObsAction action0,
+    int slot1_has_action,
+    enum ObsAction action1,
+    char* out,
+    size_t out_len
+);
+int command_to_request_choice(
     const char* command,
     const ParsedRequest* req,
     int* slot0_has_action,
     enum ObsAction* action0,
     int* slot1_has_action,
     enum ObsAction* action1
+);
+size_t collect_slot_legal_actions(
+    const ParsedRequest* req,
+    const ActionMask* mask,
+    int slot,
+    enum ObsAction* out,
+    size_t out_cap
+);
+int validate_or_resample_request_choice(
+    const ParsedRequest* req,
+    const ActionMask* mask,
+    const float* policy,
+    int proposed_slot0_has_action,
+    enum ObsAction proposed_action0,
+    int proposed_slot1_has_action,
+    enum ObsAction proposed_action1,
+    ValidatedRequestChoice* out
 );
 
 #endif

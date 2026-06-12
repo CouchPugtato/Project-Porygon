@@ -462,6 +462,10 @@ static int load_runtime_from_replay_file(const char* replay_path, GruModel* mode
     fclose(f);
     printf("[train] ingest complete lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
         lines_read, parsed_messages, invalid_lines, runtime->count);
+    printf("[train] accepted_labels direct=%zu reconstructed=%zu failed=%zu\n",
+        runtime->accepted_label_direct_count,
+        runtime->accepted_label_reconstructed_count,
+        runtime->accepted_label_failed_count);
     return 1;
 }
 
@@ -525,6 +529,10 @@ static int evaluate_checkpoint_on_replay_file(const char* replay_path, const cha
 
     printf("[eval] checkpoint=%s train_sessions=%zu val_sessions=%zu\n",
         resolved_checkpoint_path, train_sessions, val_sessions);
+    printf("[eval] accepted_labels direct=%zu reconstructed=%zu failed=%zu\n",
+        runtime.accepted_label_direct_count,
+        runtime.accepted_label_reconstructed_count,
+        runtime.accepted_label_failed_count);
     if (val_sessions == 0) {
         printf("[eval] no held-out validation sessions available\n");
     } else {
@@ -745,6 +753,10 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         return 1;
     }
     printf("[train] split train_sessions=%zu val_sessions=%zu epochs=%d\n", train_sessions, val_sessions, epochs);
+    printf("[train] accepted_labels direct=%zu reconstructed=%zu failed=%zu\n",
+        runtime.accepted_label_direct_count,
+        runtime.accepted_label_reconstructed_count,
+        runtime.accepted_label_failed_count);
 
     for (epoch = 1; epoch <= epochs; ++epoch) {
         size_t trained_in_epoch = 0;

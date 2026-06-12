@@ -129,6 +129,65 @@ static int extract_json_object(const char* start, char* out, size_t out_len) {
     return 0;
 }
 
+static const char* next_top_level_object_in_array(const char* array_json, const char* cursor) {
+    int array_depth = (cursor && cursor != array_json) ? 1 : 0;
+    int in_string = 0;
+    const char* p;
+
+    if (!array_json) {
+        return NULL;
+    }
+    p = cursor ? cursor : array_json;
+    while (*p) {
+        char ch = *p;
+        if (ch == '"' && (p == array_json || p[-1] != '\\')) {
+            in_string = !in_string;
+        } else if (!in_string) {
+            if (ch == '[') {
+                ++array_depth;
+            } else if (ch == ']') {
+                if (array_depth == 1) {
+                    return NULL;
+                }
+                if (array_depth > 0) {
+                    --array_depth;
+                }
+            } else if (ch == '{' && array_depth == 1) {
+                return p;
+            }
+        }
+        ++p;
+    }
+    return NULL;
+}
+
+static const char* skip_json_object_text(const char* start) {
+    int depth = 0;
+    int in_string = 0;
+    const char* p = start;
+
+    if (!p || *p != '{') {
+        return NULL;
+    }
+    while (*p) {
+        char ch = *p;
+        if (ch == '"' && (p == start || p[-1] != '\\')) {
+            in_string = !in_string;
+        } else if (!in_string) {
+            if (ch == '{') {
+                ++depth;
+            } else if (ch == '}') {
+                --depth;
+                if (depth == 0) {
+                    return p + 1;
+                }
+            }
+        }
+        ++p;
+    }
+    return NULL;
+}
+
 static int parse_move_id_from_object(const char* obj) {
     const char* p = strstr(obj, "\"id\":");
     char token[64];
@@ -243,6 +302,86 @@ void parsed_request_init(ParsedRequest* req) {
     req->max_chosen_team_size = 2;
 }
 
+static void finalize_slot_semantics(ParsedRequest* req) {
+    int slot;
+    if (!req) {
+        return;
+    }
+    for (slot = 0; slot < PARSED_REQUEST_ACTIVE_SLOTS; ++slot) {
+        int bench_switch_exists = 0;
+        int move_exists = 0;
+        int i;
+        req->slot_present[slot] = (slot < req->active_count) || req->force_switch[slot];
+        req->slot_needs_choice[slot] = 0;
+        req->slot_can_move[slot] = 0;
+        req->slot_can_switch[slot] = 0;
+        req->choice_kind[slot] = REQUEST_SLOT_NONE;
+
+        for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
+            if (req->switch_available[i] && !req->switch_fainted[i] && !req->switch_active[i]) {
+                bench_switch_exists = 1;
+                break;
+            }
+        }
+        for (i = 0; i < PARSED_REQUEST_MOVE_SLOTS; ++i) {
+            if (slot < req->active_count &&
+                    req->active[slot].move_id[i] > 0 &&
+                    !req->active[slot].move_disabled[i]) {
+                move_exists = 1;
+                break;
+            }
+        }
+
+        if (req->team_preview) {
+            if (slot == 0) {
+                req->slot_present[slot] = 1;
+                req->slot_needs_choice[slot] = 1;
+                req->slot_can_switch[slot] = 1;
+                req->choice_kind[slot] = REQUEST_SLOT_TEAM_PREVIEW;
+            }
+            continue;
+        }
+
+        if (!req->slot_present[slot]) {
+            continue;
+        }
+        if (req->force_switch[slot]) {
+            req->slot_needs_choice[slot] = 1;
+            req->slot_can_switch[slot] = bench_switch_exists;
+            req->choice_kind[slot] = REQUEST_SLOT_FORCE_SWITCH;
+            continue;
+        }
+        if (req->forced_switch_any) {
+            continue;
+        }
+        if (slot >= req->active_count || req->active[slot].fainted) {
+            continue;
+        }
+        req->slot_needs_choice[slot] = 1;
+        req->slot_can_move[slot] = move_exists;
+        req->slot_can_switch[slot] = !req->active[slot].trapped && bench_switch_exists;
+        if (req->slot_can_move[slot] || req->slot_can_switch[slot]) {
+            req->choice_kind[slot] = REQUEST_SLOT_MOVE_OR_SWITCH;
+        }
+    }
+}
+
+static void sync_active_fainted_state_from_side(ParsedRequest* req) {
+    int team_idx;
+    int active_slot = 0;
+
+    if (!req) {
+        return;
+    }
+    for (team_idx = 0; team_idx < PARSED_REQUEST_TEAM_SIZE && active_slot < PARSED_REQUEST_ACTIVE_SLOTS; ++team_idx) {
+        if (!req->switch_active[team_idx]) {
+            continue;
+        }
+        req->active[active_slot].fainted = req->switch_fainted[team_idx] ? 1 : 0;
+        ++active_slot;
+    }
+}
+
 int parse_request_payload(ParsedRequest* req, const char* json, int request_id, int is_doubles) {
     const char* active_key;
     const char* side_key;
@@ -296,12 +435,13 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
     if (active_key) {
         p = strchr(active_key, '[');
         if (p && extract_json_array(p, active_array, sizeof(active_array))) {
-            const char* cursor = active_array;
-            while ((cursor = strchr(cursor, '{')) != NULL && slot < PARSED_REQUEST_ACTIVE_SLOTS) {
+            const char* cursor = next_top_level_object_in_array(active_array, NULL);
+            while (cursor && slot < PARSED_REQUEST_ACTIVE_SLOTS) {
                 char obj[1024];
                 const char* moves_key;
                 const char* move_cursor;
                 int move_slot = 0;
+                const char* next_cursor;
 
                 if (!extract_json_object(cursor, obj, sizeof(obj))) {
                     break;
@@ -339,7 +479,8 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                     }
                 }
                 req->active_count = slot + 1;
-                cursor = strchr(cursor + 1, '{');
+                next_cursor = skip_json_object_text(cursor);
+                cursor = next_top_level_object_in_array(active_array, next_cursor);
                 ++slot;
             }
         }
@@ -360,11 +501,12 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                 if (!arr || !extract_json_array(arr, pokemon_array, sizeof(pokemon_array))) {
                     return 1;
                 }
-                poke_cursor = pokemon_array;
-                while ((poke_cursor = strchr(poke_cursor, '{')) != NULL && team_idx < PARSED_REQUEST_TEAM_SIZE) {
+                poke_cursor = next_top_level_object_in_array(pokemon_array, NULL);
+                while (poke_cursor && team_idx < PARSED_REQUEST_TEAM_SIZE) {
                     char poke_obj[1024];
                     int is_active = 0;
                     int fainted = 0;
+                    const char* next_poke_cursor;
                     if (!extract_json_object(poke_cursor, poke_obj, sizeof(poke_obj))) {
                         break;
                     }
@@ -401,7 +543,8 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                         req->switch_available[team_idx] = 0;
                     }
 
-                    poke_cursor = strchr(poke_cursor + 1, '{');
+                    next_poke_cursor = skip_json_object_text(poke_cursor);
+                    poke_cursor = next_top_level_object_in_array(pokemon_array, next_poke_cursor);
                     ++team_idx;
                 }
             }
@@ -414,6 +557,9 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
         req->active_count = 1;
     }
 
+    sync_active_fainted_state_from_side(req);
+    finalize_slot_semantics(req);
+
     return 1;
 }
 
@@ -421,55 +567,26 @@ int parsed_request_slot_needs_choice(const ParsedRequest* req, int slot) {
     if (!req || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS) {
         return 0;
     }
-    if (req->team_preview) {
-        return slot == 0;
-    }
-    if (req->force_switch[slot]) {
-        return 1;
-    }
-    if (req->forced_switch_any) {
-        return 0;
-    }
-    if (slot >= req->active_count) {
-        return 0;
-    }
-    return !req->active[slot].fainted;
+    return req->slot_needs_choice[slot];
 }
 
 int parsed_request_slot_can_move(const ParsedRequest* req, int slot) {
-    int m;
     if (!req || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS) {
         return 0;
     }
-    if (!parsed_request_slot_needs_choice(req, slot) || req->force_switch[slot]) {
-        return 0;
-    }
-    for (m = 0; m < PARSED_REQUEST_MOVE_SLOTS; ++m) {
-        if (req->active[slot].move_id[m] > 0 && !req->active[slot].move_disabled[m]) {
-            return 1;
-        }
-    }
-    return 0;
+    return req->slot_can_move[slot];
 }
 
 int parsed_request_slot_can_switch(const ParsedRequest* req, int slot) {
-    int i;
     if (!req || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS) {
         return 0;
     }
-    if (req->team_preview) {
-        return 1;
+    return req->slot_can_switch[slot];
+}
+
+ParsedSlotChoiceKind parsed_request_slot_choice_kind(const ParsedRequest* req, int slot) {
+    if (!req || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS) {
+        return REQUEST_SLOT_NONE;
     }
-    if (slot >= req->active_count && !req->force_switch[slot]) {
-        return 0;
-    }
-    if (!req->force_switch[slot] && req->active[slot].trapped) {
-        return 0;
-    }
-    for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
-        if (req->switch_available[i] && !req->switch_fainted[i] && !req->switch_active[i]) {
-            return 1;
-        }
-    }
-    return 0;
+    return req->choice_kind[slot];
 }

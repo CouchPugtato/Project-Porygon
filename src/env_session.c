@@ -97,10 +97,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     char command[256];
     char json[512];
     int i;
-    int living_slots[PARSED_REQUEST_ACTIVE_SLOTS] = {0};
-    int living_count = 0;
-    int slot0_needs_action;
-    int slot1_needs_action;
+    ValidatedRequestChoice validated;
     if (!runtime || !session || !out || runtime->replay_only) {
         return 1;
     }
@@ -122,78 +119,26 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         return 0;
     }
     gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, policy, &value);
-    for (i = 0; i < session->parsed_request.active_count && i < PARSED_REQUEST_ACTIVE_SLOTS; ++i) {
-        if (!session->parsed_request.active[i].fainted) {
-            living_slots[living_count++] = i;
-        }
+    if (!validate_or_resample_request_choice(
+            &session->parsed_request,
+            &session->action_mask,
+            policy,
+            1,
+            (enum ObsAction)gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A1_MOVE1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS),
+            1,
+            (enum ObsAction)gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A2_MOVE1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS),
+            &validated)) {
+        free(policy);
+        runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to validate or resample request choice");
+        fputs(json, out);
+        fputc('\n', out);
+        fflush(out);
+        return 0;
     }
-    slot0_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 0);
-    slot1_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 1);
-
-    if (!session->parsed_request.team_preview && session->parsed_request.forced_switch_any) {
-        if (slot0_needs_action) {
-            action = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A1_SWITCH1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS);
-        }
-        if (slot1_needs_action) {
-            action2 = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A2_SWITCH1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS);
-        }
-        if ((slot0_needs_action && action < 0) || (slot1_needs_action && action2 < 0) ||
-            !request_actions_to_showdown_command(command, sizeof(command), &session->parsed_request,
-                slot0_needs_action, (enum ObsAction)action,
-                slot1_needs_action, (enum ObsAction)action2)) {
-            free(policy);
-            runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map forced-switch action");
-            fputs(json, out);
-            fputc('\n', out);
-            fflush(out);
-            return 0;
-        }
-    } else if (session->parsed_request.is_doubles && living_count > 1 && !session->parsed_request.team_preview) {
-        action = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A1_MOVE1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS);
-        action2 = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A2_MOVE1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS);
-        if (action < 0 || action2 < 0 ||
-            !request_actions_to_showdown_command(command, sizeof(command), &session->parsed_request, 1, (enum ObsAction)action, 1, (enum ObsAction)action2)) {
-            free(policy);
-            runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map doubles actions");
-            fputs(json, out);
-            fputc('\n', out);
-            fflush(out);
-            return 0;
-        }
-    } else if (!session->parsed_request.team_preview && living_count == 1 && session->parsed_request.is_doubles) {
-        int living_slot = living_slots[0];
-        if (living_slot == 0) {
-            action = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A1_MOVE1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS);
-            if (action < 0 || !request_actions_to_showdown_command(command, sizeof(command), &session->parsed_request, 1, (enum ObsAction)action, 0, OBS_A2_MOVE1)) {
-                free(policy);
-                runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map single-living doubles action");
-                fputs(json, out);
-                fputc('\n', out);
-                fflush(out);
-                return 0;
-            }
-        } else {
-            action = gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A2_MOVE1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS);
-            if (action < 0 || !request_actions_to_showdown_command(command, sizeof(command), &session->parsed_request, 0, OBS_A1_MOVE1, 1, (enum ObsAction)action)) {
-                free(policy);
-                runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map single-living doubles action");
-                fputs(json, out);
-                fputc('\n', out);
-                fflush(out);
-                return 0;
-            }
-        }
-    } else {
-        action = gru_model_sample_action(policy, session->observation.legal_mask, OBS_NUM_ACTIONS);
-        if (action < 0 || !action_to_showdown_command(command, sizeof(command), (enum ObsAction)action, &session->parsed_request)) {
-            free(policy);
-            runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to map action");
-            fputs(json, out);
-            fputc('\n', out);
-            fflush(out);
-            return 0;
-        }
-    }
+    action = validated.slot0_has_action ? (int)validated.action0 : -1;
+    action2 = validated.slot1_has_action ? (int)validated.action1 : -1;
+    strncpy(command, validated.command, sizeof(command) - 1);
+    command[sizeof(command) - 1] = '\0';
     free(policy);
     session->pending_action = action;
     session->pending_action2 = action2;
@@ -296,8 +241,9 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                     int slot1_has_action = 0;
                     enum ObsAction inferred_action0 = OBS_A1_MOVE1;
                     enum ObsAction inferred_action1 = OBS_A2_MOVE1;
-                    if (showdown_command_to_request_actions(msg->command, &session->parsed_request,
+                    if (command_to_request_choice(msg->command, &session->parsed_request,
                             &slot0_has_action, &inferred_action0, &slot1_has_action, &inferred_action1)) {
+                        runtime->accepted_label_reconstructed_count += 1;
                         if (accepted_action < 0 && slot0_has_action) {
                             accepted_action = (int)inferred_action0;
                         }
@@ -309,7 +255,11 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                                 accepted_action == accepted_action2) {
                             accepted_action = -1;
                         }
+                    } else {
+                        runtime->accepted_label_failed_count += 1;
                     }
+                } else {
+                    runtime->accepted_label_direct_count += 1;
                 }
                 session->episode.actions[session->episode.count - 1] = accepted_action;
                 session->episode.actions2[session->episode.count - 1] = accepted_action2;

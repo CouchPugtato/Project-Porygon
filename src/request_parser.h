@@ -22,6 +22,13 @@ typedef enum {
     REQUEST_TARGET_FOE_SIDE
 } ParsedMoveTarget;
 
+typedef enum {
+    REQUEST_SLOT_NONE = 0,
+    REQUEST_SLOT_MOVE_OR_SWITCH,
+    REQUEST_SLOT_FORCE_SWITCH,
+    REQUEST_SLOT_TEAM_PREVIEW
+} ParsedSlotChoiceKind;
+
 typedef struct {
     int move_id[PARSED_REQUEST_MOVE_SLOTS];
     int move_disabled[PARSED_REQUEST_MOVE_SLOTS];
@@ -50,6 +57,11 @@ typedef struct {
     int force_switch[PARSED_REQUEST_ACTIVE_SLOTS];
     int can_tera;
     int forced_switch_any;
+    int slot_present[PARSED_REQUEST_ACTIVE_SLOTS];
+    int slot_needs_choice[PARSED_REQUEST_ACTIVE_SLOTS];
+    int slot_can_move[PARSED_REQUEST_ACTIVE_SLOTS];
+    int slot_can_switch[PARSED_REQUEST_ACTIVE_SLOTS];
+    ParsedSlotChoiceKind choice_kind[PARSED_REQUEST_ACTIVE_SLOTS];
     char side_ident[PARSED_REQUEST_TEAM_SIZE][32];
     int side_species_id[PARSED_REQUEST_TEAM_SIZE];
     ParsedActive active[PARSED_REQUEST_ACTIVE_SLOTS];
@@ -61,5 +73,6 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
 int parsed_request_slot_needs_choice(const ParsedRequest* req, int slot);
 int parsed_request_slot_can_move(const ParsedRequest* req, int slot);
 int parsed_request_slot_can_switch(const ParsedRequest* req, int slot);
+ParsedSlotChoiceKind parsed_request_slot_choice_kind(const ParsedRequest* req, int slot);
 
 #endif

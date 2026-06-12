@@ -1,6 +1,7 @@
 #include "action_mapper.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 void action_mask_init(ActionMask* mask) {
@@ -81,6 +82,76 @@ static int move_target_suffix(const ParsedRequest* req, int active_slot, int mov
         default:
             return 1;
     }
+}
+
+static int request_choice_pair_is_valid(
+    const ParsedRequest* req,
+    int slot0_has_action,
+    enum ObsAction action0,
+    int slot1_has_action,
+    enum ObsAction action1
+) {
+    int active_slot0 = -1;
+    int active_slot1 = -1;
+    int switch_slot0 = -1;
+    int switch_slot1 = -1;
+
+    if (!req) {
+        return 0;
+    }
+    if (slot0_has_action && slot1_has_action &&
+            is_switch_action(action0, &active_slot0, &switch_slot0) &&
+            is_switch_action(action1, &active_slot1, &switch_slot1)) {
+        if (switch_slot0 == switch_slot1) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int action_belongs_to_slot(enum ObsAction action, int slot) {
+    int active_slot = -1;
+    int move_slot = 0;
+    int switch_slot = 0;
+    int tera = 0;
+    if (is_move_action(action, &active_slot, &move_slot, &tera)) {
+        return active_slot == slot;
+    }
+    if (is_switch_action(action, &active_slot, &switch_slot)) {
+        return active_slot == slot;
+    }
+    return 0;
+}
+
+static int action_index_legal_for_request(
+    const ParsedRequest* req,
+    const ActionMask* mask,
+    int slot,
+    enum ObsAction action
+) {
+    if (!req || !mask || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS) {
+        return 0;
+    }
+    if (!parsed_request_slot_needs_choice(req, slot)) {
+        return 0;
+    }
+    if (!action_belongs_to_slot(action, slot)) {
+        return 0;
+    }
+    if ((int)action < 0 || (int)action >= OBS_NUM_ACTIONS || !mask->legal[action]) {
+        return 0;
+    }
+    if (parsed_request_slot_choice_kind(req, slot) == REQUEST_SLOT_FORCE_SWITCH) {
+        int active_slot = -1;
+        int switch_slot = 0;
+        return is_switch_action(action, &active_slot, &switch_slot);
+    }
+    if (parsed_request_slot_choice_kind(req, slot) == REQUEST_SLOT_TEAM_PREVIEW) {
+        int active_slot = -1;
+        int switch_slot = 0;
+        return is_switch_action(action, &active_slot, &switch_slot) && active_slot == 0;
+    }
+    return 1;
 }
 
 int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
@@ -273,7 +344,19 @@ int request_actions_to_showdown_command(
     return 0;
 }
 
-int showdown_command_to_request_actions(
+int request_choice_to_command(
+    const ParsedRequest* req,
+    int slot0_has_action,
+    enum ObsAction action0,
+    int slot1_has_action,
+    enum ObsAction action1,
+    char* out,
+    size_t out_len
+) {
+    return request_actions_to_showdown_command(out, out_len, req, slot0_has_action, action0, slot1_has_action, action1);
+}
+
+int command_to_request_choice(
     const char* command,
     const ParsedRequest* req,
     int* slot0_has_action,
@@ -317,23 +400,23 @@ int showdown_command_to_request_actions(
 
     for (i = 0; i < 2; ++i) {
         int has0 = has0_options[i];
-        int start0 = has0 ? 0 : -1;
-        int end0 = has0 ? OBS_NUM_ACTIONS : -1;
+        int start0 = has0 ? 0 : 0;
+        int end0 = has0 ? OBS_NUM_ACTIONS : 1;
         for (j = 0; j < 2; ++j) {
             int has1 = has1_options[j];
-            int start1 = has1 ? 0 : -1;
-            int end1 = has1 ? OBS_NUM_ACTIONS : -1;
+            int start1 = has1 ? 0 : 0;
+            int end1 = has1 ? OBS_NUM_ACTIONS : 1;
             if (!has0 && !has1) {
                 continue;
             }
             for (k = start0; k < end0; ++k) {
-                enum ObsAction a0 = has0 ? (enum ObsAction)k : OBS_A1_MOVE1;
-                if (has0 && !mask.legal[k]) {
-                    continue;
-                }
+                    enum ObsAction a0 = has0 ? (enum ObsAction)k : OBS_A1_MOVE1;
+                    if (has0 && !action_index_legal_for_request(req, &mask, 0, a0)) {
+                        continue;
+                    }
                 for (l = start1; l < end1; ++l) {
                     enum ObsAction a1 = has1 ? (enum ObsAction)l : OBS_A2_MOVE1;
-                    if (has1 && !mask.legal[l]) {
+                    if (has1 && !action_index_legal_for_request(req, &mask, 1, a1)) {
                         continue;
                     }
                     if (!request_actions_to_showdown_command(candidate, sizeof(candidate), req, has0, a0, has1, a1)) {
@@ -351,4 +434,146 @@ int showdown_command_to_request_actions(
         }
     }
     return 0;
+}
+
+size_t collect_slot_legal_actions(
+    const ParsedRequest* req,
+    const ActionMask* mask,
+    int slot,
+    enum ObsAction* out,
+    size_t out_cap
+) {
+    size_t count = 0;
+    int action;
+    if (!req || !mask || !out || out_cap == 0 || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS) {
+        return 0;
+    }
+    for (action = 0; action < OBS_NUM_ACTIONS; ++action) {
+        if (!action_index_legal_for_request(req, mask, slot, (enum ObsAction)action)) {
+            continue;
+        }
+        if (count < out_cap) {
+            out[count] = (enum ObsAction)action;
+        }
+        ++count;
+    }
+    return count;
+}
+
+static int select_best_legal_action(
+    const float* policy,
+    const enum ObsAction* legal_actions,
+    size_t legal_count,
+    enum ObsAction* chosen
+) {
+    size_t i;
+    float best_score;
+    size_t ties = 0;
+    if (!policy || !legal_actions || legal_count == 0 || !chosen) {
+        return 0;
+    }
+    best_score = policy[legal_actions[0]];
+    *chosen = legal_actions[0];
+    for (i = 1; i < legal_count; ++i) {
+        float score = policy[legal_actions[i]];
+        if (score > best_score) {
+            best_score = score;
+            *chosen = legal_actions[i];
+            ties = 0;
+        } else if (score == best_score) {
+            ++ties;
+            if ((rand() % (int)(ties + 2)) == 0) {
+                *chosen = legal_actions[i];
+            }
+        }
+    }
+    return 1;
+}
+
+int validate_or_resample_request_choice(
+    const ParsedRequest* req,
+    const ActionMask* mask,
+    const float* policy,
+    int proposed_slot0_has_action,
+    enum ObsAction proposed_action0,
+    int proposed_slot1_has_action,
+    enum ObsAction proposed_action1,
+    ValidatedRequestChoice* out
+) {
+    enum ObsAction slot0_actions[OBS_NUM_ACTIONS];
+    enum ObsAction slot1_actions[OBS_NUM_ACTIONS];
+    size_t slot0_count;
+    size_t slot1_count;
+    int need0;
+    int need1;
+
+    if (!req || !mask || !policy || !out) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    out->action0 = OBS_A1_MOVE1;
+    out->action1 = OBS_A2_MOVE1;
+
+    need0 = parsed_request_slot_needs_choice(req, 0);
+    need1 = parsed_request_slot_needs_choice(req, 1);
+    slot0_count = need0 ? collect_slot_legal_actions(req, mask, 0, slot0_actions, OBS_NUM_ACTIONS) : 0;
+    slot1_count = need1 ? collect_slot_legal_actions(req, mask, 1, slot1_actions, OBS_NUM_ACTIONS) : 0;
+
+    out->slot0_has_action = need0;
+    out->slot1_has_action = need1;
+
+    if (need0 && need1) {
+        int proposed_valid = proposed_slot0_has_action &&
+            proposed_slot1_has_action &&
+            action_index_legal_for_request(req, mask, 0, proposed_action0) &&
+            action_index_legal_for_request(req, mask, 1, proposed_action1) &&
+            request_choice_pair_is_valid(req, 1, proposed_action0, 1, proposed_action1);
+        if (proposed_valid) {
+            out->action0 = proposed_action0;
+            out->action1 = proposed_action1;
+        } else {
+            size_t i;
+            size_t j;
+            float best_score = 0.0f;
+            int found = 0;
+            for (i = 0; i < slot0_count; ++i) {
+                for (j = 0; j < slot1_count; ++j) {
+                    float score;
+                    if (!request_choice_pair_is_valid(req, 1, slot0_actions[i], 1, slot1_actions[j])) {
+                        continue;
+                    }
+                    score = policy[slot0_actions[i]] + policy[slot1_actions[j]];
+                    if (!found || score > best_score) {
+                        best_score = score;
+                        out->action0 = slot0_actions[i];
+                        out->action1 = slot1_actions[j];
+                        found = 1;
+                    }
+                }
+            }
+            if (!found) {
+                return 0;
+            }
+        }
+    } else if (need0) {
+        if (proposed_slot0_has_action && action_index_legal_for_request(req, mask, 0, proposed_action0)) {
+            out->action0 = proposed_action0;
+        } else if (!select_best_legal_action(policy, slot0_actions, slot0_count, &out->action0)) {
+            return 0;
+        }
+    } else if (need1) {
+        if (proposed_slot1_has_action && action_index_legal_for_request(req, mask, 1, proposed_action1)) {
+            out->action1 = proposed_action1;
+        } else if (!select_best_legal_action(policy, slot1_actions, slot1_count, &out->action1)) {
+            return 0;
+        }
+    }
+
+    if (!request_choice_to_command(req,
+            out->slot0_has_action, out->action0,
+            out->slot1_has_action, out->action1,
+            out->command, sizeof(out->command))) {
+        return 0;
+    }
+    return 1;
 }

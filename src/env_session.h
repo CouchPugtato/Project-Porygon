@@ -36,6 +36,9 @@ typedef struct {
     size_t obs_dim;
     FILE* replay_file;
     int replay_only;
+    size_t accepted_label_direct_count;
+    size_t accepted_label_reconstructed_count;
+    size_t accepted_label_failed_count;
 } EnvRuntime;
 
 int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, int replay_only);
