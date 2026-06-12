@@ -93,10 +93,20 @@ static int request_choice_pair_is_valid(
 ) {
     int active_slot0 = -1;
     int active_slot1 = -1;
+    int move_slot0 = -1;
+    int move_slot1 = -1;
     int switch_slot0 = -1;
     int switch_slot1 = -1;
+    int tera0 = 0;
+    int tera1 = 0;
 
     if (!req) {
+        return 0;
+    }
+    if (slot0_has_action && slot1_has_action &&
+            is_move_action(action0, &active_slot0, &move_slot0, &tera0) &&
+            is_move_action(action1, &active_slot1, &move_slot1, &tera1) &&
+            tera0 && tera1) {
         return 0;
     }
     if (slot0_has_action && slot1_has_action &&
