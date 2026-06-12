@@ -47,6 +47,7 @@ typedef struct {
 typedef struct {
     int request_id;
     int is_doubles;
+    int wait;
     int team_preview;
     int max_chosen_team_size;
     int active_count;

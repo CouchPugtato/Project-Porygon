@@ -398,6 +398,7 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
     req->request_id = request_id;
     req->is_doubles = is_doubles ? 1 : 0;
     strncpy(req->raw_json, json, sizeof(req->raw_json) - 1);
+    req->wait = parse_bool_after(json, "wait", 0);
     req->team_preview = parse_bool_after(json, "teamPreview", 0);
     req->max_chosen_team_size = parse_int_after(json, "maxChosenTeamSize", req->is_doubles ? 2 : 1);
 

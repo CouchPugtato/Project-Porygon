@@ -151,6 +151,58 @@ static int test_single_living_active_uses_single_choice(void) {
     return 1;
 }
 
+static int test_wait_request_needs_no_choice(void) {
+    const char* json =
+        "{\"wait\":true,"
+        "\"side\":{\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Lucario, L86, M\",\"condition\":\"131/261\",\"active\":true},"
+        "{\"ident\":\"p1: B\",\"details\":\"Gengar, L84, M\",\"condition\":\"3/238 par\",\"active\":true},"
+        "{\"ident\":\"p1: C\",\"details\":\"Zamazenta, L72\",\"condition\":\"251/251\",\"active\":false},"
+        "{\"ident\":\"p1: D\",\"details\":\"Latias, L80, F\",\"condition\":\"89/259\",\"active\":false}"
+        "]}}";
+    ParsedRequest req;
+    ActionMask mask;
+
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 169, 1), "parse wait request")) return 0;
+    if (!assert_true(req.wait == 1, "wait flag parsed")) return 0;
+    if (!assert_true(build_action_mask_from_request(&mask, &req), "build wait action mask")) return 0;
+    if (!assert_true(parsed_request_slot_needs_choice(&req, 0) == 0, "wait slot0 no choice")) return 0;
+    if (!assert_true(parsed_request_slot_needs_choice(&req, 1) == 0, "wait slot1 no choice")) return 0;
+    return 1;
+}
+
+static int test_double_force_switch_one_bench_degrades_to_pass(void) {
+    const char* json =
+        "{\"forceSwitch\":[true,true],"
+        "\"side\":{\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Lucario, L86, M\",\"condition\":\"0 fnt\",\"active\":true},"
+        "{\"ident\":\"p1: B\",\"details\":\"Zamazenta, L72\",\"condition\":\"0 fnt\",\"active\":true},"
+        "{\"ident\":\"p1: C\",\"details\":\"Gouging Fire, L75\",\"condition\":\"221/281 par\",\"active\":false},"
+        "{\"ident\":\"p1: D\",\"details\":\"Latias, L80, F\",\"condition\":\"0 fnt\",\"active\":false},"
+        "{\"ident\":\"p1: E\",\"details\":\"Gengar, L84, M\",\"condition\":\"0 fnt\",\"active\":false},"
+        "{\"ident\":\"p1: F\",\"details\":\"Forretress, L90, F\",\"condition\":\"0 fnt\",\"active\":false}"
+        "]}}";
+    ParsedRequest req;
+    ActionMask mask;
+    float policy[OBS_NUM_ACTIONS] = {0};
+    ValidatedRequestChoice validated;
+
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 251, 1), "parse one-bench double force-switch request")) return 0;
+    if (!assert_true(build_action_mask_from_request(&mask, &req), "build one-bench force-switch mask")) return 0;
+    if (!assert_true(mask.legal[OBS_A1_SWITCH3] == 1, "slot0 only live bench legal")) return 0;
+    if (!assert_true(mask.legal[OBS_A2_SWITCH3] == 1, "slot1 only live bench legal")) return 0;
+    policy[OBS_A1_SWITCH3] = 1.0f;
+    policy[OBS_A2_SWITCH3] = 1.0f;
+    if (!assert_true(validate_or_resample_request_choice(&req, &mask, policy, 1, OBS_A1_SWITCH3, 1, OBS_A2_SWITCH3, &validated), "degrade one-bench force-switch")) return 0;
+    if (!assert_true(
+            (strcmp(validated.command, "/choose switch 3, pass") == 0) ||
+            (strcmp(validated.command, "/choose pass, switch 3") == 0),
+            "one-bench force-switch command shape")) return 0;
+    return 1;
+}
+
 int main(void) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
@@ -166,6 +218,12 @@ int main(void) {
         return 1;
     }
     if (!test_single_living_active_uses_single_choice()) {
+        return 1;
+    }
+    if (!test_wait_request_needs_no_choice()) {
+        return 1;
+    }
+    if (!test_double_force_switch_one_bench_degrades_to_pass()) {
         return 1;
     }
     printf("legality tests passed\n");

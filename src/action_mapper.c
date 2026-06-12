@@ -552,7 +552,21 @@ int validate_or_resample_request_choice(
                 }
             }
             if (!found) {
-                return 0;
+                if (req->forced_switch_any) {
+                    if (slot0_count > 0) {
+                        out->slot0_has_action = 1;
+                        out->slot1_has_action = 0;
+                        out->action0 = slot0_actions[0];
+                    } else if (slot1_count > 0) {
+                        out->slot0_has_action = 0;
+                        out->slot1_has_action = 1;
+                        out->action1 = slot1_actions[0];
+                    } else {
+                        return 0;
+                    }
+                } else {
+                    return 0;
+                }
             }
         }
     } else if (need0) {

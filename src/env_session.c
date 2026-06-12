@@ -210,6 +210,10 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 }
                 return 0;
             }
+            if (session->parsed_request.wait) {
+                session->ready_for_decision = 0;
+                return 1;
+            }
             if (!episode_append(&session->episode, session->flat_observation, -1, 0.0f, 0)) {
                 if (out) {
                     runtime_emit_error_json(json, sizeof(json), msg->battle_id, "episode_append failed");
