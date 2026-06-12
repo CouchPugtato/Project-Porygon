@@ -414,6 +414,15 @@ class MatchStats:
         self.losses = 0
         self.draws = 0
         self.max_rating = 0
+        self.total_invalid_choices = 0
+        self.total_fallbacks = 0
+        self.total_accepted_proposals = 0
+        self.total_forced_switches = 0
+        self.total_voluntary_switches = 0
+        self.total_moves = 0
+        self.total_protects = 0
+        self.total_passes = 0
+        self.total_teras = 0
         self._load()
 
     @property
@@ -441,6 +450,24 @@ class MatchStats:
                 self.draws = parsed
             elif key == "max_rating":
                 self.max_rating = parsed
+            elif key == "total_invalid_choices":
+                self.total_invalid_choices = parsed
+            elif key == "total_fallbacks":
+                self.total_fallbacks = parsed
+            elif key == "total_accepted_proposals":
+                self.total_accepted_proposals = parsed
+            elif key == "total_forced_switches":
+                self.total_forced_switches = parsed
+            elif key == "total_voluntary_switches":
+                self.total_voluntary_switches = parsed
+            elif key == "total_moves":
+                self.total_moves = parsed
+            elif key == "total_protects":
+                self.total_protects = parsed
+            elif key == "total_passes":
+                self.total_passes = parsed
+            elif key == "total_teras":
+                self.total_teras = parsed
 
     def save(self) -> None:
         self._stats_path.parent.mkdir(parents=True, exist_ok=True)
@@ -453,6 +480,15 @@ class MatchStats:
                     f"losses={self.losses}",
                     f"draws={self.draws}",
                     f"max_rating={self.max_rating}",
+                    f"total_invalid_choices={self.total_invalid_choices}",
+                    f"total_fallbacks={self.total_fallbacks}",
+                    f"total_accepted_proposals={self.total_accepted_proposals}",
+                    f"total_forced_switches={self.total_forced_switches}",
+                    f"total_voluntary_switches={self.total_voluntary_switches}",
+                    f"total_moves={self.total_moves}",
+                    f"total_protects={self.total_protects}",
+                    f"total_passes={self.total_passes}",
+                    f"total_teras={self.total_teras}",
                 ]
             )
             + "\n",
@@ -469,6 +505,24 @@ class MatchStats:
             self.losses += 1
         if bot_rating is not None:
             self.max_rating = max(self.max_rating, bot_rating)
+        self.save()
+
+    def note_live_totals(
+        self,
+        invalid_choices: int,
+        fallbacks: int,
+        accepted_proposals: int,
+        action_counts: dict[str, int],
+    ) -> None:
+        self.total_invalid_choices = invalid_choices
+        self.total_fallbacks = fallbacks
+        self.total_accepted_proposals = accepted_proposals
+        self.total_forced_switches = action_counts.get("forced_switches", 0)
+        self.total_voluntary_switches = action_counts.get("voluntary_switches", 0)
+        self.total_moves = action_counts.get("moves", 0)
+        self.total_protects = action_counts.get("protects", 0)
+        self.total_passes = action_counts.get("passes", 0)
+        self.total_teras = action_counts.get("teras", 0)
         self.save()
 
 
@@ -731,6 +785,12 @@ async def live_mode(
             await learner.send(terminal_message(event.room_id, final_result, reward).payload)
             await learner.send(battle_end(event.room_id).payload)
             stats.note_battle(final_result, bot_rating)
+            stats.note_live_totals(
+                invalid_choice_count,
+                fallback_used_count,
+                learner_proposal_accepted_count,
+                total_action_counts,
+            )
             print(f"[live] battle ended {event.room_id} result={final_result}")
             battle_invalid = battle_invalid_choice_count.pop(event.room_id, 0)
             battle_fallbacks = battle_fallback_used_count.pop(event.room_id, 0)
