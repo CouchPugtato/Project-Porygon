@@ -22,6 +22,17 @@ THINK_DELAY_MIN_SECONDS = 0.8
 THINK_DELAY_MAX_SECONDS = 5.0
 FALLBACK_DELAY_MIN_SECONDS = 0.4
 FALLBACK_DELAY_MAX_SECONDS = 1.2
+PROTECT_MOVE_NAMES = {
+    "protect",
+    "detect",
+    "spiky shield",
+    "baneful bunker",
+    "burning bulwark",
+    "silk trap",
+    "kings shield",
+    "obstruct",
+    "endure",
+}
 
 
 def battle_label(battle_id: str) -> str:
@@ -264,6 +275,108 @@ def next_fallback_command(
     return None
 
 
+def command_slot_indices(request_payload: dict) -> list[int]:
+    if request_payload.get("teamPreview"):
+        return []
+
+    active = request_payload.get("active", [])
+    inferred_slots = len(active)
+    raw_force_switch = request_payload.get("forceSwitch")
+    if isinstance(raw_force_switch, list) and len(raw_force_switch) > inferred_slots:
+        inferred_slots = len(raw_force_switch)
+    if inferred_slots <= 0:
+        inferred_slots = 1
+
+    force_flags = force_switch_flags(request_payload, inferred_slots)
+    if any(force_flags):
+        if inferred_slots == 1:
+            return [0]
+        if force_flags == [True, False]:
+            return [0, 1]
+        if force_flags == [False, True]:
+            return [0, 1]
+        return list(range(inferred_slots))
+
+    living_slots = living_active_request_slots(request_payload)
+    if len(living_slots) <= 1:
+        return [living_slots[0] if living_slots else 0]
+    return living_slots[:2]
+
+
+def parse_choose_parts(command: str) -> list[str]:
+    if not command.startswith("/choose "):
+        return []
+    body = command[len("/choose ") :]
+    return [part.strip() for part in body.split(",")]
+
+
+def empty_action_counts() -> dict[str, int]:
+    return {
+        "forced_switches": 0,
+        "voluntary_switches": 0,
+        "moves": 0,
+        "protects": 0,
+        "passes": 0,
+        "teras": 0,
+    }
+
+
+def move_name_for_part(request_payload: dict, slot_index: int, part: str) -> str:
+    tokens = part.split()
+    if len(tokens) < 2 or tokens[0] != "move":
+        return ""
+    try:
+        move_index = int(tokens[1]) - 1
+    except ValueError:
+        return ""
+    active = request_payload.get("active", [])
+    if slot_index < 0 or slot_index >= len(active):
+        return ""
+    moves = active[slot_index].get("moves", [])
+    if move_index < 0 or move_index >= len(moves):
+        return ""
+    return str(moves[move_index].get("move", "")).strip().lower()
+
+
+def tally_command_categories(request_payload: dict, command: str, counts: dict[str, int]) -> None:
+    parts = parse_choose_parts(command)
+    if not parts:
+        return
+    slot_indices = command_slot_indices(request_payload)
+    force_flags = force_switch_flags(request_payload, max(len(request_payload.get("active", [])), len(slot_indices), 1))
+    for idx, part in enumerate(parts):
+        if " terastallize" in part:
+            counts["teras"] += 1
+        if part == "pass":
+            counts["passes"] += 1
+            continue
+        slot_index = slot_indices[idx] if idx < len(slot_indices) else idx
+        forced_slot = idx < len(force_flags) and force_flags[slot_index if slot_index < len(force_flags) else idx]
+        if part.startswith("switch "):
+            if forced_slot:
+                counts["forced_switches"] += 1
+            else:
+                counts["voluntary_switches"] += 1
+            continue
+        if part.startswith("move "):
+            move_name = move_name_for_part(request_payload, slot_index, part)
+            if move_name in PROTECT_MOVE_NAMES:
+                counts["protects"] += 1
+            else:
+                counts["moves"] += 1
+
+
+def format_action_counts(prefix: str, counts: dict[str, int]) -> str:
+    return (
+        f"{prefix}forced_switches={counts['forced_switches']} "
+        f"{prefix}voluntary_switches={counts['voluntary_switches']} "
+        f"{prefix}moves={counts['moves']} "
+        f"{prefix}protects={counts['protects']} "
+        f"{prefix}passes={counts['passes']} "
+        f"{prefix}teras={counts['teras']}"
+    )
+
+
 def parse_player_line(line: str) -> tuple[str, str] | None:
     parts = line.split("|")
     if len(parts) >= 4 and parts[1] == "player":
@@ -451,9 +564,11 @@ async def live_mode(
     fallback_used_count = 0
     learner_proposal_accepted_count = 0
     finished_battles = 0
+    total_action_counts = empty_action_counts()
     battle_invalid_choice_count: dict[str, int] = {}
     battle_fallback_used_count: dict[str, int] = {}
     battle_accepted_proposal_count: dict[str, int] = {}
+    battle_action_counts: dict[str, dict[str, int]] = {}
 
     async def on_event(event: ShowdownEvent) -> None:
         nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count, finished_battles
@@ -558,6 +673,12 @@ async def live_mode(
                         fallback_used_count += 1
                         battle_fallback_used_count[event.room_id] = battle_fallback_used_count.get(event.room_id, 0) + 1
                         print(f"[live] retrying with fallback for {battle_label(event.room_id)}: {candidate}")
+                        tally_command_categories(
+                            request_payload,
+                            candidate,
+                            battle_action_counts.setdefault(event.room_id, empty_action_counts()),
+                        )
+                        tally_command_categories(request_payload, candidate, total_action_counts)
                         pending_decisions[event.room_id] = {
                             "request_id": latest_request_seq.get(event.room_id, seq),
                             "action": -1,
@@ -605,6 +726,7 @@ async def live_mode(
             battle_invalid = battle_invalid_choice_count.pop(event.room_id, 0)
             battle_fallbacks = battle_fallback_used_count.pop(event.room_id, 0)
             battle_accepted = battle_accepted_proposal_count.pop(event.room_id, 0)
+            battle_actions = battle_action_counts.pop(event.room_id, empty_action_counts())
             total_resolved = learner_proposal_accepted_count + fallback_used_count
             accept_rate = (learner_proposal_accepted_count / total_resolved) if total_resolved > 0 else 0.0
             battle_total_resolved = battle_accepted + battle_fallbacks
@@ -615,6 +737,10 @@ async def live_mode(
                 f"battle_accept_rate={battle_accept_rate:.3f} "
                 f"total_invalid_choices={invalid_choice_count} total_fallbacks={fallback_used_count} "
                 f"total_accepted_proposals={learner_proposal_accepted_count} total_accept_rate={accept_rate:.3f}"
+            )
+            print(
+                f"[live] action mix {format_action_counts('battle_', battle_actions)} "
+                f"{format_action_counts('total_', total_action_counts)}"
             )
             request_open[event.room_id] = False
             finished_battles += 1
@@ -629,6 +755,7 @@ async def live_mode(
                 battle_invalid_choice_count[event.room_id] = 0
                 battle_fallback_used_count[event.room_id] = 0
                 battle_accepted_proposal_count[event.room_id] = 0
+                battle_action_counts[event.room_id] = empty_action_counts()
                 await learner.send(
                     battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).payload
                 )
@@ -654,6 +781,14 @@ async def live_mode(
                     continue
                 print(f"[live] action for {battle_id}: {msg['command']}")
                 attempted_commands.setdefault(battle_id, set()).add(msg["command"])
+                request_payload = latest_requests.get(battle_id)
+                if request_payload is not None:
+                    tally_command_categories(
+                        request_payload,
+                        msg["command"],
+                        battle_action_counts.setdefault(battle_id, empty_action_counts()),
+                    )
+                    tally_command_categories(request_payload, msg["command"], total_action_counts)
                 pending_decisions[battle_id] = {
                     "request_id": msg["request_id"],
                     "action": msg.get("action", -1),
