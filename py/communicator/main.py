@@ -372,7 +372,7 @@ class ReplayWriter:
             handle.write(payload + "\n")
 
 
-async def capture_mode(out_path: Path, fmt: str, username: str) -> None:
+async def capture_mode(out_path: Path, fmt: str, username: str, max_games: int | None = None) -> None:
     gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
     writer = ReplayWriter(out_path)
     stats = MatchStats(out_path)
@@ -410,7 +410,11 @@ async def capture_mode(out_path: Path, fmt: str, username: str) -> None:
             finished_battles += 1
             stats.note_battle(result, None)
             print(f"[capture] finished {event.room_id} result={result} total_matches_captured={finished_battles}")
-            await gateway.search_next_battle()
+            if max_games is not None and finished_battles >= max_games:
+                print(f"[capture] reached max games ({max_games}), stopping")
+                await gateway.close()
+            else:
+                await gateway.search_next_battle()
         else:
             writer.append(event_message(event.room_id, seq, event.line).to_json())
 
@@ -420,7 +424,13 @@ async def capture_mode(out_path: Path, fmt: str, username: str) -> None:
     await gateway.run(on_event)
 
 
-async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: str, username: str) -> None:
+async def live_mode(
+    learner_command: list[str],
+    replay_path: Path | None,
+    fmt: str,
+    username: str,
+    max_games: int | None = None,
+) -> None:
     gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
     learner = LearnerProcess(learner_command, replay_path)
     await learner.start()
@@ -440,12 +450,13 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
     invalid_choice_count = 0
     fallback_used_count = 0
     learner_proposal_accepted_count = 0
+    finished_battles = 0
     battle_invalid_choice_count: dict[str, int] = {}
     battle_fallback_used_count: dict[str, int] = {}
     battle_accepted_proposal_count: dict[str, int] = {}
 
     async def on_event(event: ShowdownEvent) -> None:
-        nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count
+        nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count, finished_battles
         summary = event_summary(event)
         if summary:
             print(summary)
@@ -606,7 +617,13 @@ async def live_mode(learner_command: list[str], replay_path: Path | None, fmt: s
                 f"total_accepted_proposals={learner_proposal_accepted_count} total_accept_rate={accept_rate:.3f}"
             )
             request_open[event.room_id] = False
-            await gateway.search_next_battle()
+            finished_battles += 1
+            if max_games is not None and finished_battles >= max_games:
+                print(f"[live] reached max games ({max_games}), stopping")
+                await gateway.close()
+                await learner.terminate()
+            else:
+                await gateway.search_next_battle()
         else:
             if event.room_id.startswith("battle-") and event.line.startswith("|init|battle"):
                 battle_invalid_choice_count[event.room_id] = 0
@@ -677,16 +694,26 @@ def main() -> None:
     parser.add_argument("--learner-args", nargs="*", default=[])
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--username", default="")
+    parser.add_argument("--max-games", type=int, default=0)
     args, learner_passthrough = parser.parse_known_args()
+    max_games = args.max_games if args.max_games > 0 else None
 
     if args.mode == "capture":
-        asyncio.run(capture_mode(Path(args.replay_path), args.format, args.username))
+        asyncio.run(capture_mode(Path(args.replay_path), args.format, args.username, max_games=max_games))
     else:
         learner_args = list(args.learner_args) + list(learner_passthrough)
         if not learner_args:
             learner_args = ["--runtime"]
         learner_command = [args.learner_command] + learner_args
-        asyncio.run(live_mode(learner_command, Path(args.replay_path), args.format, args.username))
+        asyncio.run(
+            live_mode(
+                learner_command,
+                Path(args.replay_path),
+                args.format,
+                args.username,
+                max_games=max_games,
+            )
+        )
 
 
 if __name__ == "__main__":

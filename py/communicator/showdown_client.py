@@ -72,6 +72,12 @@ class ShowdownGateway:
         self._search_sent = False
         await self.search_battle()
 
+    async def close(self) -> None:
+        if self._ws is None:
+            return
+        await self._ws.close()
+        self._ws = None
+
     async def handle_control_line(self, line: str) -> None:
         if line.startswith("|challstr|"):
             if self.username:

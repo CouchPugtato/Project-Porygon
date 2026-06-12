@@ -46,3 +46,12 @@ class LearnerProcess:
         if not line:
             return None
         return line.decode("utf-8", errors="replace").rstrip()
+
+    async def terminate(self) -> None:
+        if self._process is None:
+            return
+        if self._process.stdin is not None:
+            self._process.stdin.close()
+        if self._process.returncode is None:
+            self._process.terminate()
+        await self._process.wait()
