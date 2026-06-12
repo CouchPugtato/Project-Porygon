@@ -377,6 +377,10 @@ def format_action_counts(prefix: str, counts: dict[str, int]) -> str:
     )
 
 
+def command_uses_tera(command: str) -> bool:
+    return " terastallize" in command
+
+
 def parse_player_line(line: str) -> tuple[str, str] | None:
     parts = line.split("|")
     if len(parts) >= 4 and parts[1] == "player":
@@ -423,11 +427,17 @@ class MatchStats:
         self.total_protects = 0
         self.total_passes = 0
         self.total_teras = 0
+        self.tera_battles = 0
+        self._avg_turns_until_tera = 0.0
         self._load()
 
     @property
     def record(self) -> str:
         return f"{self.wins}-{self.losses}-{self.draws}"
+
+    @property
+    def avg_turns_until_tera(self) -> float:
+        return self._avg_turns_until_tera
 
     def _load(self) -> None:
         if not self._stats_path.exists():
@@ -436,38 +446,42 @@ class MatchStats:
             if "=" not in line:
                 continue
             key, value = line.split("=", 1)
+            stripped = value.strip()
             try:
-                parsed = int(value.strip())
+                if key == "matches_played":
+                    self.matches_played = int(stripped)
+                elif key == "wins":
+                    self.wins = int(stripped)
+                elif key == "losses":
+                    self.losses = int(stripped)
+                elif key == "draws":
+                    self.draws = int(stripped)
+                elif key == "max_rating":
+                    self.max_rating = int(stripped)
+                elif key == "total_invalid_choices":
+                    self.total_invalid_choices = int(stripped)
+                elif key == "total_fallbacks":
+                    self.total_fallbacks = int(stripped)
+                elif key == "total_accepted_proposals":
+                    self.total_accepted_proposals = int(stripped)
+                elif key == "total_forced_switches":
+                    self.total_forced_switches = int(stripped)
+                elif key == "total_voluntary_switches":
+                    self.total_voluntary_switches = int(stripped)
+                elif key == "total_moves":
+                    self.total_moves = int(stripped)
+                elif key == "total_protects":
+                    self.total_protects = int(stripped)
+                elif key == "total_passes":
+                    self.total_passes = int(stripped)
+                elif key == "total_teras":
+                    self.total_teras = int(stripped)
+                elif key == "tera_battles":
+                    self.tera_battles = int(stripped)
+                elif key == "avg_turns_until_tera":
+                    self._avg_turns_until_tera = float(stripped)
             except ValueError:
                 continue
-            if key == "matches_played":
-                self.matches_played = parsed
-            elif key == "wins":
-                self.wins = parsed
-            elif key == "losses":
-                self.losses = parsed
-            elif key == "draws":
-                self.draws = parsed
-            elif key == "max_rating":
-                self.max_rating = parsed
-            elif key == "total_invalid_choices":
-                self.total_invalid_choices = parsed
-            elif key == "total_fallbacks":
-                self.total_fallbacks = parsed
-            elif key == "total_accepted_proposals":
-                self.total_accepted_proposals = parsed
-            elif key == "total_forced_switches":
-                self.total_forced_switches = parsed
-            elif key == "total_voluntary_switches":
-                self.total_voluntary_switches = parsed
-            elif key == "total_moves":
-                self.total_moves = parsed
-            elif key == "total_protects":
-                self.total_protects = parsed
-            elif key == "total_passes":
-                self.total_passes = parsed
-            elif key == "total_teras":
-                self.total_teras = parsed
 
     def save(self) -> None:
         self._stats_path.parent.mkdir(parents=True, exist_ok=True)
@@ -489,6 +503,8 @@ class MatchStats:
                     f"total_protects={self.total_protects}",
                     f"total_passes={self.total_passes}",
                     f"total_teras={self.total_teras}",
+                    f"tera_battles={self.tera_battles}",
+                    f"avg_turns_until_tera={self.avg_turns_until_tera:.3f}",
                 ]
             )
             + "\n",
@@ -513,6 +529,7 @@ class MatchStats:
         fallbacks: int,
         accepted_proposals: int,
         action_counts: dict[str, int],
+        first_tera_turn: int | None,
     ) -> None:
         self.total_invalid_choices = invalid_choices
         self.total_fallbacks = fallbacks
@@ -523,6 +540,10 @@ class MatchStats:
         self.total_protects = action_counts.get("protects", 0)
         self.total_passes = action_counts.get("passes", 0)
         self.total_teras = action_counts.get("teras", 0)
+        if first_tera_turn is not None:
+            total_tera_turns = (self._avg_turns_until_tera * self.tera_battles) + first_tera_turn
+            self.tera_battles += 1
+            self._avg_turns_until_tera = total_tera_turns / self.tera_battles
         self.save()
 
 
@@ -620,6 +641,8 @@ async def live_mode(
     learner_proposal_accepted_count = 0
     finished_battles = 0
     total_action_counts = empty_action_counts()
+    battle_current_turn: dict[str, int] = {}
+    battle_first_tera_turn: dict[str, int | None] = {}
     battle_invalid_choice_count: dict[str, int] = {}
     battle_fallback_used_count: dict[str, int] = {}
     battle_accepted_proposal_count: dict[str, int] = {}
@@ -639,7 +662,12 @@ async def live_mode(
             ratings[side] = rating
             if event.room_id not in announced_matchups and "p1" in players and "p2" in players:
                 print()
-                print(f"[stats] matches={stats.matches_played} record={stats.record} max_rating={stats.max_rating}")
+                print(
+                    f"[stats] matches={stats.matches_played} record={stats.record} max_rating={stats.max_rating} "
+                    f"moves={stats.total_moves} protects={stats.total_protects} "
+                    f"passes={stats.total_passes} teras={stats.total_teras} "
+                    f"avg_turns_until_tera={stats.avg_turns_until_tera:.2f}"
+                )
                 print(
                     f"[matchup] {players['p1']} ({ratings.get('p1', '?') if ratings.get('p1') is not None else '?'}) vs "
                     f"{players['p2']} ({ratings.get('p2', '?') if ratings.get('p2') is not None else '?'})"
@@ -790,6 +818,7 @@ async def live_mode(
                 fallback_used_count,
                 learner_proposal_accepted_count,
                 total_action_counts,
+                battle_first_tera_turn.pop(event.room_id, None),
             )
             print(f"[live] battle ended {event.room_id} result={final_result}")
             battle_invalid = battle_invalid_choice_count.pop(event.room_id, 0)
@@ -813,6 +842,7 @@ async def live_mode(
             )
             request_open[event.room_id] = False
             latest_request_identity.pop(event.room_id, None)
+            battle_current_turn.pop(event.room_id, None)
             finished_battles += 1
             if max_games is not None and finished_battles >= max_games:
                 print(f"[live] reached max games ({max_games}), stopping")
@@ -822,6 +852,8 @@ async def live_mode(
                 await gateway.search_next_battle()
         else:
             if event.room_id.startswith("battle-") and event.line.startswith("|init|battle"):
+                battle_current_turn[event.room_id] = 0
+                battle_first_tera_turn[event.room_id] = None
                 battle_invalid_choice_count[event.room_id] = 0
                 battle_fallback_used_count[event.room_id] = 0
                 battle_accepted_proposal_count[event.room_id] = 0
@@ -832,6 +864,13 @@ async def live_mode(
                 print(f"[live] battle started {event.room_id}")
                 await gateway.send_room_command(event.room_id, "/timer on")
                 print(f"[live] timer enabled for {event.room_id}")
+            elif event.line.startswith("|turn|"):
+                parts = event.line.split("|")
+                if len(parts) >= 3:
+                    try:
+                        battle_current_turn[event.room_id] = int(parts[2])
+                    except ValueError:
+                        pass
             await learner.send(event_message(event.room_id, seq, event.line).payload)
 
         seq += 1
@@ -853,6 +892,8 @@ async def live_mode(
                 attempted_commands.setdefault(battle_id, set()).add(msg["command"])
                 request_payload = latest_requests.get(battle_id)
                 if request_payload is not None:
+                    if command_uses_tera(msg["command"]) and battle_first_tera_turn.get(battle_id) is None:
+                        battle_first_tera_turn[battle_id] = battle_current_turn.get(battle_id, 0)
                     tally_command_categories(
                         request_payload,
                         msg["command"],
