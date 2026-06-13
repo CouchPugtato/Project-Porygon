@@ -422,6 +422,7 @@ class MatchStats:
         self._stats_path = replay_path.with_suffix(".stats.txt")
         self.matches_played = 0
         self.wins = 0
+        self.earned_wins = 0
         self.losses = 0
         self.draws = 0
         self.max_rating = 0
@@ -459,6 +460,8 @@ class MatchStats:
                     self.matches_played = int(stripped)
                 elif key == "wins":
                     self.wins = int(stripped)
+                elif key == "earned_wins":
+                    self.earned_wins = int(stripped)
                 elif key == "losses":
                     self.losses = int(stripped)
                 elif key == "draws":
@@ -498,6 +501,7 @@ class MatchStats:
                     f"matches_played={self.matches_played}",
                     f"record={self.record}",
                     f"wins={self.wins}",
+                    f"earned_wins={self.earned_wins}",
                     f"losses={self.losses}",
                     f"draws={self.draws}",
                     f"max_rating={self.max_rating}",
@@ -518,10 +522,12 @@ class MatchStats:
             encoding="utf-8",
         )
 
-    def note_battle(self, result: str, bot_rating: int | None) -> None:
+    def note_battle(self, result: str, bot_rating: int | None, earned_win: bool = False) -> None:
         self.matches_played += 1
         if result == "win":
             self.wins += 1
+            if earned_win:
+                self.earned_wins += 1
         elif result == "draw":
             self.draws += 1
         else:
@@ -605,12 +611,13 @@ async def capture_mode(out_path: Path, fmt: str, username: str, max_games: int |
         elif event.line.startswith("|win|") or event.line.startswith("|tie|"):
             result = "win" if event.line.startswith("|win|") else "draw"
             reward = 1.0 if result == "win" else 0.0
-            if disconnect_or_forfeit_end.get(event.room_id, False):
+            disconnected_or_forfeited = disconnect_or_forfeit_end.get(event.room_id, False)
+            if disconnected_or_forfeited:
                 reward = 0.0
             writer.append(terminal_message(event.room_id, result, reward).to_json())
             writer.append(battle_end(event.room_id).to_json())
             finished_battles += 1
-            stats.note_battle(result, None)
+            stats.note_battle(result, None, earned_win=(result == "win" and not disconnected_or_forfeited))
             print(f"[capture] finished {event.room_id} result={result} total_matches_captured={finished_battles}")
             disconnect_or_forfeit_end.pop(event.room_id, None)
             if max_games is not None and finished_battles >= max_games:
@@ -679,7 +686,7 @@ async def live_mode(
             if event.room_id not in announced_matchups and "p1" in players and "p2" in players:
                 print()
                 print(
-                    f"[stats] matches={stats.matches_played} record={stats.record} max_rating={stats.max_rating} "
+                    f"[stats] matches={stats.matches_played} record={stats.record} earned_wins={stats.earned_wins} max_rating={stats.max_rating} "
                     f"moves={stats.total_moves} protects={stats.total_protects} "
                     f"passes={stats.total_passes} teras={stats.total_teras} "
                     f"avg_turns_until_tera={stats.avg_turns_until_tera:.2f}"
@@ -826,11 +833,16 @@ async def live_mode(
             else:
                 final_result = "loss"
                 reward = -1.0
-            if disconnect_or_forfeit_end.get(event.room_id, False):
+            disconnected_or_forfeited = disconnect_or_forfeit_end.get(event.room_id, False)
+            if disconnected_or_forfeited:
                 reward = 0.0
             await learner.send(terminal_message(event.room_id, final_result, reward).payload)
             await learner.send(battle_end(event.room_id).payload)
-            stats.note_battle(final_result, bot_rating)
+            stats.note_battle(
+                final_result,
+                bot_rating,
+                earned_win=(final_result == "win" and not disconnected_or_forfeited),
+            )
             stats.note_live_totals(
                 invalid_choice_count,
                 fallback_used_count,
