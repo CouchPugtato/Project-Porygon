@@ -349,6 +349,27 @@ void gru_model_forward_sequence(
     free(next_hidden);
 }
 
+int gru_model_evaluate_sequence_step(
+    const GruModel* model,
+    const float* sequence,
+    size_t steps,
+    float* policy_out,
+    float* value_out
+) {
+    float* hidden_state;
+    if (!model || !sequence || steps == 0 || !policy_out || !value_out) {
+        return 0;
+    }
+    hidden_state = (float*)malloc(model->hidden_dim * sizeof(float));
+    if (!hidden_state) {
+        return 0;
+    }
+    gru_model_zero_state(model, hidden_state);
+    gru_model_forward_sequence(model, sequence, steps, hidden_state, policy_out, value_out);
+    free(hidden_state);
+    return 1;
+}
+
 int gru_model_select_action(const float* policy, const unsigned char* legal_mask, size_t num_actions) {
     size_t i;
     int best_index = -1;

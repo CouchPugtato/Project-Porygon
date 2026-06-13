@@ -14,6 +14,14 @@ typedef struct {
     float last_action_loss;
     float last_value_loss;
     float last_accuracy;
+    float gamma;
+    float entropy_coef;
+    int advantage_norm;
+    float last_policy_loss;
+    float last_mean_return;
+    float last_mean_advantage;
+    float last_entropy;
+    size_t last_rl_labels;
 } GruTrainer;
 
 void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_window, float gradient_clip, unsigned int seed);

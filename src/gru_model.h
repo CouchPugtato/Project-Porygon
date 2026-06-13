@@ -29,6 +29,13 @@ void gru_model_forward_sequence(
     float* policy_out,
     float* value_out
 );
+int gru_model_evaluate_sequence_step(
+    const GruModel* model,
+    const float* sequence,
+    size_t steps,
+    float* policy_out,
+    float* value_out
+);
 int gru_model_select_action(const float* policy, const unsigned char* legal_mask, size_t num_actions);
 int gru_model_select_action_range(
     const float* policy,

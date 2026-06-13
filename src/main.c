@@ -153,6 +153,37 @@ static int parse_epochs_arg(int argc, char** argv, int default_epochs) {
     return default_epochs;
 }
 
+static float parse_float_flag(int argc, char** argv, const char* name, float default_value) {
+    int i;
+    for (i = 1; i + 1 < argc; ++i) {
+        if (strcmp(argv[i], name) == 0) {
+            float parsed = (float)atof(argv[i + 1]);
+            return parsed;
+        }
+    }
+    return default_value;
+}
+
+static int parse_int_flag(int argc, char** argv, const char* name, int default_value) {
+    int i;
+    for (i = 1; i + 1 < argc; ++i) {
+        if (strcmp(argv[i], name) == 0) {
+            return atoi(argv[i + 1]);
+        }
+    }
+    return default_value;
+}
+
+static const char* parse_string_flag(int argc, char** argv, const char* name, const char* default_value) {
+    int i;
+    for (i = 1; i + 1 < argc; ++i) {
+        if (strcmp(argv[i], name) == 0) {
+            return argv[i + 1];
+        }
+    }
+    return default_value;
+}
+
 static int is_validation_session(size_t index, size_t total_sessions) {
     if (total_sessions < 10) {
         return 0;
@@ -698,7 +729,16 @@ static int run_runtime_mode(const char* checkpoint_path) {
     return 0;
 }
 
-static int train_from_replay_file(const char* replay_path, const char* checkpoint_path, int rl_mode, int epochs) {
+static int train_from_replay_file(
+    const char* replay_path,
+    const char* checkpoint_path,
+    int rl_mode,
+    int epochs,
+    float rl_gamma,
+    float rl_entropy_coef,
+    int rl_advantage_norm,
+    const char* rl_reward_mode
+) {
     char* resolved_checkpoint_path = NULL;
     GruModel* model = NULL;
     GruTrainer trainer;
@@ -715,6 +755,16 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
 
     if (!replay_path || !checkpoint_path || epochs <= 0) {
         return 1;
+    }
+    if (rl_mode) {
+        if (!rl_reward_mode || strcmp(rl_reward_mode, "terminal") != 0) {
+            fprintf(stderr, "Unsupported --reward-mode '%s'. Only 'terminal' is implemented in phase 1.\n",
+                rl_reward_mode ? rl_reward_mode : "");
+            return 1;
+        }
+        if (strstr(replay_path, "legacy") != NULL) {
+            printf("[train-rl] warning: replay path contains 'legacy'; RL is intended for fresh post-fix runs only\n");
+        }
     }
     resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path);
     if (!resolved_checkpoint_path) {
@@ -739,6 +789,11 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         checkpoint_state.gradient_clip,
         checkpoint_state.seed);
     trainer.step = checkpoint_state.step;
+    if (rl_mode) {
+        trainer.gamma = rl_gamma;
+        trainer.entropy_coef = rl_entropy_coef;
+        trainer.advantage_norm = rl_advantage_norm ? 1 : 0;
+    }
 
     if (!load_runtime_from_replay_file(replay_path, model, &runtime)) {
         gru_model_destroy(model);
@@ -757,6 +812,13 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         runtime.accepted_label_direct_count,
         runtime.accepted_label_reconstructed_count,
         runtime.accepted_label_failed_count);
+    if (rl_mode) {
+        printf("[train-rl] config gamma=%.4f entropy_coef=%.4f advantage_norm=%d reward_mode=%s\n",
+            trainer.gamma,
+            trainer.entropy_coef,
+            trainer.advantage_norm,
+            rl_reward_mode);
+    }
 
     for (epoch = 1; epoch <= epochs; ++epoch) {
         size_t trained_in_epoch = 0;
@@ -780,23 +842,53 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         for (size_t order_i = 0; order_i < train_sessions; ++order_i) {
             size_t session_index = train_indices[order_i];
             if (rl_mode) {
-                gru_trainer_policy_gradient_episode(&trainer, model, &runtime.sessions[session_index].episode);
+                if (!gru_trainer_policy_gradient_episode(&trainer, model, &runtime.sessions[session_index].episode)) {
+                    fprintf(stderr, "Failed RL training episode\n");
+                    free(train_indices);
+                    free(val_indices);
+                    env_runtime_free(&runtime);
+                    gru_model_destroy(model);
+                    free(resolved_checkpoint_path);
+                    return 1;
+                }
             } else {
-                gru_trainer_supervised_episode(&trainer, model, &runtime.sessions[session_index].episode);
+                if (!gru_trainer_supervised_episode(&trainer, model, &runtime.sessions[session_index].episode)) {
+                    fprintf(stderr, "Failed supervised training episode\n");
+                    free(train_indices);
+                    free(val_indices);
+                    env_runtime_free(&runtime);
+                    gru_model_destroy(model);
+                    free(resolved_checkpoint_path);
+                    return 1;
+                }
             }
             ++trained_in_epoch;
             {
                 double elapsed = elapsed_seconds_since(train_loop_start_clock);
                 double episodes_per_sec = elapsed > 0.0 ? (double)trained_in_epoch / elapsed : 0.0;
                 double eta = episodes_per_sec > 0.0 ? (double)(train_sessions - trained_in_epoch) / episodes_per_sec : 0.0;
-                printf("[train] epoch=%d episodes=%zu/%zu step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f\n",
-                    epoch,
-                    trained_in_epoch,
-                    train_sessions,
-                    trainer.step,
-                    trainer.last_action_loss,
-                    trainer.last_value_loss,
-                    trainer.last_accuracy);
+                if (rl_mode) {
+                    printf("[train-rl] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f mean_advantage=%.4f entropy=%.4f labels=%zu\n",
+                        epoch,
+                        trained_in_epoch,
+                        train_sessions,
+                        trainer.step,
+                        trainer.last_mean_return,
+                        trainer.last_policy_loss,
+                        trainer.last_value_loss,
+                        trainer.last_mean_advantage,
+                        trainer.last_entropy,
+                        trainer.last_rl_labels);
+                } else {
+                    printf("[train] epoch=%d episodes=%zu/%zu step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f\n",
+                        epoch,
+                        trained_in_epoch,
+                        train_sessions,
+                        trainer.step,
+                        trainer.last_action_loss,
+                        trainer.last_value_loss,
+                        trainer.last_accuracy);
+                }
                 printf("[train] epoch=%d elapsed=%.1fs episodes_per_sec=%.2f eta=%.1fs\n",
                     epoch,
                     elapsed,
@@ -903,13 +995,24 @@ static int train_from_replay_file(const char* replay_path, const char* checkpoin
         free(resolved_checkpoint_path);
         return 1;
     }
-    printf("trained mode=%s step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f sessions=%zu\n",
-        rl_mode ? "rl" : "supervised",
-        trainer.step,
-        trainer.last_action_loss,
-        trainer.last_value_loss,
-        trainer.last_accuracy,
-        runtime.count);
+    if (rl_mode) {
+        printf("trained mode=rl step=%zu policy_loss=%.4f value_loss=%.4f mean_return=%.4f mean_advantage=%.4f entropy=%.4f labels=%zu sessions=%zu\n",
+            trainer.step,
+            trainer.last_policy_loss,
+            trainer.last_value_loss,
+            trainer.last_mean_return,
+            trainer.last_mean_advantage,
+            trainer.last_entropy,
+            trainer.last_rl_labels,
+            runtime.count);
+    } else {
+        printf("trained mode=supervised step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f sessions=%zu\n",
+            trainer.step,
+            trainer.last_action_loss,
+            trainer.last_value_loss,
+            trainer.last_accuracy,
+            runtime.count);
+    }
     printf("[train] saved checkpoint %s\n", resolved_checkpoint_path);
     free(train_indices);
     free(val_indices);
@@ -968,6 +1071,10 @@ static int clean_replay_file(const char* input_path, const char* output_path) {
 
 int main(int argc, char** argv) {
     int epochs = parse_epochs_arg(argc, argv, 1);
+    float rl_gamma = parse_float_flag(argc, argv, "--gamma", 1.0f);
+    float rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef", 0.001f);
+    int rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", 1);
+    const char* rl_reward_mode = parse_string_flag(argc, argv, "--reward-mode", "terminal");
     srand((unsigned int)time(NULL));
     if (!id_tables_init()) {
         fprintf(stderr, "Failed to initialize ID tables\n");
@@ -980,10 +1087,10 @@ int main(int argc, char** argv) {
         return run_runtime_mode(argc >= 3 ? argv[2] : NULL);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-supervised") == 0) {
-        return train_from_replay_file(argv[2], argv[3], 0, epochs);
+        return train_from_replay_file(argv[2], argv[3], 0, epochs, rl_gamma, rl_entropy_coef, rl_advantage_norm, rl_reward_mode);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-rl") == 0) {
-        return train_from_replay_file(argv[2], argv[3], 1, epochs);
+        return train_from_replay_file(argv[2], argv[3], 1, epochs, rl_gamma, rl_entropy_coef, rl_advantage_norm, rl_reward_mode);
     }
     if (argc >= 4 && strcmp(argv[1], "--eval-supervised") == 0) {
         return evaluate_checkpoint_on_replay_file(argv[2], argv[3]);
@@ -1011,7 +1118,7 @@ int main(int argc, char** argv) {
         "Usage:\n"
         "  showdown_client --runtime [checkpoint]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N]\n"
-        "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N]\n"
+        "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal]\n"
         "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
         "  Set PORYGON_DEMO_GRU=1 for the demo mode.\n"
