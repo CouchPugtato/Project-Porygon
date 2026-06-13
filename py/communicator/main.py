@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import random
+import signal
 import sys
 from itertools import product
 from pathlib import Path
@@ -670,6 +671,26 @@ async def live_mode(
     battle_fallback_used_count: dict[str, int] = {}
     battle_accepted_proposal_count: dict[str, int] = {}
     battle_action_counts: dict[str, dict[str, int]] = {}
+    active_battles: set[str] = set()
+    stop_after_current_battle = asyncio.Event()
+
+    async def request_shutdown() -> None:
+        if active_battles:
+            if not stop_after_current_battle.is_set():
+                stop_after_current_battle.set()
+                print("[live] shutdown requested; will stop after the current battle finishes")
+            return
+        print("[live] shutdown requested with no active battle; stopping now")
+        await gateway.close()
+        await learner.terminate()
+
+    loop = asyncio.get_running_loop()
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def handle_sigint(_signum: int, _frame: object) -> None:
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(request_shutdown()))
+
+    signal.signal(signal.SIGINT, handle_sigint)
 
     async def on_event(event: ShowdownEvent) -> None:
         nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count, finished_battles
@@ -874,15 +895,21 @@ async def live_mode(
             latest_request_identity.pop(event.room_id, None)
             disconnect_or_forfeit_end.pop(event.room_id, None)
             battle_current_turn.pop(event.room_id, None)
+            active_battles.discard(event.room_id)
             finished_battles += 1
             if max_games is not None and finished_battles >= max_games:
                 print(f"[live] reached max games ({max_games}), stopping")
+                await gateway.close()
+                await learner.terminate()
+            elif stop_after_current_battle.is_set():
+                print("[live] current battle finished; stopping")
                 await gateway.close()
                 await learner.terminate()
             else:
                 await gateway.search_next_battle()
         else:
             if event.room_id.startswith("battle-") and event.line.startswith("|init|battle"):
+                active_battles.add(event.room_id)
                 disconnect_or_forfeit_end[event.room_id] = False
                 battle_current_turn[event.room_id] = 0
                 battle_first_tera_turn[event.room_id] = None
@@ -963,7 +990,10 @@ async def live_mode(
                 print(f"[learner-stderr] {line}")
 
     await gateway.connect()
-    await asyncio.gather(gateway.run(on_event), action_loop(), stderr_loop())
+    try:
+        await asyncio.gather(gateway.run(on_event), action_loop(), stderr_loop())
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
 def main() -> None:
