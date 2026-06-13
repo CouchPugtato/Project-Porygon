@@ -500,6 +500,459 @@ static int load_runtime_from_replay_file(const char* replay_path, GruModel* mode
     return 1;
 }
 
+static EnvSession* find_runtime_session_by_id(EnvRuntime* runtime, const char* battle_id) {
+    size_t i;
+    if (!runtime || !battle_id) {
+        return NULL;
+    }
+    for (i = 0; i < runtime->count; ++i) {
+        if (strcmp(runtime->sessions[i].battle_id, battle_id) == 0) {
+            return &runtime->sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static const char* runtime_message_type_name(RuntimeMessageType type) {
+    switch (type) {
+        case RUNTIME_MSG_BATTLE_START: return "battle_start";
+        case RUNTIME_MSG_REQUEST: return "request";
+        case RUNTIME_MSG_EVENT: return "event";
+        case RUNTIME_MSG_TERMINAL: return "terminal";
+        case RUNTIME_MSG_BATTLE_END: return "battle_end";
+        case RUNTIME_MSG_ERROR: return "error";
+        case RUNTIME_MSG_HEARTBEAT: return "heartbeat";
+        case RUNTIME_MSG_DECISION: return "decision";
+        default: return "unknown";
+    }
+}
+
+static const char* knowledge_level_name(KnowledgeLevel knowledge) {
+    switch (knowledge) {
+        case KNOW_INFERRED: return "inferred";
+        case KNOW_CONFIRMED: return "confirmed";
+        case KNOW_UNKNOWN:
+        default:
+            return "unknown";
+    }
+}
+
+static const char* obs_action_name(enum ObsAction action) {
+    switch (action) {
+        case OBS_A1_MOVE1: return "a1_move1";
+        case OBS_A1_MOVE2: return "a1_move2";
+        case OBS_A1_MOVE3: return "a1_move3";
+        case OBS_A1_MOVE4: return "a1_move4";
+        case OBS_A1_MOVE1_TERA: return "a1_move1_tera";
+        case OBS_A1_MOVE2_TERA: return "a1_move2_tera";
+        case OBS_A1_MOVE3_TERA: return "a1_move3_tera";
+        case OBS_A1_MOVE4_TERA: return "a1_move4_tera";
+        case OBS_A1_SWITCH1: return "a1_switch1";
+        case OBS_A1_SWITCH2: return "a1_switch2";
+        case OBS_A1_SWITCH3: return "a1_switch3";
+        case OBS_A1_SWITCH4: return "a1_switch4";
+        case OBS_A1_SWITCH5: return "a1_switch5";
+        case OBS_A1_SWITCH6: return "a1_switch6";
+        case OBS_A2_MOVE1: return "a2_move1";
+        case OBS_A2_MOVE2: return "a2_move2";
+        case OBS_A2_MOVE3: return "a2_move3";
+        case OBS_A2_MOVE4: return "a2_move4";
+        case OBS_A2_MOVE1_TERA: return "a2_move1_tera";
+        case OBS_A2_MOVE2_TERA: return "a2_move2_tera";
+        case OBS_A2_MOVE3_TERA: return "a2_move3_tera";
+        case OBS_A2_MOVE4_TERA: return "a2_move4_tera";
+        case OBS_A2_SWITCH1: return "a2_switch1";
+        case OBS_A2_SWITCH2: return "a2_switch2";
+        case OBS_A2_SWITCH3: return "a2_switch3";
+        case OBS_A2_SWITCH4: return "a2_switch4";
+        case OBS_A2_SWITCH5: return "a2_switch5";
+        case OBS_A2_SWITCH6: return "a2_switch6";
+        default: return "unknown";
+    }
+}
+
+static void json_write_escaped(FILE* out, const char* text) {
+    const unsigned char* p = (const unsigned char*)(text ? text : "");
+    fputc('"', out);
+    while (*p) {
+        switch (*p) {
+            case '\\': fputs("\\\\", out); break;
+            case '"': fputs("\\\"", out); break;
+            case '\n': fputs("\\n", out); break;
+            case '\r': fputs("\\r", out); break;
+            case '\t': fputs("\\t", out); break;
+            default:
+                if (*p < 0x20u) {
+                    fprintf(out, "\\u%04x", (unsigned int)(*p));
+                } else {
+                    fputc((int)(*p), out);
+                }
+                break;
+        }
+        ++p;
+    }
+    fputc('"', out);
+}
+
+static void json_write_tracked_int(FILE* out, const TrackedInt* tracked, const char* (*name_fn)(int)) {
+    const char* resolved_name = NULL;
+    if (!tracked) {
+        fputs("null", out);
+        return;
+    }
+    if (name_fn && tracked->value > 0) {
+        resolved_name = name_fn(tracked->value);
+    }
+    fputs("{\"value\":", out);
+    fprintf(out, "%d", tracked->value);
+    fputs(",\"knowledge\":", out);
+    json_write_escaped(out, knowledge_level_name(tracked->knowledge));
+    fputs(",\"name\":", out);
+    json_write_escaped(out, resolved_name ? resolved_name : "");
+    fputs("}", out);
+}
+
+static void json_write_int_array(FILE* out, const int* values, size_t count) {
+    size_t i;
+    fputc('[', out);
+    for (i = 0; i < count; ++i) {
+        if (i) fputc(',', out);
+        fprintf(out, "%d", values[i]);
+    }
+    fputc(']', out);
+}
+
+static void json_write_float_array(FILE* out, const float* values, size_t count) {
+    size_t i;
+    fputc('[', out);
+    for (i = 0; i < count; ++i) {
+        if (i) fputc(',', out);
+        fprintf(out, "%.6f", values[i]);
+    }
+    fputc(']', out);
+}
+
+static void json_write_raw_pokemon(FILE* out, const RawPokemon* mon) {
+    int i;
+    if (!mon) {
+        fputs("null", out);
+        return;
+    }
+    fputs("{\"known\":", out); fprintf(out, "%d", mon->known);
+    fputs(",\"active\":", out); fprintf(out, "%d", mon->active);
+    fputs(",\"active_slot\":", out); fprintf(out, "%d", mon->active_slot);
+    fputs(",\"revealed\":", out); fprintf(out, "%d", mon->revealed);
+    fputs(",\"fainted\":", out); fprintf(out, "%d", mon->fainted);
+    fputs(",\"species\":", out); json_write_tracked_int(out, &mon->species_id, species_name_from_id);
+    fputs(",\"item\":", out); json_write_tracked_int(out, &mon->item_id, item_name_from_id);
+    fputs(",\"ability\":", out); json_write_tracked_int(out, &mon->ability_id, ability_name_from_id);
+    fputs(",\"tera_type\":", out); json_write_tracked_int(out, &mon->tera_type_id, NULL);
+    fputs(",\"tera_used\":", out); fprintf(out, "%d", mon->tera_used);
+    fputs(",\"can_tera\":", out); fprintf(out, "%d", mon->can_tera);
+    fputs(",\"transformed\":", out); fprintf(out, "%d", mon->transformed);
+    fputs(",\"substitute_active\":", out); fprintf(out, "%d", mon->substitute_active);
+    fputs(",\"current_hp\":", out); fprintf(out, "%d", mon->current_hp);
+    fputs(",\"max_hp\":", out); fprintf(out, "%d", mon->max_hp);
+    fputs(",\"status\":", out); json_write_tracked_int(out, &mon->status_id, condition_name_from_id);
+    fputs(",\"sleep_turns\":", out); fprintf(out, "%d", mon->sleep_turns);
+    fputs(",\"toxic_counter\":", out); fprintf(out, "%d", mon->toxic_counter);
+    fputs(",\"type1_id\":", out); fprintf(out, "%d", mon->type1_id);
+    fputs(",\"type2_id\":", out); fprintf(out, "%d", mon->type2_id);
+    fputs(",\"boosts\":", out); json_write_int_array(out, mon->boosts, 7);
+    fputs(",\"moves\":[", out);
+    for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
+        if (i) fputc(',', out);
+        fputs("{\"move\":", out); json_write_tracked_int(out, &mon->move_ids[i], move_name_from_id);
+        fputs(",\"known\":", out); fprintf(out, "%d", mon->move_known[i]);
+        fputs(",\"pp\":", out); fprintf(out, "%d", mon->move_pp[i]);
+        fputs(",\"max_pp\":", out); fprintf(out, "%d", mon->move_max_pp[i]);
+        fputs(",\"disabled\":", out); fprintf(out, "%d", mon->move_disabled[i]);
+        fputs(",\"maybe_disabled\":", out); fprintf(out, "%d", mon->move_maybe_disabled[i]);
+        fputs("}", out);
+    }
+    fputs("]", out);
+    fputs(",\"encore_active\":", out); fprintf(out, "%d", mon->encore_active);
+    fputs(",\"encore_turns\":", out); fprintf(out, "%d", mon->encore_turns);
+    fputs(",\"disable_active\":", out); fprintf(out, "%d", mon->disable_active);
+    fputs(",\"disable_turns\":", out); fprintf(out, "%d", mon->disable_turns);
+    fputs(",\"taunt_active\":", out); fprintf(out, "%d", mon->taunt_active);
+    fputs(",\"taunt_turns\":", out); fprintf(out, "%d", mon->taunt_turns);
+    fputs(",\"torment_active\":", out); fprintf(out, "%d", mon->torment_active);
+    fputs(",\"torment_turns\":", out); fprintf(out, "%d", mon->torment_turns);
+    fputs(",\"heal_block_active\":", out); fprintf(out, "%d", mon->heal_block_active);
+    fputs(",\"heal_block_turns\":", out); fprintf(out, "%d", mon->heal_block_turns);
+    fputs(",\"embargo_active\":", out); fprintf(out, "%d", mon->embargo_active);
+    fputs(",\"embargo_turns\":", out); fprintf(out, "%d", mon->embargo_turns);
+    fputs(",\"yawn_active\":", out); fprintf(out, "%d", mon->yawn_active);
+    fputs(",\"yawn_turns\":", out); fprintf(out, "%d", mon->yawn_turns);
+    fputs(",\"encore_move_slot\":", out); fprintf(out, "%d", mon->encore_move_slot);
+    fputs(",\"disable_move_slot\":", out); fprintf(out, "%d", mon->disable_move_slot);
+    fputs(",\"protect_active\":", out); fprintf(out, "%d", mon->protect_active);
+    fputs(",\"protect_chain_count\":", out); fprintf(out, "%d", mon->protect_chain_count);
+    fputs(",\"helping_hand_active\":", out); fprintf(out, "%d", mon->helping_hand_active);
+    fputs(",\"flinch_active\":", out); fprintf(out, "%d", mon->flinch_active);
+    fputs(",\"confusion_active\":", out); fprintf(out, "%d", mon->confusion_active);
+    fputs(",\"confusion_turns\":", out); fprintf(out, "%d", mon->confusion_turns);
+    fputs(",\"seed_active\":", out); fprintf(out, "%d", mon->seed_active);
+    fputs(",\"perish_song_counter\":", out); fprintf(out, "%d", mon->perish_song_counter);
+    fputs(",\"charge_active\":", out); fprintf(out, "%d", mon->charge_active);
+    fputs(",\"charge_turns\":", out); fprintf(out, "%d", mon->charge_turns);
+    fputs(",\"last_move_id\":", out); fprintf(out, "%d", mon->last_move_id);
+    fputs(",\"last_move_turn\":", out); fprintf(out, "%d", mon->last_move_turn);
+    fputs(",\"switched_in_turn\":", out); fprintf(out, "%d", mon->switched_in_turn);
+    fputs(",\"first_turn_on_field\":", out); fprintf(out, "%d", mon->first_turn_on_field);
+    fputs(",\"ability_triggered_on_switch_in\":", out); fprintf(out, "%d", mon->ability_triggered_on_switch_in);
+    fputs(",\"ident\":", out); json_write_escaped(out, mon->ident);
+    fputs("}", out);
+}
+
+static void json_write_raw_side(FILE* out, const RawSideState* side) {
+    if (!side) {
+        fputs("null", out);
+        return;
+    }
+    fprintf(out,
+        "{\"stealth_rock\":%d,\"spikes\":%d,\"toxic_spikes\":%d,\"sticky_web\":%d,"
+        "\"reflect\":%d,\"reflect_turns\":%d,\"light_screen\":%d,\"light_screen_turns\":%d,"
+        "\"aurora_veil\":%d,\"aurora_veil_turns\":%d,\"tailwind\":%d,\"tailwind_turns\":%d,"
+        "\"safeguard\":%d,\"safeguard_turns\":%d,\"mist\":%d,\"mist_turns\":%d,"
+        "\"lucky_chant\":%d,\"lucky_chant_turns\":%d,\"quick_guard\":%d,\"wide_guard\":%d,"
+        "\"crafty_shield\":%d,\"mat_block\":%d,\"remaining_pokemon\":%d}",
+        side->stealth_rock, side->spikes, side->toxic_spikes, side->sticky_web,
+        side->reflect, side->reflect_turns, side->light_screen, side->light_screen_turns,
+        side->aurora_veil, side->aurora_veil_turns, side->tailwind, side->tailwind_turns,
+        side->safeguard, side->safeguard_turns, side->mist, side->mist_turns,
+        side->lucky_chant, side->lucky_chant_turns, side->quick_guard, side->wide_guard,
+        side->crafty_shield, side->mat_block, side->remaining_pokemon);
+}
+
+static void json_write_raw_state(FILE* out, const RawBattleState* state) {
+    int i;
+    if (!state) {
+        fputs("null", out);
+        return;
+    }
+    fprintf(out,
+        "{\"turn_number\":%d,\"can_tera\":%d,\"is_doubles\":%d,\"self_active_count\":%d,\"opp_active_count\":%d,"
+        "\"weather_id\":%d,\"weather_turns_remaining\":%d,\"terrain_id\":%d,\"terrain_turns_remaining\":%d,"
+        "\"trick_room\":%d,\"trick_room_turns_remaining\":%d,\"magic_room\":%d,\"magic_room_turns_remaining\":%d,"
+        "\"wonder_room\":%d,\"wonder_room_turns_remaining\":%d,\"gravity\":%d,\"gravity_turns_remaining\":%d,"
+        "\"mud_sport\":%d,\"water_sport\":%d,\"ion_deluge\":%d,",
+        state->turn_number, state->can_tera, state->is_doubles, state->self_active_count, state->opp_active_count,
+        state->weather_id, state->weather_turns_remaining, state->terrain_id, state->terrain_turns_remaining,
+        state->trick_room, state->trick_room_turns_remaining, state->magic_room, state->magic_room_turns_remaining,
+        state->wonder_room, state->wonder_room_turns_remaining, state->gravity, state->gravity_turns_remaining,
+        state->mud_sport, state->water_sport, state->ion_deluge);
+    fputs("\"self_side\":", out);
+    json_write_raw_side(out, &state->self_side);
+    fputs(",\"opp_side\":", out);
+    json_write_raw_side(out, &state->opp_side);
+    fputs(",\"self_team\":[", out);
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        if (i) fputc(',', out);
+        json_write_raw_pokemon(out, &state->self_team[i]);
+    }
+    fputs("],\"opp_team\":[", out);
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        if (i) fputc(',', out);
+        json_write_raw_pokemon(out, &state->opp_team[i]);
+    }
+    fputs("]}", out);
+}
+
+static void json_write_request(FILE* out, const ParsedRequest* req, const ActionMask* mask) {
+    int i;
+    if (!req) {
+        fputs("null", out);
+        return;
+    }
+    fprintf(out,
+        "{\"request_id\":%d,\"is_doubles\":%d,\"wait\":%d,\"team_preview\":%d,\"max_chosen_team_size\":%d,"
+        "\"active_count\":%d,\"living_active_count\":%d,\"can_tera\":%d,\"forced_switch_any\":%d,",
+        req->request_id, req->is_doubles, req->wait, req->team_preview, req->max_chosen_team_size,
+        req->active_count, req->living_active_count, req->can_tera, req->forced_switch_any);
+    fputs("\"switch_available\":", out);
+    json_write_int_array(out, req->switch_available, PARSED_REQUEST_TEAM_SIZE);
+    fputs(",\"switch_fainted\":", out);
+    json_write_int_array(out, req->switch_fainted, PARSED_REQUEST_TEAM_SIZE);
+    fputs(",\"switch_active\":", out);
+    json_write_int_array(out, req->switch_active, PARSED_REQUEST_TEAM_SIZE);
+    fputs(",\"force_switch\":", out);
+    json_write_int_array(out, req->force_switch, PARSED_REQUEST_ACTIVE_SLOTS);
+    fputs(",\"side\":[", out);
+    for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
+        if (i) fputc(',', out);
+        fputs("{\"ident\":", out);
+        json_write_escaped(out, req->side_ident[i]);
+        fputs(",\"species_id\":", out);
+        fprintf(out, "%d", req->side_species_id[i]);
+        fputs("}", out);
+    }
+    fputs("],\"active\":[", out);
+    for (i = 0; i < PARSED_REQUEST_ACTIVE_SLOTS; ++i) {
+        int m;
+        char part[128];
+        if (i) fputc(',', out);
+        fprintf(out,
+            "{\"slot_present\":%d,\"slot_needs_choice\":%d,\"slot_can_move\":%d,\"slot_can_switch\":%d,"
+            "\"choice_kind\":%d,\"can_tera\":%d,\"tera_type_id\":%d,\"trapped\":%d,\"maybe_trapped\":%d,\"fainted\":%d,"
+            "\"has_force_switch\":%d,\"moves\":[",
+            req->slot_present[i], req->slot_needs_choice[i], req->slot_can_move[i], req->slot_can_switch[i],
+            req->choice_kind[i], req->active[i].can_tera, req->active[i].tera_type_id, req->active[i].trapped,
+            req->active[i].maybe_trapped, req->active[i].fainted, req->active[i].has_force_switch);
+        for (m = 0; m < PARSED_REQUEST_MOVE_SLOTS; ++m) {
+            if (m) fputc(',', out);
+            fputs("{\"move_id\":", out); fprintf(out, "%d", req->active[i].move_id[m]);
+            fputs(",\"move_name\":", out); json_write_escaped(out, move_name_from_id(req->active[i].move_id[m]));
+            fputs(",\"disabled\":", out); fprintf(out, "%d", req->active[i].move_disabled[m]);
+            fputs(",\"maybe_disabled\":", out); fprintf(out, "%d", req->active[i].move_maybe_disabled[m]);
+            fputs(",\"pp\":", out); fprintf(out, "%d", req->active[i].move_pp[m]);
+            fputs(",\"max_pp\":", out); fprintf(out, "%d", req->active[i].move_max_pp[m]);
+            fputs(",\"target\":", out); fprintf(out, "%d", req->active[i].move_target[m]);
+            fputs("}", out);
+        }
+        fputs("],\"legal_actions\":[", out);
+        {
+            int first = 1;
+            enum ObsAction actions[OBS_NUM_ACTIONS];
+            size_t count = mask ? collect_slot_legal_actions(req, mask, i, actions, OBS_NUM_ACTIONS) : 0;
+            size_t a;
+            for (a = 0; a < count; ++a) {
+                if (!first) fputc(',', out);
+                first = 0;
+                part[0] = '\0';
+                action_to_showdown_part(part, sizeof(part), actions[a], req);
+                fprintf(out, "{\"index\":%d,\"name\":", (int)actions[a]);
+                json_write_escaped(out, obs_action_name(actions[a]));
+                fputs(",\"command_part\":", out);
+                json_write_escaped(out, part);
+                fputs("}", out);
+            }
+        }
+        fputs("]}", out);
+    }
+    fputs("],\"raw_json\":", out);
+    json_write_escaped(out, req->raw_json);
+    fputs("}", out);
+}
+
+static int export_battle_snapshots(const char* replay_path, const char* battle_id, const char* output_path) {
+    FILE* in = NULL;
+    FILE* out = NULL;
+    GruModel* model = NULL;
+    EnvRuntime runtime;
+    char line[16384];
+    size_t snapshots = 0;
+    int found_any = 0;
+    int first_snapshot = 1;
+
+    if (!replay_path || !battle_id || !output_path) {
+        return 1;
+    }
+    model = create_default_model();
+    if (!model) {
+        fprintf(stderr, "Failed to create model for battle export\n");
+        return 1;
+    }
+    if (!env_runtime_init(&runtime, model, NULL, 1)) {
+        fprintf(stderr, "Failed to initialize runtime for battle export\n");
+        gru_model_destroy(model);
+        return 1;
+    }
+    in = fopen(replay_path, "r");
+    if (!in) {
+        fprintf(stderr, "Failed to open replay file '%s': %s\n", replay_path, strerror(errno));
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 1;
+    }
+    out = fopen(output_path, "w");
+    if (!out) {
+        fprintf(stderr, "Failed to open output file '%s': %s\n", output_path, strerror(errno));
+        fclose(in);
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 1;
+    }
+
+    fputs("{\"battle_id\":", out);
+    json_write_escaped(out, battle_id);
+    fputs(",\"snapshots\":[", out);
+
+    while (fgets(line, sizeof(line), in)) {
+        RuntimeMessage msg;
+        EnvSession* session;
+        runtime_message_init(&msg);
+        if (!runtime_message_parse(&msg, line)) {
+            continue;
+        }
+        if (strcmp(msg.battle_id, battle_id) != 0) {
+            continue;
+        }
+        found_any = 1;
+        if (!env_runtime_handle_message(&runtime, &msg, NULL)) {
+            continue;
+        }
+        session = find_runtime_session_by_id(&runtime, battle_id);
+        if (!first_snapshot) {
+            fputc(',', out);
+        }
+        first_snapshot = 0;
+        fputs("{\"index\":", out);
+        fprintf(out, "%zu", snapshots);
+        fputs(",\"message_type\":", out);
+        json_write_escaped(out, runtime_message_type_name(msg.type));
+        fputs(",\"message\":{", out);
+        fputs("\"request_id\":", out); fprintf(out, "%d", msg.request_id);
+        fputs(",\"seq\":", out); fprintf(out, "%d", msg.seq);
+        fputs(",\"result\":", out); json_write_escaped(out, msg.result);
+        fputs(",\"reward\":", out); fprintf(out, "%.3f", msg.reward);
+        fputs(",\"action\":", out); fprintf(out, "%d", msg.action);
+        fputs(",\"action2\":", out); fprintf(out, "%d", msg.action2);
+        fputs(",\"accepted\":", out); fprintf(out, "%d", msg.accepted);
+        fputs(",\"command\":", out); json_write_escaped(out, msg.command);
+        fputs(",\"line\":", out); json_write_escaped(out, msg.line);
+        fputs(",\"payload\":", out); json_write_escaped(out, msg.payload);
+        fputs(",\"raw_record\":", out); json_write_escaped(out, line);
+        fputs("}", out);
+        fputs(",\"session\":", out);
+        if (!session) {
+            fputs("null", out);
+        } else {
+            fputs("{\"last_request_id\":", out); fprintf(out, "%d", session->last_request_id);
+            fputs(",\"terminal\":", out); fprintf(out, "%d", session->terminal);
+            fputs(",\"ready_for_decision\":", out); fprintf(out, "%d", session->ready_for_decision);
+            fputs(",\"pending_action\":", out); fprintf(out, "%d", session->pending_action);
+            fputs(",\"pending_action2\":", out); fprintf(out, "%d", session->pending_action2);
+            fputs(",\"pending_command\":", out); json_write_escaped(out, session->pending_command);
+            fputs(",\"episode_count\":", out); fprintf(out, "%zu", session->episode.count);
+            fputs(",\"raw_state\":", out); json_write_raw_state(out, &session->raw_state);
+            fputs(",\"request\":", out); json_write_request(out, &session->parsed_request, &session->action_mask);
+            fputs(",\"flat_observation\":", out); json_write_float_array(out, session->flat_observation, runtime.obs_dim);
+            fputs("}", out);
+        }
+        fputs("}", out);
+        ++snapshots;
+        if (msg.type == RUNTIME_MSG_BATTLE_END) {
+            break;
+        }
+    }
+
+    fputs("]}\n", out);
+    fclose(out);
+    fclose(in);
+    env_runtime_free(&runtime);
+    gru_model_destroy(model);
+
+    if (!found_any) {
+        fprintf(stderr, "Battle '%s' was not found in '%s'\n", battle_id, replay_path);
+        return 1;
+    }
+    printf("[export-battle] replay=%s battle_id=%s output=%s snapshots=%zu\n",
+        replay_path, battle_id, output_path, snapshots);
+    return 0;
+}
+
 static int evaluate_checkpoint_on_replay_file(const char* replay_path, const char* checkpoint_path) {
     char* resolved_checkpoint_path = NULL;
     GruModel* model = NULL;
@@ -1098,6 +1551,9 @@ int main(int argc, char** argv) {
     if (argc >= 4 && strcmp(argv[1], "--clean-replay") == 0) {
         return clean_replay_file(argv[2], argv[3]);
     }
+    if (argc >= 5 && strcmp(argv[1], "--export-battle") == 0) {
+        return export_battle_snapshots(argv[2], argv[3], argv[4]);
+    }
 
 #ifdef HAVE_NATIVE_SHOWDOWN_CLIENT
     const char* host = "sim3.psim.us"; // Showdown sim host (rotates)
@@ -1121,6 +1577,7 @@ int main(int argc, char** argv) {
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal]\n"
         "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
+        "  showdown_client --export-battle <replay.jsonl> <battle_id> <output.json>\n"
         "  Set PORYGON_DEMO_GRU=1 for the demo mode.\n"
         "Legacy native websocket mode is disabled; use the Python communicator for live Showdown.\n");
     return 1;
