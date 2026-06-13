@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -17,12 +18,16 @@ class LearnerProcess:
         env = os.environ.copy()
         if self._replay_path is not None:
             env["PORYGON_REPLAY_PATH"] = str(self._replay_path)
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         self._process = await asyncio.create_subprocess_exec(
             *self._command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            creationflags=creationflags,
         )
 
     async def send(self, payload: Dict[str, Any]) -> None:
