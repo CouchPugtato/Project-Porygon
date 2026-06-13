@@ -79,6 +79,13 @@ def event_summary(event: ShowdownEvent) -> str | None:
     return None
 
 
+def is_disconnect_or_forfeit_end(line: str) -> bool:
+    if not line.startswith("|-message|"):
+        return False
+    lowered = line.lower()
+    return " forfeited." in lowered or "lost due to inactivity." in lowered
+
+
 def is_fainted_condition(condition: str) -> bool:
     return "fnt" in condition.lower()
 
@@ -565,6 +572,7 @@ async def capture_mode(out_path: Path, fmt: str, username: str, max_games: int |
     writer = ReplayWriter(out_path)
     stats = MatchStats(out_path)
     started_battles: set[str] = set()
+    disconnect_or_forfeit_end: dict[str, bool] = {}
     finished_battles = 0
     seq = 0
 
@@ -575,6 +583,7 @@ async def capture_mode(out_path: Path, fmt: str, username: str, max_games: int |
 
         if event.room_id.startswith("battle-") and event.room_id not in started_battles:
             started_battles.add(event.room_id)
+            disconnect_or_forfeit_end[event.room_id] = False
             writer.append(
                 battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json()
             )
@@ -590,14 +599,20 @@ async def capture_mode(out_path: Path, fmt: str, username: str, max_games: int |
             payload = event.line.split("|request|", 1)[1]
             writer.append(request_message(event.room_id, seq, json.loads(payload)).to_json())
             print(f"[capture] request {seq} for {battle_label(event.room_id)}")
+        elif is_disconnect_or_forfeit_end(event.line):
+            disconnect_or_forfeit_end[event.room_id] = True
+            writer.append(event_message(event.room_id, seq, event.line).to_json())
         elif event.line.startswith("|win|") or event.line.startswith("|tie|"):
             result = "win" if event.line.startswith("|win|") else "draw"
             reward = 1.0 if result == "win" else 0.0
+            if disconnect_or_forfeit_end.get(event.room_id, False):
+                reward = 0.0
             writer.append(terminal_message(event.room_id, result, reward).to_json())
             writer.append(battle_end(event.room_id).to_json())
             finished_battles += 1
             stats.note_battle(result, None)
             print(f"[capture] finished {event.room_id} result={result} total_matches_captured={finished_battles}")
+            disconnect_or_forfeit_end.pop(event.room_id, None)
             if max_games is not None and finished_battles >= max_games:
                 print(f"[capture] reached max games ({max_games}), stopping")
                 await gateway.close()
@@ -635,6 +650,7 @@ async def live_mode(
     pending_decisions: dict[str, dict] = {}
     battle_players: dict[str, dict[str, str]] = {}
     battle_ratings: dict[str, dict[str, int | None]] = {}
+    disconnect_or_forfeit_end: dict[str, bool] = {}
     announced_matchups: set[str] = set()
     invalid_choice_count = 0
     fallback_used_count = 0
@@ -810,6 +826,8 @@ async def live_mode(
             else:
                 final_result = "loss"
                 reward = -1.0
+            if disconnect_or_forfeit_end.get(event.room_id, False):
+                reward = 0.0
             await learner.send(terminal_message(event.room_id, final_result, reward).payload)
             await learner.send(battle_end(event.room_id).payload)
             stats.note_battle(final_result, bot_rating)
@@ -842,6 +860,7 @@ async def live_mode(
             )
             request_open[event.room_id] = False
             latest_request_identity.pop(event.room_id, None)
+            disconnect_or_forfeit_end.pop(event.room_id, None)
             battle_current_turn.pop(event.room_id, None)
             finished_battles += 1
             if max_games is not None and finished_battles >= max_games:
@@ -852,6 +871,7 @@ async def live_mode(
                 await gateway.search_next_battle()
         else:
             if event.room_id.startswith("battle-") and event.line.startswith("|init|battle"):
+                disconnect_or_forfeit_end[event.room_id] = False
                 battle_current_turn[event.room_id] = 0
                 battle_first_tera_turn[event.room_id] = None
                 battle_invalid_choice_count[event.room_id] = 0
@@ -864,6 +884,8 @@ async def live_mode(
                 print(f"[live] battle started {event.room_id}")
                 await gateway.send_room_command(event.room_id, "/timer on")
                 print(f"[live] timer enabled for {event.room_id}")
+            elif is_disconnect_or_forfeit_end(event.line):
+                disconnect_or_forfeit_end[event.room_id] = True
             elif event.line.startswith("|turn|"):
                 parts = event.line.split("|")
                 if len(parts) >= 3:
