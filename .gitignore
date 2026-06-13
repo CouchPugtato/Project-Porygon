@@ -1,6 +1,7 @@
 build-local/
 build/
 matches/
+models/
 
 CMakeFiles/
 CMakeCache.txt
