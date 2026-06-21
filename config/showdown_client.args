@@ -1,0 +1,3 @@
+# Default showdown_client invocation when launched with no CLI args.
+# One token per line.
+--runtime

@@ -23,6 +23,7 @@ THINK_DELAY_MIN_SECONDS = 0.8
 THINK_DELAY_MAX_SECONDS = 5.0
 FALLBACK_DELAY_MIN_SECONDS = 0.4
 FALLBACK_DELAY_MAX_SECONDS = 1.2
+DEFAULT_ARGS_PATH = Path("config/communicator.args")
 PROTECT_MOVE_NAMES = {
     "protect",
     "detect",
@@ -34,6 +35,18 @@ PROTECT_MOVE_NAMES = {
     "obstruct",
     "endure",
 }
+
+
+def load_default_args(path: Path) -> list[str]:
+    args: list[str] = []
+    if not path.exists():
+        return args
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        args.append(line)
+    return args
 
 
 def battle_label(battle_id: str) -> str:
@@ -1010,7 +1023,10 @@ def main() -> None:
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--username", default="")
     parser.add_argument("--max-games", type=int, default=0)
-    args, learner_passthrough = parser.parse_known_args()
+    argv = sys.argv[1:]
+    if not argv:
+        argv = load_default_args(DEFAULT_ARGS_PATH)
+    args, learner_passthrough = parser.parse_known_args(argv)
     max_games = args.max_games if args.max_games > 0 else None
 
     if args.mode == "capture":

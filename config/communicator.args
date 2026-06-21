@@ -1,0 +1,11 @@
+# Default communicator invocation when launched with no CLI args.
+# One token per line.
+--mode
+live
+--replay-path
+matches/runtime_capture.jsonl
+--learner-command
+.\build-fresh\showdown_client.exe
+--format
+gen9randomdoublesbattle
+--runtime

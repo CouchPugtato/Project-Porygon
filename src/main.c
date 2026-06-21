@@ -11,10 +11,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <ctype.h>
 
 #ifdef HAVE_NATIVE_SHOWDOWN_CLIENT
 #include "showdown_client.h"
 #endif
+
+#define SHOWDOWN_CLIENT_DEFAULT_ARGS_PATH "config/showdown_client.args"
 
 static GruModel* create_default_model(void) {
     return gru_model_create(observation_flat_size(), 128, OBS_NUM_ACTIONS);
@@ -140,6 +143,92 @@ static char* make_best_checkpoint_path(const char* base_path) {
 
 static double elapsed_seconds_since(clock_t start_clock) {
     return (double)(clock() - start_clock) / (double)CLOCKS_PER_SEC;
+}
+
+static char* trim_whitespace(char* text) {
+    char* end;
+    if (!text) {
+        return NULL;
+    }
+    while (*text && isspace((unsigned char)*text)) {
+        ++text;
+    }
+    if (!*text) {
+        return text;
+    }
+    end = text + strlen(text) - 1;
+    while (end > text && isspace((unsigned char)*end)) {
+        *end-- = '\0';
+    }
+    return text;
+}
+
+static char** load_default_args_file(const char* path, int* out_argc) {
+    FILE* fp;
+    char line[1024];
+    char** args = NULL;
+    int count = 0;
+    int capacity = 0;
+    if (out_argc) {
+        *out_argc = 0;
+    }
+    if (!path) {
+        return NULL;
+    }
+    fp = fopen(path, "r");
+    if (!fp) {
+        return NULL;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        char* token = trim_whitespace(line);
+        char* copy;
+        if (!token || !*token || *token == '#') {
+            continue;
+        }
+        if (count >= capacity) {
+            int new_capacity = capacity > 0 ? capacity * 2 : 8;
+            char** resized = (char**)realloc(args, (size_t)new_capacity * sizeof(char*));
+            if (!resized) {
+                int i;
+                for (i = 0; i < count; ++i) {
+                    free(args[i]);
+                }
+                free(args);
+                fclose(fp);
+                return NULL;
+            }
+            args = resized;
+            capacity = new_capacity;
+        }
+        copy = (char*)malloc(strlen(token) + 1);
+        if (!copy) {
+            int i;
+            for (i = 0; i < count; ++i) {
+                free(args[i]);
+            }
+            free(args);
+            fclose(fp);
+            return NULL;
+        }
+        strcpy(copy, token);
+        args[count++] = copy;
+    }
+    fclose(fp);
+    if (out_argc) {
+        *out_argc = count;
+    }
+    return args;
+}
+
+static void free_default_args(char** args, int argc) {
+    int i;
+    if (!args) {
+        return;
+    }
+    for (i = 0; i < argc; ++i) {
+        free(args[i]);
+    }
+    free(args);
 }
 
 static int parse_epochs_arg(int argc, char** argv, int default_epochs) {
@@ -1690,7 +1779,7 @@ static int clean_replay_file(const char* input_path, const char* output_path) {
     return 0;
 }
 
-int main(int argc, char** argv) {
+static int showdown_client_main(int argc, char** argv) {
     int epochs = parse_epochs_arg(argc, argv, 1);
     float rl_gamma = parse_float_flag(argc, argv, "--gamma", 1.0f);
     float rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef", 0.001f);
@@ -1750,5 +1839,39 @@ int main(int argc, char** argv) {
         "Legacy native websocket mode is disabled; use the Python communicator for live Showdown.\n");
     return 1;
 #endif
+}
+
+int main(int argc, char** argv) {
+    char** config_args = NULL;
+    char** merged_argv = NULL;
+    int config_argc = 0;
+    int effective_argc = argc;
+    char** effective_argv = argv;
+    int rc;
+
+    if (argc == 1) {
+        config_args = load_default_args_file(SHOWDOWN_CLIENT_DEFAULT_ARGS_PATH, &config_argc);
+        if (config_args && config_argc > 0) {
+            int i;
+            merged_argv = (char**)malloc((size_t)(config_argc + 2) * sizeof(char*));
+            if (!merged_argv) {
+                free_default_args(config_args, config_argc);
+                fprintf(stderr, "Failed to allocate default argv\n");
+                return 1;
+            }
+            merged_argv[0] = argv[0];
+            for (i = 0; i < config_argc; ++i) {
+                merged_argv[i + 1] = config_args[i];
+            }
+            merged_argv[config_argc + 1] = NULL;
+            effective_argc = config_argc + 1;
+            effective_argv = merged_argv;
+        }
+    }
+
+    rc = showdown_client_main(effective_argc, effective_argv);
+    free(merged_argv);
+    free_default_args(config_args, config_argc);
+    return rc;
 }
 
