@@ -656,6 +656,209 @@ async def capture_mode(out_path: Path, fmt: str, username: str, max_games: int |
     await gateway.run(on_event)
 
 
+async def random_mode(
+    replay_path: Path,
+    fmt: str,
+    username: str,
+    max_games: int | None = None,
+) -> None:
+    gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
+    writer = ReplayWriter(replay_path)
+    stats = MatchStats(replay_path)
+    seq = 0
+    latest_requests: dict[str, dict] = {}
+    latest_request_identity: dict[str, tuple[int | None, str]] = {}
+    attempted_commands: dict[str, set[str]] = {}
+    request_open: dict[str, bool] = {}
+    invalid_retry_count: dict[str, int] = {}
+    battle_players: dict[str, dict[str, str]] = {}
+    battle_ratings: dict[str, dict[str, int | None]] = {}
+    disconnect_or_forfeit_end: dict[str, bool] = {}
+    announced_matchups: set[str] = set()
+    finished_battles = 0
+    invalid_choice_count = 0
+    fallback_used_count = 0
+    accepted_count = 0
+    total_action_counts = empty_action_counts()
+    battle_current_turn: dict[str, int] = {}
+    battle_first_tera_turn: dict[str, int | None] = {}
+    active_battles: set[str] = set()
+    stop_after_current_battle = asyncio.Event()
+
+    async def request_shutdown() -> None:
+        if active_battles:
+            if not stop_after_current_battle.is_set():
+                stop_after_current_battle.set()
+                print("[random] shutdown requested; will stop after the current battle finishes")
+            return
+        print("[random] shutdown requested with no active battle; stopping now")
+        await gateway.close()
+
+    loop = asyncio.get_running_loop()
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def handle_sigint(_signum: int, _frame: object) -> None:
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(request_shutdown()))
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    async def send_random_choice(room_id: str, request_payload: dict, initial: bool) -> None:
+        nonlocal fallback_used_count, accepted_count
+        candidate = next_fallback_command(request_payload, attempted_commands.setdefault(room_id, set()))
+        if candidate is None:
+            print(
+                f"[random] no legal random candidates left for {battle_label(room_id)} "
+                f"forceSwitch={request_payload.get('forceSwitch')} legal_switches={legal_switch_indices(request_payload)}"
+            )
+            request_open[room_id] = False
+            return
+        if not initial:
+            fallback_used_count += 1
+        else:
+            accepted_count += 1
+        if command_uses_tera(candidate) and battle_first_tera_turn.get(room_id) is None:
+            battle_first_tera_turn[room_id] = battle_current_turn.get(room_id, 0)
+        tally_command_categories(request_payload, candidate, total_action_counts)
+        print(f"[random] action for {battle_label(room_id)}: {candidate}")
+        await randomized_send_delay(
+            THINK_DELAY_MIN_SECONDS if initial else FALLBACK_DELAY_MIN_SECONDS,
+            THINK_DELAY_MAX_SECONDS if initial else FALLBACK_DELAY_MAX_SECONDS,
+        )
+        await gateway.send_room_command(room_id, candidate)
+
+    async def on_event(event: ShowdownEvent) -> None:
+        nonlocal seq, finished_battles, invalid_choice_count
+        summary = event_summary(event)
+        if summary:
+            print(summary)
+        player_info = parse_player_metadata(event.line)
+        if player_info is not None:
+            side, username_found, rating = player_info
+            players = battle_players.setdefault(event.room_id, {})
+            ratings = battle_ratings.setdefault(event.room_id, {})
+            players[side] = username_found
+            ratings[side] = rating
+            if event.room_id not in announced_matchups and "p1" in players and "p2" in players:
+                print()
+                print(
+                    f"[stats] matches={stats.matches_played} record={stats.record} earned_wins={stats.earned_wins} max_rating={stats.max_rating} "
+                    f"moves={stats.total_moves} protects={stats.total_protects} "
+                    f"passes={stats.total_passes} teras={stats.total_teras} "
+                    f"avg_turns_until_tera={stats.avg_turns_until_tera:.2f}"
+                )
+                print(
+                    f"[matchup] {players['p1']} ({ratings.get('p1', '?') if ratings.get('p1') is not None else '?'}) vs "
+                    f"{players['p2']} ({ratings.get('p2', '?') if ratings.get('p2') is not None else '?'})"
+                )
+                announced_matchups.add(event.room_id)
+        if event.line.startswith("|request|"):
+            payload = event.line.split("|request|", 1)[1]
+            request_payload = json.loads(payload)
+            request_identity = (
+                request_payload.get("rqid") if isinstance(request_payload, dict) else None,
+                json.dumps(request_payload, sort_keys=True, separators=(",", ":")),
+            )
+            if request_open.get(event.room_id, False) and latest_request_identity.get(event.room_id) == request_identity:
+                print(f"[random] duplicate request ignored for {battle_label(event.room_id)}")
+                return
+            latest_requests[event.room_id] = request_payload
+            latest_request_identity[event.room_id] = request_identity
+            attempted_commands[event.room_id] = set()
+            request_open[event.room_id] = True
+            invalid_retry_count[event.room_id] = 0
+            writer.append(request_message(event.room_id, seq, request_payload).to_json())
+            print(f"[random] request {seq} for {battle_label(event.room_id)}")
+            await send_random_choice(event.room_id, request_payload, initial=True)
+        elif event.line.startswith("|error|") and "Invalid choice" in event.line:
+            invalid_choice_count += 1
+            request_payload = latest_requests.get(event.room_id)
+            if "There's nothing to choose" in event.line:
+                request_open[event.room_id] = False
+                print(f"[random] request closed for {battle_label(event.room_id)} after stale choice rejection")
+                return
+            if request_payload is not None and request_open.get(event.room_id, False):
+                invalid_retry_count[event.room_id] = invalid_retry_count.get(event.room_id, 0) + 1
+                if invalid_retry_count[event.room_id] > MAX_INVALID_RETRIES_PER_REQUEST:
+                    request_open[event.room_id] = False
+                    print(f"[random] request closed for {battle_label(event.room_id)} after too many invalid retries")
+                    return
+                await send_random_choice(event.room_id, request_payload, initial=False)
+        elif event.line.startswith("|win|") or event.line.startswith("|tie|"):
+            players = battle_players.get(event.room_id, {})
+            ratings = battle_ratings.get(event.room_id, {})
+            winner_name = event.line.split("|", 2)[2] if event.line.startswith("|win|") and "|" in event.line else ""
+            bot_side = identify_bot_side(players, gateway.current_username)
+            bot_rating = ratings.get(bot_side)
+            if event.line.startswith("|tie|"):
+                final_result = "draw"
+                reward = 0.0
+            elif bot_side is not None and players.get(bot_side) == winner_name:
+                final_result = "win"
+                reward = 1.0
+            else:
+                final_result = "loss"
+                reward = -1.0
+            disconnected_or_forfeited = disconnect_or_forfeit_end.get(event.room_id, False)
+            if disconnected_or_forfeited:
+                reward = 0.0
+            writer.append(terminal_message(event.room_id, final_result, reward).to_json())
+            writer.append(battle_end(event.room_id).to_json())
+            stats.note_battle(
+                final_result,
+                bot_rating,
+                earned_win=(final_result == "win" and not disconnected_or_forfeited),
+            )
+            stats.note_live_totals(
+                invalid_choice_count,
+                fallback_used_count,
+                accepted_count,
+                total_action_counts,
+                battle_first_tera_turn.pop(event.room_id, None),
+            )
+            print(f"[random] battle ended {event.room_id} result={final_result}")
+            request_open[event.room_id] = False
+            latest_request_identity.pop(event.room_id, None)
+            disconnect_or_forfeit_end.pop(event.room_id, None)
+            battle_current_turn.pop(event.room_id, None)
+            active_battles.discard(event.room_id)
+            finished_battles += 1
+            if max_games is not None and finished_battles >= max_games:
+                print(f"[random] reached max games ({max_games}), stopping")
+                await gateway.close()
+            elif stop_after_current_battle.is_set():
+                print("[random] current battle finished; stopping")
+                await gateway.close()
+            else:
+                await gateway.search_next_battle()
+        else:
+            if event.room_id.startswith("battle-") and event.room_id not in active_battles and event.line.startswith("|init|battle"):
+                active_battles.add(event.room_id)
+                disconnect_or_forfeit_end[event.room_id] = False
+                battle_current_turn[event.room_id] = 0
+                battle_first_tera_turn[event.room_id] = None
+                writer.append(battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json())
+                print(f"[random] battle started {event.room_id}")
+                await gateway.send_room_command(event.room_id, "/timer on")
+                print(f"[random] timer enabled for {event.room_id}")
+            elif is_disconnect_or_forfeit_end(event.line):
+                disconnect_or_forfeit_end[event.room_id] = True
+            elif event.line.startswith("|turn|"):
+                parts = event.line.split("|")
+                if len(parts) >= 3:
+                    try:
+                        battle_current_turn[event.room_id] = int(parts[2])
+                    except ValueError:
+                        pass
+            writer.append(event_message(event.room_id, seq, event.line).to_json())
+        seq += 1
+
+    await gateway.connect()
+    try:
+        await gateway.run(on_event)
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+
+
 async def live_mode(
     learner_command: list[str],
     replay_path: Path | None,
@@ -1024,7 +1227,7 @@ async def live_mode(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["live", "capture"], default="live")
+    parser.add_argument("--mode", choices=["live", "capture", "random"], default="live")
     parser.add_argument("--replay-save", default="runtime_capture")
     parser.add_argument("--learner-command", default="./showdown_client")
     parser.add_argument("--learner-args", nargs="*", default=[])
@@ -1040,6 +1243,8 @@ def main() -> None:
 
     if args.mode == "capture":
         asyncio.run(capture_mode(replay_path, args.format, args.username, max_games=max_games))
+    elif args.mode == "random":
+        asyncio.run(random_mode(replay_path, args.format, args.username, max_games=max_games))
     else:
         learner_args = list(args.learner_args) + list(learner_passthrough)
         if not learner_args:
