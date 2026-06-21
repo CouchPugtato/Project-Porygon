@@ -177,17 +177,17 @@ static int extract_json_object_value(const char* line, const char* key, char* ou
     return 1;
 }
 
-static int replay_capture_battle(const char* battle_id, int stop_after_turn_request, CaptureReplayResult* out) {
+static int replay_capture_battle_from_path(const char* path, const char* battle_id, int stop_after_turn_request, CaptureReplayResult* out) {
     FILE* fp;
     char line[TEST_JSONL_LINE_MAX];
     char line_battle_id[256];
     char type[64];
-    if (!battle_id || !out) {
+    if (!path || !battle_id || !out) {
         return 0;
     }
     memset(out, 0, sizeof(*out));
     raw_battle_state_init(&out->state, 1);
-    fp = fopen(TEST_CAPTURE_PATH, "r");
+    fp = fopen(path, "r");
     if (!fp) {
         return 0;
     }
@@ -265,6 +265,10 @@ static int replay_capture_battle(const char* battle_id, int stop_after_turn_requ
     return out->saw_battle_start != 0;
 }
 
+static int replay_capture_battle(const char* battle_id, int stop_after_turn_request, CaptureReplayResult* out) {
+    return replay_capture_battle_from_path(TEST_CAPTURE_PATH, battle_id, stop_after_turn_request, out);
+}
+
 static int state_slot_maps_consistent(const RawBattleState* state) {
     int slot;
     if (!state) {
@@ -327,6 +331,88 @@ static int assert_capture_replay_sane(const CaptureReplayResult* replay, const c
     snprintf(message, sizeof(message), "%s opponent remaining count stays synchronized", label);
     if (!assert_true(team_remaining_matches(replay->state.opp_team, replay->state.opp_side.remaining_pokemon), message)) return 0;
     return 1;
+}
+
+static int battle_id_seen(char ids[][256], int count, const char* battle_id) {
+    int i;
+    for (i = 0; i < count; ++i) {
+        if (strcmp(ids[i], battle_id) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int run_batch_replay_mode(const char* path) {
+    FILE* fp;
+    char line[TEST_JSONL_LINE_MAX];
+    char battle_id[256];
+    char type[64];
+    char result[32];
+    char seen_ids[512][256];
+    int seen_count = 0;
+    int terminal_count = 0;
+    int clean_count = 0;
+    int pass_count = 0;
+    int skipped_disconnect = 0;
+
+    if (!path) {
+        fprintf(stderr, "batch replay requires a jsonl path\n");
+        return 1;
+    }
+    fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "failed to open batch replay file: %s\n", path);
+        return 1;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        CaptureReplayResult replay;
+        char label[320];
+        if (!extract_json_string_value(line, "type", type, sizeof(type))) {
+            continue;
+        }
+        if (strcmp(type, "terminal") != 0) {
+            continue;
+        }
+        if (!extract_json_string_value(line, "battle_id", battle_id, sizeof(battle_id))) {
+            continue;
+        }
+        if (battle_id_seen(seen_ids, seen_count, battle_id)) {
+            continue;
+        }
+        if (!extract_json_string_value(line, "result", result, sizeof(result))) {
+            continue;
+        }
+        if (strcmp(result, "win") != 0 && strcmp(result, "loss") != 0) {
+            continue;
+        }
+        if (seen_count < (int)(sizeof(seen_ids) / sizeof(seen_ids[0]))) {
+            strncpy(seen_ids[seen_count], battle_id, sizeof(seen_ids[seen_count]) - 1);
+            seen_ids[seen_count][sizeof(seen_ids[seen_count]) - 1] = '\0';
+            ++seen_count;
+        }
+        ++terminal_count;
+        if (!replay_capture_battle_from_path(path, battle_id, 0, &replay)) {
+            fclose(fp);
+            fprintf(stderr, "batch replay failed to parse battle: %s\n", battle_id);
+            return 1;
+        }
+        if (replay.saw_disconnect_loss) {
+            ++skipped_disconnect;
+            continue;
+        }
+        ++clean_count;
+        snprintf(label, sizeof(label), "batch replay %s", battle_id);
+        if (!assert_capture_replay_sane(&replay, label)) {
+            fclose(fp);
+            return 1;
+        }
+        ++pass_count;
+    }
+    fclose(fp);
+    printf("batch replay passed: %d clean battles (%d terminal seen, %d skipped disconnect) from %s\n",
+        pass_count, terminal_count, skipped_disconnect, path);
+    return clean_count == pass_count ? 0 : 1;
 }
 
 static int test_request_reconciliation_preserves_identity(void) {
@@ -2267,9 +2353,19 @@ static int test_synthetic_weather_clear_sets_unknown_duration(void) {
     return assert_true(state.weather_id == 0 && state.weather_turns_remaining.knowledge == KNOW_UNKNOWN, "synthetic weather clear resets id and duration knowledge");
 }
 
-int main(void) {
+int main(int argc, char** argv) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
+        return 1;
+    }
+    if (argc >= 3 && strcmp(argv[1], "--batch-replay") == 0) {
+        return run_batch_replay_mode(argv[2]);
+    }
+    if (argc > 1) {
+        fprintf(stderr, "unknown arguments\n");
+        fprintf(stderr, "usage:\n");
+        fprintf(stderr, "  %s\n", argv[0]);
+        fprintf(stderr, "  %s --batch-replay <jsonl_path>\n", argv[0]);
         return 1;
     }
     if (!test_request_reconciliation_preserves_identity()) return 1;
