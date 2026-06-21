@@ -304,6 +304,56 @@ def next_fallback_command(
     return None
 
 
+def weighted_random_command(
+    request_payload: dict,
+    attempted: set[str],
+) -> str | None:
+    candidates = [candidate for candidate in fallback_commands_for_request(request_payload) if candidate not in attempted]
+    if not candidates:
+        return None
+    if request_payload.get("teamPreview"):
+        choice = random.choice(candidates)
+        attempted.add(choice)
+        return choice
+
+    active = request_payload.get("active", [])
+    inferred_slots = len(active)
+    raw_force_switch = request_payload.get("forceSwitch")
+    if isinstance(raw_force_switch, list) and len(raw_force_switch) > inferred_slots:
+        inferred_slots = len(raw_force_switch)
+    if inferred_slots <= 0:
+        inferred_slots = 1
+    if any(force_switch_flags(request_payload, inferred_slots)):
+        choice = random.choice(candidates)
+        attempted.add(choice)
+        return choice
+
+    weighted_candidates: list[tuple[str, int]] = []
+    for candidate in candidates:
+        weight = 1
+        for part in parse_choose_parts(candidate):
+            if part.startswith("move "):
+                weight *= 8
+            elif part.startswith("switch "):
+                weight *= 1
+            elif part == "pass":
+                weight *= 1
+        weighted_candidates.append((candidate, max(weight, 1)))
+
+    total_weight = sum(weight for _, weight in weighted_candidates)
+    roll = random.randint(1, total_weight)
+    cumulative = 0
+    for candidate, weight in weighted_candidates:
+        cumulative += weight
+        if roll <= cumulative:
+            attempted.add(candidate)
+            return candidate
+
+    choice = weighted_candidates[-1][0]
+    attempted.add(choice)
+    return choice
+
+
 def command_slot_indices(request_payload: dict) -> list[int]:
     if request_payload.get("teamPreview"):
         return []
@@ -704,7 +754,7 @@ async def random_mode(
 
     async def send_random_choice(room_id: str, request_payload: dict, initial: bool) -> None:
         nonlocal fallback_used_count, accepted_count
-        candidate = next_fallback_command(request_payload, attempted_commands.setdefault(room_id, set()))
+        candidate = weighted_random_command(request_payload, attempted_commands.setdefault(room_id, set()))
         if candidate is None:
             print(
                 f"[random] no legal random candidates left for {battle_label(room_id)} "
