@@ -1022,12 +1022,12 @@ def main() -> None:
     parser.add_argument("--learner-args", nargs="*", default=[])
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--username", default="")
-    parser.add_argument("--max-games", type=int, default=0)
+    parser.add_argument("--games", type=int, default=0)
     argv = sys.argv[1:]
     if not argv:
         argv = load_default_args(DEFAULT_ARGS_PATH)
     args, learner_passthrough = parser.parse_known_args(argv)
-    max_games = args.max_games if args.max_games > 0 else None
+    max_games = args.games if args.games > 0 else None
 
     if args.mode == "capture":
         asyncio.run(capture_mode(Path(args.replay_path), args.format, args.username, max_games=max_games))
