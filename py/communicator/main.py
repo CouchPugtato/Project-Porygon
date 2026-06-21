@@ -49,6 +49,14 @@ def load_default_args(path: Path) -> list[str]:
     return args
 
 
+def resolve_replay_save_path(run_name: str) -> Path:
+    normalized = (run_name or "").strip()
+    if not normalized:
+        normalized = "runtime_capture"
+    run_dir = Path("matches") / "runs" / normalized
+    return run_dir / f"{normalized}_raw.jsonl"
+
+
 def battle_label(battle_id: str) -> str:
     return battle_id if battle_id else "unknown-battle"
 
@@ -1017,7 +1025,7 @@ async def live_mode(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["live", "capture"], default="live")
-    parser.add_argument("--replay-path", default="matches/runtime_capture.jsonl")
+    parser.add_argument("--replay-save", default="runtime_capture")
     parser.add_argument("--learner-command", default="./showdown_client")
     parser.add_argument("--learner-args", nargs="*", default=[])
     parser.add_argument("--format", default="gen9randomdoublesbattle")
@@ -1028,9 +1036,10 @@ def main() -> None:
         argv = load_default_args(DEFAULT_ARGS_PATH)
     args, learner_passthrough = parser.parse_known_args(argv)
     max_games = args.games if args.games > 0 else None
+    replay_path = resolve_replay_save_path(args.replay_save)
 
     if args.mode == "capture":
-        asyncio.run(capture_mode(Path(args.replay_path), args.format, args.username, max_games=max_games))
+        asyncio.run(capture_mode(replay_path, args.format, args.username, max_games=max_games))
     else:
         learner_args = list(args.learner_args) + list(learner_passthrough)
         if not learner_args:
@@ -1039,7 +1048,7 @@ def main() -> None:
         asyncio.run(
             live_mode(
                 learner_command,
-                Path(args.replay_path),
+                replay_path,
                 args.format,
                 args.username,
                 max_games=max_games,

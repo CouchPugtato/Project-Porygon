@@ -19,3 +19,9 @@ python -m py.communicator.main
 ```
 
 Those commands will use the tokens from these files automatically.
+
+For the communicator, `--replay-save <run_name>` resolves to:
+
+```text
+matches/runs/<run_name>/<run_name>_raw.jsonl
+```

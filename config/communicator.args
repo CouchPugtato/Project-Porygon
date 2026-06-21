@@ -2,8 +2,8 @@
 # One token per line.
 --mode
 live
---replay-path
-matches/runtime_capture.jsonl
+--replay-save
+runtime_capture
 --learner-command
 .\build-fresh\showdown_client.exe
 --format
