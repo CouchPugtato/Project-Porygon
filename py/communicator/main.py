@@ -673,6 +673,7 @@ async def live_mode(
     battle_action_counts: dict[str, dict[str, int]] = {}
     active_battles: set[str] = set()
     stop_after_current_battle = asyncio.Event()
+    learner_stopping = asyncio.Event()
 
     async def request_shutdown() -> None:
         if active_battles:
@@ -681,6 +682,7 @@ async def live_mode(
                 print("[live] shutdown requested; will stop after the current battle finishes")
             return
         print("[live] shutdown requested with no active battle; stopping now")
+        learner_stopping.set()
         await gateway.close()
         await learner.terminate()
 
@@ -899,10 +901,12 @@ async def live_mode(
             finished_battles += 1
             if max_games is not None and finished_battles >= max_games:
                 print(f"[live] reached max games ({max_games}), stopping")
+                learner_stopping.set()
                 await gateway.close()
                 await learner.terminate()
             elif stop_after_current_battle.is_set():
                 print("[live] current battle finished; stopping")
+                learner_stopping.set()
                 await gateway.close()
                 await learner.terminate()
             else:
@@ -932,7 +936,8 @@ async def live_mode(
                         battle_current_turn[event.room_id] = int(parts[2])
                     except ValueError:
                         pass
-            await learner.send(event_message(event.room_id, seq, event.line).payload)
+            if not learner_stopping.is_set():
+                await learner.send(event_message(event.room_id, seq, event.line).payload)
 
         seq += 1
 

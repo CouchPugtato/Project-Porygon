@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 
-#define PARSED_REQUEST_MAX_JSON 8192
+#define PARSED_REQUEST_MAX_JSON 32768
 #define PARSED_REQUEST_ACTIVE_SLOTS 2
 #define PARSED_REQUEST_MOVE_SLOTS 4
 #define PARSED_REQUEST_TEAM_SIZE 6
@@ -47,6 +47,7 @@ typedef struct {
 typedef struct {
     int request_id;
     int is_doubles;
+    int side_player;
     int wait;
     int team_preview;
     int max_chosen_team_size;
@@ -62,7 +63,11 @@ typedef struct {
     int slot_needs_choice[PARSED_REQUEST_ACTIVE_SLOTS];
     int slot_can_move[PARSED_REQUEST_ACTIVE_SLOTS];
     int slot_can_switch[PARSED_REQUEST_ACTIVE_SLOTS];
+    int active_team_idx[PARSED_REQUEST_ACTIVE_SLOTS];
+    unsigned char active_team_idx_known[PARSED_REQUEST_ACTIVE_SLOTS];
+    unsigned char bootstrap_slot_binding_ambiguous;
     ParsedSlotChoiceKind choice_kind[PARSED_REQUEST_ACTIVE_SLOTS];
+    char side_id[8];
     char side_ident[PARSED_REQUEST_TEAM_SIZE][32];
     int side_species_id[PARSED_REQUEST_TEAM_SIZE];
     ParsedActive active[PARSED_REQUEST_ACTIVE_SLOTS];

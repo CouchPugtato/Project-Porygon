@@ -64,6 +64,17 @@ static void free_session(EnvSession* session) {
     memset(session, 0, sizeof(*session));
 }
 
+static int queue_prestart_message(EnvSession* session, const RuntimeMessage* msg) {
+    if (!session || !msg) {
+        return 0;
+    }
+    if (session->pending_prestart_count >= ENV_PRESTART_QUEUE_MAX) {
+        return 0;
+    }
+    session->pending_prestart_messages[session->pending_prestart_count++] = *msg;
+    return 1;
+}
+
 int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, int replay_only) {
     if (!runtime || !model) {
         return 0;
@@ -163,25 +174,61 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
 
     switch (msg->type) {
         case RUNTIME_MSG_BATTLE_START:
-            return ensure_session(runtime, msg->battle_id, msg->is_doubles) != NULL;
+            session = ensure_session(runtime, msg->battle_id, msg->is_doubles);
+            if (!session) {
+                return 0;
+            }
+            session->raw_state.is_doubles = msg->is_doubles ? 1 : 0;
+            session->format_known = 1;
+            if (session->pending_prestart_count > 0) {
+                size_t i;
+                size_t count = session->pending_prestart_count;
+                session->pending_prestart_count = 0;
+                for (i = 0; i < count; ++i) {
+                    if (!env_runtime_handle_message(runtime, &session->pending_prestart_messages[i], out)) {
+                        return 0;
+                    }
+                }
+            }
+            return 1;
         case RUNTIME_MSG_EVENT:
-            session = ensure_session(runtime, msg->battle_id, 1);
-            if (!session) return 0;
+            session = ensure_session(runtime, msg->battle_id, msg->is_doubles);
+            if (!session) {
+                return 0;
+            }
+            if (!session->format_known) {
+                if (!queue_prestart_message(session, msg)) {
+                    if (out) {
+                        runtime_emit_error_json(json, sizeof(json), msg->battle_id, "pre-start event queue overflow");
+                        fputs(json, out);
+                        fputc('\n', out);
+                        fflush(out);
+                    }
+                    return 0;
+                }
+                return 1;
+            }
             raw_battle_state_update_from_event_line(&session->raw_state, msg->line);
             return 1;
         case RUNTIME_MSG_REQUEST:
-            session = ensure_session(runtime, msg->battle_id, 1);
+            session = ensure_session(runtime, msg->battle_id, msg->is_doubles);
             if (!session) {
-                if (out) {
-                    runtime_emit_error_json(json, sizeof(json), msg->battle_id, "failed to create or find session");
-                    fputs(json, out);
-                    fputc('\n', out);
-                    fflush(out);
-                }
                 return 0;
             }
+            if (!session->format_known) {
+                if (!queue_prestart_message(session, msg)) {
+                    if (out) {
+                        runtime_emit_error_json(json, sizeof(json), msg->battle_id, "pre-start request queue overflow");
+                        fputs(json, out);
+                        fputc('\n', out);
+                        fflush(out);
+                    }
+                    return 0;
+                }
+                return 1;
+            }
             session->last_request_id = msg->request_id;
-            if (!parse_request_payload(&session->parsed_request, msg->payload, msg->request_id, 1)) {
+            if (!parse_request_payload(&session->parsed_request, msg->payload, msg->request_id, session->raw_state.is_doubles)) {
                 if (out) {
                     runtime_emit_error_json(json, sizeof(json), msg->battle_id, "parse_request_payload failed");
                     fputs(json, out);
@@ -190,7 +237,15 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 }
                 return 0;
             }
-            raw_battle_state_update_from_request(&session->raw_state, &session->parsed_request);
+            if (!raw_battle_state_update_from_request(&session->raw_state, &session->parsed_request)) {
+                if (out) {
+                    runtime_emit_error_json(json, sizeof(json), msg->battle_id, "raw_battle_state_update_from_request failed");
+                    fputs(json, out);
+                    fputc('\n', out);
+                    fflush(out);
+                }
+                return 0;
+            }
             if (!build_action_mask_from_request(&session->action_mask, &session->parsed_request)) {
                 if (out) {
                     runtime_emit_error_json(json, sizeof(json), msg->battle_id, "build_action_mask_from_request failed");
@@ -200,7 +255,7 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 }
                 return 0;
             }
-            observation_from_raw_state(&session->observation, &session->raw_state, &session->action_mask);
+            observation_from_raw_state(&session->observation, &session->raw_state, &session->parsed_request, &session->action_mask);
             if (observation_flatten(session->flat_observation, runtime->obs_dim, &session->observation) != runtime->obs_dim) {
                 if (out) {
                     runtime_emit_error_json(json, sizeof(json), msg->battle_id, "observation_flatten failed");
@@ -235,8 +290,22 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
             session->terminal = 1;
             return 1;
         case RUNTIME_MSG_DECISION:
-            session = ensure_session(runtime, msg->battle_id, 1);
-            if (!session) return 0;
+            session = ensure_session(runtime, msg->battle_id, msg->is_doubles);
+            if (!session) {
+                return 0;
+            }
+            if (!session->format_known) {
+                if (!queue_prestart_message(session, msg)) {
+                    if (out) {
+                        runtime_emit_error_json(json, sizeof(json), msg->battle_id, "pre-start decision queue overflow");
+                        fputs(json, out);
+                        fputc('\n', out);
+                        fflush(out);
+                    }
+                    return 0;
+                }
+                return 1;
+            }
             if (msg->accepted > 0 && session->episode.count > 0) {
                 int accepted_action = msg->action;
                 int accepted_action2 = msg->action2;

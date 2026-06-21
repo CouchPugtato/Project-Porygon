@@ -8,6 +8,7 @@
 void observation_from_raw_state(
     Observation* out,
     const RawBattleState* state,
+    const ParsedRequest* req,
     const ActionMask* mask
 );
 

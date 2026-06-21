@@ -16,6 +16,11 @@ static IdTable g_move_table = {0};
 static IdTable g_item_table = {0};
 static IdTable g_ability_table = {0};
 static IdTable g_condition_table = {0};
+static IdTable g_type_table = {0};
+static int* g_species_type1 = NULL;
+static int* g_species_type2 = NULL;
+static int g_species_type_capacity = 0;
+static int g_species_type_entries = 0;
 
 static void normalize_token(const char* in, char* out, size_t out_len) {
     size_t i = 0;
@@ -118,6 +123,104 @@ static int load_table_file(IdTable* table, const char* path) {
     return 1;
 }
 
+static int lookup_id(const IdTable* table, const char* name);
+
+static int ensure_species_type_capacity(int species_id) {
+    int new_capacity;
+    int* resized_type1;
+    int* resized_type2;
+    int i;
+    if (species_id <= g_species_type_capacity) {
+        return 1;
+    }
+    new_capacity = g_species_type_capacity ? g_species_type_capacity : 32;
+    while (new_capacity < species_id) {
+        new_capacity *= 2;
+    }
+    resized_type1 = (int*)realloc(g_species_type1, (size_t)new_capacity * sizeof(int));
+    resized_type2 = (int*)realloc(g_species_type2, (size_t)new_capacity * sizeof(int));
+    if (!resized_type1 || !resized_type2) {
+        free(resized_type1);
+        free(resized_type2);
+        return 0;
+    }
+    g_species_type1 = resized_type1;
+    g_species_type2 = resized_type2;
+    for (i = g_species_type_capacity; i < new_capacity; ++i) {
+        g_species_type1[i] = 0;
+        g_species_type2[i] = 0;
+    }
+    g_species_type_capacity = new_capacity;
+    return 1;
+}
+
+static int load_species_types_file(const char* path) {
+    FILE* f;
+    char line[256];
+    if (!path) {
+        return 0;
+    }
+    f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        char species[128];
+        char type1[64];
+        char type2[64];
+        char* p = line;
+        char* comma1;
+        char* comma2;
+        int species_id;
+        int type1_id;
+        int type2_id;
+        while (*p && isspace((unsigned char)*p)) {
+            ++p;
+        }
+        if (!*p || *p == '#') {
+            continue;
+        }
+        strncpy(species, p, sizeof(species) - 1);
+        species[sizeof(species) - 1] = '\0';
+        comma1 = strchr(species, ',');
+        if (!comma1) {
+            continue;
+        }
+        *comma1++ = '\0';
+        comma2 = strchr(comma1, ',');
+        if (!comma2) {
+            continue;
+        }
+        *comma2++ = '\0';
+        strncpy(type1, comma1, sizeof(type1) - 1);
+        type1[sizeof(type1) - 1] = '\0';
+        strncpy(type2, comma2, sizeof(type2) - 1);
+        type2[sizeof(type2) - 1] = '\0';
+        {
+            size_t len;
+            len = strlen(type2);
+            while (len > 0 && isspace((unsigned char)type2[len - 1])) {
+                type2[--len] = '\0';
+            }
+        }
+        species_id = species_id_from_name(species);
+        type1_id = lookup_id(&g_type_table, type1);
+        type2_id = lookup_id(&g_type_table, type2);
+        if (species_id <= 0 || type1_id <= 0) {
+            continue;
+        }
+        if (!ensure_species_type_capacity(species_id)) {
+            fclose(f);
+            return 0;
+        }
+        g_species_type1[species_id - 1] = type1_id;
+        g_species_type2[species_id - 1] = type2_id;
+        g_species_type_entries += 1;
+    }
+    fclose(f);
+    return 1;
+}
+
 static int lookup_id(const IdTable* table, const char* name) {
     char normalized[128];
     int i;
@@ -141,6 +244,11 @@ static const char* lookup_name(const IdTable* table, int id) {
 }
 
 int id_tables_init(void) {
+    static const char* kTypeNames[] = {
+        "normal", "fire", "water", "electric", "grass", "ice", "fighting", "poison",
+        "ground", "flying", "psychic", "bug", "rock", "ghost", "dragon", "dark", "steel", "fairy"
+    };
+    size_t i;
     if (g_species_table.count > 0) {
         return 1;
     }
@@ -153,6 +261,18 @@ int id_tables_init(void) {
     }
     /* Optional until all environments regenerate vocab files. */
     load_table_file(&g_condition_table, "data/conditions_ids.txt");
+    for (i = 0; i < sizeof(kTypeNames) / sizeof(kTypeNames[0]); ++i) {
+        if (!table_append(&g_type_table, kTypeNames[i])) {
+            return 0;
+        }
+    }
+    /* Optional while the repository is being upgraded to exact type reconstruction. */
+    load_species_types_file("data/species_types.txt");
+    if (g_species_type_entries > 0 && g_species_type_entries < 100) {
+        fprintf(stderr,
+            "[id_tables] warning: data/species_types.txt only loaded %d entries; rerun py/tools/showdown_vocab_export.py\n",
+            g_species_type_entries);
+    }
     return 1;
 }
 
@@ -176,6 +296,10 @@ int condition_id_from_name(const char* name) {
     return lookup_id(&g_condition_table, name);
 }
 
+int type_id_from_name(const char* name) {
+    return lookup_id(&g_type_table, name);
+}
+
 const char* species_name_from_id(int id) {
     return lookup_name(&g_species_table, id);
 }
@@ -194,4 +318,22 @@ const char* ability_name_from_id(int id) {
 
 const char* condition_name_from_id(int id) {
     return lookup_name(&g_condition_table, id);
+}
+
+const char* type_name_from_id(int id) {
+    return lookup_name(&g_type_table, id);
+}
+
+int species_type1_from_id(int id) {
+    if (id <= 0 || id > g_species_type_capacity || !g_species_type1) {
+        return 0;
+    }
+    return g_species_type1[id - 1];
+}
+
+int species_type2_from_id(int id) {
+    if (id <= 0 || id > g_species_type_capacity || !g_species_type2) {
+        return 0;
+    }
+    return g_species_type2[id - 1];
 }

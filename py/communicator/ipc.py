@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -13,6 +14,7 @@ class LearnerProcess:
         self._command = command
         self._replay_path = replay_path
         self._process: Optional[asyncio.subprocess.Process] = None
+        self._closed = False
 
     async def start(self) -> None:
         env = os.environ.copy()
@@ -31,18 +33,31 @@ class LearnerProcess:
         )
 
     async def send(self, payload: Dict[str, Any]) -> None:
-        if not self._process or not self._process.stdin:
+        if self._closed or not self._process or not self._process.stdin:
             return
-        self._process.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
-        await self._process.stdin.drain()
+        if self._process.returncode is not None:
+            self._closed = True
+            return
+        try:
+            self._process.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+            await self._process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            self._closed = True
 
     async def read_message(self) -> Optional[Dict[str, Any]]:
         if not self._process or not self._process.stdout:
             return None
-        line = await self._process.stdout.readline()
-        if not line:
-            return None
-        return json.loads(line.decode("utf-8"))
+        while True:
+            line = await self._process.stdout.readline()
+            if not line:
+                return None
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                print(f"[learner-stdout] ignored non-JSON line: {text}", file=sys.stderr)
 
     async def read_stderr_line(self) -> Optional[str]:
         if not self._process or not self._process.stderr:
@@ -55,6 +70,7 @@ class LearnerProcess:
     async def terminate(self) -> None:
         if self._process is None:
             return
+        self._closed = True
         if self._process.stdin is not None:
             self._process.stdin.close()
         if self._process.returncode is None:

@@ -9,6 +9,8 @@
 #define RAW_IDENT_LEN 32
 
 typedef struct {
+    /* Base identity/request-visible state. This must never be mutated by temporary
+       battle-only effects like Transform. */
     int known;
     int active;
     int active_slot;
@@ -19,6 +21,13 @@ typedef struct {
     TrackedInt item_id;
     TrackedInt ability_id;
     TrackedInt tera_type_id;
+    TrackedInt type1_id;
+    TrackedInt type2_id;
+    /* Effective battle state. This is what the model sees and may diverge from
+       base state during temporary effects like Transform or Terastallization. */
+    TrackedInt effective_species_id;
+    TrackedInt effective_type1_id;
+    TrackedInt effective_type2_id;
     int tera_used;
     int can_tera;
     int transformed;
@@ -27,18 +36,22 @@ typedef struct {
     int current_hp;
     int max_hp;
     TrackedInt status_id;
-    int sleep_turns;
+    int sleep_turns_elapsed;
     int toxic_counter;
-    int type1_id;
-    int type2_id;
     int boosts[7];
 
     TrackedInt move_ids[RAW_MOVE_SLOTS];
+    TrackedInt effective_move_ids[RAW_MOVE_SLOTS];
     int move_known[RAW_MOVE_SLOTS];
+    int effective_move_known[RAW_MOVE_SLOTS];
     int move_pp[RAW_MOVE_SLOTS];
+    int effective_move_pp[RAW_MOVE_SLOTS];
     int move_max_pp[RAW_MOVE_SLOTS];
+    int effective_move_max_pp[RAW_MOVE_SLOTS];
     int move_disabled[RAW_MOVE_SLOTS];
+    int effective_move_disabled[RAW_MOVE_SLOTS];
     int move_maybe_disabled[RAW_MOVE_SLOTS];
+    int effective_move_maybe_disabled[RAW_MOVE_SLOTS];
 
     int encore_active;
     int encore_turns;
@@ -73,8 +86,10 @@ typedef struct {
     int switched_in_turn;
     int first_turn_on_field;
     int ability_triggered_on_switch_in;
+    int self_request_roster_index;
 
     char ident[RAW_IDENT_LEN];
+    char canonical_ident[RAW_IDENT_LEN];
 } RawPokemon;
 
 typedef struct {
@@ -112,9 +127,9 @@ typedef struct {
     RawSideState opp_side;
 
     int weather_id;
-    int weather_turns_remaining;
+    TrackedInt weather_turns_remaining;
     int terrain_id;
-    int terrain_turns_remaining;
+    TrackedInt terrain_turns_remaining;
 
     int trick_room;
     int trick_room_turns_remaining;
@@ -132,15 +147,23 @@ typedef struct {
     int turn_number;
     int can_tera;
     int is_doubles;
+    int self_side_player;
+    int perspective_known;
     int self_active_count;
     int opp_active_count;
+    int self_active_slot_to_team_index[2];
+    int opp_active_slot_to_team_index[2];
 } RawBattleState;
 
 void raw_battle_state_init(RawBattleState* state, int is_doubles);
 void raw_battle_state_reset(RawBattleState* state);
-void raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequest* req);
+int raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequest* req);
 void raw_battle_state_update_from_event_line(RawBattleState* state, const char* line);
 void raw_battle_state_begin_turn(RawBattleState* state, int turn_number);
 void raw_battle_state_end_turn(RawBattleState* state);
+void raw_pokemon_refresh_types(RawPokemon* pokemon);
+void raw_pokemon_refresh_effective_state(RawPokemon* pokemon);
+void raw_pokemon_clear_transform(RawPokemon* pokemon);
+void raw_pokemon_apply_transform(RawPokemon* pokemon, const RawPokemon* target);
 
 #endif

@@ -11,6 +11,8 @@
 
 #include <stdio.h>
 
+#define ENV_PRESTART_QUEUE_MAX 32
+
 typedef struct {
     char battle_id[RUNTIME_BATTLE_ID_LEN];
     RawBattleState raw_state;
@@ -21,6 +23,9 @@ typedef struct {
     float* hidden_state;
     float* flat_observation;
     int last_request_id;
+    int format_known;
+    RuntimeMessage pending_prestart_messages[ENV_PRESTART_QUEUE_MAX];
+    size_t pending_prestart_count;
     int terminal;
     int ready_for_decision;
     int pending_action;

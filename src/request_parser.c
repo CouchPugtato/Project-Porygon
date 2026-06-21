@@ -295,11 +295,17 @@ static int parse_json_string_field(const char* obj, const char* key, char* out, 
 }
 
 void parsed_request_init(ParsedRequest* req) {
+    int i;
     if (!req) {
         return;
     }
     memset(req, 0, sizeof(*req));
     req->max_chosen_team_size = 2;
+    req->side_player = 0;
+    for (i = 0; i < PARSED_REQUEST_ACTIVE_SLOTS; ++i) {
+        req->active_team_idx[i] = -1;
+        req->active_team_idx_known[i] = 0;
+    }
 }
 
 static void finalize_slot_semantics(ParsedRequest* req) {
@@ -369,6 +375,7 @@ static void finalize_slot_semantics(ParsedRequest* req) {
 static void sync_active_fainted_state_from_side(ParsedRequest* req) {
     int team_idx;
     int active_slot = 0;
+    int active_found = 0;
 
     if (!req) {
         return;
@@ -377,16 +384,36 @@ static void sync_active_fainted_state_from_side(ParsedRequest* req) {
         if (!req->switch_active[team_idx]) {
             continue;
         }
+        if (active_found < PARSED_REQUEST_ACTIVE_SLOTS) {
+            ++active_found;
+        }
+        req->active_team_idx[active_slot] = team_idx;
         req->active[active_slot].fainted = req->switch_fainted[team_idx] ? 1 : 0;
         ++active_slot;
+    }
+    if (active_found == req->active_count && active_found > 0) {
+        int i;
+        for (i = 0; i < active_found && i < PARSED_REQUEST_ACTIVE_SLOTS; ++i) {
+            req->active_team_idx_known[i] = (req->active_team_idx[i] >= 0) ? 1u : 0u;
+        }
+        req->bootstrap_slot_binding_ambiguous = 0;
+    } else if (active_found > 0 || req->active_count > 0) {
+        req->bootstrap_slot_binding_ambiguous = 1;
+    }
+    for (; active_slot < PARSED_REQUEST_ACTIVE_SLOTS; ++active_slot) {
+        req->active_team_idx[active_slot] = -1;
+        req->active_team_idx_known[active_slot] = 0;
+    }
+    if (active_found != req->active_count && req->active_count > 0) {
+        req->bootstrap_slot_binding_ambiguous = 1;
     }
 }
 
 int parse_request_payload(ParsedRequest* req, const char* json, int request_id, int is_doubles) {
     const char* active_key;
     const char* side_key;
-    char active_array[4096];
-    char side_obj[4096];
+    char active_array[PARSED_REQUEST_MAX_JSON];
+    char side_obj[PARSED_REQUEST_MAX_JSON];
     const char* p;
     int slot = 0;
 
@@ -434,21 +461,32 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
 
     active_key = find_after_key(json, "active");
     if (active_key) {
-        p = strchr(active_key, '[');
-        if (p && extract_json_array(p, active_array, sizeof(active_array))) {
+        p = strchr(active_key, ':');
+        if (!p) {
+            return 0;
+        }
+        p = skip_ws(p + 1);
+        if (*p == '[') {
+            if (!extract_json_array(p, active_array, sizeof(active_array))) {
+                return 0;
+            }
+        } else {
+            p = NULL;
+        }
+        if (p) {
             const char* cursor = next_top_level_object_in_array(active_array, NULL);
             while (cursor && slot < PARSED_REQUEST_ACTIVE_SLOTS) {
-                char obj[1024];
+                char obj[4096];
                 const char* moves_key;
                 const char* move_cursor;
                 int move_slot = 0;
                 const char* next_cursor;
 
                 if (!extract_json_object(cursor, obj, sizeof(obj))) {
-                    break;
+                    return 0;
                 }
                 req->active[slot].can_tera = strstr(obj, "\"canTerastallize\"") != NULL;
-                req->active[slot].tera_type_id = 0;
+                req->active[slot].tera_type_id = parse_string_id_after(obj, "canTerastallize", type_id_from_name);
                 req->active[slot].trapped = parse_bool_after(obj, "trapped", 0);
                 req->active[slot].maybe_trapped = parse_bool_after(obj, "maybeTrapped", 0);
                 req->active[slot].fainted = parse_bool_after(obj, "fainted", 0);
@@ -457,14 +495,17 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                 if (req->active[slot].has_force_switch) {
                     req->forced_switch_any = 1;
                 }
+                if (req->active[slot].can_tera) {
+                    req->can_tera = 1;
+                }
 
                 moves_key = find_after_key(obj, "moves");
                 if (moves_key) {
                     move_cursor = strchr(moves_key, '{');
                     while (move_cursor && move_slot < PARSED_REQUEST_MOVE_SLOTS) {
-                        char move_obj[512];
+                        char move_obj[1024];
                         if (!extract_json_object(move_cursor, move_obj, sizeof(move_obj))) {
-                            break;
+                            return 0;
                         }
                         req->active[slot].move_id[move_slot] = parse_move_id_from_object(move_obj);
                         req->active[slot].move_disabled[move_slot] = parse_bool_after(move_obj, "disabled", 0);
@@ -472,9 +513,6 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                         req->active[slot].move_pp[move_slot] = parse_int_after(move_obj, "pp", 0);
                         req->active[slot].move_max_pp[move_slot] = parse_int_after(move_obj, "maxpp", req->active[slot].move_pp[move_slot]);
                         req->active[slot].move_target[move_slot] = parse_move_target_value(move_obj);
-                        if (req->active[slot].can_tera && !req->active[slot].move_disabled[move_slot]) {
-                            req->can_tera = 1;
-                        }
                         move_cursor = strchr(move_cursor + 1, '{');
                         ++move_slot;
                     }
@@ -490,26 +528,29 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
     side_key = find_after_key(json, "side");
     if (side_key) {
         p = strchr(side_key, '{');
-        if (p && extract_json_object(p, side_obj, sizeof(side_obj))) {
+        if (!p || !extract_json_object(p, side_obj, sizeof(side_obj))) {
+            return 0;
+        }
+        {
             const char* pokemon_key = find_after_key(side_obj, "pokemon");
             int team_idx = 0;
             if (pokemon_key) {
-                char pokemon_array[4096];
+                char pokemon_array[PARSED_REQUEST_MAX_JSON];
                 const char* poke_cursor;
                 const char* arr = strchr(pokemon_key, '[');
                 char cond[64];
                 char details[64];
                 if (!arr || !extract_json_array(arr, pokemon_array, sizeof(pokemon_array))) {
-                    return 1;
+                    return 0;
                 }
                 poke_cursor = next_top_level_object_in_array(pokemon_array, NULL);
                 while (poke_cursor && team_idx < PARSED_REQUEST_TEAM_SIZE) {
-                    char poke_obj[1024];
+                    char poke_obj[4096];
                     int is_active = 0;
                     int fainted = 0;
                     const char* next_poke_cursor;
                     if (!extract_json_object(poke_cursor, poke_obj, sizeof(poke_obj))) {
-                        break;
+                        return 0;
                     }
 
                     req->switch_available[team_idx] = 1;
@@ -548,6 +589,12 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                     poke_cursor = next_top_level_object_in_array(pokemon_array, next_poke_cursor);
                     ++team_idx;
                 }
+            }
+            parse_json_string_field(side_obj, "id", req->side_id, sizeof(req->side_id));
+            if (strcmp(req->side_id, "p1") == 0) {
+                req->side_player = 1;
+            } else if (strcmp(req->side_id, "p2") == 0) {
+                req->side_player = 2;
             }
         }
     }

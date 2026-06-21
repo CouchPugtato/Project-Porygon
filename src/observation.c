@@ -42,6 +42,16 @@ static size_t flatten_side(float* out, size_t idx, const ObsSide* side) {
     idx = write_scalar(out, idx, side->aurora_veil_turns / 8.0f);
     idx = write_flag(out, idx, side->tailwind);
     idx = write_scalar(out, idx, side->tailwind_turns / 8.0f);
+    idx = write_flag(out, idx, side->safeguard);
+    idx = write_scalar(out, idx, side->safeguard_turns / 8.0f);
+    idx = write_flag(out, idx, side->mist);
+    idx = write_scalar(out, idx, side->mist_turns / 8.0f);
+    idx = write_flag(out, idx, side->lucky_chant);
+    idx = write_scalar(out, idx, side->lucky_chant_turns / 8.0f);
+    idx = write_flag(out, idx, side->quick_guard);
+    idx = write_flag(out, idx, side->wide_guard);
+    idx = write_flag(out, idx, side->crafty_shield);
+    idx = write_flag(out, idx, side->mat_block);
     return idx;
 }
 
@@ -56,7 +66,9 @@ static size_t flatten_pokemon(float* out, size_t idx, const ObsPokemon* p) {
 
     idx = write_one_hot(out, idx, p->status_id, OBS_NUM_STATUS);
     idx = write_one_hot(out, idx, p->type1_id, OBS_NUM_TYPES);
+    idx = write_knowledge(out, idx, p->type1_known_mode);
     idx = write_one_hot(out, idx, p->type2_id, OBS_NUM_TYPES);
+    idx = write_knowledge(out, idx, p->type2_known_mode);
     idx = write_one_hot(out, idx, p->species_id, OBS_NUM_SPECIES);
     idx = write_knowledge(out, idx, p->species_known_mode);
     idx = write_one_hot(out, idx, p->item_id, OBS_NUM_ITEMS);
@@ -81,7 +93,9 @@ static size_t flatten_pokemon(float* out, size_t idx, const ObsPokemon* p) {
     idx = write_scalar(out, idx, p->confusion_turns / 5.0f);
     idx = write_flag(out, idx, p->substitute_active);
     idx = write_scalar(out, idx, p->toxic_counter / 15.0f);
-    idx = write_scalar(out, idx, p->sleep_turns / 5.0f);
+    idx = write_scalar(out, idx, p->sleep_turns_elapsed / 5.0f);
+    idx = write_flag(out, idx, p->transformed);
+    idx = write_scalar(out, idx, p->perish_song_counter / 4.0f);
 
     for (i = 0; i < OBS_MOVE_SLOTS; ++i) {
         idx = write_flag(out, idx, p->move_known[i]);
@@ -142,7 +156,9 @@ size_t observation_flatten(float* out, size_t out_len, const Observation* obs) {
     idx = write_one_hot(out, idx, obs->weather_id, OBS_NUM_WEATHER);
     idx = write_one_hot(out, idx, obs->terrain_id, OBS_NUM_TERRAIN);
     idx = write_scalar(out, idx, obs->weather_turns);
+    idx = write_knowledge(out, idx, obs->weather_turns_known_mode);
     idx = write_scalar(out, idx, obs->terrain_turns);
+    idx = write_knowledge(out, idx, obs->terrain_turns_known_mode);
     idx = write_scalar(out, idx, obs->turn_norm);
 
     idx = write_flag(out, idx, obs->trick_room);
@@ -151,6 +167,9 @@ size_t observation_flatten(float* out, size_t out_len, const Observation* obs) {
     idx = write_flag(out, idx, obs->team_preview);
     idx = write_flag(out, idx, obs->can_tera);
     idx = write_flag(out, idx, obs->is_doubles);
+    idx = write_flag(out, idx, obs->mud_sport);
+    idx = write_flag(out, idx, obs->water_sport);
+    idx = write_flag(out, idx, obs->ion_deluge);
 
     idx = flatten_side(out, idx, &obs->self_side);
     idx = flatten_side(out, idx, &obs->opp_side);

@@ -60,7 +60,9 @@ typedef struct {
 
     int status_id;
     int type1_id;
+    uint8_t type1_known_mode;
     int type2_id;
+    uint8_t type2_known_mode;
     int species_id;
     uint8_t species_known_mode;
     int item_id;
@@ -84,7 +86,9 @@ typedef struct {
     float confusion_turns;
     uint8_t substitute_active;
     float toxic_counter;
-    float sleep_turns;
+    float sleep_turns_elapsed;
+    uint8_t transformed;
+    float perish_song_counter;
 
     uint8_t move_known[OBS_MOVE_SLOTS];
     uint8_t move_disabled[OBS_MOVE_SLOTS];
@@ -106,13 +110,25 @@ typedef struct {
     float aurora_veil_turns;
     uint8_t tailwind;
     float tailwind_turns;
+    uint8_t safeguard;
+    float safeguard_turns;
+    uint8_t mist;
+    float mist_turns;
+    uint8_t lucky_chant;
+    float lucky_chant_turns;
+    uint8_t quick_guard;
+    uint8_t wide_guard;
+    uint8_t crafty_shield;
+    uint8_t mat_block;
 } ObsSide;
 
 typedef struct {
     int weather_id;
     int terrain_id;
     float weather_turns;
+    uint8_t weather_turns_known_mode;
     float terrain_turns;
+    uint8_t terrain_turns_known_mode;
     float turn_norm;
 
     uint8_t trick_room;
@@ -121,6 +137,9 @@ typedef struct {
     uint8_t team_preview;
     uint8_t can_tera;
     uint8_t is_doubles;
+    uint8_t mud_sport;
+    uint8_t water_sport;
+    uint8_t ion_deluge;
 
     ObsSide self_side;
     ObsSide opp_side;
@@ -136,7 +155,9 @@ typedef struct {
     1 + \
     OBS_NUM_STATUS + \
     OBS_NUM_TYPES + \
+    3 + \
     OBS_NUM_TYPES + \
+    3 + \
     OBS_NUM_SPECIES + \
     3 + \
     OBS_NUM_ITEMS + \
@@ -146,18 +167,19 @@ typedef struct {
     OBS_NUM_TYPES + \
     3 + \
     OBS_BOOST_SLOTS + \
-    13 + \
+    15 + \
     OBS_MOVE_SLOTS * (2 + 3 + 1 + OBS_NUM_MOVES) \
 )
 
-#define OBS_SIDE_FEATURES 12
+#define OBS_SIDE_FEATURES 22
 
 #define OBS_GLOBAL_FEATURES ( \
     OBS_NUM_WEATHER + \
     OBS_NUM_TERRAIN + \
-    2 + \
-    2 + \
-    5 \
+    1 + 3 + \
+    1 + 3 + \
+    1 + \
+    1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 \
 )
 
 #define OBSERVATION_FLAT_SIZE ( \

@@ -8,11 +8,15 @@ int move_id_from_name(const char* name);
 int item_id_from_name(const char* name);
 int ability_id_from_name(const char* name);
 int condition_id_from_name(const char* name);
+int type_id_from_name(const char* name);
 
 const char* species_name_from_id(int id);
 const char* move_name_from_id(int id);
 const char* item_name_from_id(int id);
 const char* ability_name_from_id(int id);
 const char* condition_name_from_id(int id);
+const char* type_name_from_id(int id);
+int species_type1_from_id(int id);
+int species_type2_from_id(int id);
 
 #endif

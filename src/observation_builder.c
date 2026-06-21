@@ -21,6 +21,16 @@ static void copy_side(ObsSide* out, const RawSideState* in) {
     out->aurora_veil_turns = (float)in->aurora_veil_turns;
     out->tailwind = (unsigned char)in->tailwind;
     out->tailwind_turns = (float)in->tailwind_turns;
+    out->safeguard = (unsigned char)in->safeguard;
+    out->safeguard_turns = (float)in->safeguard_turns;
+    out->mist = (unsigned char)in->mist;
+    out->mist_turns = (float)in->mist_turns;
+    out->lucky_chant = (unsigned char)in->lucky_chant;
+    out->lucky_chant_turns = (float)in->lucky_chant_turns;
+    out->quick_guard = (unsigned char)in->quick_guard;
+    out->wide_guard = (unsigned char)in->wide_guard;
+    out->crafty_shield = (unsigned char)in->crafty_shield;
+    out->mat_block = (unsigned char)in->mat_block;
 }
 
 static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
@@ -31,10 +41,12 @@ static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
     out->revealed = (unsigned char)in->revealed;
     out->hp_frac = (in->max_hp > 0) ? ((float)in->current_hp / (float)in->max_hp) : 0.0f;
     out->status_id = in->status_id.value;
-    out->type1_id = in->type1_id;
-    out->type2_id = in->type2_id;
-    out->species_id = in->species_id.value;
-    out->species_known_mode = knowledge_to_mode(in->species_id.knowledge);
+    out->type1_id = in->effective_type1_id.value;
+    out->type1_known_mode = knowledge_to_mode(in->effective_type1_id.knowledge);
+    out->type2_id = in->effective_type2_id.value;
+    out->type2_known_mode = knowledge_to_mode(in->effective_type2_id.knowledge);
+    out->species_id = in->effective_species_id.value;
+    out->species_known_mode = knowledge_to_mode(in->effective_species_id.knowledge);
     out->item_id = in->item_id.value;
     out->item_known_mode = knowledge_to_mode(in->item_id.knowledge);
     out->ability_id = in->ability_id.value;
@@ -56,19 +68,22 @@ static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
     out->confusion_turns = (float)in->confusion_turns;
     out->substitute_active = (unsigned char)in->substitute_active;
     out->toxic_counter = (float)in->toxic_counter;
-    out->sleep_turns = (float)in->sleep_turns;
+    out->sleep_turns_elapsed = (float)in->sleep_turns_elapsed;
+    out->transformed = (unsigned char)in->transformed;
+    out->perish_song_counter = (float)in->perish_song_counter;
     for (i = 0; i < OBS_MOVE_SLOTS; ++i) {
-        out->move_known[i] = (unsigned char)in->move_known[i];
-        out->move_disabled[i] = (unsigned char)in->move_disabled[i];
-        out->move_known_mode[i] = knowledge_to_mode(in->move_ids[i].knowledge);
-        out->move_pp_frac[i] = in->move_max_pp[i] > 0 ? ((float)in->move_pp[i] / (float)in->move_max_pp[i]) : 0.0f;
-        out->move_id[i] = in->move_ids[i].value;
+        out->move_known[i] = (unsigned char)in->effective_move_known[i];
+        out->move_disabled[i] = (unsigned char)in->effective_move_disabled[i];
+        out->move_known_mode[i] = knowledge_to_mode(in->effective_move_ids[i].knowledge);
+        out->move_pp_frac[i] = in->effective_move_max_pp[i] > 0 ? ((float)in->effective_move_pp[i] / (float)in->effective_move_max_pp[i]) : 0.0f;
+        out->move_id[i] = in->effective_move_ids[i].value;
     }
 }
 
 void observation_from_raw_state(
     Observation* out,
     const RawBattleState* state,
+    const ParsedRequest* req,
     const ActionMask* mask
 ) {
     int i;
@@ -78,15 +93,20 @@ void observation_from_raw_state(
     observation_init(out);
     out->weather_id = state->weather_id;
     out->terrain_id = state->terrain_id;
-    out->weather_turns = (float)state->weather_turns_remaining;
-    out->terrain_turns = (float)state->terrain_turns_remaining;
+    out->weather_turns = (float)state->weather_turns_remaining.value;
+    out->weather_turns_known_mode = knowledge_to_mode(state->weather_turns_remaining.knowledge);
+    out->terrain_turns = (float)state->terrain_turns_remaining.value;
+    out->terrain_turns_known_mode = knowledge_to_mode(state->terrain_turns_remaining.knowledge);
     out->turn_norm = (float)state->turn_number / 100.0f;
     out->trick_room = (unsigned char)state->trick_room;
     out->trick_room_turns = (float)state->trick_room_turns_remaining;
-    out->forced_switch = 0;
-    out->team_preview = 0;
+    out->forced_switch = (unsigned char)((req && req->forced_switch_any) ? 1 : 0);
+    out->team_preview = (unsigned char)((req && req->team_preview) ? 1 : 0);
     out->can_tera = (unsigned char)state->can_tera;
     out->is_doubles = (unsigned char)state->is_doubles;
+    out->mud_sport = (unsigned char)state->mud_sport;
+    out->water_sport = (unsigned char)state->water_sport;
+    out->ion_deluge = (unsigned char)state->ion_deluge;
 
     copy_side(&out->self_side, &state->self_side);
     copy_side(&out->opp_side, &state->opp_side);

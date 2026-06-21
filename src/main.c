@@ -654,10 +654,10 @@ static void json_write_raw_pokemon(FILE* out, const RawPokemon* mon) {
     fputs(",\"current_hp\":", out); fprintf(out, "%d", mon->current_hp);
     fputs(",\"max_hp\":", out); fprintf(out, "%d", mon->max_hp);
     fputs(",\"status\":", out); json_write_tracked_int(out, &mon->status_id, condition_name_from_id);
-    fputs(",\"sleep_turns\":", out); fprintf(out, "%d", mon->sleep_turns);
+    fputs(",\"sleep_turns_elapsed\":", out); fprintf(out, "%d", mon->sleep_turns_elapsed);
     fputs(",\"toxic_counter\":", out); fprintf(out, "%d", mon->toxic_counter);
-    fputs(",\"type1_id\":", out); fprintf(out, "%d", mon->type1_id);
-    fputs(",\"type2_id\":", out); fprintf(out, "%d", mon->type2_id);
+    fputs(",\"type1\":", out); json_write_tracked_int(out, &mon->type1_id, type_name_from_id);
+    fputs(",\"type2\":", out); json_write_tracked_int(out, &mon->type2_id, type_name_from_id);
     fputs(",\"boosts\":", out); json_write_int_array(out, mon->boosts, 7);
     fputs(",\"moves\":[", out);
     for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
@@ -734,16 +734,20 @@ static void json_write_raw_state(FILE* out, const RawBattleState* state) {
     }
     fprintf(out,
         "{\"turn_number\":%d,\"can_tera\":%d,\"is_doubles\":%d,\"self_active_count\":%d,\"opp_active_count\":%d,"
-        "\"weather_id\":%d,\"weather_turns_remaining\":%d,\"terrain_id\":%d,\"terrain_turns_remaining\":%d,"
+        "\"weather_id\":%d,\"terrain_id\":%d,"
         "\"trick_room\":%d,\"trick_room_turns_remaining\":%d,\"magic_room\":%d,\"magic_room_turns_remaining\":%d,"
         "\"wonder_room\":%d,\"wonder_room_turns_remaining\":%d,\"gravity\":%d,\"gravity_turns_remaining\":%d,"
         "\"mud_sport\":%d,\"water_sport\":%d,\"ion_deluge\":%d,",
         state->turn_number, state->can_tera, state->is_doubles, state->self_active_count, state->opp_active_count,
-        state->weather_id, state->weather_turns_remaining, state->terrain_id, state->terrain_turns_remaining,
+        state->weather_id, state->terrain_id,
         state->trick_room, state->trick_room_turns_remaining, state->magic_room, state->magic_room_turns_remaining,
         state->wonder_room, state->wonder_room_turns_remaining, state->gravity, state->gravity_turns_remaining,
         state->mud_sport, state->water_sport, state->ion_deluge);
-    fputs("\"self_side\":", out);
+    fputs("\"weather_turns_remaining\":", out);
+    json_write_tracked_int(out, &state->weather_turns_remaining, NULL);
+    fputs(",\"terrain_turns_remaining\":", out);
+    json_write_tracked_int(out, &state->terrain_turns_remaining, NULL);
+    fputs(",\"self_side\":", out);
     json_write_raw_side(out, &state->self_side);
     fputs(",\"opp_side\":", out);
     json_write_raw_side(out, &state->opp_side);
@@ -760,6 +764,144 @@ static void json_write_raw_state(FILE* out, const RawBattleState* state) {
     fputs("]}", out);
 }
 
+static void json_write_canonical_pokemon(FILE* out, const RawPokemon* mon) {
+    int i;
+    if (!mon) {
+        fputs("null", out);
+        return;
+    }
+    fputs("{\"canonical_ident\":", out); json_write_escaped(out, mon->canonical_ident[0] ? mon->canonical_ident : mon->ident);
+    fputs(",\"known\":", out); fprintf(out, "%d", mon->known);
+    fputs(",\"active\":", out); fprintf(out, "%d", mon->active);
+    fputs(",\"active_slot\":", out); fprintf(out, "%d", mon->active_slot);
+    fputs(",\"revealed\":", out); fprintf(out, "%d", mon->revealed);
+    fputs(",\"fainted\":", out); fprintf(out, "%d", mon->fainted);
+    fputs(",\"current_hp\":", out); fprintf(out, "%d", mon->current_hp);
+    fputs(",\"max_hp\":", out); fprintf(out, "%d", mon->max_hp);
+    fputs(",\"species\":", out); json_write_tracked_int(out, &mon->species_id, species_name_from_id);
+    fputs(",\"effective_species\":", out); json_write_tracked_int(out, &mon->effective_species_id, species_name_from_id);
+    fputs(",\"item\":", out); json_write_tracked_int(out, &mon->item_id, item_name_from_id);
+    fputs(",\"ability\":", out); json_write_tracked_int(out, &mon->ability_id, ability_name_from_id);
+    fputs(",\"status\":", out); json_write_tracked_int(out, &mon->status_id, condition_name_from_id);
+    fputs(",\"tera_type\":", out); json_write_tracked_int(out, &mon->tera_type_id, type_name_from_id);
+    fputs(",\"base_type1\":", out); json_write_tracked_int(out, &mon->type1_id, type_name_from_id);
+    fputs(",\"base_type2\":", out); json_write_tracked_int(out, &mon->type2_id, type_name_from_id);
+    fputs(",\"effective_type1\":", out); json_write_tracked_int(out, &mon->effective_type1_id, type_name_from_id);
+    fputs(",\"effective_type2\":", out); json_write_tracked_int(out, &mon->effective_type2_id, type_name_from_id);
+    fputs(",\"tera_used\":", out); fprintf(out, "%d", mon->tera_used);
+    fputs(",\"can_tera\":", out); fprintf(out, "%d", mon->can_tera);
+    fputs(",\"transformed\":", out); fprintf(out, "%d", mon->transformed);
+    fputs(",\"sleep_turns_elapsed\":", out); fprintf(out, "%d", mon->sleep_turns_elapsed);
+    fputs(",\"toxic_counter\":", out); fprintf(out, "%d", mon->toxic_counter);
+    fputs(",\"boosts\":", out); json_write_int_array(out, mon->boosts, 7);
+    fputs(",\"moves\":[", out);
+    for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
+        if (i) fputc(',', out);
+        fputs("{\"base_move\":", out); json_write_tracked_int(out, &mon->move_ids[i], move_name_from_id);
+        fputs(",\"effective_move\":", out); json_write_tracked_int(out, &mon->effective_move_ids[i], move_name_from_id);
+        fputs(",\"effective_known\":", out); fprintf(out, "%d", mon->effective_move_known[i]);
+        fputs(",\"effective_pp\":", out); fprintf(out, "%d", mon->effective_move_pp[i]);
+        fputs(",\"effective_max_pp\":", out); fprintf(out, "%d", mon->effective_move_max_pp[i]);
+        fputs(",\"effective_disabled\":", out); fprintf(out, "%d", mon->effective_move_disabled[i]);
+        fputs(",\"effective_maybe_disabled\":", out); fprintf(out, "%d", mon->effective_move_maybe_disabled[i]);
+        fputs("}", out);
+    }
+    fputs("]", out);
+    fputs(",\"encore_active\":", out); fprintf(out, "%d", mon->encore_active);
+    fputs(",\"encore_turns\":", out); fprintf(out, "%d", mon->encore_turns);
+    fputs(",\"disable_active\":", out); fprintf(out, "%d", mon->disable_active);
+    fputs(",\"disable_turns\":", out); fprintf(out, "%d", mon->disable_turns);
+    fputs(",\"taunt_active\":", out); fprintf(out, "%d", mon->taunt_active);
+    fputs(",\"taunt_turns\":", out); fprintf(out, "%d", mon->taunt_turns);
+    fputs(",\"protect_active\":", out); fprintf(out, "%d", mon->protect_active);
+    fputs(",\"protect_chain_count\":", out); fprintf(out, "%d", mon->protect_chain_count);
+    fputs(",\"confusion_active\":", out); fprintf(out, "%d", mon->confusion_active);
+    fputs(",\"confusion_turns\":", out); fprintf(out, "%d", mon->confusion_turns);
+    fputs(",\"substitute_active\":", out); fprintf(out, "%d", mon->substitute_active);
+    fputs(",\"perish_song_counter\":", out); fprintf(out, "%d", mon->perish_song_counter);
+    fputs("}", out);
+}
+
+static void json_write_debug_pokemon(FILE* out, const RawPokemon* mon) {
+    if (!mon) {
+        fputs("null", out);
+        return;
+    }
+    fputs("{\"ident\":", out);
+    json_write_escaped(out, mon->ident);
+    fprintf(out,
+        ",\"self_request_roster_index\":%d,\"first_turn_on_field\":%d,"
+        "\"switched_in_turn\":%d,\"last_move_id\":%d,\"last_move_turn\":%d,"
+        "\"ability_triggered_on_switch_in\":%d}",
+        mon->self_request_roster_index,
+        mon->first_turn_on_field,
+        mon->switched_in_turn,
+        mon->last_move_id,
+        mon->last_move_turn,
+        mon->ability_triggered_on_switch_in);
+}
+
+static void json_write_canonical_state(FILE* out, const RawBattleState* state) {
+    int i;
+    if (!state) {
+        fputs("null", out);
+        return;
+    }
+    fprintf(out,
+        "{\"turn_number\":%d,\"can_tera\":%d,\"is_doubles\":%d,\"self_active_count\":%d,\"opp_active_count\":%d,"
+        "\"weather_id\":%d,\"terrain_id\":%d,"
+        "\"trick_room\":%d,\"trick_room_turns_remaining\":%d,\"magic_room\":%d,\"magic_room_turns_remaining\":%d,"
+        "\"wonder_room\":%d,\"wonder_room_turns_remaining\":%d,\"gravity\":%d,\"gravity_turns_remaining\":%d,"
+        "\"mud_sport\":%d,\"water_sport\":%d,\"ion_deluge\":%d,",
+        state->turn_number, state->can_tera, state->is_doubles, state->self_active_count, state->opp_active_count,
+        state->weather_id, state->terrain_id,
+        state->trick_room, state->trick_room_turns_remaining, state->magic_room, state->magic_room_turns_remaining,
+        state->wonder_room, state->wonder_room_turns_remaining, state->gravity, state->gravity_turns_remaining,
+        state->mud_sport, state->water_sport, state->ion_deluge);
+    fputs("\"weather_turns_remaining\":", out);
+    json_write_tracked_int(out, &state->weather_turns_remaining, NULL);
+    fputs(",\"terrain_turns_remaining\":", out);
+    json_write_tracked_int(out, &state->terrain_turns_remaining, NULL);
+    fputs(",\"self_active_slot_to_team_index\":", out);
+    json_write_int_array(out, state->self_active_slot_to_team_index, 2);
+    fputs(",\"opp_active_slot_to_team_index\":", out);
+    json_write_int_array(out, state->opp_active_slot_to_team_index, 2);
+    fputs(",\"self_side\":", out);
+    json_write_raw_side(out, &state->self_side);
+    fputs(",\"opp_side\":", out);
+    json_write_raw_side(out, &state->opp_side);
+    fputs(",\"self_team\":[", out);
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        if (i) fputc(',', out);
+        json_write_canonical_pokemon(out, &state->self_team[i]);
+    }
+    fputs("],\"opp_team\":[", out);
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        if (i) fputc(',', out);
+        json_write_canonical_pokemon(out, &state->opp_team[i]);
+    }
+    fputs("]}", out);
+}
+
+static void json_write_debug_state(FILE* out, const RawBattleState* state) {
+    int i;
+    if (!state) {
+        fputs("null", out);
+        return;
+    }
+    fputs("{\"self_team\":[", out);
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        if (i) fputc(',', out);
+        json_write_debug_pokemon(out, &state->self_team[i]);
+    }
+    fputs("],\"opp_team\":[", out);
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        if (i) fputc(',', out);
+        json_write_debug_pokemon(out, &state->opp_team[i]);
+    }
+    fputs("]}", out);
+}
+
 static void json_write_request(FILE* out, const ParsedRequest* req, const ActionMask* mask) {
     int i;
     if (!req) {
@@ -767,9 +909,13 @@ static void json_write_request(FILE* out, const ParsedRequest* req, const Action
         return;
     }
     fprintf(out,
-        "{\"request_id\":%d,\"is_doubles\":%d,\"wait\":%d,\"team_preview\":%d,\"max_chosen_team_size\":%d,"
+        "{\"request_id\":%d,\"is_doubles\":%d,\"side_player\":%d,\"side_id\":",
+        req->request_id, req->is_doubles, req->side_player);
+    json_write_escaped(out, req->side_id);
+    fprintf(out,
+        ",\"wait\":%d,\"team_preview\":%d,\"max_chosen_team_size\":%d,"
         "\"active_count\":%d,\"living_active_count\":%d,\"can_tera\":%d,\"forced_switch_any\":%d,",
-        req->request_id, req->is_doubles, req->wait, req->team_preview, req->max_chosen_team_size,
+        req->wait, req->team_preview, req->max_chosen_team_size,
         req->active_count, req->living_active_count, req->can_tera, req->forced_switch_any);
     fputs("\"switch_available\":", out);
     json_write_int_array(out, req->switch_available, PARSED_REQUEST_TEAM_SIZE);
@@ -779,6 +925,17 @@ static void json_write_request(FILE* out, const ParsedRequest* req, const Action
     json_write_int_array(out, req->switch_active, PARSED_REQUEST_TEAM_SIZE);
     fputs(",\"force_switch\":", out);
     json_write_int_array(out, req->force_switch, PARSED_REQUEST_ACTIVE_SLOTS);
+    fputs(",\"active_team_idx\":", out);
+    json_write_int_array(out, req->active_team_idx, PARSED_REQUEST_ACTIVE_SLOTS);
+    fputs(",\"active_team_idx_known\":", out);
+    fputc('[', out);
+    for (i = 0; i < PARSED_REQUEST_ACTIVE_SLOTS; ++i) {
+        if (i) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)req->active_team_idx_known[i]);
+    }
+    fputc(']', out);
+    fputs(",\"bootstrap_slot_binding_ambiguous\":", out);
+    fprintf(out, "%u", (unsigned int)req->bootstrap_slot_binding_ambiguous);
     fputs(",\"side\":[", out);
     for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
         if (i) fputc(',', out);
@@ -926,7 +1083,8 @@ static int export_battle_snapshots(const char* replay_path, const char* battle_i
             fputs(",\"pending_action2\":", out); fprintf(out, "%d", session->pending_action2);
             fputs(",\"pending_command\":", out); json_write_escaped(out, session->pending_command);
             fputs(",\"episode_count\":", out); fprintf(out, "%zu", session->episode.count);
-            fputs(",\"raw_state\":", out); json_write_raw_state(out, &session->raw_state);
+            fputs(",\"canonical_state\":", out); json_write_canonical_state(out, &session->raw_state);
+            fputs(",\"debug_only\":", out); json_write_debug_state(out, &session->raw_state);
             fputs(",\"request\":", out); json_write_request(out, &session->parsed_request, &session->action_mask);
             fputs(",\"flat_observation\":", out); json_write_float_array(out, session->flat_observation, runtime.obs_dim);
             fputs("}", out);
@@ -1138,6 +1296,16 @@ static int run_runtime_mode(const char* checkpoint_path) {
     }
     if (!model) {
         model = create_default_model();
+        if (checkpoint_path && *checkpoint_path) {
+            fprintf(stderr, "[runtime] failed to load checkpoint %s, starting fresh model\n",
+                resolved_checkpoint_path ? resolved_checkpoint_path : checkpoint_path);
+        } else {
+            fprintf(stderr, "[runtime] no checkpoint provided, starting fresh model\n");
+        }
+    } else {
+        fprintf(stderr, "[runtime] loaded checkpoint %s step=%zu\n",
+            resolved_checkpoint_path ? resolved_checkpoint_path : checkpoint_path,
+            state.step);
     }
     if (!model) {
         fprintf(stderr, "Failed to initialize runtime model\n");
