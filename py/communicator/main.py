@@ -304,11 +304,41 @@ def next_fallback_command(
     return None
 
 
+def random_mode_candidates(request_payload: dict) -> list[str]:
+    base_candidates = fallback_commands_for_request(request_payload)
+    candidates = list(base_candidates)
+    active = request_payload.get("active", [])
+    slot_indices = command_slot_indices(request_payload)
+
+    if request_payload.get("teamPreview"):
+        return candidates
+
+    for candidate in base_candidates:
+        parts = parse_choose_parts(candidate)
+        if not parts:
+            continue
+        for idx, part in enumerate(parts):
+            slot_index = slot_indices[idx] if idx < len(slot_indices) else idx
+            if slot_index < 0 or slot_index >= len(active):
+                continue
+            if not part.startswith("move "):
+                continue
+            if not active[slot_index].get("canTerastallize"):
+                continue
+            tera_parts = list(parts)
+            tera_parts[idx] = f"{part} terastallize"
+            tera_candidate = "/choose " + ", ".join(tera_parts)
+            if tera_candidate not in candidates:
+                candidates.append(tera_candidate)
+
+    return candidates
+
+
 def weighted_random_command(
     request_payload: dict,
     attempted: set[str],
 ) -> str | None:
-    candidates = [candidate for candidate in fallback_commands_for_request(request_payload) if candidate not in attempted]
+    candidates = [candidate for candidate in random_mode_candidates(request_payload) if candidate not in attempted]
     if not candidates:
         return None
     if request_payload.get("teamPreview"):
@@ -330,6 +360,9 @@ def weighted_random_command(
 
     weighted_candidates: list[tuple[str, int]] = []
     for candidate in candidates:
+        if " terastallize" in candidate:
+            weighted_candidates.append((candidate, 4))
+            continue
         weight = 1
         for part in parse_choose_parts(candidate):
             if part.startswith("move "):
