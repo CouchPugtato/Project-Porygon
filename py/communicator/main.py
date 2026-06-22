@@ -8,6 +8,7 @@ import signal
 import sys
 from itertools import product
 from pathlib import Path
+from websockets.exceptions import ConnectionClosed
 
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -24,6 +25,7 @@ THINK_DELAY_MAX_SECONDS = 5.0
 FALLBACK_DELAY_MIN_SECONDS = 0.4
 FALLBACK_DELAY_MAX_SECONDS = 1.2
 DEFAULT_ARGS_PATH = Path("config/communicator.args")
+DEFAULT_RECONNECT_SECONDS = 5.0
 PROTECT_MOVE_NAMES = {
     "protect",
     "detect",
@@ -678,27 +680,56 @@ class ReplayWriter:
             handle.write(payload + "\n")
 
 
-async def capture_mode(out_path: Path, fmt: str, username: str, max_games: int | None = None) -> None:
-    gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
-    writer = ReplayWriter(out_path)
+class BufferedReplayWriter:
+    def __init__(self, out_path: Path) -> None:
+        self._writer = ReplayWriter(out_path)
+        self._pending_by_battle: dict[str, list[str]] = {}
+
+    def append(self, battle_id: str, payload: str) -> None:
+        self._pending_by_battle.setdefault(battle_id, []).append(payload)
+
+    def commit_battle(self, battle_id: str) -> None:
+        for payload in self._pending_by_battle.pop(battle_id, []):
+            self._writer.append(payload)
+
+    def discard_battle(self, battle_id: str) -> None:
+        self._pending_by_battle.pop(battle_id, None)
+
+    def discard_all(self, battle_ids: set[str]) -> None:
+        for battle_id in list(battle_ids):
+            self.discard_battle(battle_id)
+
+
+async def capture_mode(
+    out_path: Path,
+    fmt: str,
+    username: str,
+    max_games: int | None = None,
+    reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
+) -> None:
+    gateway: ShowdownGateway | None = None
+    writer = BufferedReplayWriter(out_path)
     stats = MatchStats(out_path)
     started_battles: set[str] = set()
     disconnect_or_forfeit_end: dict[str, bool] = {}
     finished_battles = 0
     seq = 0
+    stop_requested = False
 
     print(f"[capture] writing replay records to {out_path}")
 
     async def on_event(event: ShowdownEvent) -> None:
-        nonlocal finished_battles, seq
+        nonlocal finished_battles, seq, stop_requested
 
         if event.room_id.startswith("battle-") and event.room_id not in started_battles:
             started_battles.add(event.room_id)
             disconnect_or_forfeit_end[event.room_id] = False
             writer.append(
-                battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json()
+                event.room_id,
+                battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json(),
             )
             print(f"[capture] started {event.room_id}")
+            assert gateway is not None
             await gateway.send_room_command(event.room_id, "/timer on")
             print(f"[capture] timer enabled for {event.room_id}")
 
@@ -708,35 +739,52 @@ async def capture_mode(out_path: Path, fmt: str, username: str, max_games: int |
 
         if event.line.startswith("|request|"):
             payload = event.line.split("|request|", 1)[1]
-            writer.append(request_message(event.room_id, seq, json.loads(payload)).to_json())
+            writer.append(event.room_id, request_message(event.room_id, seq, json.loads(payload)).to_json())
             print(f"[capture] request {seq} for {battle_label(event.room_id)}")
         elif is_disconnect_or_forfeit_end(event.line):
             disconnect_or_forfeit_end[event.room_id] = True
-            writer.append(event_message(event.room_id, seq, event.line).to_json())
+            writer.append(event.room_id, event_message(event.room_id, seq, event.line).to_json())
         elif event.line.startswith("|win|") or event.line.startswith("|tie|"):
             result = "win" if event.line.startswith("|win|") else "draw"
             reward = 1.0 if result == "win" else 0.0
             disconnected_or_forfeited = disconnect_or_forfeit_end.get(event.room_id, False)
             if disconnected_or_forfeited:
                 reward = 0.0
-            writer.append(terminal_message(event.room_id, result, reward).to_json())
-            writer.append(battle_end(event.room_id).to_json())
+            writer.append(event.room_id, terminal_message(event.room_id, result, reward).to_json())
+            writer.append(event.room_id, battle_end(event.room_id).to_json())
+            writer.commit_battle(event.room_id)
             finished_battles += 1
             stats.note_battle(result, None, earned_win=(result == "win" and not disconnected_or_forfeited))
             print(f"[capture] finished {event.room_id} result={result} total_matches_captured={finished_battles}")
+            started_battles.discard(event.room_id)
             disconnect_or_forfeit_end.pop(event.room_id, None)
             if max_games is not None and finished_battles >= max_games:
                 print(f"[capture] reached max games ({max_games}), stopping")
+                stop_requested = True
+                assert gateway is not None
                 await gateway.close()
             else:
+                assert gateway is not None
                 await gateway.search_next_battle()
         else:
-            writer.append(event_message(event.room_id, seq, event.line).to_json())
+            writer.append(event.room_id, event_message(event.room_id, seq, event.line).to_json())
 
         seq += 1
 
-    await gateway.connect()
-    await gateway.run(on_event)
+    while not stop_requested:
+        gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
+        try:
+            await gateway.connect()
+            await gateway.run(on_event)
+            if not stop_requested:
+                print("[capture] gateway closed cleanly")
+                break
+        except (OSError, ConnectionClosed) as exc:
+            writer.discard_all(started_battles)
+            started_battles.clear()
+            disconnect_or_forfeit_end.clear()
+            print(f"[capture] connection lost: {exc}; reconnecting in {reconnect_seconds:.1f}s")
+            await asyncio.sleep(reconnect_seconds)
 
 
 async def random_mode(
@@ -744,9 +792,10 @@ async def random_mode(
     fmt: str,
     username: str,
     max_games: int | None = None,
+    reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
 ) -> None:
-    gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
-    writer = ReplayWriter(replay_path)
+    gateway: ShowdownGateway | None = None
+    writer = BufferedReplayWriter(replay_path)
     stats = MatchStats(replay_path)
     seq = 0
     latest_requests: dict[str, dict] = {}
@@ -767,15 +816,19 @@ async def random_mode(
     battle_first_tera_turn: dict[str, int | None] = {}
     active_battles: set[str] = set()
     stop_after_current_battle = asyncio.Event()
+    stop_requested = False
 
     async def request_shutdown() -> None:
+        nonlocal stop_requested
         if active_battles:
             if not stop_after_current_battle.is_set():
                 stop_after_current_battle.set()
                 print("[random] shutdown requested; will stop after the current battle finishes")
             return
         print("[random] shutdown requested with no active battle; stopping now")
-        await gateway.close()
+        stop_requested = True
+        if gateway is not None:
+            await gateway.close()
 
     loop = asyncio.get_running_loop()
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -807,6 +860,7 @@ async def random_mode(
             THINK_DELAY_MIN_SECONDS if initial else FALLBACK_DELAY_MIN_SECONDS,
             THINK_DELAY_MAX_SECONDS if initial else FALLBACK_DELAY_MAX_SECONDS,
         )
+        assert gateway is not None
         await gateway.send_room_command(room_id, candidate)
 
     async def on_event(event: ShowdownEvent) -> None:
@@ -849,7 +903,7 @@ async def random_mode(
             attempted_commands[event.room_id] = set()
             request_open[event.room_id] = True
             invalid_retry_count[event.room_id] = 0
-            writer.append(request_message(event.room_id, seq, request_payload).to_json())
+            writer.append(event.room_id, request_message(event.room_id, seq, request_payload).to_json())
             print(f"[random] request {seq} for {battle_label(event.room_id)}")
             await send_random_choice(event.room_id, request_payload, initial=True)
         elif event.line.startswith("|error|") and "Invalid choice" in event.line:
@@ -884,8 +938,9 @@ async def random_mode(
             disconnected_or_forfeited = disconnect_or_forfeit_end.get(event.room_id, False)
             if disconnected_or_forfeited:
                 reward = 0.0
-            writer.append(terminal_message(event.room_id, final_result, reward).to_json())
-            writer.append(battle_end(event.room_id).to_json())
+            writer.append(event.room_id, terminal_message(event.room_id, final_result, reward).to_json())
+            writer.append(event.room_id, battle_end(event.room_id).to_json())
+            writer.commit_battle(event.room_id)
             stats.note_battle(
                 final_result,
                 bot_rating,
@@ -907,11 +962,16 @@ async def random_mode(
             finished_battles += 1
             if max_games is not None and finished_battles >= max_games:
                 print(f"[random] reached max games ({max_games}), stopping")
+                stop_requested = True
+                assert gateway is not None
                 await gateway.close()
             elif stop_after_current_battle.is_set():
                 print("[random] current battle finished; stopping")
+                stop_requested = True
+                assert gateway is not None
                 await gateway.close()
             else:
+                assert gateway is not None
                 await gateway.search_next_battle()
         else:
             if event.room_id.startswith("battle-") and event.room_id not in active_battles and event.line.startswith("|init|battle"):
@@ -919,8 +979,12 @@ async def random_mode(
                 disconnect_or_forfeit_end[event.room_id] = False
                 battle_current_turn[event.room_id] = 0
                 battle_first_tera_turn[event.room_id] = None
-                writer.append(battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json())
+                writer.append(
+                    event.room_id,
+                    battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json(),
+                )
                 print(f"[random] battle started {event.room_id}")
+                assert gateway is not None
                 await gateway.send_room_command(event.room_id, "/timer on")
                 print(f"[random] timer enabled for {event.room_id}")
             elif is_disconnect_or_forfeit_end(event.line):
@@ -932,12 +996,31 @@ async def random_mode(
                         battle_current_turn[event.room_id] = int(parts[2])
                     except ValueError:
                         pass
-            writer.append(event_message(event.room_id, seq, event.line).to_json())
+            writer.append(event.room_id, event_message(event.room_id, seq, event.line).to_json())
         seq += 1
 
-    await gateway.connect()
     try:
-        await gateway.run(on_event)
+        while not stop_requested:
+            gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
+            try:
+                await gateway.connect()
+                await gateway.run(on_event)
+                if not stop_requested:
+                    print("[random] gateway closed cleanly")
+                    break
+            except (OSError, ConnectionClosed) as exc:
+                writer.discard_all(active_battles)
+                active_battles.clear()
+                latest_requests.clear()
+                latest_request_identity.clear()
+                attempted_commands.clear()
+                request_open.clear()
+                invalid_retry_count.clear()
+                disconnect_or_forfeit_end.clear()
+                battle_current_turn.clear()
+                battle_first_tera_turn.clear()
+                print(f"[random] connection lost: {exc}; reconnecting in {reconnect_seconds:.1f}s")
+                await asyncio.sleep(reconnect_seconds)
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
 
@@ -948,11 +1031,11 @@ async def live_mode(
     fmt: str,
     username: str,
     max_games: int | None = None,
+    reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
 ) -> None:
-    gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
-    learner = LearnerProcess(learner_command, replay_path)
-    await learner.start()
-    print(f"[live] started learner: {' '.join(learner_command)}")
+    gateway: ShowdownGateway | None = None
+    learner: LearnerProcess | None = None
+    writer = BufferedReplayWriter(replay_path) if replay_path is not None else None
     stats = MatchStats(replay_path or Path("matches/runtime_capture.jsonl"))
     seq = 0
     latest_requests: dict[str, dict] = {}
@@ -981,17 +1064,22 @@ async def live_mode(
     active_battles: set[str] = set()
     stop_after_current_battle = asyncio.Event()
     learner_stopping = asyncio.Event()
+    stop_requested = False
 
     async def request_shutdown() -> None:
+        nonlocal stop_requested
         if active_battles:
             if not stop_after_current_battle.is_set():
                 stop_after_current_battle.set()
                 print("[live] shutdown requested; will stop after the current battle finishes")
             return
         print("[live] shutdown requested with no active battle; stopping now")
+        stop_requested = True
         learner_stopping.set()
-        await gateway.close()
-        await learner.terminate()
+        if gateway is not None:
+            await gateway.close()
+        if learner is not None:
+            await learner.terminate()
 
     loop = asyncio.get_running_loop()
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -1002,7 +1090,7 @@ async def live_mode(
     signal.signal(signal.SIGINT, handle_sigint)
 
     async def on_event(event: ShowdownEvent) -> None:
-        nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count, finished_battles
+        nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count, finished_battles, stop_requested
         summary = event_summary(event)
         if summary:
             print(summary)
@@ -1076,6 +1164,9 @@ async def live_mode(
             invalid_retry_count[event.room_id] = 0
             learner_rerolls[event.room_id] = 0
             print(f"[live] sending request {seq} to learner for {battle_label(event.room_id)}")
+            if writer is not None:
+                writer.append(event.room_id, request_message(event.room_id, seq, request_payload).to_json())
+            assert learner is not None
             await learner.send(request_message(event.room_id, seq, request_payload).payload)
             print(f"[live] request {seq} for {battle_label(event.room_id)}")
         elif event.line.startswith("|error|") and "Invalid choice" in event.line:
@@ -1129,6 +1220,18 @@ async def live_mode(
                             "action2": -1,
                             "command": candidate,
                         }
+                        if writer is not None:
+                            writer.append(
+                                event.room_id,
+                                decision_message(
+                                    event.room_id,
+                                    latest_request_seq.get(event.room_id, seq),
+                                    -1,
+                                    -1,
+                                    candidate,
+                                ).to_json(),
+                            )
+                        assert learner is not None
                         await learner.send(
                             decision_message(
                                 event.room_id,
@@ -1166,6 +1269,11 @@ async def live_mode(
             disconnected_or_forfeited = disconnect_or_forfeit_end.get(event.room_id, False)
             if disconnected_or_forfeited:
                 reward = 0.0
+            if writer is not None:
+                writer.append(event.room_id, terminal_message(event.room_id, final_result, reward).to_json())
+                writer.append(event.room_id, battle_end(event.room_id).to_json())
+                writer.commit_battle(event.room_id)
+            assert learner is not None
             await learner.send(terminal_message(event.room_id, final_result, reward).payload)
             await learner.send(battle_end(event.room_id).payload)
             stats.note_battle(
@@ -1208,15 +1316,22 @@ async def live_mode(
             finished_battles += 1
             if max_games is not None and finished_battles >= max_games:
                 print(f"[live] reached max games ({max_games}), stopping")
+                stop_requested = True
                 learner_stopping.set()
+                assert gateway is not None
                 await gateway.close()
+                assert learner is not None
                 await learner.terminate()
             elif stop_after_current_battle.is_set():
                 print("[live] current battle finished; stopping")
+                stop_requested = True
                 learner_stopping.set()
+                assert gateway is not None
                 await gateway.close()
+                assert learner is not None
                 await learner.terminate()
             else:
+                assert gateway is not None
                 await gateway.search_next_battle()
         else:
             if event.room_id.startswith("battle-") and event.line.startswith("|init|battle"):
@@ -1228,10 +1343,17 @@ async def live_mode(
                 battle_fallback_used_count[event.room_id] = 0
                 battle_accepted_proposal_count[event.room_id] = 0
                 battle_action_counts[event.room_id] = empty_action_counts()
+                if writer is not None:
+                    writer.append(
+                        event.room_id,
+                        battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json(),
+                    )
+                assert learner is not None
                 await learner.send(
                     battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).payload
                 )
                 print(f"[live] battle started {event.room_id}")
+                assert gateway is not None
                 await gateway.send_room_command(event.room_id, "/timer on")
                 print(f"[live] timer enabled for {event.room_id}")
             elif is_disconnect_or_forfeit_end(event.line):
@@ -1243,7 +1365,10 @@ async def live_mode(
                         battle_current_turn[event.room_id] = int(parts[2])
                     except ValueError:
                         pass
+            if writer is not None:
+                writer.append(event.room_id, event_message(event.room_id, seq, event.line).to_json())
             if not learner_stopping.is_set():
+                assert learner is not None
                 await learner.send(event_message(event.room_id, seq, event.line).payload)
 
         seq += 1
@@ -1273,6 +1398,17 @@ async def live_mode(
                         battle_action_counts.setdefault(battle_id, empty_action_counts()),
                     )
                     tally_command_categories(request_payload, msg["command"], total_action_counts)
+                if writer is not None:
+                    writer.append(
+                        battle_id,
+                        decision_message(
+                            battle_id,
+                            msg["request_id"],
+                            msg.get("action", -1),
+                            msg.get("action2", -1),
+                            msg["command"],
+                        ).to_json(),
+                    )
                 pending_decisions[battle_id] = {
                     "request_id": msg["request_id"],
                     "action": msg.get("action", -1),
@@ -1289,6 +1425,7 @@ async def live_mode(
                     ).payload
                 )
                 await randomized_send_delay(THINK_DELAY_MIN_SECONDS, THINK_DELAY_MAX_SECONDS)
+                assert gateway is not None
                 await gateway.send_room_command(battle_id, msg["command"])
             elif msg.get("type") == "error":
                 print(f"[live] learner error: {msg}")
@@ -1301,9 +1438,41 @@ async def live_mode(
             if line:
                 print(f"[learner-stderr] {line}")
 
-    await gateway.connect()
     try:
-        await asyncio.gather(gateway.run(on_event), action_loop(), stderr_loop())
+        while not stop_requested:
+            gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
+            learner = LearnerProcess(learner_command, None)
+            await learner.start()
+            print(f"[live] started learner: {' '.join(learner_command)}")
+            try:
+                await gateway.connect()
+                await asyncio.gather(gateway.run(on_event), action_loop(), stderr_loop())
+                if not stop_requested:
+                    print("[live] gateway/learner session ended cleanly")
+                    break
+            except (OSError, ConnectionClosed) as exc:
+                if writer is not None:
+                    writer.discard_all(active_battles)
+                active_battles.clear()
+                latest_requests.clear()
+                latest_request_identity.clear()
+                attempted_commands.clear()
+                latest_request_seq.clear()
+                request_open.clear()
+                invalid_retry_count.clear()
+                learner_rerolls.clear()
+                pending_decisions.clear()
+                disconnect_or_forfeit_end.clear()
+                battle_current_turn.clear()
+                battle_first_tera_turn.clear()
+                battle_invalid_choice_count.clear()
+                battle_fallback_used_count.clear()
+                battle_accepted_proposal_count.clear()
+                battle_action_counts.clear()
+                learner_stopping.clear()
+                print(f"[live] connection lost: {exc}; reconnecting in {reconnect_seconds:.1f}s")
+                await learner.terminate()
+                await asyncio.sleep(reconnect_seconds)
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
 
@@ -1317,6 +1486,7 @@ def main() -> None:
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--username", default="")
     parser.add_argument("--games", type=int, default=0)
+    parser.add_argument("--reconnect-seconds", type=float, default=DEFAULT_RECONNECT_SECONDS)
     argv = sys.argv[1:]
     if not argv:
         argv = load_default_args(DEFAULT_ARGS_PATH)
@@ -1325,9 +1495,25 @@ def main() -> None:
     replay_path = resolve_replay_save_path(args.replay_save)
 
     if args.mode == "capture":
-        asyncio.run(capture_mode(replay_path, args.format, args.username, max_games=max_games))
+        asyncio.run(
+            capture_mode(
+                replay_path,
+                args.format,
+                args.username,
+                max_games=max_games,
+                reconnect_seconds=args.reconnect_seconds,
+            )
+        )
     elif args.mode == "random":
-        asyncio.run(random_mode(replay_path, args.format, args.username, max_games=max_games))
+        asyncio.run(
+            random_mode(
+                replay_path,
+                args.format,
+                args.username,
+                max_games=max_games,
+                reconnect_seconds=args.reconnect_seconds,
+            )
+        )
     else:
         learner_args = list(args.learner_args) + list(learner_passthrough)
         if not learner_args:
@@ -1340,6 +1526,7 @@ def main() -> None:
                 args.format,
                 args.username,
                 max_games=max_games,
+                reconnect_seconds=args.reconnect_seconds,
             )
         )
 

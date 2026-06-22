@@ -25,3 +25,5 @@ For the communicator, `--replay-save <run_name>` resolves to:
 ```text
 matches/runs/<run_name>/<run_name>_raw.jsonl
 ```
+
+`--reconnect-seconds <n>` controls how long the communicator waits before reconnecting after an unexpected websocket/network drop.

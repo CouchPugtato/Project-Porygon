@@ -8,4 +8,6 @@ runtime_capture
 .\build-fresh\showdown_client.exe
 --format
 gen9randomdoublesbattle
+--reconnect-seconds
+15
 --runtime
