@@ -12,9 +12,23 @@ DEFAULT_BINARY = Path("build-fresh/showdown_client.exe")
 LEFT_PANEL_WIDTH = 280
 
 
-def scan_battle_ids(replay_path: Path) -> list[str]:
-    battle_ids: list[str] = []
-    seen: set[str] = set()
+def is_earned_victory_record(payload: dict) -> bool:
+    record_type = str(payload.get("type") or payload.get("message_type") or "").strip().lower()
+    if record_type != "terminal":
+        return False
+    result = str(payload.get("result") or "").strip().lower()
+    if result != "win":
+        return False
+    try:
+        reward = float(payload.get("reward", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        reward = 0.0
+    return reward > 0.0
+
+
+def scan_battle_entries(replay_path: Path) -> list[dict[str, object]]:
+    battle_entries: list[dict[str, object]] = []
+    by_battle_id: dict[str, dict[str, object]] = {}
     with replay_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             try:
@@ -22,11 +36,17 @@ def scan_battle_ids(replay_path: Path) -> list[str]:
             except json.JSONDecodeError:
                 continue
             battle_id = payload.get("battle_id")
-            if not battle_id or battle_id in seen:
+            if not battle_id:
                 continue
-            seen.add(battle_id)
-            battle_ids.append(str(battle_id))
-    return battle_ids
+            battle_id = str(battle_id)
+            entry = by_battle_id.get(battle_id)
+            if entry is None:
+                entry = {"battle_id": battle_id, "earned_win": False}
+                by_battle_id[battle_id] = entry
+                battle_entries.append(entry)
+            if is_earned_victory_record(payload):
+                entry["earned_win"] = True
+    return battle_entries
 
 
 def snapshot_turn_numbers(snapshots: list[dict]) -> list[int]:
@@ -308,12 +328,15 @@ class ReplayStateViewer(tk.Tk):
         self.current_battle_var = tk.StringVar(value="No battle loaded")
         self.current_turn_var = tk.StringVar(value="Turn 0")
         self.current_meta_var = tk.StringVar(value="")
+        self.earned_victories_only_var = tk.BooleanVar(value=False)
 
         self.snapshot_path: Path | None = None
         self.snapshots: list[dict] = []
         self.snapshot_turns: list[int] = []
         self.turns: list[tuple[int, int]] = []
         self.turn_groups: list[tuple[int, list[int], int]] = []
+        self.battle_entries: list[dict[str, object]] = []
+        self.visible_battle_ids: list[str] = []
         self.current_turn_idx = 0
         self.loading_active = False
         self._programmatic_battle_select = False
@@ -368,6 +391,12 @@ class ReplayStateViewer(tk.Tk):
     def _build_left_panel(self) -> None:
         ttk.Label(self.left_panel, text="Battles", style="Section.TLabel").pack(anchor="w")
         ttk.Label(self.left_panel, text="Select a replay to scan and load battles.", style="Meta.TLabel", wraplength=240).pack(anchor="w", pady=(2, 8))
+        ttk.Checkbutton(
+            self.left_panel,
+            text="Earned victories only",
+            variable=self.earned_victories_only_var,
+            command=self.on_filter_change,
+        ).pack(anchor="w", pady=(0, 8))
         self.battle_list = tk.Listbox(
             self.left_panel,
             exportselection=False,
@@ -467,19 +496,50 @@ class ReplayStateViewer(tk.Tk):
         self.set_loading(True, "Scanning battles...")
         try:
             self.clear_battle_state()
-            battle_ids = scan_battle_ids(replay_path)
-            self.battle_list.delete(0, tk.END)
-            for battle_id in battle_ids:
-                self.battle_list.insert(tk.END, battle_id)
-            if battle_ids:
-                self._programmatic_battle_select = True
-                self.battle_list.selection_clear(0, tk.END)
-                self.battle_list.selection_set(0)
-                self.battle_list.see(0)
-                self._programmatic_battle_select = False
-                self.export_and_load()
+            self.battle_entries = scan_battle_entries(replay_path)
+            self.refresh_battle_list()
         finally:
             self.set_loading(False)
+
+    def filtered_battle_ids(self) -> list[str]:
+        earned_only = bool(self.earned_victories_only_var.get())
+        battle_ids: list[str] = []
+        for entry in self.battle_entries:
+            if earned_only and not bool(entry.get("earned_win")):
+                continue
+            battle_ids.append(str(entry.get("battle_id") or ""))
+        return [battle_id for battle_id in battle_ids if battle_id]
+
+    def refresh_battle_list(self, preferred_battle_id: str | None = None) -> None:
+        if preferred_battle_id is None and self.battle_list.curselection():
+            preferred_battle_id = self.battle_list.get(self.battle_list.curselection()[0])
+        self.visible_battle_ids = self.filtered_battle_ids()
+        self.battle_list.delete(0, tk.END)
+        for battle_id in self.visible_battle_ids:
+            self.battle_list.insert(tk.END, battle_id)
+        if not self.visible_battle_ids:
+            self.clear_battle_state()
+            if self.battle_entries:
+                self.current_battle_var.set("No battles match current filter")
+            return
+
+        selected_idx = 0
+        if preferred_battle_id and preferred_battle_id in self.visible_battle_ids:
+            selected_idx = self.visible_battle_ids.index(preferred_battle_id)
+
+        self._programmatic_battle_select = True
+        self.battle_list.selection_clear(0, tk.END)
+        self.battle_list.selection_set(selected_idx)
+        self.battle_list.see(selected_idx)
+        self._programmatic_battle_select = False
+        self.export_and_load()
+
+    def on_filter_change(self) -> None:
+        if self.loading_active:
+            return
+        current_battle_id = self.current_battle_var.get()
+        preferred_battle_id = current_battle_id if current_battle_id not in {"No battle loaded", "No battles match current filter"} else None
+        self.refresh_battle_list(preferred_battle_id)
 
     def export_and_load(self) -> None:
         replay_path = Path(self.replay_var.get())
