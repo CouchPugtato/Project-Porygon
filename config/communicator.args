@@ -1,13 +1,16 @@
-# Default communicator invocation when launched with no CLI args.
-# One token per line.
+# Default communicator invocation when launched with no CLI args
+# One token per line
+
 --mode
-live
+random
+
 --replay-save
-runtime_capture
---learner-command
-.\build-fresh\showdown_client.exe
+run_0011_new_random
+
 --format
 gen9randomdoublesbattle
+
 --reconnect-seconds
 15
---runtime
+
+--battle-agent

@@ -26,6 +26,7 @@ FALLBACK_DELAY_MIN_SECONDS = 0.4
 FALLBACK_DELAY_MAX_SECONDS = 1.2
 DEFAULT_ARGS_PATH = Path("config/communicator.args")
 DEFAULT_RECONNECT_SECONDS = 5.0
+DEFAULT_LEARNER_COMMAND = r".\build-fresh\showdown_client.exe"
 PROTECT_MOVE_NAMES = {
     "protect",
     "detect",
@@ -1481,7 +1482,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["live", "capture", "random"], default="live")
     parser.add_argument("--replay-save", default="runtime_capture")
-    parser.add_argument("--learner-command", default="./showdown_client")
     parser.add_argument("--learner-args", nargs="*", default=[])
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--username", default="")
@@ -1517,8 +1517,8 @@ def main() -> None:
     else:
         learner_args = list(args.learner_args) + list(learner_passthrough)
         if not learner_args:
-            learner_args = ["--runtime"]
-        learner_command = [args.learner_command] + learner_args
+            learner_args = ["--battle-agent"]
+        learner_command = [DEFAULT_LEARNER_COMMAND] + learner_args
         asyncio.run(
             live_mode(
                 learner_command,

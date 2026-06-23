@@ -1793,7 +1793,7 @@ static int showdown_client_main(int argc, char** argv) {
     if (getenv("PORYGON_DEMO_GRU")) {
         return run_demo_gru();
     }
-    if (argc >= 2 && strcmp(argv[1], "--runtime") == 0) {
+    if (argc >= 2 && (strcmp(argv[1], "--battle-agent") == 0 || strcmp(argv[1], "--runtime") == 0)) {
         return run_runtime_mode(argc >= 3 ? argv[2] : NULL);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-supervised") == 0) {
@@ -1827,9 +1827,9 @@ static int showdown_client_main(int argc, char** argv) {
     showdown_client_destroy(cli);
     return rc;
 #else
-    fprintf(stderr,
+        fprintf(stderr,
         "Usage:\n"
-        "  showdown_client --runtime [checkpoint]\n"
+        "  showdown_client --battle-agent [checkpoint]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal]\n"
         "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
