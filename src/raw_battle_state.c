@@ -204,6 +204,8 @@ static void clear_on_switch(RawPokemon* pokemon) {
     pokemon->sleep_turns_elapsed = 0;
     pokemon->perish_song_counter = 0;
     pokemon->ability_triggered_on_switch_in = 0;
+    pokemon->trapped = 0;
+    pokemon->maybe_trapped = 0;
     raw_pokemon_clear_transform(pokemon);
 }
 
@@ -247,6 +249,48 @@ static void refresh_active_counts(RawBattleState* state) {
     state->opp_active_count = count_living_active(state->opp_team);
     state->self_side.remaining_pokemon = count_remaining_pokemon(state->self_team);
     state->opp_side.remaining_pokemon = count_remaining_pokemon(state->opp_team);
+}
+
+static int infer_single_disabled_move_slot(const ParsedActive* active) {
+    int i;
+    int slot = -1;
+    if (!active) {
+        return -1;
+    }
+    for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
+        if (!active->move_id[i]) {
+            continue;
+        }
+        if (!active->move_disabled[i]) {
+            continue;
+        }
+        if (slot >= 0) {
+            return -1;
+        }
+        slot = i;
+    }
+    return slot;
+}
+
+static int infer_encore_move_slot(const ParsedActive* active) {
+    int i;
+    int slot = -1;
+    if (!active) {
+        return -1;
+    }
+    for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
+        if (!active->move_id[i]) {
+            continue;
+        }
+        if (active->move_disabled[i] || active->move_maybe_disabled[i]) {
+            continue;
+        }
+        if (slot >= 0) {
+            return -1;
+        }
+        slot = i;
+    }
+    return slot;
 }
 
 static void apply_self_side_perspective(RawBattleState* state, int side_player) {
@@ -572,6 +616,8 @@ int raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequ
         state->self_team[i].active = 0;
         state->self_team[i].active_slot = 0;
         state->self_team[i].can_tera = 0;
+        state->self_team[i].trapped = 0;
+        state->self_team[i].maybe_trapped = 0;
     }
     for (i = 0; i < RAW_TEAM_SIZE; ++i) {
         RawPokemon* pokemon;
@@ -609,6 +655,8 @@ int raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequ
         }
         if (req->side_ability_id[i] > 0) {
             tracked_int_promote_confirmed(&pokemon->ability_id, req->side_ability_id[i]);
+        } else if (req->side_base_ability_id[i] > 0) {
+            tracked_int_promote_confirmed(&pokemon->ability_id, req->side_base_ability_id[i]);
         }
         if (req->side_tera_type_id[i] > 0) {
             tracked_int_promote_confirmed(&pokemon->tera_type_id, req->side_tera_type_id[i]);
@@ -616,6 +664,14 @@ int raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequ
         if (req->side_tera_used[i]) {
             pokemon->tera_used = 1;
         }
+        pokemon->base_hp_stat = req->side_stats_hp[i];
+        pokemon->base_atk_stat = req->side_stats_atk[i];
+        pokemon->base_def_stat = req->side_stats_def[i];
+        pokemon->base_spa_stat = req->side_stats_spa[i];
+        pokemon->base_spd_stat = req->side_stats_spd[i];
+        pokemon->base_spe_stat = req->side_stats_spe[i];
+        pokemon->commanding_active = req->side_commanding[i];
+        pokemon->reviving = req->side_reviving[i];
         {
             int m;
             for (m = 0; m < RAW_MOVE_SLOTS; ++m) {
@@ -670,8 +726,16 @@ int raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequ
         pokemon = &state->self_team[team_index];
         pokemon->can_tera = req->active[i].can_tera;
         pokemon->fainted = req->active[i].fainted;
+        pokemon->trapped = req->active[i].trapped;
+        pokemon->maybe_trapped = req->active[i].maybe_trapped;
         if (req->active[i].tera_type_id > 0) {
             tracked_int_promote_confirmed(&pokemon->tera_type_id, req->active[i].tera_type_id);
+        }
+        if (pokemon->disable_active && pokemon->disable_move_slot < 0) {
+            pokemon->disable_move_slot = infer_single_disabled_move_slot(&req->active[i]);
+        }
+        if (pokemon->encore_active && pokemon->encore_move_slot < 0) {
+            pokemon->encore_move_slot = infer_encore_move_slot(&req->active[i]);
         }
         for (m = 0; m < RAW_MOVE_SLOTS; ++m) {
             if (pokemon->transformed) {

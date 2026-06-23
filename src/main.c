@@ -740,6 +740,10 @@ static void json_write_raw_pokemon(FILE* out, const RawPokemon* mon) {
     fputs(",\"can_tera\":", out); fprintf(out, "%d", mon->can_tera);
     fputs(",\"transformed\":", out); fprintf(out, "%d", mon->transformed);
     fputs(",\"substitute_active\":", out); fprintf(out, "%d", mon->substitute_active);
+    fprintf(out,
+        ",\"base_stats\":{\"hp\":%d,\"atk\":%d,\"def\":%d,\"spa\":%d,\"spd\":%d,\"spe\":%d}",
+        mon->base_hp_stat, mon->base_atk_stat, mon->base_def_stat,
+        mon->base_spa_stat, mon->base_spd_stat, mon->base_spe_stat);
     fputs(",\"current_hp\":", out); fprintf(out, "%d", mon->current_hp);
     fputs(",\"max_hp\":", out); fprintf(out, "%d", mon->max_hp);
     fputs(",\"status\":", out); json_write_tracked_int(out, &mon->status_id, condition_name_from_id);
@@ -780,6 +784,10 @@ static void json_write_raw_pokemon(FILE* out, const RawPokemon* mon) {
     fputs(",\"protect_chain_count\":", out); fprintf(out, "%d", mon->protect_chain_count);
     fputs(",\"helping_hand_active\":", out); fprintf(out, "%d", mon->helping_hand_active);
     fputs(",\"flinch_active\":", out); fprintf(out, "%d", mon->flinch_active);
+    fputs(",\"trapped\":", out); fprintf(out, "%d", mon->trapped);
+    fputs(",\"maybe_trapped\":", out); fprintf(out, "%d", mon->maybe_trapped);
+    fputs(",\"commanding_active\":", out); fprintf(out, "%d", mon->commanding_active);
+    fputs(",\"reviving\":", out); fprintf(out, "%d", mon->reviving);
     fputs(",\"confusion_active\":", out); fprintf(out, "%d", mon->confusion_active);
     fputs(",\"confusion_turns\":", out); fprintf(out, "%d", mon->confusion_turns);
     fputs(",\"seed_active\":", out); fprintf(out, "%d", mon->seed_active);
@@ -880,6 +888,10 @@ static void json_write_canonical_pokemon(FILE* out, const RawPokemon* mon) {
     fputs(",\"tera_used\":", out); fprintf(out, "%d", mon->tera_used);
     fputs(",\"can_tera\":", out); fprintf(out, "%d", mon->can_tera);
     fputs(",\"transformed\":", out); fprintf(out, "%d", mon->transformed);
+    fprintf(out,
+        ",\"base_stats\":{\"hp\":%d,\"atk\":%d,\"def\":%d,\"spa\":%d,\"spd\":%d,\"spe\":%d}",
+        mon->base_hp_stat, mon->base_atk_stat, mon->base_def_stat,
+        mon->base_spa_stat, mon->base_spd_stat, mon->base_spe_stat);
     fputs(",\"sleep_turns_elapsed\":", out); fprintf(out, "%d", mon->sleep_turns_elapsed);
     fputs(",\"toxic_counter\":", out); fprintf(out, "%d", mon->toxic_counter);
     fputs(",\"boosts\":", out); json_write_int_array(out, mon->boosts, 7);
@@ -900,10 +912,17 @@ static void json_write_canonical_pokemon(FILE* out, const RawPokemon* mon) {
     fputs(",\"encore_turns\":", out); fprintf(out, "%d", mon->encore_turns);
     fputs(",\"disable_active\":", out); fprintf(out, "%d", mon->disable_active);
     fputs(",\"disable_turns\":", out); fprintf(out, "%d", mon->disable_turns);
+    fputs(",\"encore_move_slot\":", out); fprintf(out, "%d", mon->encore_move_slot);
+    fputs(",\"disable_move_slot\":", out); fprintf(out, "%d", mon->disable_move_slot);
     fputs(",\"taunt_active\":", out); fprintf(out, "%d", mon->taunt_active);
     fputs(",\"taunt_turns\":", out); fprintf(out, "%d", mon->taunt_turns);
     fputs(",\"protect_active\":", out); fprintf(out, "%d", mon->protect_active);
     fputs(",\"protect_chain_count\":", out); fprintf(out, "%d", mon->protect_chain_count);
+    fputs(",\"flinch_active\":", out); fprintf(out, "%d", mon->flinch_active);
+    fputs(",\"trapped\":", out); fprintf(out, "%d", mon->trapped);
+    fputs(",\"maybe_trapped\":", out); fprintf(out, "%d", mon->maybe_trapped);
+    fputs(",\"commanding_active\":", out); fprintf(out, "%d", mon->commanding_active);
+    fputs(",\"reviving\":", out); fprintf(out, "%d", mon->reviving);
     fputs(",\"confusion_active\":", out); fprintf(out, "%d", mon->confusion_active);
     fputs(",\"confusion_turns\":", out); fprintf(out, "%d", mon->confusion_turns);
     fputs(",\"substitute_active\":", out); fprintf(out, "%d", mon->substitute_active);

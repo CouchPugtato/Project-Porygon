@@ -1108,6 +1108,28 @@ static int test_request_parser_reads_private_side_item_ability_tera_and_moves(vo
     return 1;
 }
 
+static int test_request_parser_reads_private_side_stats_and_flags(void) {
+    const char* json =
+        "{\"active\":["
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false}],\"trapped\":true,\"maybeTrapped\":true}"
+        "],"
+        "\"side\":{\"id\":\"p1\",\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/321\",\"active\":true,\"stats\":{\"atk\":222,\"def\":180,\"spa\":140,\"spd\":160,\"spe\":199},\"moves\":[\"protect\",\"doubleedge\"],\"baseAbility\":\"chlorophyll\",\"ability\":\"\",\"item\":\"\",\"commanding\":true,\"reviving\":true,\"teraType\":\"Grass\",\"terastallized\":\"\"}"
+        "]}}";
+    ParsedRequest req;
+
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 61, 0), "parse private side stats and flags request")) return 0;
+    if (!assert_true(req.side_ability_id[0] == ability_id_from_name("chlorophyll"), "baseAbility fallback parsed")) return 0;
+    if (!assert_true(req.side_base_ability_id[0] == ability_id_from_name("chlorophyll"), "baseAbility stored separately")) return 0;
+    if (!assert_true(req.side_item_id[0] == 0, "empty item parsed as confirmed none")) return 0;
+    if (!assert_true(req.side_stats_hp[0] == 321, "private hp stat parsed from condition")) return 0;
+    if (!assert_true(req.side_stats_atk[0] == 222 && req.side_stats_spe[0] == 199, "private stats parsed")) return 0;
+    if (!assert_true(req.side_commanding[0] == 1 && req.side_reviving[0] == 1, "private commanding and reviving parsed")) return 0;
+    if (!assert_true(req.active[0].trapped == 1 && req.active[0].maybe_trapped == 1, "active trapped flags parsed")) return 0;
+    return 1;
+}
+
 static int test_request_reconciliation_imports_private_side_metadata(void) {
     const char* json =
         "{\"active\":["
@@ -1138,6 +1160,108 @@ static int test_request_reconciliation_imports_private_side_metadata(void) {
     if (!assert_true(bench->tera_used == 1 && bench->tera_type_id.value == type_id_from_name("Dark"), "bench tera metadata imported from request side data")) return 0;
     if (!assert_true(bench->move_ids[0].value == move_id_from_name("kowtowcleave"), "bench move list imported from request side data")) return 0;
     return 1;
+}
+
+static int test_request_reconciliation_imports_stats_flags_and_trapped_state(void) {
+    const char* json =
+        "{\"active\":["
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false}],\"trapped\":true,\"maybeTrapped\":true}"
+        "],"
+        "\"side\":{\"id\":\"p1\",\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/321\",\"active\":true,\"stats\":{\"atk\":222,\"def\":180,\"spa\":140,\"spd\":160,\"spe\":199},\"moves\":[\"protect\",\"doubleedge\"],\"ability\":\"\",\"baseAbility\":\"chlorophyll\",\"item\":\"\",\"commanding\":true,\"reviving\":true,\"teraType\":\"Grass\",\"terastallized\":\"\"},"
+        "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77, M\",\"condition\":\"100/303\",\"active\":false,\"stats\":{\"atk\":240,\"def\":201,\"spa\":120,\"spd\":155,\"spe\":111},\"moves\":[\"kowtowcleave\",\"ironhead\"],\"ability\":\"supremeoverlord\",\"item\":\"leftovers\",\"commanding\":false,\"reviving\":false,\"teraType\":\"Dark\",\"terastallized\":\"Dark\"}"
+        "]}}";
+    const char* untrapped_json =
+        "{\"active\":["
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":15,\"maxpp\":16,\"target\":\"self\",\"disabled\":false}],\"trapped\":false,\"maybeTrapped\":false}"
+        "],"
+        "\"side\":{\"id\":\"p1\",\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/321\",\"active\":true,\"stats\":{\"atk\":222,\"def\":180,\"spa\":140,\"spd\":160,\"spe\":199},\"moves\":[\"protect\",\"doubleedge\"],\"ability\":\"chlorophyll\",\"item\":\"\",\"commanding\":false,\"reviving\":false,\"teraType\":\"Grass\",\"terastallized\":\"\"},"
+        "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77, M\",\"condition\":\"100/303\",\"active\":false,\"stats\":{\"atk\":240,\"def\":201,\"spa\":120,\"spd\":155,\"spe\":111},\"moves\":[\"kowtowcleave\",\"ironhead\"],\"ability\":\"supremeoverlord\",\"item\":\"leftovers\",\"commanding\":false,\"reviving\":false,\"teraType\":\"Dark\",\"terastallized\":\"Dark\"}"
+        "]}}";
+    ParsedRequest req;
+    RawBattleState state;
+    RawPokemon* active;
+    RawPokemon* bench;
+    Observation obs;
+
+    raw_battle_state_init(&state, 0);
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 62, 0), "parse stats and trapped reconciliation request")) return 0;
+    if (!assert_true(raw_battle_state_update_from_request(&state, &req), "apply stats and trapped reconciliation request")) return 0;
+    active = find_self(&state, "p1: A");
+    bench = find_self(&state, "p1: B");
+    if (!assert_true(active != NULL && bench != NULL, "find self pokemon after stats reconciliation")) return 0;
+    if (!assert_true(active->ability_id.value == ability_id_from_name("chlorophyll"), "ability fallback imported from request")) return 0;
+    if (!assert_true(active->item_id.value == 0, "empty item imported as confirmed none")) return 0;
+    if (!assert_true(active->base_hp_stat == 321 && active->base_atk_stat == 222 && active->base_spe_stat == 199, "active base stats imported")) return 0;
+    if (!assert_true(active->commanding_active == 1 && active->reviving == 1, "active commanding and reviving imported")) return 0;
+    if (!assert_true(active->trapped == 1 && active->maybe_trapped == 1, "active trapped state persisted")) return 0;
+    if (!assert_true(bench->base_hp_stat == 303 && bench->base_def_stat == 201, "bench base stats imported")) return 0;
+    if (!assert_true(bench->tera_used == 1, "bench tera used imported")) return 0;
+    observation_from_raw_state(&obs, &state, &req, NULL);
+    if (!assert_true(obs.self_team[0].trapped == 1 && obs.self_team[0].maybe_trapped == 1, "observation exports trapped state")) return 0;
+
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, untrapped_json, 63, 0), "parse untrapped followup request")) return 0;
+    if (!assert_true(raw_battle_state_update_from_request(&state, &req), "apply untrapped followup request")) return 0;
+    if (!assert_true(active->trapped == 0 && active->maybe_trapped == 0, "later request clears trapped state")) return 0;
+    if (!assert_true(active->commanding_active == 0 && active->reviving == 0, "later request clears transient request booleans")) return 0;
+    return 1;
+}
+
+static int test_request_reconciliation_infers_encore_move_slot(void) {
+    const char* json =
+        "{\"active\":["
+        "{\"moves\":["
+        "{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false},"
+        "{\"id\":\"doubleedge\",\"pp\":15,\"maxpp\":24,\"target\":\"normal\",\"disabled\":true},"
+        "{\"id\":\"jumpkick\",\"pp\":15,\"maxpp\":24,\"target\":\"normal\",\"disabled\":true},"
+        "{\"id\":\"trailblaze\",\"pp\":15,\"maxpp\":24,\"target\":\"normal\",\"disabled\":true}"
+        "],\"trapped\":false}"
+        "],"
+        "\"side\":{\"id\":\"p1\",\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/100\",\"active\":true,\"moves\":[\"protect\",\"doubleedge\",\"jumpkick\",\"trailblaze\"],\"ability\":\"chlorophyll\"}"
+        "]}}";
+    ParsedRequest req;
+    RawBattleState state;
+    RawPokemon* active;
+
+    raw_battle_state_init(&state, 0);
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: A|Sawsbuck, L91, M|100/100");
+    raw_battle_state_update_from_event_line(&state, "|-start|p1a: A|Encore");
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 64, 0), "parse encore inference request")) return 0;
+    if (!assert_true(raw_battle_state_update_from_request(&state, &req), "apply encore inference request")) return 0;
+    active = find_self(&state, "p1: A");
+    if (!assert_true(active != NULL, "find active encore pokemon")) return 0;
+    return assert_true(active->encore_move_slot == 0, "request inference resolves encore move slot");
+}
+
+static int test_event_parser_sets_flinch_and_disable_slot(void) {
+    RawBattleState state;
+    RawPokemon* active;
+
+    raw_battle_state_init(&state, 0);
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: A|Sawsbuck, L91, M|100/100");
+    active = find_self(&state, "p1: A");
+    if (!assert_true(active != NULL, "find active pokemon for event parser transient test")) return 0;
+    tracked_int_set_confirmed(&active->move_ids[0], move_id_from_name("protect"));
+    tracked_int_set_confirmed(&active->move_ids[1], move_id_from_name("doubleedge"));
+    tracked_int_set_confirmed(&active->move_ids[2], move_id_from_name("jumpkick"));
+    tracked_int_set_confirmed(&active->move_ids[3], move_id_from_name("trailblaze"));
+    raw_pokemon_refresh_effective_state(active);
+
+    raw_battle_state_update_from_event_line(&state, "|cant|p1a: A|flinch");
+    if (!assert_true(active->flinch_active == 1, "cant flinch sets flinch_active")) return 0;
+    raw_battle_state_update_from_event_line(&state, "|turn|2");
+    if (!assert_true(active->flinch_active == 0, "turn boundary clears flinch_active")) return 0;
+
+    raw_battle_state_update_from_event_line(&state, "|-start|p1a: A|Disable|Jump Kick");
+    if (!assert_true(active->disable_active == 1, "disable event sets disable_active")) return 0;
+    if (!assert_true(active->disable_move_slot == 2, "disable event resolves disabled move slot")) return 0;
+    raw_battle_state_update_from_event_line(&state, "|-end|p1a: A|Disable");
+    return assert_true(active->disable_move_slot == -1, "disable end clears disabled move slot");
 }
 
 static int test_request_reconciliation_preserves_can_tera_through_wait_and_forced_switch(void) {
@@ -2449,7 +2573,11 @@ int main(int argc, char** argv) {
     if (!test_faint_condition_without_slash_zeros_hp()) return 1;
     if (!test_request_parser_reads_private_tera_type_even_when_moves_disabled()) return 1;
     if (!test_request_parser_reads_private_side_item_ability_tera_and_moves()) return 1;
+    if (!test_request_parser_reads_private_side_stats_and_flags()) return 1;
     if (!test_request_reconciliation_imports_private_side_metadata()) return 1;
+    if (!test_request_reconciliation_imports_stats_flags_and_trapped_state()) return 1;
+    if (!test_request_reconciliation_infers_encore_move_slot()) return 1;
+    if (!test_event_parser_sets_flinch_and_disable_slot()) return 1;
     if (!test_request_reconciliation_preserves_can_tera_through_wait_and_forced_switch()) return 1;
     if (!test_real_battle_2632274530_faint_force_switch_and_tera_request()) return 1;
     if (!test_real_battle_2632287191_switch_tera_and_force_switch()) return 1;

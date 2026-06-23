@@ -279,6 +279,8 @@ def mon_flags(mon: dict) -> list[str]:
         flags.append("substitute")
     if mon.get("protect_active"):
         flags.append("protect")
+    if mon.get("flinch_active"):
+        flags.append("flinched")
     if mon.get("confusion_active"):
         flags.append("confused")
     if mon.get("seed_active"):
@@ -289,7 +291,41 @@ def mon_flags(mon: dict) -> list[str]:
         flags.append("disable")
     if mon.get("taunt_active"):
         flags.append("taunt")
+    if mon.get("trapped"):
+        flags.append("trapped")
+    elif mon.get("maybe_trapped"):
+        flags.append("maybe trapped")
+    if mon.get("commanding_active"):
+        flags.append("commanding")
+    if mon.get("reviving"):
+        flags.append("reviving")
     return flags
+
+
+def base_stats_text(mon: dict) -> str | None:
+    stats = mon.get("base_stats") or {}
+    values = [
+        ("HP", int(stats.get("hp", 0) or 0)),
+        ("Atk", int(stats.get("atk", 0) or 0)),
+        ("Def", int(stats.get("def", 0) or 0)),
+        ("SpA", int(stats.get("spa", 0) or 0)),
+        ("SpD", int(stats.get("spd", 0) or 0)),
+        ("Spe", int(stats.get("spe", 0) or 0)),
+    ]
+    if not any(value for _, value in values):
+        return None
+    return " / ".join(f"{label} {value}" for label, value in values)
+
+
+def slot_flag_text(mon: dict) -> str | None:
+    details: list[str] = []
+    encore_slot = int(mon.get("encore_move_slot", -1) or -1)
+    disable_slot = int(mon.get("disable_move_slot", -1) or -1)
+    if encore_slot >= 0:
+        details.append(f"encore slot {encore_slot + 1}")
+    if disable_slot >= 0:
+        details.append(f"disable slot {disable_slot + 1}")
+    return ", ".join(details) if details else None
 
 
 def hp_text(mon: dict) -> str:
@@ -883,11 +919,18 @@ class ReplayStateViewer(tk.Tk):
         self.render_known_line(card, "Ability", mon.get("ability"), "ability")
         self.render_known_line(card, "Item", mon.get("item"), "item")
         self.render_known_line(card, "Tera", mon.get("tera_type"), "type")
+        stats_text = base_stats_text(mon)
+        if stats_text:
+            ttk.Label(card, text=f"Stats {stats_text}", style="CompactMeta.TLabel", wraplength=240 if active else 140).pack(anchor="w", pady=(2, 0))
 
         ttk.Label(card, text=f"Boosts {mon.get('boosts') or []}", style="CompactMeta.TLabel", wraplength=240 if active else 140).pack(anchor="w", pady=(2, 0))
 
         moves = move_names(mon)
         ttk.Label(card, text=f"Moves: {', '.join(moves) if moves else '-'}", style="CompactMeta.TLabel", wraplength=240 if active else 140).pack(anchor="w", pady=(2, 0))
+
+        slot_text = slot_flag_text(mon)
+        if slot_text:
+            ttk.Label(card, text=f"Slots: {slot_text}", style="CompactMeta.TLabel", wraplength=240 if active else 140).pack(anchor="w", pady=(2, 0))
 
         flags = mon_flags(mon)
         ttk.Label(card, text=f"Flags: {', '.join(flags) if flags else '-'}", style="CompactMeta.TLabel", wraplength=240 if active else 140).pack(anchor="w", pady=(2, 0))

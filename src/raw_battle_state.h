@@ -28,10 +28,20 @@ typedef struct {
     TrackedInt effective_species_id;
     TrackedInt effective_type1_id;
     TrackedInt effective_type2_id;
+    int base_hp_stat;
+    int base_atk_stat;
+    int base_def_stat;
+    int base_spa_stat;
+    int base_spd_stat;
+    int base_spe_stat;
     int tera_used;
     int can_tera;
     int transformed;
     int substitute_active;
+    int trapped;
+    int maybe_trapped;
+    int commanding_active;
+    int reviving;
 
     int current_hp;
     int max_hp;
@@ -127,6 +137,8 @@ typedef struct {
     RawSideState opp_side;
 
     int weather_id;
+    /* Remaining turn counters for weather/terrain are inferred estimates from
+       public protocol starts and ends, not exact hidden-info reconstruction. */
     TrackedInt weather_turns_remaining;
     int terrain_id;
     TrackedInt terrain_turns_remaining;

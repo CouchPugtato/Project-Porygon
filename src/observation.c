@@ -92,6 +92,8 @@ static size_t flatten_pokemon(float* out, size_t idx, const ObsPokemon* p) {
     idx = write_flag(out, idx, p->confusion_active);
     idx = write_scalar(out, idx, p->confusion_turns / 5.0f);
     idx = write_flag(out, idx, p->substitute_active);
+    idx = write_flag(out, idx, p->trapped);
+    idx = write_flag(out, idx, p->maybe_trapped);
     idx = write_scalar(out, idx, p->toxic_counter / 15.0f);
     idx = write_scalar(out, idx, p->sleep_turns_elapsed / 5.0f);
     idx = write_flag(out, idx, p->transformed);

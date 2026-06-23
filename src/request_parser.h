@@ -72,9 +72,18 @@ typedef struct {
     int side_species_id[PARSED_REQUEST_TEAM_SIZE];
     int side_item_id[PARSED_REQUEST_TEAM_SIZE];
     int side_ability_id[PARSED_REQUEST_TEAM_SIZE];
+    int side_base_ability_id[PARSED_REQUEST_TEAM_SIZE];
     int side_tera_type_id[PARSED_REQUEST_TEAM_SIZE];
     int side_tera_used[PARSED_REQUEST_TEAM_SIZE];
     int side_move_id[PARSED_REQUEST_TEAM_SIZE][PARSED_REQUEST_MOVE_SLOTS];
+    int side_stats_hp[PARSED_REQUEST_TEAM_SIZE];
+    int side_stats_atk[PARSED_REQUEST_TEAM_SIZE];
+    int side_stats_def[PARSED_REQUEST_TEAM_SIZE];
+    int side_stats_spa[PARSED_REQUEST_TEAM_SIZE];
+    int side_stats_spd[PARSED_REQUEST_TEAM_SIZE];
+    int side_stats_spe[PARSED_REQUEST_TEAM_SIZE];
+    int side_commanding[PARSED_REQUEST_TEAM_SIZE];
+    int side_reviving[PARSED_REQUEST_TEAM_SIZE];
     ParsedActive active[PARSED_REQUEST_ACTIVE_SLOTS];
     char raw_json[PARSED_REQUEST_MAX_JSON];
 } ParsedRequest;

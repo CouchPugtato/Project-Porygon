@@ -600,13 +600,26 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                     req->side_species_id[team_idx] = 0;
                     req->side_item_id[team_idx] = 0;
                     req->side_ability_id[team_idx] = 0;
+                    req->side_base_ability_id[team_idx] = 0;
                     req->side_tera_type_id[team_idx] = 0;
                     req->side_tera_used[team_idx] = 0;
+                    req->side_stats_hp[team_idx] = 0;
+                    req->side_stats_atk[team_idx] = 0;
+                    req->side_stats_def[team_idx] = 0;
+                    req->side_stats_spa[team_idx] = 0;
+                    req->side_stats_spd[team_idx] = 0;
+                    req->side_stats_spe[team_idx] = 0;
+                    req->side_commanding[team_idx] = 0;
+                    req->side_reviving[team_idx] = 0;
                     req->side_ident[team_idx][0] = '\0';
                     memset(req->side_move_id[team_idx], 0, sizeof(req->side_move_id[team_idx]));
 
-                    if (parse_json_string_field(poke_obj, "condition", cond, sizeof(cond)) && strstr(cond, "fnt")) {
-                        fainted = 1;
+                    if (parse_json_string_field(poke_obj, "condition", cond, sizeof(cond))) {
+                        const char* slash = strchr(cond, '/');
+                        fainted = strstr(cond, "fnt") ? 1 : 0;
+                        if (slash) {
+                            req->side_stats_hp[team_idx] = atoi(slash + 1);
+                        }
                     } else {
                         fainted = 0;
                     }
@@ -623,13 +636,21 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                     }
                     req->side_item_id[team_idx] = parse_string_id_after(poke_obj, "item", item_id_from_name);
                     req->side_ability_id[team_idx] = parse_string_id_after(poke_obj, "ability", ability_id_from_name);
+                    req->side_base_ability_id[team_idx] = parse_string_id_after(poke_obj, "baseAbility", ability_id_from_name);
                     if (req->side_ability_id[team_idx] <= 0) {
-                        req->side_ability_id[team_idx] = parse_string_id_after(poke_obj, "baseAbility", ability_id_from_name);
+                        req->side_ability_id[team_idx] = req->side_base_ability_id[team_idx];
                     }
                     req->side_tera_type_id[team_idx] = parse_string_id_after(poke_obj, "teraType", type_id_from_name);
                     if (parse_json_string_field(poke_obj, "terastallized", details, sizeof(details)) && details[0]) {
                         req->side_tera_used[team_idx] = 1;
                     }
+                    req->side_stats_atk[team_idx] = parse_int_after(poke_obj, "atk", 0);
+                    req->side_stats_def[team_idx] = parse_int_after(poke_obj, "def", 0);
+                    req->side_stats_spa[team_idx] = parse_int_after(poke_obj, "spa", 0);
+                    req->side_stats_spd[team_idx] = parse_int_after(poke_obj, "spd", 0);
+                    req->side_stats_spe[team_idx] = parse_int_after(poke_obj, "spe", 0);
+                    req->side_commanding[team_idx] = parse_bool_after(poke_obj, "commanding", 0);
+                    req->side_reviving[team_idx] = parse_bool_after(poke_obj, "reviving", 0);
                     {
                         const char* moves_key = find_after_key(poke_obj, "moves");
                         const char* moves_arr = moves_key ? strchr(moves_key, '[') : NULL;

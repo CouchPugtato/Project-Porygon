@@ -85,6 +85,8 @@ typedef struct {
     uint8_t confusion_active;
     float confusion_turns;
     uint8_t substitute_active;
+    uint8_t trapped;
+    uint8_t maybe_trapped;
     float toxic_counter;
     float sleep_turns_elapsed;
     uint8_t transformed;
@@ -167,7 +169,7 @@ typedef struct {
     OBS_NUM_TYPES + \
     3 + \
     OBS_BOOST_SLOTS + \
-    15 + \
+    17 + \
     OBS_MOVE_SLOTS * (2 + 3 + 1 + OBS_NUM_MOVES) \
 )
 

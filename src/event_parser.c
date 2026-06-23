@@ -357,6 +357,8 @@ static void handle_weather(RawBattleState* state, const char* value) {
     else if (strncmp(value, "Snow", 4) == 0) state->weather_id = 4;
     else state->weather_id = 0;
     if (state->weather_id) {
+        /* Public protocol usually tells us weather start/clear but not whether an
+           extender is in play, so remaining turns are tracked as inferred. */
         tracked_int_set_inferred(&state->weather_turns_remaining, 5);
     } else {
         tracked_int_set_unknown(&state->weather_turns_remaining);
@@ -366,6 +368,7 @@ static void handle_weather(RawBattleState* state, const char* value) {
 static void handle_field_start(RawBattleState* state, const char* value) {
     if (strncmp(value, "Electric Terrain", 16) == 0) {
         state->terrain_id = 1;
+        /* Terrain duration is an inferred estimate unless separately proven. */
         tracked_int_set_inferred(&state->terrain_turns_remaining, 5);
     } else if (strncmp(value, "Grassy Terrain", 14) == 0) {
         state->terrain_id = 2;
@@ -505,7 +508,25 @@ static void handle_boost(RawBattleState* state, const char* ident, const char* s
     else if (mode == 2) pokemon->boosts[idx] = amount;
 }
 
-static void handle_start(RawBattleState* state, const char* ident, const char* effect) {
+static int move_slot_for_name(const RawPokemon* pokemon, const char* move_name) {
+    int move_id;
+    int i;
+    if (!pokemon || !move_name || !*move_name) {
+        return -1;
+    }
+    move_id = move_id_from_name(move_name);
+    if (move_id <= 0) {
+        return -1;
+    }
+    for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
+        if (pokemon->effective_move_ids[i].value == move_id || pokemon->move_ids[i].value == move_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void handle_start(RawBattleState* state, const char* ident, const char* effect, const char* detail) {
     RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, ident);
     const char* normalized = effect;
     if (!p) return;
@@ -513,7 +534,13 @@ static void handle_start(RawBattleState* state, const char* ident, const char* e
         normalized += 6;
     }
     if (strncmp(normalized, "Encore", 6) == 0) { p->encore_active = 1; p->encore_turns = 3; }
-    else if (strncmp(normalized, "Disable", 7) == 0) { p->disable_active = 1; p->disable_turns = 4; }
+    else if (strncmp(normalized, "Disable", 7) == 0) {
+        p->disable_active = 1;
+        p->disable_turns = 4;
+        if (detail && *detail) {
+            p->disable_move_slot = move_slot_for_name(p, detail);
+        }
+    }
     else if (strncmp(normalized, "Taunt", 5) == 0) { p->taunt_active = 1; p->taunt_turns = 3; }
     else if (strncmp(normalized, "Torment", 7) == 0) { p->torment_active = 1; p->torment_turns = 3; }
     else if (strncmp(normalized, "Heal Block", 10) == 0) { p->heal_block_active = 1; p->heal_block_turns = 5; }
@@ -533,8 +560,8 @@ static void handle_end(RawBattleState* state, const char* ident, const char* eff
     if (normalized && strncmp(normalized, "move: ", 6) == 0) {
         normalized += 6;
     }
-    if (strncmp(normalized, "Encore", 6) == 0) { p->encore_active = 0; p->encore_turns = 0; }
-    else if (strncmp(normalized, "Disable", 7) == 0) { p->disable_active = 0; p->disable_turns = 0; }
+    if (strncmp(normalized, "Encore", 6) == 0) { p->encore_active = 0; p->encore_turns = 0; p->encore_move_slot = -1; }
+    else if (strncmp(normalized, "Disable", 7) == 0) { p->disable_active = 0; p->disable_turns = 0; p->disable_move_slot = -1; }
     else if (strncmp(normalized, "Taunt", 5) == 0) { p->taunt_active = 0; p->taunt_turns = 0; }
     else if (strncmp(normalized, "Torment", 7) == 0) { p->torment_active = 0; p->torment_turns = 0; }
     else if (strncmp(normalized, "Heal Block", 10) == 0) { p->heal_block_active = 0; p->heal_block_turns = 0; }
@@ -654,8 +681,20 @@ void event_parser_apply_line(RawBattleState* state, const char* line) {
     else if (strcmp(parts.parts[0], "-setboost") == 0 && parts.count > 3) handle_boost(state, parts.parts[1], parts.parts[2], atoi(parts.parts[3]), 2);
     else if (strcmp(parts.parts[0], "-clearallboost") == 0) { int i,j; for (i = 0; i < RAW_TEAM_SIZE; ++i) for (j = 0; j < 7; ++j) { state->self_team[i].boosts[j] = 0; state->opp_team[i].boosts[j] = 0; } }
     else if (strcmp(parts.parts[0], "-clearboost") == 0 && parts.count > 1) { int j; RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]); if (p) for (j = 0; j < 7; ++j) p->boosts[j] = 0; }
-    else if (strcmp(parts.parts[0], "-start") == 0 && parts.count > 2) handle_start(state, parts.parts[1], parts.parts[2]);
+    else if (strcmp(parts.parts[0], "-start") == 0 && parts.count > 2) handle_start(state, parts.parts[1], parts.parts[2], parts.count > 3 ? parts.parts[3] : NULL);
     else if (strcmp(parts.parts[0], "-end") == 0 && parts.count > 2) handle_end(state, parts.parts[1], parts.parts[2]);
+    else if (strcmp(parts.parts[0], "-flinch") == 0 && parts.count > 1) {
+        RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]);
+        if (p) {
+            p->flinch_active = 1;
+        }
+    }
+    else if (strcmp(parts.parts[0], "cant") == 0 && parts.count > 2) {
+        RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]);
+        if (p && strcmp(parts.parts[2], "flinch") == 0) {
+            p->flinch_active = 1;
+        }
+    }
     else if (strcmp(parts.parts[0], "-singleturn") == 0 && parts.count > 2) {
         RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]);
         RawSideState* side = side_for_ident(state, parts.parts[1]);

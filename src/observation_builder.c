@@ -67,6 +67,8 @@ static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
     out->confusion_active = (unsigned char)in->confusion_active;
     out->confusion_turns = (float)in->confusion_turns;
     out->substitute_active = (unsigned char)in->substitute_active;
+    out->trapped = (unsigned char)in->trapped;
+    out->maybe_trapped = (unsigned char)in->maybe_trapped;
     out->toxic_counter = (float)in->toxic_counter;
     out->sleep_turns_elapsed = (float)in->sleep_turns_elapsed;
     out->transformed = (unsigned char)in->transformed;
@@ -93,6 +95,8 @@ void observation_from_raw_state(
     observation_init(out);
     out->weather_id = state->weather_id;
     out->terrain_id = state->terrain_id;
+    /* Weather/terrain turn counts may be inferred rather than exact hidden-info
+       truth; preserve the knowledge mode alongside the numeric estimate. */
     out->weather_turns = (float)state->weather_turns_remaining.value;
     out->weather_turns_known_mode = knowledge_to_mode(state->weather_turns_remaining.knowledge);
     out->terrain_turns = (float)state->terrain_turns_remaining.value;
