@@ -13,4 +13,7 @@ gen9randomdoublesbattle
 --reconnect-seconds
 15
 
+--guest-refresh-seconds
+21600
+
 --battle-agent

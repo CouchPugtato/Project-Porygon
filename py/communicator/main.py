@@ -6,6 +6,7 @@ import json
 import random
 import signal
 import sys
+import time
 from itertools import product
 from pathlib import Path
 from websockets.exceptions import ConnectionClosed
@@ -27,6 +28,7 @@ FALLBACK_DELAY_MAX_SECONDS = 1.2
 DEFAULT_ARGS_PATH = Path("config/communicator.args")
 DEFAULT_RECONNECT_SECONDS = 5.0
 DEFAULT_LEARNER_COMMAND = r".\build-fresh\showdown_client.exe"
+DEFAULT_GUEST_REFRESH_SECONDS = 0.0
 PROTECT_MOVE_NAMES = {
     "protect",
     "detect",
@@ -58,6 +60,14 @@ def resolve_replay_save_path(run_name: str) -> Path:
         normalized = "runtime_capture"
     run_dir = Path("matches") / "runs" / normalized
     return run_dir / f"{normalized}_raw.jsonl"
+
+
+def should_refresh_guest(username: str, guest_refresh_seconds: float, session_started_at: float | None) -> bool:
+    if username:
+        return False
+    if guest_refresh_seconds <= 0.0 or session_started_at is None:
+        return False
+    return (time.monotonic() - session_started_at) >= guest_refresh_seconds
 
 
 def battle_label(battle_id: str) -> str:
@@ -707,6 +717,7 @@ async def capture_mode(
     username: str,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
+    guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
 ) -> None:
     gateway: ShowdownGateway | None = None
     writer = BufferedReplayWriter(out_path)
@@ -716,11 +727,13 @@ async def capture_mode(
     finished_battles = 0
     seq = 0
     stop_requested = False
+    refresh_requested = False
+    session_started_at: float | None = None
 
     print(f"[capture] writing replay records to {out_path}")
 
     async def on_event(event: ShowdownEvent) -> None:
-        nonlocal finished_battles, seq, stop_requested
+        nonlocal finished_battles, seq, stop_requested, refresh_requested
 
         if event.room_id.startswith("battle-") and event.room_id not in started_battles:
             started_battles.add(event.room_id)
@@ -764,6 +777,11 @@ async def capture_mode(
                 stop_requested = True
                 assert gateway is not None
                 await gateway.close()
+            elif should_refresh_guest(username, guest_refresh_seconds, session_started_at):
+                print(f"[capture] refreshing guest session after {guest_refresh_seconds:.1f}s")
+                refresh_requested = True
+                assert gateway is not None
+                await gateway.close()
             else:
                 assert gateway is not None
                 await gateway.search_next_battle()
@@ -776,7 +794,12 @@ async def capture_mode(
         gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
         try:
             await gateway.connect()
+            session_started_at = time.monotonic()
             await gateway.run(on_event)
+            if refresh_requested and not stop_requested:
+                refresh_requested = False
+                print("[capture] guest session refreshed; reconnecting now")
+                continue
             if not stop_requested:
                 print("[capture] gateway closed cleanly")
                 break
@@ -794,6 +817,7 @@ async def random_mode(
     username: str,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
+    guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
 ) -> None:
     gateway: ShowdownGateway | None = None
     writer = BufferedReplayWriter(replay_path)
@@ -818,6 +842,8 @@ async def random_mode(
     active_battles: set[str] = set()
     stop_after_current_battle = asyncio.Event()
     stop_requested = False
+    refresh_requested = False
+    session_started_at: float | None = None
 
     async def request_shutdown() -> None:
         nonlocal stop_requested
@@ -865,7 +891,7 @@ async def random_mode(
         await gateway.send_room_command(room_id, candidate)
 
     async def on_event(event: ShowdownEvent) -> None:
-        nonlocal seq, finished_battles, invalid_choice_count
+        nonlocal seq, finished_battles, invalid_choice_count, stop_requested, refresh_requested
         summary = event_summary(event)
         if summary:
             print(summary)
@@ -966,6 +992,11 @@ async def random_mode(
                 stop_requested = True
                 assert gateway is not None
                 await gateway.close()
+            elif should_refresh_guest(username, guest_refresh_seconds, session_started_at):
+                print(f"[random] refreshing guest session after {guest_refresh_seconds:.1f}s")
+                refresh_requested = True
+                assert gateway is not None
+                await gateway.close()
             elif stop_after_current_battle.is_set():
                 print("[random] current battle finished; stopping")
                 stop_requested = True
@@ -1005,7 +1036,12 @@ async def random_mode(
             gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
             try:
                 await gateway.connect()
+                session_started_at = time.monotonic()
                 await gateway.run(on_event)
+                if refresh_requested and not stop_requested:
+                    refresh_requested = False
+                    print("[random] guest session refreshed; reconnecting now")
+                    continue
                 if not stop_requested:
                     print("[random] gateway closed cleanly")
                     break
@@ -1033,6 +1069,7 @@ async def live_mode(
     username: str,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
+    guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
 ) -> None:
     gateway: ShowdownGateway | None = None
     learner: LearnerProcess | None = None
@@ -1066,6 +1103,8 @@ async def live_mode(
     stop_after_current_battle = asyncio.Event()
     learner_stopping = asyncio.Event()
     stop_requested = False
+    refresh_requested = False
+    session_started_at: float | None = None
 
     async def request_shutdown() -> None:
         nonlocal stop_requested
@@ -1091,7 +1130,7 @@ async def live_mode(
     signal.signal(signal.SIGINT, handle_sigint)
 
     async def on_event(event: ShowdownEvent) -> None:
-        nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count, finished_battles, stop_requested
+        nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count, finished_battles, stop_requested, refresh_requested
         summary = event_summary(event)
         if summary:
             print(summary)
@@ -1323,6 +1362,14 @@ async def live_mode(
                 await gateway.close()
                 assert learner is not None
                 await learner.terminate()
+            elif should_refresh_guest(username, guest_refresh_seconds, session_started_at):
+                print(f"[live] refreshing guest session after {guest_refresh_seconds:.1f}s")
+                refresh_requested = True
+                learner_stopping.set()
+                assert gateway is not None
+                await gateway.close()
+                assert learner is not None
+                await learner.terminate()
             elif stop_after_current_battle.is_set():
                 print("[live] current battle finished; stopping")
                 stop_requested = True
@@ -1447,7 +1494,13 @@ async def live_mode(
             print(f"[live] started learner: {' '.join(learner_command)}")
             try:
                 await gateway.connect()
+                session_started_at = time.monotonic()
                 await asyncio.gather(gateway.run(on_event), action_loop(), stderr_loop())
+                if refresh_requested and not stop_requested:
+                    refresh_requested = False
+                    learner_stopping.clear()
+                    print("[live] guest session refreshed; reconnecting now")
+                    continue
                 if not stop_requested:
                     print("[live] gateway/learner session ended cleanly")
                     break
@@ -1487,6 +1540,7 @@ def main() -> None:
     parser.add_argument("--username", default="")
     parser.add_argument("--games", type=int, default=0)
     parser.add_argument("--reconnect-seconds", type=float, default=DEFAULT_RECONNECT_SECONDS)
+    parser.add_argument("--guest-refresh-seconds", type=float, default=DEFAULT_GUEST_REFRESH_SECONDS)
     argv = sys.argv[1:]
     if not argv:
         argv = load_default_args(DEFAULT_ARGS_PATH)
@@ -1502,6 +1556,7 @@ def main() -> None:
                 args.username,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
+                guest_refresh_seconds=args.guest_refresh_seconds,
             )
         )
     elif args.mode == "random":
@@ -1512,6 +1567,7 @@ def main() -> None:
                 args.username,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
+                guest_refresh_seconds=args.guest_refresh_seconds,
             )
         )
     else:
@@ -1527,6 +1583,7 @@ def main() -> None:
                 args.username,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
+                guest_refresh_seconds=args.guest_refresh_seconds,
             )
         )
 

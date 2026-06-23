@@ -27,3 +27,5 @@ matches/runs/<run_name>/<run_name>_raw.jsonl
 ```
 
 `--reconnect-seconds <n>` controls how long the communicator waits before reconnecting after an unexpected websocket/network drop.
+
+`--guest-refresh-seconds <n>` controls how long a guest session may live before the communicator intentionally reconnects between battles to get a fresh guest account. `0` disables this.
