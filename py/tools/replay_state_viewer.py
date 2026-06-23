@@ -103,7 +103,7 @@ def build_turn_groups(snapshots: list[dict], turn_numbers: list[int]) -> list[tu
 def canonical_turn_snapshot_score(candidate: tuple[int, dict]) -> tuple[int, int, int, int]:
     idx, snapshot = candidate
     session = snapshot.get("session") or {}
-    raw_state = session.get("raw_state") or {}
+    raw_state = session.get("canonical_state") or session.get("raw_state") or {}
     request = session.get("request") or {}
     is_doubles = int(raw_state.get("is_doubles", 0) or 0)
     expected_active = 2 if is_doubles else 1
@@ -113,10 +113,17 @@ def canonical_turn_snapshot_score(candidate: tuple[int, dict]) -> tuple[int, int
     has_full_field = int(self_active >= expected_active and opp_active >= expected_active)
     is_request = int(snapshot.get("message_type") == "request")
     request_needs_choice = int(bool(request) and not int(request.get("wait", 0) or 0))
+    ready_for_decision = int(session.get("ready_for_decision", 0) or 0)
+    known_count = 0
+    for team_name in ("self_team", "opp_team"):
+        for mon in raw_state.get(team_name) or []:
+            if mon.get("known") or mon.get("revealed") or mon.get("active"):
+                known_count += 1
     return (
         has_full_field,
         active_completeness,
-        is_request + request_needs_choice,
+        is_request + request_needs_choice + ready_for_decision,
+        known_count,
         idx,
     )
 
@@ -134,6 +141,33 @@ def tracked_knowledge(tracked: dict | None) -> str:
     tracked = tracked or {}
     knowledge = str(tracked.get("knowledge") or "unknown").strip()
     return knowledge if knowledge else "unknown"
+
+
+def session_state(session: dict) -> dict:
+    if not session:
+        return {}
+    state = session.get("canonical_state")
+    if isinstance(state, dict) and state:
+        return state
+    state = session.get("raw_state")
+    if isinstance(state, dict) and state:
+        return state
+    return {}
+
+
+def merge_team_debug(team: list[dict], debug_team: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    for idx, mon in enumerate(team):
+        if not isinstance(mon, dict):
+            merged.append({})
+            continue
+        combined = dict(mon)
+        if idx < len(debug_team) and isinstance(debug_team[idx], dict):
+            for key, value in debug_team[idx].items():
+                if key not in combined:
+                    combined[key] = value
+        merged.append(combined)
+    return merged
 
 
 def pretty_knowledge(tracked: dict | None) -> str:
@@ -224,8 +258,11 @@ def reserve_mons(team: list[dict]) -> list[dict]:
 def move_names(mon: dict) -> list[str]:
     names: list[str] = []
     for move in mon.get("moves") or []:
-        move_data = move.get("move") or {}
-        if move.get("known") or move_data.get("value", 0):
+        move_data = move.get("effective_move") or move.get("move") or move.get("base_move") or {}
+        known = move.get("effective_known")
+        if known is None:
+            known = move.get("known")
+        if known or move_data.get("value", 0):
             names.append(tracked_name(move_data, "move"))
     return names
 
@@ -701,7 +738,10 @@ class ReplayStateViewer(tk.Tk):
         turn, snapshot_idx = self.turns[self.current_turn_idx]
         snapshot = self.snapshots[snapshot_idx]
         session = snapshot.get("session") or {}
-        raw_state = session.get("raw_state") or {}
+        raw_state = session_state(session)
+        debug_only = session.get("debug_only") or {}
+        self_team = merge_team_debug(raw_state.get("self_team") or [], debug_only.get("self_team") or [])
+        opp_team = merge_team_debug(raw_state.get("opp_team") or [], debug_only.get("opp_team") or [])
         self.current_turn_var.set(f"Turn {turn}")
         self.current_meta_var.set(
             f"message={snapshot.get('message_type', '')}  "
@@ -711,14 +751,14 @@ class ReplayStateViewer(tk.Tk):
         self.render_field_state(snapshot)
         self.render_side_section(
             self.opp_side_frame,
-            active_mons(raw_state.get("opp_team") or []),
-            reserve_mons(raw_state.get("opp_team") or []),
+            active_mons(opp_team),
+            reserve_mons(opp_team),
             align="right",
         )
         self.render_side_section(
             self.self_side_frame,
-            active_mons(raw_state.get("self_team") or []),
-            reserve_mons(raw_state.get("self_team") or []),
+            active_mons(self_team),
+            reserve_mons(self_team),
             align="left",
         )
 
@@ -729,7 +769,7 @@ class ReplayStateViewer(tk.Tk):
     def render_field_state(self, snapshot: dict) -> None:
         self.clear_frame(self.field_frame)
         session = snapshot.get("session") or {}
-        raw_state = session.get("raw_state") or {}
+        raw_state = session_state(session)
         turn, snapshot_indices, _ = self.turn_groups[self.current_turn_idx]
 
         row = ttk.Frame(self.field_frame, style="CenterCard.TFrame")
@@ -827,7 +867,7 @@ class ReplayStateViewer(tk.Tk):
             ttk.Label(card, text="No known data", style="CompactMeta.TLabel", wraplength=160 if active else 100).pack(anchor="w", pady=(2, 0))
             return card
 
-        ident = mon.get("ident") or tracked_name(mon.get("species"), "species")
+        ident = mon.get("ident") or mon.get("canonical_ident") or tracked_name(mon.get("species"), "species")
         ttk.Label(card, text=ident, style="Section.TLabel").pack(anchor="w")
 
         species_row = ttk.Frame(card, style="Panel.TFrame")
