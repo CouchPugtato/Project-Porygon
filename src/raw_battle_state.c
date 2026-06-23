@@ -604,6 +604,31 @@ int raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequ
                 pokemon->ident[RAW_IDENT_LEN - 1] = '\0';
             }
         }
+        if (req->side_item_id[i] >= 0) {
+            tracked_int_promote_confirmed(&pokemon->item_id, req->side_item_id[i]);
+        }
+        if (req->side_ability_id[i] > 0) {
+            tracked_int_promote_confirmed(&pokemon->ability_id, req->side_ability_id[i]);
+        }
+        if (req->side_tera_type_id[i] > 0) {
+            tracked_int_promote_confirmed(&pokemon->tera_type_id, req->side_tera_type_id[i]);
+        }
+        if (req->side_tera_used[i]) {
+            pokemon->tera_used = 1;
+        }
+        {
+            int m;
+            for (m = 0; m < RAW_MOVE_SLOTS; ++m) {
+                if (req->side_move_id[i][m] > 0) {
+                    tracked_int_promote_confirmed(&pokemon->move_ids[m], req->side_move_id[i][m]);
+                    pokemon->move_known[m] = 1;
+                }
+            }
+        }
+        raw_pokemon_refresh_types(pokemon);
+        if (!pokemon->transformed) {
+            raw_pokemon_refresh_effective_state(pokemon);
+        }
     }
     if (!had_prior_active_slot_mapping) {
         for (i = 0; i < req->active_count && i < 2; ++i) {

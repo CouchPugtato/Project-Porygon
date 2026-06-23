@@ -1087,6 +1087,59 @@ static int test_request_parser_reads_private_tera_type_even_when_moves_disabled(
     return 1;
 }
 
+static int test_request_parser_reads_private_side_item_ability_tera_and_moves(void) {
+    const char* json =
+        "{\"active\":["
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false}],\"canTerastallize\":\"Grass\"}"
+        "],"
+        "\"side\":{\"id\":\"p1\",\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/100\",\"active\":true,\"moves\":[\"protect\",\"doubleedge\",\"jumpkick\",\"trailblaze\"],\"baseAbility\":\"chlorophyll\",\"ability\":\"chlorophyll\",\"item\":\"lifeorb\",\"teraType\":\"Grass\",\"terastallized\":\"\"},"
+        "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77, M\",\"condition\":\"100/100\",\"active\":false,\"moves\":[\"kowtowcleave\",\"ironhead\",\"protect\",\"suckerpunch\"],\"baseAbility\":\"supremeoverlord\",\"item\":\"leftovers\",\"teraType\":\"Dark\",\"terastallized\":\"Dark\"}"
+        "]}}";
+    ParsedRequest req;
+
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 6, 0), "parse private side metadata request")) return 0;
+    if (!assert_true(req.side_item_id[0] == item_id_from_name("lifeorb"), "private side item parsed")) return 0;
+    if (!assert_true(req.side_ability_id[0] == ability_id_from_name("chlorophyll"), "private side ability parsed")) return 0;
+    if (!assert_true(req.side_tera_type_id[0] == type_id_from_name("Grass"), "private side tera type parsed")) return 0;
+    if (!assert_true(req.side_move_id[0][1] == move_id_from_name("doubleedge"), "private side move list parsed")) return 0;
+    if (!assert_true(req.side_tera_used[1] == 1, "private side terastallized flag parsed")) return 0;
+    return 1;
+}
+
+static int test_request_reconciliation_imports_private_side_metadata(void) {
+    const char* json =
+        "{\"active\":["
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false}],\"canTerastallize\":\"Grass\"}"
+        "],"
+        "\"side\":{\"id\":\"p1\",\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/100\",\"active\":true,\"moves\":[\"protect\",\"doubleedge\",\"jumpkick\",\"trailblaze\"],\"ability\":\"chlorophyll\",\"item\":\"lifeorb\",\"teraType\":\"Grass\",\"terastallized\":\"\"},"
+        "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77, M\",\"condition\":\"100/100\",\"active\":false,\"moves\":[\"kowtowcleave\",\"ironhead\",\"protect\",\"suckerpunch\"],\"ability\":\"supremeoverlord\",\"item\":\"leftovers\",\"teraType\":\"Dark\",\"terastallized\":\"Dark\"}"
+        "]}}";
+    ParsedRequest req;
+    RawBattleState state;
+    RawPokemon* active;
+    RawPokemon* bench;
+
+    raw_battle_state_init(&state, 0);
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 7, 0), "parse private side metadata reconciliation request")) return 0;
+    if (!assert_true(raw_battle_state_update_from_request(&state, &req), "apply private side metadata reconciliation request")) return 0;
+    active = find_self(&state, "p1: A");
+    bench = find_self(&state, "p1: B");
+    if (!assert_true(active != NULL && bench != NULL, "find self pokemon after private metadata reconciliation")) return 0;
+    if (!assert_true(active->item_id.value == item_id_from_name("lifeorb"), "active item imported from request side data")) return 0;
+    if (!assert_true(active->ability_id.value == ability_id_from_name("chlorophyll"), "active ability imported from request side data")) return 0;
+    if (!assert_true(active->tera_type_id.value == type_id_from_name("Grass"), "active tera type imported from request side data")) return 0;
+    if (!assert_true(active->move_ids[1].value == move_id_from_name("doubleedge"), "active full move list imported from request side data")) return 0;
+    if (!assert_true(bench->item_id.value == item_id_from_name("leftovers"), "bench item imported from request side data")) return 0;
+    if (!assert_true(bench->ability_id.value == ability_id_from_name("supremeoverlord"), "bench ability imported from request side data")) return 0;
+    if (!assert_true(bench->tera_used == 1 && bench->tera_type_id.value == type_id_from_name("Dark"), "bench tera metadata imported from request side data")) return 0;
+    if (!assert_true(bench->move_ids[0].value == move_id_from_name("kowtowcleave"), "bench move list imported from request side data")) return 0;
+    return 1;
+}
+
 static int test_request_reconciliation_preserves_can_tera_through_wait_and_forced_switch(void) {
     const char* actionable_json =
         "{\"active\":["
@@ -2395,6 +2448,8 @@ int main(int argc, char** argv) {
     if (!test_faint_event_zeros_hp_in_state_and_observation()) return 1;
     if (!test_faint_condition_without_slash_zeros_hp()) return 1;
     if (!test_request_parser_reads_private_tera_type_even_when_moves_disabled()) return 1;
+    if (!test_request_parser_reads_private_side_item_ability_tera_and_moves()) return 1;
+    if (!test_request_reconciliation_imports_private_side_metadata()) return 1;
     if (!test_request_reconciliation_preserves_can_tera_through_wait_and_forced_switch()) return 1;
     if (!test_real_battle_2632274530_faint_force_switch_and_tera_request()) return 1;
     if (!test_real_battle_2632287191_switch_tera_and_force_switch()) return 1;
