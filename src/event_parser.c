@@ -351,6 +351,7 @@ static RawPokemon* active_switch_source_for_side(RawBattleState* state, int self
 }
 
 static void clear_on_switch_local(RawPokemon* pokemon) {
+    int i;
     if (!pokemon) {
         return;
     }
@@ -381,6 +382,9 @@ static void clear_on_switch_local(RawPokemon* pokemon) {
     pokemon->sleep_turns_elapsed = 0;
     pokemon->perish_song_counter = 0;
     pokemon->ability_triggered_on_switch_in = 0;
+    for (i = 0; i < 7; ++i) {
+        pokemon->boosts[i] = 0;
+    }
     raw_pokemon_clear_transform(pokemon);
 }
 
@@ -859,13 +863,13 @@ void event_parser_apply_line(RawBattleState* state, const char* line) {
         if (p && strcmp(parts.parts[2], "Helping Hand") == 0) p->helping_hand_active = 1;
     }
     else if (strcmp(parts.parts[0], "-damage") == 0 && parts.count > 2) {
-        RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]); int hp,max_hp,status,fnt,hp_known; if (p) { parse_condition(parts.parts[2], &hp,&max_hp,&status,&fnt,&hp_known); if (hp_known) { p->current_hp=hp; p->max_hp=max_hp; } else if (fnt) { p->current_hp = 0; } if (status) tracked_int_promote_confirmed(&p->status_id,status); p->fainted=fnt; }
+        RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]); int hp,max_hp,status,fnt,hp_known; if (p) { parse_condition(parts.parts[2], &hp,&max_hp,&status,&fnt,&hp_known); if (hp_known) { p->current_hp=hp; p->max_hp=max_hp; } else if (fnt) { p->current_hp = 0; } if (status) tracked_int_promote_confirmed(&p->status_id,status); if (fnt) { clear_on_switch_local(p); p->fainted = 1; p->current_hp = 0; } else { p->fainted = 0; } }
     }
     else if (strcmp(parts.parts[0], "-heal") == 0 && parts.count > 2) {
-        RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]); int hp,max_hp,status,fnt,hp_known; if (p) { parse_condition(parts.parts[2], &hp,&max_hp,&status,&fnt,&hp_known); if (hp_known) { p->current_hp=hp; p->max_hp=max_hp; } else if (fnt) { p->current_hp = 0; } if (status) tracked_int_promote_confirmed(&p->status_id,status); p->fainted=fnt; }
+        RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]); int hp,max_hp,status,fnt,hp_known; if (p) { parse_condition(parts.parts[2], &hp,&max_hp,&status,&fnt,&hp_known); if (hp_known) { p->current_hp=hp; p->max_hp=max_hp; } else if (fnt) { p->current_hp = 0; } if (status) tracked_int_promote_confirmed(&p->status_id,status); if (fnt) { clear_on_switch_local(p); p->fainted = 1; p->current_hp = 0; } else { p->fainted = 0; } }
     }
     else if (strcmp(parts.parts[0], "faint") == 0 && parts.count > 1) {
-        RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]); if (p) { p->fainted = 1; p->current_hp = 0; }
+        RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]); if (p) { clear_on_switch_local(p); p->fainted = 1; p->current_hp = 0; }
     }
     else if (strcmp(parts.parts[0], "-ability") == 0 && parts.count > 2) {
         RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]); if (p) tracked_int_set_confirmed(&p->ability_id, ability_id_from_name(parts.parts[2]));

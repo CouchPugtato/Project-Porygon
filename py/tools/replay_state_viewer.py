@@ -360,6 +360,13 @@ def hp_text(mon: dict) -> str:
     return f"{mon.get('current_hp', 0)}/{mon.get('max_hp', 0)}"
 
 
+def boost_text(mon: dict) -> str:
+    boosts = mon.get("boosts") or []
+    if mon.get("fainted"):
+        boosts = [0] * len(boosts) if boosts else [0, 0, 0, 0, 0, 0, 0]
+    return f"Boosts {boosts}"
+
+
 def compact_ident(text: str) -> str:
     if not text:
         return "unknown"
@@ -957,7 +964,7 @@ class ReplayStateViewer(tk.Tk):
         if stats_text:
             ttk.Label(card, text=f"Stats {stats_text}", style="CompactMeta.TLabel", wraplength=240 if active else 140).pack(anchor="w", pady=(2, 0))
 
-        ttk.Label(card, text=f"Boosts {mon.get('boosts') or []}", style="CompactMeta.TLabel", wraplength=240 if active else 140).pack(anchor="w", pady=(2, 0))
+        ttk.Label(card, text=boost_text(mon), style="CompactMeta.TLabel", wraplength=240 if active else 140).pack(anchor="w", pady=(2, 0))
 
         moves = move_names(mon)
         ttk.Label(card, text=f"Moves: {', '.join(moves) if moves else '-'}", style="CompactMeta.TLabel", wraplength=240 if active else 140).pack(anchor="w", pady=(2, 0))

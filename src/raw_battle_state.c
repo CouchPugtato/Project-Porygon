@@ -197,6 +197,16 @@ static void clear_per_turn_flags(RawPokemon* pokemon) {
     pokemon->first_turn_on_field = 0;
 }
 
+static void clear_boosts(RawPokemon* pokemon) {
+    int i;
+    if (!pokemon) {
+        return;
+    }
+    for (i = 0; i < 7; ++i) {
+        pokemon->boosts[i] = 0;
+    }
+}
+
 static void clear_on_switch(RawPokemon* pokemon) {
     if (!pokemon) {
         return;
@@ -230,6 +240,7 @@ static void clear_on_switch(RawPokemon* pokemon) {
     pokemon->ability_triggered_on_switch_in = 0;
     pokemon->trapped = 0;
     pokemon->maybe_trapped = 0;
+    clear_boosts(pokemon);
     raw_pokemon_clear_transform(pokemon);
 }
 
@@ -659,6 +670,10 @@ int raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequ
         pokemon->revealed = 1;
         pokemon->self_request_roster_index = i;
         pokemon->fainted = req->switch_fainted[i];
+        if (req->switch_fainted[i]) {
+            clear_on_switch(pokemon);
+            pokemon->fainted = 1;
+        }
         if (req->side_max_hp[i] > 0) {
             pokemon->current_hp = req->side_current_hp[i];
             pokemon->max_hp = req->side_max_hp[i];
@@ -756,6 +771,11 @@ int raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequ
         pokemon = &state->self_team[team_index];
         pokemon->can_tera = req->active[i].can_tera;
         pokemon->fainted = req->active[i].fainted;
+        if (req->active[i].fainted) {
+            clear_on_switch(pokemon);
+            pokemon->fainted = 1;
+            pokemon->current_hp = 0;
+        }
         pokemon->trapped = req->active[i].trapped;
         pokemon->maybe_trapped = req->active[i].maybe_trapped;
         if (req->active[i].tera_type_id > 0) {

@@ -60,6 +60,7 @@ drought
 dryskin
 earlybird
 eartheater
+eelevate
 effectspore
 electricsurge
 electromorphosis
@@ -70,6 +71,7 @@ embodyaspectwellspring
 emergencyexit
 fairyaura
 filter
+firemane
 flamebody
 flareboost
 flashfire

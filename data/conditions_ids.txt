@@ -1,9 +1,9 @@
 brn
 par
+slp
+frz
 psn
 tox
-frz
-slp
 confusion
 flinch
 trapped

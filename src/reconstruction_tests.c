@@ -1268,6 +1268,24 @@ static int test_event_parser_sets_flinch_and_disable_slot(void) {
     return assert_true(active->disable_move_slot == -1, "disable end clears disabled move slot");
 }
 
+static int test_switch_and_faint_clear_boosts(void) {
+    RawBattleState state;
+    RawPokemon* active;
+
+    raw_battle_state_init(&state, 0);
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: A|Sawsbuck, L91, M|100/100");
+    active = find_self(&state, "p1: A");
+    if (!assert_true(active != NULL, "find boosted pokemon")) return 0;
+    raw_battle_state_update_from_event_line(&state, "|-boost|p1a: A|atk|2");
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: B|Kingambit, L77, M|100/100");
+    if (!assert_true(active->boosts[0] == 0, "switch out clears boosts")) return 0;
+
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: A|Sawsbuck, L91, M|100/100");
+    raw_battle_state_update_from_event_line(&state, "|-boost|p1a: A|atk|2");
+    raw_battle_state_update_from_event_line(&state, "|faint|p1a: A");
+    return assert_true(active->boosts[0] == 0 && active->active == 0 && active->fainted == 1, "faint clears boosts and active state");
+}
+
 static int test_observation_hides_inferred_weather_and_exports_more_transients(void) {
     RawBattleState state;
     Observation obs;
@@ -2720,6 +2738,7 @@ int main(int argc, char** argv) {
     if (!test_request_reconciliation_imports_stats_flags_and_trapped_state()) return 1;
     if (!test_request_reconciliation_infers_encore_move_slot()) return 1;
     if (!test_event_parser_sets_flinch_and_disable_slot()) return 1;
+    if (!test_switch_and_faint_clear_boosts()) return 1;
     if (!test_observation_hides_inferred_weather_and_exports_more_transients()) return 1;
     if (!test_event_parser_reveals_public_abilities_typechange_and_cant_status()) return 1;
     if (!test_event_parser_formechange_updates_species_and_reveals_ability()) return 1;
