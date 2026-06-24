@@ -635,6 +635,12 @@ int raw_battle_state_update_from_request(RawBattleState* state, const ParsedRequ
         pokemon->revealed = 1;
         pokemon->self_request_roster_index = i;
         pokemon->fainted = req->switch_fainted[i];
+        if (req->side_max_hp[i] > 0) {
+            pokemon->current_hp = req->side_current_hp[i];
+            pokemon->max_hp = req->side_max_hp[i];
+        } else if (req->switch_fainted[i]) {
+            pokemon->current_hp = 0;
+        }
         if (req->side_ident[i][0] && !pokemon->canonical_ident[0]) {
             strncpy(pokemon->canonical_ident, req->side_ident[i], RAW_IDENT_LEN - 1);
             pokemon->canonical_ident[RAW_IDENT_LEN - 1] = '\0';

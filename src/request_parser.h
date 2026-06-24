@@ -76,6 +76,8 @@ typedef struct {
     int side_tera_type_id[PARSED_REQUEST_TEAM_SIZE];
     int side_tera_used[PARSED_REQUEST_TEAM_SIZE];
     int side_move_id[PARSED_REQUEST_TEAM_SIZE][PARSED_REQUEST_MOVE_SLOTS];
+    int side_current_hp[PARSED_REQUEST_TEAM_SIZE];
+    int side_max_hp[PARSED_REQUEST_TEAM_SIZE];
     int side_stats_hp[PARSED_REQUEST_TEAM_SIZE];
     int side_stats_atk[PARSED_REQUEST_TEAM_SIZE];
     int side_stats_def[PARSED_REQUEST_TEAM_SIZE];

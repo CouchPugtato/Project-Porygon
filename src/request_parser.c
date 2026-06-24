@@ -603,6 +603,8 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                     req->side_base_ability_id[team_idx] = 0;
                     req->side_tera_type_id[team_idx] = 0;
                     req->side_tera_used[team_idx] = 0;
+                    req->side_current_hp[team_idx] = 0;
+                    req->side_max_hp[team_idx] = 0;
                     req->side_stats_hp[team_idx] = 0;
                     req->side_stats_atk[team_idx] = 0;
                     req->side_stats_def[team_idx] = 0;
@@ -618,7 +620,11 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                         const char* slash = strchr(cond, '/');
                         fainted = strstr(cond, "fnt") ? 1 : 0;
                         if (slash) {
+                            req->side_current_hp[team_idx] = atoi(cond);
+                            req->side_max_hp[team_idx] = atoi(slash + 1);
                             req->side_stats_hp[team_idx] = atoi(slash + 1);
+                        } else if (fainted) {
+                            req->side_current_hp[team_idx] = 0;
                         }
                     } else {
                         fainted = 0;

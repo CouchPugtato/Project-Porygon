@@ -9,6 +9,7 @@
 
 #define TEST_JSONL_LINE_MAX 65536
 #define TEST_CAPTURE_PATH "matches/runs/run_0010_postfix_smoke/run_0010_postfix_smoke_raw.jsonl"
+#define TEST_RANDOM_CAPTURE_PATH "matches/runs/run_0011_new_random/run_0011_new_random_raw.jsonl"
 
 static int assert_true(int condition, const char* message) {
     if (!condition) {
@@ -2316,6 +2317,45 @@ static int test_full_battle_replay_2632310612(void) {
     return assert_full_battle_replay("battle-gen9randomdoublesbattle-2632310612", 1, 4, "full replay 2632310612");
 }
 
+static int test_full_battle_replay_2636632844_gliscor_terminal_state(void) {
+    CaptureReplayResult replay;
+    RawPokemon* gliscor;
+    int self_remaining;
+    int opp_remaining;
+    if (!assert_true(replay_capture_battle_from_path(TEST_RANDOM_CAPTURE_PATH, "battle-gen9randomdoublesbattle-2636632844", 0, &replay), "full replay 2636632844")) return 0;
+    if (!assert_capture_replay_sane(&replay, "full replay 2636632844")) return 0;
+    if (!assert_true(replay.saw_terminal == 1 && replay.terminal_is_win == 1, "full replay 2636632844 reaches clean win terminal")) return 0;
+    gliscor = find_opp(&replay.state, "p1: Gliscor");
+    if (!assert_true(gliscor != NULL, "find Gliscor in full replay 2636632844")) return 0;
+    if (!assert_true(gliscor->fainted == 1 && gliscor->current_hp == 0, "full replay 2636632844 keeps Gliscor fainted at terminal")) return 0;
+    self_remaining = replay.state.self_side.remaining_pokemon;
+    opp_remaining = replay.state.opp_side.remaining_pokemon;
+    if (!assert_true(self_remaining == 2, "full replay 2636632844 keeps two self mons alive at terminal")) return 0;
+    if (!assert_true(opp_remaining == 0, "full replay 2636632844 fully clears the losing side at terminal")) return 0;
+    return 1;
+}
+
+static int test_full_battle_replay_2637505742_zeroes_fainted_reserve_hp(void) {
+    CaptureReplayResult replay;
+    RawPokemon* murkrow;
+    RawPokemon* krookodile;
+    RawPokemon* hitmonchan;
+    RawPokemon* iron_leaves;
+    if (!assert_true(replay_capture_battle_from_path(TEST_RANDOM_CAPTURE_PATH, "battle-gen9randomdoublesbattle-2637505742-hksiymfrrflfie2b6yqnvo8sh0w06gupw", 0, &replay), "full replay 2637505742")) return 0;
+    if (!assert_capture_replay_sane(&replay, "full replay 2637505742")) return 0;
+    if (!assert_true(replay.saw_terminal == 1 && replay.terminal_is_win == 1, "full replay 2637505742 reaches clean win terminal")) return 0;
+    murkrow = find_self(&replay.state, "p1: Murkrow");
+    krookodile = find_self(&replay.state, "p1: Krookodile");
+    hitmonchan = find_self(&replay.state, "p1: Hitmonchan");
+    iron_leaves = find_self(&replay.state, "p1: Iron Leaves");
+    if (!assert_true(murkrow != NULL && krookodile != NULL && hitmonchan != NULL && iron_leaves != NULL, "find fainted reserves in full replay 2637505742")) return 0;
+    if (!assert_true(murkrow->fainted == 1 && murkrow->current_hp == 0, "full replay 2637505742 zeroes Murkrow reserve hp")) return 0;
+    if (!assert_true(krookodile->fainted == 1 && krookodile->current_hp == 0, "full replay 2637505742 zeroes Krookodile reserve hp")) return 0;
+    if (!assert_true(hitmonchan->fainted == 1 && hitmonchan->current_hp == 0, "full replay 2637505742 zeroes Hitmonchan reserve hp")) return 0;
+    if (!assert_true(iron_leaves->fainted == 1 && iron_leaves->current_hp == 0, "full replay 2637505742 zeroes Iron Leaves reserve hp")) return 0;
+    return 1;
+}
+
 static int test_synthetic_sideeffect_prefix_tailwind(void) {
     RawBattleState state;
     raw_battle_state_init(&state, 1);
@@ -2614,6 +2654,8 @@ int main(int argc, char** argv) {
     if (!test_full_battle_replay_2632290515()) return 1;
     if (!test_full_battle_replay_2632293423()) return 1;
     if (!test_full_battle_replay_2632310612()) return 1;
+    if (!test_full_battle_replay_2636632844_gliscor_terminal_state()) return 1;
+    if (!test_full_battle_replay_2637505742_zeroes_fainted_reserve_hp()) return 1;
     if (!test_synthetic_sideeffect_prefix_tailwind()) return 1;
     if (!test_synthetic_sideeffect_prefix_reflect()) return 1;
     if (!test_synthetic_sideeffect_prefix_light_screen()) return 1;

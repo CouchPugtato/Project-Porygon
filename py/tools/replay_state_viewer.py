@@ -272,13 +272,13 @@ def field_badges(raw_state: dict) -> list[str]:
 
 
 def active_mons(team: list[dict]) -> list[dict]:
-    mons = [mon for mon in team if mon.get("active")]
+    mons = [mon for mon in team if mon.get("active") and not mon.get("fainted")]
     mons.sort(key=lambda mon: int(mon.get("active_slot", 0) or 0))
     return mons
 
 
 def reserve_mons(team: list[dict]) -> list[dict]:
-    return [mon for mon in team if not mon.get("active")]
+    return [mon for mon in team if not mon.get("active") or mon.get("fainted")]
 
 
 def move_names(mon: dict) -> list[str]:
@@ -355,6 +355,8 @@ def slot_flag_text(mon: dict) -> str | None:
 
 
 def hp_text(mon: dict) -> str:
+    if mon.get("fainted"):
+        return f"0/{mon.get('max_hp', 0)}"
     return f"{mon.get('current_hp', 0)}/{mon.get('max_hp', 0)}"
 
 
