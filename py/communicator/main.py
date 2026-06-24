@@ -58,8 +58,20 @@ def resolve_replay_save_path(run_name: str) -> Path:
     normalized = (run_name or "").strip()
     if not normalized:
         normalized = "runtime_capture"
-    run_dir = Path("matches") / "runs" / normalized
-    return run_dir / f"{normalized}_raw.jsonl"
+    normalized_path = Path(normalized)
+    if len(normalized_path.parts) > 1:
+        run_dir = Path("matches") / "runs" / normalized_path.parent
+        file_stem = normalized_path.name
+    else:
+        run_dir = Path("matches") / "runs" / normalized
+        file_stem = normalized
+    return run_dir / f"{file_stem}_raw.jsonl"
+
+
+def resolved_server_uri(explicit_uri: str | None) -> str:
+    if explicit_uri and explicit_uri.strip():
+        return explicit_uri.strip()
+    return default_showdown_uri()
 
 
 def should_refresh_guest(username: str, guest_refresh_seconds: float, session_started_at: float | None) -> bool:
@@ -715,6 +727,7 @@ async def capture_mode(
     out_path: Path,
     fmt: str,
     username: str,
+    server_uri: str,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
     guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
@@ -791,7 +804,7 @@ async def capture_mode(
         seq += 1
 
     while not stop_requested:
-        gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
+        gateway = ShowdownGateway(server_uri, username=username, fmt=fmt)
         try:
             await gateway.connect()
             session_started_at = time.monotonic()
@@ -815,6 +828,7 @@ async def random_mode(
     replay_path: Path,
     fmt: str,
     username: str,
+    server_uri: str,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
     guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
@@ -1033,7 +1047,7 @@ async def random_mode(
 
     try:
         while not stop_requested:
-            gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
+            gateway = ShowdownGateway(server_uri, username=username, fmt=fmt)
             try:
                 await gateway.connect()
                 session_started_at = time.monotonic()
@@ -1067,6 +1081,7 @@ async def live_mode(
     replay_path: Path | None,
     fmt: str,
     username: str,
+    server_uri: str,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
     guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
@@ -1488,7 +1503,7 @@ async def live_mode(
 
     try:
         while not stop_requested:
-            gateway = ShowdownGateway(default_showdown_uri(), username=username, fmt=fmt)
+            gateway = ShowdownGateway(server_uri, username=username, fmt=fmt)
             learner = LearnerProcess(learner_command, None)
             await learner.start()
             print(f"[live] started learner: {' '.join(learner_command)}")
@@ -1538,6 +1553,7 @@ def main() -> None:
     parser.add_argument("--learner-args", nargs="*", default=[])
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--username", default="")
+    parser.add_argument("--server-uri", default="")
     parser.add_argument("--games", type=int, default=0)
     parser.add_argument("--reconnect-seconds", type=float, default=DEFAULT_RECONNECT_SECONDS)
     parser.add_argument("--guest-refresh-seconds", type=float, default=DEFAULT_GUEST_REFRESH_SECONDS)
@@ -1547,6 +1563,7 @@ def main() -> None:
     args, learner_passthrough = parser.parse_known_args(argv)
     max_games = args.games if args.games > 0 else None
     replay_path = resolve_replay_save_path(args.replay_save)
+    server_uri = resolved_server_uri(args.server_uri)
 
     if args.mode == "capture":
         asyncio.run(
@@ -1554,6 +1571,7 @@ def main() -> None:
                 replay_path,
                 args.format,
                 args.username,
+                server_uri,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
                 guest_refresh_seconds=args.guest_refresh_seconds,
@@ -1565,6 +1583,7 @@ def main() -> None:
                 replay_path,
                 args.format,
                 args.username,
+                server_uri,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
                 guest_refresh_seconds=args.guest_refresh_seconds,
@@ -1581,6 +1600,7 @@ def main() -> None:
                 replay_path,
                 args.format,
                 args.username,
+                server_uri,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
                 guest_refresh_seconds=args.guest_refresh_seconds,

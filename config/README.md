@@ -26,6 +26,20 @@ For the communicator, `--replay-save <run_name>` resolves to:
 matches/runs/<run_name>/<run_name>_raw.jsonl
 ```
 
+It also accepts a nested worker token like:
+
+```text
+--replay-save run_0013_random_pool/worker_000_a
+```
+
+which resolves to:
+
+```text
+matches/runs/run_0013_random_pool/worker_000_a_raw.jsonl
+```
+
+`--server-uri <ws://...>` overrides the websocket endpoint directly. If omitted, the communicator falls back to `PS_URI`, then `PS_SERVER`, then the public default server.
+
 `--reconnect-seconds <n>` controls how long the communicator waits before reconnecting after an unexpected websocket/network drop.
 
 `--guest-refresh-seconds <n>` controls how long a guest session may live before the communicator intentionally reconnects between battles to get a fresh guest account. `0` disables this.

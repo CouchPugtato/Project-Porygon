@@ -33,3 +33,11 @@ Communicator modes:
   - connect to Showdown
   - log raw protocol messages to a replay file
   - do not require a learner subprocess
+
+Useful runtime flags:
+
+- `--server-uri`
+  - direct websocket override, including local `ws://127.0.0.1:8000/showdown/websocket`
+- `--replay-save`
+  - accepts either a run name like `run_0011_new_random`
+  - or a nested worker token like `run_0013_random_pool/worker_000_a`

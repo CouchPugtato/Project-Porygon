@@ -2,6 +2,7 @@ build-local/
 build/
 matches/
 models/
+external/
 
 CMakeFiles/
 CMakeCache.txt

@@ -10,6 +10,9 @@ import websockets
 
 
 def default_showdown_uri() -> str:
+    explicit_uri = (os.getenv("PS_URI", "") or "").strip()
+    if explicit_uri:
+        return explicit_uri
     host = os.getenv("PS_SERVER", "sim3.psim.us")
     return f"wss://{host}/showdown/websocket"
 
