@@ -1277,8 +1277,17 @@ static int test_observation_hides_inferred_weather_and_exports_more_transients(v
     raw_battle_state_update_from_event_line(&state, "|switch|p1a: A|Sawsbuck, L91, M|100/100");
     raw_battle_state_update_from_event_line(&state, "|-weather|RainDance");
     raw_battle_state_update_from_event_line(&state, "|-fieldstart|Electric Terrain");
+    raw_battle_state_update_from_event_line(&state, "|-fieldstart|move: Magic Room");
+    raw_battle_state_update_from_event_line(&state, "|-fieldstart|move: Wonder Room");
+    raw_battle_state_update_from_event_line(&state, "|-fieldstart|move: Gravity");
     active = find_self(&state, "p1: A");
     if (!assert_true(active != NULL, "find active pokemon for observation transient export test")) return 0;
+    tracked_int_set_confirmed(&active->move_ids[0], move_id_from_name("protect"));
+    tracked_int_set_confirmed(&active->move_ids[1], move_id_from_name("trailblaze"));
+    active->move_known[0] = 1;
+    active->move_known[1] = 1;
+    active->encore_move_slot = 1;
+    active->disable_move_slot = 0;
     active->torment_active = 1;
     active->torment_turns = 2;
     active->heal_block_active = 1;
@@ -1292,15 +1301,21 @@ static int test_observation_hides_inferred_weather_and_exports_more_transients(v
     active->seed_active = 1;
     active->charge_active = 1;
     active->charge_turns = 2;
+    raw_pokemon_refresh_effective_state(active);
 
     observation_from_raw_state(&obs, &state, NULL, NULL);
     if (!assert_true(obs.weather_turns == 0.0f && obs.weather_turns_known_mode == 1, "observation hides inferred weather turns but keeps knowledge mode")) return 0;
     if (!assert_true(obs.terrain_turns == 0.0f && obs.terrain_turns_known_mode == 1, "observation hides inferred terrain turns but keeps knowledge mode")) return 0;
+    if (!assert_true(obs.magic_room == 1 && obs.magic_room_turns == 5.0f, "observation exports Magic Room state")) return 0;
+    if (!assert_true(obs.wonder_room == 1 && obs.wonder_room_turns == 5.0f, "observation exports Wonder Room state")) return 0;
+    if (!assert_true(obs.gravity == 1 && obs.gravity_turns == 5.0f, "observation exports Gravity state")) return 0;
     if (!assert_true(obs.self_team[0].torment_active == 1 && obs.self_team[0].torment_turns == 2.0f, "observation exports torment state")) return 0;
     if (!assert_true(obs.self_team[0].heal_block_active == 1 && obs.self_team[0].heal_block_turns == 4.0f, "observation exports heal block state")) return 0;
     if (!assert_true(obs.self_team[0].embargo_active == 1 && obs.self_team[0].embargo_turns == 3.0f, "observation exports embargo state")) return 0;
     if (!assert_true(obs.self_team[0].yawn_active == 1 && obs.self_team[0].yawn_turns == 2.0f, "observation exports yawn state")) return 0;
+    if (!assert_true(obs.self_team[0].encore_move_slot == 1 && obs.self_team[0].disable_move_slot == 0, "observation exports encore and disable move slots")) return 0;
     if (!assert_true(obs.self_team[0].helping_hand_active == 1 && obs.self_team[0].flinch_active == 1, "observation exports single-turn flags")) return 0;
+    if (!assert_true(obs.self_team[0].move_type_id[0] == type_id_from_name("normal") && obs.self_team[0].move_type_id[1] == type_id_from_name("grass"), "observation exports move types")) return 0;
     return assert_true(obs.self_team[0].seed_active == 1 && obs.self_team[0].charge_active == 1 && obs.self_team[0].charge_turns == 2.0f,
         "observation exports seed and charge state");
 }

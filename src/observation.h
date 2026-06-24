@@ -88,6 +88,8 @@ typedef struct {
     float embargo_turns;
     uint8_t yawn_active;
     float yawn_turns;
+    int encore_move_slot;
+    int disable_move_slot;
     uint8_t protect_active;
     float protect_chain_count;
     uint8_t helping_hand_active;
@@ -110,6 +112,7 @@ typedef struct {
     uint8_t move_known_mode[OBS_MOVE_SLOTS];
     float move_pp_frac[OBS_MOVE_SLOTS];
     int move_id[OBS_MOVE_SLOTS];
+    int move_type_id[OBS_MOVE_SLOTS];
 } ObsPokemon;
 
 typedef struct {
@@ -148,6 +151,12 @@ typedef struct {
 
     uint8_t trick_room;
     float trick_room_turns;
+    uint8_t magic_room;
+    float magic_room_turns;
+    uint8_t wonder_room;
+    float wonder_room_turns;
+    uint8_t gravity;
+    float gravity_turns;
     uint8_t forced_switch;
     uint8_t team_preview;
     uint8_t can_tera;
@@ -182,8 +191,8 @@ typedef struct {
     OBS_NUM_TYPES + \
     3 + \
     OBS_BOOST_SLOTS + \
-    30 + \
-    OBS_MOVE_SLOTS * (2 + 3 + 1 + OBS_NUM_MOVES) \
+    40 + \
+    OBS_MOVE_SLOTS * (2 + 3 + 1 + OBS_NUM_MOVES + OBS_NUM_TYPES) \
 )
 
 #define OBS_SIDE_FEATURES 22
@@ -194,7 +203,11 @@ typedef struct {
     1 + 3 + \
     1 + 3 + \
     1 + \
-    1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 \
+    1 + 1 + \
+    1 + 1 + \
+    1 + 1 + \
+    1 + 1 + \
+    1 + 1 + 1 + 1 + 1 + 1 + 1 \
 )
 
 #define OBSERVATION_FLAT_SIZE ( \

@@ -29,6 +29,10 @@ static size_t write_knowledge(float* out, size_t idx, uint8_t mode) {
     return write_one_hot(out, idx, mapped, 3);
 }
 
+static size_t write_slot_one_hot(float* out, size_t idx, int slot) {
+    return write_one_hot(out, idx, slot + 1, 5);
+}
+
 static size_t flatten_side(float* out, size_t idx, const ObsSide* side) {
     idx = write_flag(out, idx, side->stealth_rock);
     idx = write_scalar(out, idx, (float)side->spikes / 3.0f);
@@ -95,6 +99,8 @@ static size_t flatten_pokemon(float* out, size_t idx, const ObsPokemon* p) {
     idx = write_scalar(out, idx, p->embargo_turns / 5.0f);
     idx = write_flag(out, idx, p->yawn_active);
     idx = write_scalar(out, idx, p->yawn_turns / 5.0f);
+    idx = write_slot_one_hot(out, idx, p->encore_move_slot);
+    idx = write_slot_one_hot(out, idx, p->disable_move_slot);
     idx = write_flag(out, idx, p->protect_active);
     idx = write_scalar(out, idx, p->protect_chain_count / 5.0f);
     idx = write_flag(out, idx, p->helping_hand_active);
@@ -118,6 +124,7 @@ static size_t flatten_pokemon(float* out, size_t idx, const ObsPokemon* p) {
         idx = write_knowledge(out, idx, p->move_known_mode[i]);
         idx = write_scalar(out, idx, p->move_pp_frac[i]);
         idx = write_one_hot(out, idx, p->move_id[i], OBS_NUM_MOVES);
+        idx = write_one_hot(out, idx, p->move_type_id[i], OBS_NUM_TYPES);
     }
 
     return idx;
@@ -149,9 +156,15 @@ void observation_init(Observation* obs) {
         obs->opp_team[i].item_id = 0;
         obs->opp_team[i].ability_id = 0;
         obs->opp_team[i].tera_type_id = 0;
+        obs->self_team[i].encore_move_slot = -1;
+        obs->self_team[i].disable_move_slot = -1;
+        obs->opp_team[i].encore_move_slot = -1;
+        obs->opp_team[i].disable_move_slot = -1;
         for (m = 0; m < OBS_MOVE_SLOTS; ++m) {
             obs->self_team[i].move_id[m] = 0;
+            obs->self_team[i].move_type_id[m] = 0;
             obs->opp_team[i].move_id[m] = 0;
+            obs->opp_team[i].move_type_id[m] = 0;
         }
     }
 }
@@ -178,6 +191,12 @@ size_t observation_flatten(float* out, size_t out_len, const Observation* obs) {
 
     idx = write_flag(out, idx, obs->trick_room);
     idx = write_scalar(out, idx, obs->trick_room_turns / 8.0f);
+    idx = write_flag(out, idx, obs->magic_room);
+    idx = write_scalar(out, idx, obs->magic_room_turns / 8.0f);
+    idx = write_flag(out, idx, obs->wonder_room);
+    idx = write_scalar(out, idx, obs->wonder_room_turns / 8.0f);
+    idx = write_flag(out, idx, obs->gravity);
+    idx = write_scalar(out, idx, obs->gravity_turns / 8.0f);
     idx = write_flag(out, idx, obs->forced_switch);
     idx = write_flag(out, idx, obs->team_preview);
     idx = write_flag(out, idx, obs->can_tera);

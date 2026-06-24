@@ -77,6 +77,8 @@ static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
     out->embargo_turns = (float)in->embargo_turns;
     out->yawn_active = (unsigned char)in->yawn_active;
     out->yawn_turns = (float)in->yawn_turns;
+    out->encore_move_slot = in->encore_move_slot;
+    out->disable_move_slot = in->disable_move_slot;
     out->protect_active = (unsigned char)in->protect_active;
     out->protect_chain_count = (float)in->protect_chain_count;
     out->helping_hand_active = (unsigned char)in->helping_hand_active;
@@ -99,6 +101,7 @@ static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
         out->move_known_mode[i] = knowledge_to_mode(in->effective_move_ids[i].knowledge);
         out->move_pp_frac[i] = in->effective_move_max_pp[i] > 0 ? ((float)in->effective_move_pp[i] / (float)in->effective_move_max_pp[i]) : 0.0f;
         out->move_id[i] = in->effective_move_ids[i].value;
+        out->move_type_id[i] = in->effective_move_type_ids[i].value;
     }
 }
 
@@ -125,6 +128,12 @@ void observation_from_raw_state(
     out->turn_norm = (float)state->turn_number / 100.0f;
     out->trick_room = (unsigned char)state->trick_room;
     out->trick_room_turns = (float)state->trick_room_turns_remaining;
+    out->magic_room = (unsigned char)state->magic_room;
+    out->magic_room_turns = (float)state->magic_room_turns_remaining;
+    out->wonder_room = (unsigned char)state->wonder_room;
+    out->wonder_room_turns = (float)state->wonder_room_turns_remaining;
+    out->gravity = (unsigned char)state->gravity;
+    out->gravity_turns = (float)state->gravity_turns_remaining;
     out->forced_switch = (unsigned char)((req && req->forced_switch_any) ? 1 : 0);
     out->team_preview = (unsigned char)((req && req->team_preview) ? 1 : 0);
     out->can_tera = (unsigned char)state->can_tera;
