@@ -8,6 +8,13 @@ static uint8_t knowledge_to_mode(KnowledgeLevel level) {
     return 0;
 }
 
+static float counter_value_for_observation(const TrackedInt* counter) {
+    if (!counter || counter->knowledge != KNOW_CONFIRMED) {
+        return 0.0f;
+    }
+    return (float)counter->value;
+}
+
 static void copy_side(ObsSide* out, const RawSideState* in) {
     out->stealth_rock = (unsigned char)in->stealth_rock;
     out->spikes = (unsigned char)in->spikes;
@@ -62,17 +69,30 @@ static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
     out->disable_turns = (float)in->disable_turns;
     out->taunt_active = (unsigned char)in->taunt_active;
     out->taunt_turns = (float)in->taunt_turns;
+    out->torment_active = (unsigned char)in->torment_active;
+    out->torment_turns = (float)in->torment_turns;
+    out->heal_block_active = (unsigned char)in->heal_block_active;
+    out->heal_block_turns = (float)in->heal_block_turns;
+    out->embargo_active = (unsigned char)in->embargo_active;
+    out->embargo_turns = (float)in->embargo_turns;
+    out->yawn_active = (unsigned char)in->yawn_active;
+    out->yawn_turns = (float)in->yawn_turns;
     out->protect_active = (unsigned char)in->protect_active;
     out->protect_chain_count = (float)in->protect_chain_count;
+    out->helping_hand_active = (unsigned char)in->helping_hand_active;
+    out->flinch_active = (unsigned char)in->flinch_active;
     out->confusion_active = (unsigned char)in->confusion_active;
     out->confusion_turns = (float)in->confusion_turns;
     out->substitute_active = (unsigned char)in->substitute_active;
     out->trapped = (unsigned char)in->trapped;
     out->maybe_trapped = (unsigned char)in->maybe_trapped;
+    out->seed_active = (unsigned char)in->seed_active;
     out->toxic_counter = (float)in->toxic_counter;
     out->sleep_turns_elapsed = (float)in->sleep_turns_elapsed;
     out->transformed = (unsigned char)in->transformed;
     out->perish_song_counter = (float)in->perish_song_counter;
+    out->charge_active = (unsigned char)in->charge_active;
+    out->charge_turns = (float)in->charge_turns;
     for (i = 0; i < OBS_MOVE_SLOTS; ++i) {
         out->move_known[i] = (unsigned char)in->effective_move_known[i];
         out->move_disabled[i] = (unsigned char)in->effective_move_disabled[i];
@@ -95,11 +115,12 @@ void observation_from_raw_state(
     observation_init(out);
     out->weather_id = state->weather_id;
     out->terrain_id = state->terrain_id;
-    /* Weather/terrain turn counts may be inferred rather than exact hidden-info
-       truth; preserve the knowledge mode alongside the numeric estimate. */
-    out->weather_turns = (float)state->weather_turns_remaining.value;
+    /* Weather/terrain remaining turns are only surfaced numerically when
+       confirmed. Inferred counters stay visible through knowledge mode but do
+       not masquerade as exact truth in model features. */
+    out->weather_turns = counter_value_for_observation(&state->weather_turns_remaining);
     out->weather_turns_known_mode = knowledge_to_mode(state->weather_turns_remaining.knowledge);
-    out->terrain_turns = (float)state->terrain_turns_remaining.value;
+    out->terrain_turns = counter_value_for_observation(&state->terrain_turns_remaining);
     out->terrain_turns_known_mode = knowledge_to_mode(state->terrain_turns_remaining.knowledge);
     out->turn_norm = (float)state->turn_number / 100.0f;
     out->trick_room = (unsigned char)state->trick_room;

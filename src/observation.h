@@ -80,17 +80,30 @@ typedef struct {
     float disable_turns;
     uint8_t taunt_active;
     float taunt_turns;
+    uint8_t torment_active;
+    float torment_turns;
+    uint8_t heal_block_active;
+    float heal_block_turns;
+    uint8_t embargo_active;
+    float embargo_turns;
+    uint8_t yawn_active;
+    float yawn_turns;
     uint8_t protect_active;
     float protect_chain_count;
+    uint8_t helping_hand_active;
+    uint8_t flinch_active;
     uint8_t confusion_active;
     float confusion_turns;
     uint8_t substitute_active;
     uint8_t trapped;
     uint8_t maybe_trapped;
+    uint8_t seed_active;
     float toxic_counter;
     float sleep_turns_elapsed;
     uint8_t transformed;
     float perish_song_counter;
+    uint8_t charge_active;
+    float charge_turns;
 
     uint8_t move_known[OBS_MOVE_SLOTS];
     uint8_t move_disabled[OBS_MOVE_SLOTS];
@@ -169,7 +182,7 @@ typedef struct {
     OBS_NUM_TYPES + \
     3 + \
     OBS_BOOST_SLOTS + \
-    17 + \
+    30 + \
     OBS_MOVE_SLOTS * (2 + 3 + 1 + OBS_NUM_MOVES) \
 )
 

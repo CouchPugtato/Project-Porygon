@@ -249,6 +249,85 @@ static RawPokemon* pokemon_for_ident_via_slot_or_identity(RawBattleState* state,
     return fallback_pokemon_for_ident(state, ident);
 }
 
+static void reveal_ability_for_ident(RawBattleState* state, const char* ident, const char* ability_name) {
+    RawPokemon* pokemon;
+    int ability_id;
+    if (!state || !ident || !ability_name || !*ability_name) {
+        return;
+    }
+    ability_id = ability_id_from_name(ability_name);
+    if (ability_id <= 0) {
+        return;
+    }
+    pokemon = pokemon_for_ident_via_slot_or_identity(state, ident);
+    if (!pokemon) {
+        return;
+    }
+    tracked_int_set_confirmed(&pokemon->ability_id, ability_id);
+}
+
+static const char* direct_ability_name_from_part(const char* part) {
+    if (!part) {
+        return NULL;
+    }
+    if (strncmp(part, "ability: ", 9) == 0) {
+        return part + 9;
+    }
+    return NULL;
+}
+
+static const char* from_ability_name_from_part(const char* part) {
+    if (!part) {
+        return NULL;
+    }
+    if (strncmp(part, "[from] ability: ", 16) == 0) {
+        return part + 16;
+    }
+    return NULL;
+}
+
+static const char* of_ident_from_part(const char* part) {
+    if (!part) {
+        return NULL;
+    }
+    if (strncmp(part, "[of] ", 5) == 0) {
+        return part + 5;
+    }
+    return NULL;
+}
+
+static void reveal_ability_from_parts(RawBattleState* state, const char* subject_ident, const LineParts* parts, int start_index) {
+    const char* direct_ability = NULL;
+    const char* from_ability = NULL;
+    const char* of_ident = NULL;
+    int i;
+    if (!state || !parts) {
+        return;
+    }
+    for (i = start_index; i < parts->count; ++i) {
+        if (!direct_ability) {
+            direct_ability = direct_ability_name_from_part(parts->parts[i]);
+        }
+        if (!from_ability) {
+            from_ability = from_ability_name_from_part(parts->parts[i]);
+        }
+        if (!of_ident) {
+            of_ident = of_ident_from_part(parts->parts[i]);
+        }
+    }
+    if (direct_ability && subject_ident && ident_side_player(subject_ident) != 0) {
+        reveal_ability_for_ident(state, subject_ident, direct_ability);
+        return;
+    }
+    if (from_ability) {
+        if (of_ident) {
+            reveal_ability_for_ident(state, of_ident, from_ability);
+        } else if (subject_ident && ident_side_player(subject_ident) != 0) {
+            reveal_ability_for_ident(state, subject_ident, from_ability);
+        }
+    }
+}
+
 static RawSideState* side_for_ident(RawBattleState* state, const char* ident) {
     if (!state || !ident) {
         return NULL;
@@ -343,6 +422,43 @@ static void parse_condition(const char* cond, int* hp, int* max_hp, int* status_
         *hp = atoi(cond);
         *max_hp = atoi(slash + 1);
     }
+}
+
+static void apply_effective_type_change(RawPokemon* pokemon, const char* detail) {
+    const char* slash;
+    char type1_name[32];
+    char type2_name[32];
+    size_t len;
+    int type1_id;
+    int type2_id = 0;
+    if (!pokemon || !detail || !*detail) {
+        return;
+    }
+    slash = strchr(detail, '/');
+    if (!slash) {
+        type1_id = type_id_from_name(detail);
+        if (type1_id <= 0) {
+            return;
+        }
+        tracked_int_set_confirmed(&pokemon->effective_type1_id, type1_id);
+        tracked_int_set_confirmed(&pokemon->effective_type2_id, 0);
+        return;
+    }
+    len = (size_t)(slash - detail);
+    if (len >= sizeof(type1_name)) {
+        len = sizeof(type1_name) - 1;
+    }
+    memcpy(type1_name, detail, len);
+    type1_name[len] = '\0';
+    strncpy(type2_name, slash + 1, sizeof(type2_name) - 1);
+    type2_name[sizeof(type2_name) - 1] = '\0';
+    type1_id = type_id_from_name(type1_name);
+    type2_id = type_id_from_name(type2_name);
+    if (type1_id <= 0) {
+        return;
+    }
+    tracked_int_set_confirmed(&pokemon->effective_type1_id, type1_id);
+    tracked_int_set_confirmed(&pokemon->effective_type2_id, type2_id > 0 ? type2_id : 0);
 }
 
 static void handle_turn(RawBattleState* state, const char* value) {
@@ -530,6 +646,10 @@ static void handle_start(RawBattleState* state, const char* ident, const char* e
     RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, ident);
     const char* normalized = effect;
     if (!p) return;
+    if (normalized && strncmp(normalized, "ability: ", 9) == 0) {
+        reveal_ability_for_ident(state, ident, normalized + 9);
+        return;
+    }
     if (normalized && strncmp(normalized, "move: ", 6) == 0) {
         normalized += 6;
     }
@@ -551,6 +671,8 @@ static void handle_start(RawBattleState* state, const char* ident, const char* e
     else if (strncmp(normalized, "Leech Seed", 10) == 0) p->seed_active = 1;
     else if (strncmp(normalized, "Perish Song", 11) == 0) p->perish_song_counter = 4;
     else if (strncmp(normalized, "Charge", 6) == 0) { p->charge_active = 1; p->charge_turns = 2; }
+    else if (strncmp(normalized, "No Retreat", 10) == 0) { p->trapped = 1; p->maybe_trapped = 0; }
+    else if (strncmp(normalized, "typechange", 10) == 0) apply_effective_type_change(p, detail);
 }
 
 static void handle_end(RawBattleState* state, const char* ident, const char* effect) {
@@ -571,6 +693,7 @@ static void handle_end(RawBattleState* state, const char* ident, const char* eff
     else if (strncmp(normalized, "Substitute", 10) == 0) p->substitute_active = 0;
     else if (strncmp(normalized, "Leech Seed", 10) == 0) p->seed_active = 0;
     else if (strncmp(normalized, "Charge", 6) == 0) { p->charge_active = 0; p->charge_turns = 0; }
+    else if (strncmp(normalized, "typechange", 10) == 0) raw_pokemon_refresh_effective_state(p);
 }
 
 static void refresh_active_counts(RawBattleState* state) {
@@ -628,6 +751,7 @@ void event_parser_apply_line(RawBattleState* state, const char* line) {
     if (strcmp(parts.parts[0], "turn") == 0 && parts.count > 1) handle_turn(state, parts.parts[1]);
     else if (strcmp(parts.parts[0], "-weather") == 0 && parts.count > 1) {
         handle_weather(state, parts.parts[1]);
+        reveal_ability_from_parts(state, NULL, &parts, 2);
         if (state->weather_id > 0) {
             RawPokemon* source = active_switch_source_for_side(state, 0);
             if (!source) {
@@ -641,6 +765,7 @@ void event_parser_apply_line(RawBattleState* state, const char* line) {
     }
     else if (strcmp(parts.parts[0], "-fieldstart") == 0 && parts.count > 1) {
         handle_field_start(state, parts.parts[1]);
+        reveal_ability_from_parts(state, NULL, &parts, 2);
         if (strstr(parts.parts[1], "Terrain")) {
             RawPokemon* source = active_switch_source_for_side(state, 0);
             if (!source) {
@@ -681,8 +806,21 @@ void event_parser_apply_line(RawBattleState* state, const char* line) {
     else if (strcmp(parts.parts[0], "-setboost") == 0 && parts.count > 3) handle_boost(state, parts.parts[1], parts.parts[2], atoi(parts.parts[3]), 2);
     else if (strcmp(parts.parts[0], "-clearallboost") == 0) { int i,j; for (i = 0; i < RAW_TEAM_SIZE; ++i) for (j = 0; j < 7; ++j) { state->self_team[i].boosts[j] = 0; state->opp_team[i].boosts[j] = 0; } }
     else if (strcmp(parts.parts[0], "-clearboost") == 0 && parts.count > 1) { int j; RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]); if (p) for (j = 0; j < 7; ++j) p->boosts[j] = 0; }
-    else if (strcmp(parts.parts[0], "-start") == 0 && parts.count > 2) handle_start(state, parts.parts[1], parts.parts[2], parts.count > 3 ? parts.parts[3] : NULL);
+    else if (strcmp(parts.parts[0], "-start") == 0 && parts.count > 2) {
+        handle_start(state, parts.parts[1], parts.parts[2], parts.count > 3 ? parts.parts[3] : NULL);
+        reveal_ability_from_parts(state, parts.parts[1], &parts, 2);
+    }
     else if (strcmp(parts.parts[0], "-end") == 0 && parts.count > 2) handle_end(state, parts.parts[1], parts.parts[2]);
+    else if (strcmp(parts.parts[0], "-formechange") == 0 && parts.count > 2) {
+        RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]);
+        int species_id = species_id_from_name(parts.parts[2]);
+        if (p && species_id > 0) {
+            tracked_int_set_confirmed(&p->species_id, species_id);
+            raw_pokemon_refresh_types(p);
+            raw_pokemon_refresh_effective_state(p);
+        }
+        reveal_ability_from_parts(state, parts.parts[1], &parts, 3);
+    }
     else if (strcmp(parts.parts[0], "-flinch") == 0 && parts.count > 1) {
         RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]);
         if (p) {
@@ -694,7 +832,16 @@ void event_parser_apply_line(RawBattleState* state, const char* line) {
         if (p && strcmp(parts.parts[2], "flinch") == 0) {
             p->flinch_active = 1;
         }
+        if (p && strcmp(parts.parts[2], "par") == 0) {
+            tracked_int_promote_confirmed(&p->status_id, 2);
+        } else if (p && strcmp(parts.parts[2], "frz") == 0) {
+            tracked_int_promote_confirmed(&p->status_id, 5);
+        } else if (p && strcmp(parts.parts[2], "slp") == 0) {
+            tracked_int_promote_confirmed(&p->status_id, 6);
+        }
+        reveal_ability_from_parts(state, parts.parts[1], &parts, 2);
     }
+    else if (strcmp(parts.parts[0], "-activate") == 0 && parts.count > 2) reveal_ability_from_parts(state, parts.parts[1], &parts, 2);
     else if (strcmp(parts.parts[0], "-singleturn") == 0 && parts.count > 2) {
         RawPokemon* p = pokemon_for_ident_via_slot_or_identity(state, parts.parts[1]);
         RawSideState* side = side_for_ident(state, parts.parts[1]);

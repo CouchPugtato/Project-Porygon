@@ -1265,6 +1265,90 @@ static int test_event_parser_sets_flinch_and_disable_slot(void) {
     return assert_true(active->disable_move_slot == -1, "disable end clears disabled move slot");
 }
 
+static int test_observation_hides_inferred_weather_and_exports_more_transients(void) {
+    RawBattleState state;
+    Observation obs;
+    RawPokemon* active;
+
+    raw_battle_state_init(&state, 0);
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: A|Sawsbuck, L91, M|100/100");
+    raw_battle_state_update_from_event_line(&state, "|-weather|RainDance");
+    raw_battle_state_update_from_event_line(&state, "|-fieldstart|Electric Terrain");
+    active = find_self(&state, "p1: A");
+    if (!assert_true(active != NULL, "find active pokemon for observation transient export test")) return 0;
+    active->torment_active = 1;
+    active->torment_turns = 2;
+    active->heal_block_active = 1;
+    active->heal_block_turns = 4;
+    active->embargo_active = 1;
+    active->embargo_turns = 3;
+    active->yawn_active = 1;
+    active->yawn_turns = 2;
+    active->helping_hand_active = 1;
+    active->flinch_active = 1;
+    active->seed_active = 1;
+    active->charge_active = 1;
+    active->charge_turns = 2;
+
+    observation_from_raw_state(&obs, &state, NULL, NULL);
+    if (!assert_true(obs.weather_turns == 0.0f && obs.weather_turns_known_mode == 1, "observation hides inferred weather turns but keeps knowledge mode")) return 0;
+    if (!assert_true(obs.terrain_turns == 0.0f && obs.terrain_turns_known_mode == 1, "observation hides inferred terrain turns but keeps knowledge mode")) return 0;
+    if (!assert_true(obs.self_team[0].torment_active == 1 && obs.self_team[0].torment_turns == 2.0f, "observation exports torment state")) return 0;
+    if (!assert_true(obs.self_team[0].heal_block_active == 1 && obs.self_team[0].heal_block_turns == 4.0f, "observation exports heal block state")) return 0;
+    if (!assert_true(obs.self_team[0].embargo_active == 1 && obs.self_team[0].embargo_turns == 3.0f, "observation exports embargo state")) return 0;
+    if (!assert_true(obs.self_team[0].yawn_active == 1 && obs.self_team[0].yawn_turns == 2.0f, "observation exports yawn state")) return 0;
+    if (!assert_true(obs.self_team[0].helping_hand_active == 1 && obs.self_team[0].flinch_active == 1, "observation exports single-turn flags")) return 0;
+    return assert_true(obs.self_team[0].seed_active == 1 && obs.self_team[0].charge_active == 1 && obs.self_team[0].charge_turns == 2.0f,
+        "observation exports seed and charge state");
+}
+
+static int test_event_parser_reveals_public_abilities_typechange_and_cant_status(void) {
+    RawBattleState state;
+    RawPokemon* cinderace;
+    RawPokemon* farigiraf;
+    RawPokemon* lumineon;
+    RawPokemon* vaporeon;
+
+    raw_battle_state_init(&state, 1);
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: Cinderace|Cinderace, L82, F|100/100");
+    raw_battle_state_update_from_event_line(&state, "|switch|p1b: Farigiraf|Farigiraf, L80|100/100");
+    raw_battle_state_update_from_event_line(&state, "|switch|p2a: Lumineon|Lumineon, L79, F|100/100");
+    raw_battle_state_update_from_event_line(&state, "|switch|p2b: Vaporeon|Vaporeon, L80|100/100");
+
+    raw_battle_state_update_from_event_line(&state, "|-start|p1a: Cinderace|typechange|Fighting|[from] ability: Libero");
+    raw_battle_state_update_from_event_line(&state, "|-start|p1a: Cinderace|move: No Retreat");
+    raw_battle_state_update_from_event_line(&state, "|cant|p1b: Farigiraf|ability: Armor Tail|Fake Out|[of] p2a: Persian");
+    raw_battle_state_update_from_event_line(&state, "|-activate|p2a: Lumineon|ability: Storm Drain");
+    raw_battle_state_update_from_event_line(&state, "|cant|p2b: Vaporeon|frz");
+
+    cinderace = find_self(&state, "p1: Cinderace");
+    farigiraf = find_self(&state, "p1: Farigiraf");
+    lumineon = find_opp(&state, "p2: Lumineon");
+    vaporeon = find_opp(&state, "p2: Vaporeon");
+
+    if (!assert_true(cinderace != NULL && farigiraf != NULL && lumineon != NULL && vaporeon != NULL, "find public reveal test pokemon")) return 0;
+    if (!assert_true(cinderace->ability_id.value == ability_id_from_name("Libero"), "typechange reveal confirms subject ability")) return 0;
+    if (!assert_true(cinderace->effective_type1_id.value == type_id_from_name("Fighting") && cinderace->effective_type2_id.value == 0, "typechange updates effective types")) return 0;
+    if (!assert_true(cinderace->trapped == 1, "No Retreat start marks trapped state")) return 0;
+    if (!assert_true(farigiraf->ability_id.value == ability_id_from_name("Armor Tail"), "cant ability reveal confirms subject ability")) return 0;
+    if (!assert_true(lumineon->ability_id.value == ability_id_from_name("Storm Drain"), "activate ability reveal confirms opponent ability")) return 0;
+    return assert_true(vaporeon->status_id.value == 5, "cant frz confirms frozen status");
+}
+
+static int test_event_parser_formechange_updates_species_and_reveals_ability(void) {
+    RawBattleState state;
+    RawPokemon* minior;
+
+    raw_battle_state_init(&state, 0);
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: Minior|Minior, L75|100/100");
+    raw_battle_state_update_from_event_line(&state, "|-formechange|p1a: Minior|Minior-Meteor||[from] ability: Shields Down");
+    minior = find_self(&state, "p1: Minior");
+    if (!assert_true(minior != NULL, "find formechange pokemon")) return 0;
+    if (!assert_true(minior->species_id.value == species_id_from_name("Minior-Meteor"), "formechange updates species")) return 0;
+    if (!assert_true(minior->effective_species_id.value == species_id_from_name("Minior-Meteor"), "formechange updates effective species")) return 0;
+    return assert_true(minior->ability_id.value == ability_id_from_name("Shields Down"), "formechange reveal confirms ability");
+}
+
 static int test_request_reconciliation_preserves_can_tera_through_wait_and_forced_switch(void) {
     const char* actionable_json =
         "{\"active\":["
@@ -2618,6 +2702,9 @@ int main(int argc, char** argv) {
     if (!test_request_reconciliation_imports_stats_flags_and_trapped_state()) return 1;
     if (!test_request_reconciliation_infers_encore_move_slot()) return 1;
     if (!test_event_parser_sets_flinch_and_disable_slot()) return 1;
+    if (!test_observation_hides_inferred_weather_and_exports_more_transients()) return 1;
+    if (!test_event_parser_reveals_public_abilities_typechange_and_cant_status()) return 1;
+    if (!test_event_parser_formechange_updates_species_and_reveals_ability()) return 1;
     if (!test_request_reconciliation_preserves_can_tera_through_wait_and_forced_switch()) return 1;
     if (!test_real_battle_2632274530_faint_force_switch_and_tera_request()) return 1;
     if (!test_real_battle_2632287191_switch_tera_and_force_switch()) return 1;
