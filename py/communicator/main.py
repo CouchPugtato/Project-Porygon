@@ -803,7 +803,7 @@ async def capture_mode(
             if not stop_requested:
                 print("[capture] gateway closed cleanly")
                 break
-        except (OSError, ConnectionClosed) as exc:
+        except (OSError, ConnectionClosed, asyncio.TimeoutError, TimeoutError) as exc:
             writer.discard_all(started_battles)
             started_battles.clear()
             disconnect_or_forfeit_end.clear()
@@ -1045,7 +1045,7 @@ async def random_mode(
                 if not stop_requested:
                     print("[random] gateway closed cleanly")
                     break
-            except (OSError, ConnectionClosed) as exc:
+            except (OSError, ConnectionClosed, asyncio.TimeoutError, TimeoutError) as exc:
                 writer.discard_all(active_battles)
                 active_battles.clear()
                 latest_requests.clear()
@@ -1504,7 +1504,7 @@ async def live_mode(
                 if not stop_requested:
                     print("[live] gateway/learner session ended cleanly")
                     break
-            except (OSError, ConnectionClosed) as exc:
+            except (OSError, ConnectionClosed, asyncio.TimeoutError, TimeoutError) as exc:
                 if writer is not None:
                     writer.discard_all(active_battles)
                 active_battles.clear()
