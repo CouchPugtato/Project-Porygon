@@ -19,8 +19,11 @@ static IdTable g_condition_table = {0};
 static IdTable g_type_table = {0};
 static int* g_species_type1 = NULL;
 static int* g_species_type2 = NULL;
+static int* g_move_type = NULL;
 static int g_species_type_capacity = 0;
 static int g_species_type_entries = 0;
+static int g_move_type_capacity = 0;
+static int g_move_type_entries = 0;
 
 static void normalize_token(const char* in, char* out, size_t out_len) {
     size_t i = 0;
@@ -221,6 +224,83 @@ static int load_species_types_file(const char* path) {
     return 1;
 }
 
+static int ensure_move_type_capacity(int move_id) {
+    int new_capacity;
+    int* resized;
+    int i;
+    if (move_id <= g_move_type_capacity) {
+        return 1;
+    }
+    new_capacity = g_move_type_capacity ? g_move_type_capacity : 32;
+    while (new_capacity < move_id) {
+        new_capacity *= 2;
+    }
+    resized = (int*)realloc(g_move_type, (size_t)new_capacity * sizeof(int));
+    if (!resized) {
+        return 0;
+    }
+    g_move_type = resized;
+    for (i = g_move_type_capacity; i < new_capacity; ++i) {
+        g_move_type[i] = 0;
+    }
+    g_move_type_capacity = new_capacity;
+    return 1;
+}
+
+static int load_move_types_file(const char* path) {
+    FILE* f;
+    char line[256];
+    if (!path) {
+        return 0;
+    }
+    f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        char move[128];
+        char type[64];
+        char* p = line;
+        char* comma;
+        int move_id;
+        int type_id;
+        while (*p && isspace((unsigned char)*p)) {
+            ++p;
+        }
+        if (!*p || *p == '#') {
+            continue;
+        }
+        strncpy(move, p, sizeof(move) - 1);
+        move[sizeof(move) - 1] = '\0';
+        comma = strchr(move, ',');
+        if (!comma) {
+            continue;
+        }
+        *comma++ = '\0';
+        strncpy(type, comma, sizeof(type) - 1);
+        type[sizeof(type) - 1] = '\0';
+        {
+            size_t len = strlen(type);
+            while (len > 0 && isspace((unsigned char)type[len - 1])) {
+                type[--len] = '\0';
+            }
+        }
+        move_id = move_id_from_name(move);
+        type_id = lookup_id(&g_type_table, type);
+        if (move_id <= 0 || type_id <= 0) {
+            continue;
+        }
+        if (!ensure_move_type_capacity(move_id)) {
+            fclose(f);
+            return 0;
+        }
+        g_move_type[move_id - 1] = type_id;
+        g_move_type_entries += 1;
+    }
+    fclose(f);
+    return 1;
+}
+
 static int lookup_id(const IdTable* table, const char* name) {
     char normalized[128];
     int i;
@@ -268,10 +348,16 @@ int id_tables_init(void) {
     }
     /* Optional while the repository is being upgraded to exact type reconstruction. */
     load_species_types_file("data/species_types.txt");
+    load_move_types_file("data/move_types.txt");
     if (g_species_type_entries > 0 && g_species_type_entries < 100) {
         fprintf(stderr,
             "[id_tables] warning: data/species_types.txt only loaded %d entries; rerun py/tools/showdown_vocab_export.py\n",
             g_species_type_entries);
+    }
+    if (g_move_type_entries > 0 && g_move_type_entries < 100) {
+        fprintf(stderr,
+            "[id_tables] warning: data/move_types.txt only loaded %d entries; rerun py/tools/showdown_vocab_export.py\n",
+            g_move_type_entries);
     }
     return 1;
 }
@@ -336,4 +422,11 @@ int species_type2_from_id(int id) {
         return 0;
     }
     return g_species_type2[id - 1];
+}
+
+int move_type_from_id(int id) {
+    if (id <= 0 || id > g_move_type_capacity || !g_move_type) {
+        return 0;
+    }
+    return g_move_type[id - 1];
 }

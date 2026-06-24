@@ -756,6 +756,8 @@ static void json_write_raw_pokemon(FILE* out, const RawPokemon* mon) {
     for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
         if (i) fputc(',', out);
         fputs("{\"move\":", out); json_write_tracked_int(out, &mon->move_ids[i], move_name_from_id);
+        fputs(",\"move_type\":", out); json_write_tracked_int(out, &mon->move_type_ids[i], type_name_from_id);
+        fputs(",\"effective_move_type\":", out); json_write_tracked_int(out, &mon->effective_move_type_ids[i], type_name_from_id);
         fputs(",\"known\":", out); fprintf(out, "%d", mon->move_known[i]);
         fputs(",\"pp\":", out); fprintf(out, "%d", mon->move_pp[i]);
         fputs(",\"max_pp\":", out); fprintf(out, "%d", mon->move_max_pp[i]);
@@ -900,6 +902,8 @@ static void json_write_canonical_pokemon(FILE* out, const RawPokemon* mon) {
         if (i) fputc(',', out);
         fputs("{\"base_move\":", out); json_write_tracked_int(out, &mon->move_ids[i], move_name_from_id);
         fputs(",\"effective_move\":", out); json_write_tracked_int(out, &mon->effective_move_ids[i], move_name_from_id);
+        fputs(",\"base_move_type\":", out); json_write_tracked_int(out, &mon->move_type_ids[i], type_name_from_id);
+        fputs(",\"effective_move_type\":", out); json_write_tracked_int(out, &mon->effective_move_type_ids[i], type_name_from_id);
         fputs(",\"effective_known\":", out); fprintf(out, "%d", mon->effective_move_known[i]);
         fputs(",\"effective_pp\":", out); fprintf(out, "%d", mon->effective_move_pp[i]);
         fputs(",\"effective_max_pp\":", out); fprintf(out, "%d", mon->effective_move_max_pp[i]);

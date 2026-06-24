@@ -13,6 +13,7 @@ FILE_MAP = {
     "species_ids.txt": "pokedex.ts",
     "species_types.txt": "pokedex.ts",
     "move_ids.txt": "moves.ts",
+    "move_types.txt": "moves.ts",
     "item_ids.txt": "items.ts",
     "ability_ids.txt": "abilities.ts",
     "conditions_ids.txt": "conditions.ts",
@@ -199,6 +200,71 @@ def extract_species_types(ts_text: str) -> list[str]:
     return entries
 
 
+def extract_move_types(ts_text: str) -> list[str]:
+    entries: list[str] = []
+    seen: set[str] = set()
+    keys = extract_top_level_keys(ts_text)
+
+    for key in keys:
+        match = re.search(rf"(?m)^\s*{re.escape(key)}\s*:\s*\{{", ts_text)
+        if not match:
+            continue
+
+        obj_start = ts_text.find("{", match.start())
+        if obj_start < 0:
+            continue
+
+        depth = 0
+        in_string = False
+        string_quote = ""
+        escape = False
+        obj_end = -1
+
+        for idx, ch in enumerate(ts_text[obj_start:], start=obj_start):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == string_quote:
+                    in_string = False
+                continue
+
+            if ch in ("'", '"'):
+                in_string = True
+                string_quote = ch
+                continue
+
+            if ch == "{":
+                depth += 1
+                continue
+
+            if ch == "}":
+                depth -= 1
+                if depth == 0:
+                    obj_end = idx + 1
+                    break
+
+        if obj_end < 0:
+            continue
+
+        obj_text = ts_text[obj_start:obj_end]
+        type_match = re.search(r"type\s*:\s*['\"]([^'\"]+)['\"]", obj_text)
+        if not type_match:
+            continue
+
+        move = normalize_token(key)
+        if move in seen:
+            continue
+        move_type = normalize_token(type_match.group(1))
+        if not move or not move_type:
+            continue
+        entries.append(f"{move},{move_type}")
+        seen.add(move)
+
+    return entries
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Export Pokemon Showdown *.ts data keys into the current txt vocab format."
@@ -230,6 +296,8 @@ def main() -> int:
         ts_text = load_text(args.source_dir, args.base_url, source_name)
         if out_name == "species_types.txt":
             tokens = extract_species_types(ts_text)
+        elif out_name == "move_types.txt":
+            tokens = extract_move_types(ts_text)
         else:
             tokens = extract_top_level_keys(ts_text)
         if not tokens:

@@ -45,10 +45,31 @@ static void raw_pokemon_init(RawPokemon* pokemon) {
     for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
         tracked_int_reset(&pokemon->move_ids[i]);
         tracked_int_reset(&pokemon->effective_move_ids[i]);
+        tracked_int_reset(&pokemon->move_type_ids[i]);
+        tracked_int_reset(&pokemon->effective_move_type_ids[i]);
     }
     pokemon->encore_move_slot = -1;
     pokemon->disable_move_slot = -1;
     pokemon->self_request_roster_index = -1;
+}
+
+static void refresh_tracked_move_type(TrackedInt* out, const TrackedInt* move_id) {
+    int type_id;
+    if (!out || !move_id) {
+        return;
+    }
+    type_id = move_type_from_id(move_id->value);
+    if (type_id <= 0) {
+        tracked_int_set_unknown(out);
+        return;
+    }
+    if (move_id->knowledge == KNOW_CONFIRMED) {
+        tracked_int_set_confirmed(out, type_id);
+    } else if (move_id->knowledge == KNOW_INFERRED) {
+        tracked_int_set_inferred(out, type_id);
+    } else {
+        tracked_int_set_unknown(out);
+    }
 }
 
 static void raw_side_init(RawSideState* side) {
@@ -109,7 +130,9 @@ void raw_pokemon_refresh_effective_state(RawPokemon* pokemon) {
         }
     }
     for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
+        refresh_tracked_move_type(&pokemon->move_type_ids[i], &pokemon->move_ids[i]);
         tracked_int_copy(&pokemon->effective_move_ids[i], &pokemon->move_ids[i]);
+        tracked_int_copy(&pokemon->effective_move_type_ids[i], &pokemon->move_type_ids[i]);
         pokemon->effective_move_known[i] = pokemon->move_known[i];
         pokemon->effective_move_pp[i] = pokemon->move_pp[i];
         pokemon->effective_move_max_pp[i] = pokemon->move_max_pp[i];
@@ -129,6 +152,7 @@ void raw_pokemon_apply_transform(RawPokemon* pokemon, const RawPokemon* target) 
     tracked_int_copy(&pokemon->effective_type2_id, &target->effective_type2_id);
     for (i = 0; i < RAW_MOVE_SLOTS; ++i) {
         tracked_int_copy(&pokemon->effective_move_ids[i], &target->effective_move_ids[i]);
+        tracked_int_copy(&pokemon->effective_move_type_ids[i], &target->effective_move_type_ids[i]);
         pokemon->effective_move_known[i] = target->effective_move_known[i];
         if (target->effective_move_ids[i].value > 0 || target->effective_move_known[i]) {
             pokemon->effective_move_pp[i] = 5;

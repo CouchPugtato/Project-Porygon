@@ -52,6 +52,8 @@ typedef struct {
 
     TrackedInt move_ids[RAW_MOVE_SLOTS];
     TrackedInt effective_move_ids[RAW_MOVE_SLOTS];
+    TrackedInt move_type_ids[RAW_MOVE_SLOTS];
+    TrackedInt effective_move_type_ids[RAW_MOVE_SLOTS];
     int move_known[RAW_MOVE_SLOTS];
     int effective_move_known[RAW_MOVE_SLOTS];
     int move_pp[RAW_MOVE_SLOTS];

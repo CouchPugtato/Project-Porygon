@@ -18,5 +18,6 @@ const char* condition_name_from_id(int id);
 const char* type_name_from_id(int id);
 int species_type1_from_id(int id);
 int species_type2_from_id(int id);
+int move_type_from_id(int id);
 
 #endif

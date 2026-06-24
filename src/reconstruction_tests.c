@@ -938,6 +938,7 @@ static int test_transform_survives_request_reconciliation(void) {
     if (!assert_true(transformed_mon->transformed == 1, "transform flag preserved across request")) return 0;
     if (!assert_true(transformed_mon->effective_species_id.value == species_id_from_name("kingambit"), "effective species preserved across request")) return 0;
     if (!assert_true(transformed_mon->effective_move_ids[0].value == move_id_from_name("protect"), "effective move preserved across request")) return 0;
+    if (!assert_true(transformed_mon->effective_move_type_ids[0].value == type_id_from_name("normal"), "effective move type preserved across request")) return 0;
     if (!assert_true(transformed_mon->effective_move_pp[0] == 3 && transformed_mon->effective_move_max_pp[0] == 5, "request updates transformed effective pp only")) return 0;
     observation_from_raw_state(&obs, &state, &req, &mask);
     if (!assert_true(obs.self_team[0].species_id == species_id_from_name("kingambit"), "observation keeps transformed species after request")) return 0;
@@ -1156,10 +1157,12 @@ static int test_request_reconciliation_imports_private_side_metadata(void) {
     if (!assert_true(active->ability_id.value == ability_id_from_name("chlorophyll"), "active ability imported from request side data")) return 0;
     if (!assert_true(active->tera_type_id.value == type_id_from_name("Grass"), "active tera type imported from request side data")) return 0;
     if (!assert_true(active->move_ids[1].value == move_id_from_name("doubleedge"), "active full move list imported from request side data")) return 0;
+    if (!assert_true(active->move_type_ids[1].value == type_id_from_name("normal"), "active move type imported from request side data")) return 0;
     if (!assert_true(bench->item_id.value == item_id_from_name("leftovers"), "bench item imported from request side data")) return 0;
     if (!assert_true(bench->ability_id.value == ability_id_from_name("supremeoverlord"), "bench ability imported from request side data")) return 0;
     if (!assert_true(bench->tera_used == 1 && bench->tera_type_id.value == type_id_from_name("Dark"), "bench tera metadata imported from request side data")) return 0;
     if (!assert_true(bench->move_ids[0].value == move_id_from_name("kowtowcleave"), "bench move list imported from request side data")) return 0;
+    if (!assert_true(bench->move_type_ids[0].value == type_id_from_name("dark"), "bench move type imported from request side data")) return 0;
     return 1;
 }
 
