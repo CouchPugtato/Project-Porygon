@@ -29,6 +29,7 @@ DEFAULT_RECONNECT_SECONDS = 5.0
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_SHUTDOWN_GRACE_SECONDS = 20.0
 DEFAULT_USERNAME_PREFIX = "PoryPool"
+DEFAULT_ARGS_PATH = Path("config/selfplay_server.args")
 
 BATTLE_STARTED_RE = re.compile(r"\[(?:live|random)\] battle started (battle-[^\s]+)")
 BATTLE_ENDED_RE = re.compile(r"\[(?:live|random)\] battle ended (battle-[^\s]+) result=")
@@ -76,6 +77,18 @@ def parse_bool01(value: str) -> bool:
     if value not in {"0", "1"}:
         raise argparse.ArgumentTypeError("value must be 0 or 1")
     return value == "1"
+
+
+def load_default_args(path: Path) -> list[str]:
+    args: list[str] = []
+    if not path.exists():
+        return args
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        args.append(line)
+    return args
 
 
 def split_weighted_workers(total_workers: int, model_a_weight: int, model_b_weight: int) -> tuple[int, int]:
@@ -744,7 +757,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def async_main() -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    if not argv:
+        argv = load_default_args(DEFAULT_ARGS_PATH)
+    args = parser.parse_args(argv)
     orchestrator = PoolOrchestrator(args)
     return await orchestrator.run()
 

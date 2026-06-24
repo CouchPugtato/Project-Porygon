@@ -10,12 +10,15 @@ Files:
   - consumed by `showdown_client` when launched with no CLI args
 - `communicator.args`
   - consumed by `py/communicator/main.py` when launched with no CLI args
+- `selfplay_server.args`
+  - consumed by `py/tools/selfplay_server.py` when launched with no CLI args
 
 Examples:
 
 ```powershell
 .\build-fresh\showdown_client.exe
 python -m py.communicator.main
+python py/tools/selfplay_server.py
 ```
 
 Those commands will use the tokens from these files automatically.
