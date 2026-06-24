@@ -473,6 +473,11 @@ class ReplayStateViewer(tk.Tk):
         self._programmatic_battle_select = False
         self._programmatic_turn_select = False
         self.turn_chip_buttons: list[tk.Button] = []
+        self.turn_left_button: ttk.Button | None = None
+        self.turn_right_button: ttk.Button | None = None
+        self.turn_chip_frame: ttk.Frame | None = None
+        self.turn_canvas: tk.Canvas | None = None
+        self.turn_canvas_window: int | None = None
 
         self._build_style()
         self._build_ui()
@@ -576,25 +581,6 @@ class ReplayStateViewer(tk.Tk):
         self.self_side_frame = ttk.LabelFrame(self.battle_surface, text="Player", style="Card.TLabelframe", padding=8)
         self.self_side_frame.pack(fill=tk.X)
 
-        turns_frame = ttk.Frame(self.center_panel, style="Panel.TFrame", padding=8)
-        turns_frame.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(turns_frame, text="Turns", style="Section.TLabel").pack(anchor="w")
-        turn_nav = ttk.Frame(turns_frame, style="Panel.TFrame")
-        turn_nav.pack(fill=tk.X, pady=(6, 0))
-        self.turn_left_button = ttk.Button(turn_nav, text="<", width=3, command=self.prev_turn)
-        self.turn_left_button.pack(side=tk.LEFT, padx=(0, 6))
-        self.turn_canvas = tk.Canvas(turn_nav, height=78, bg="#ffffff", highlightthickness=0)
-        self.turn_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.turn_right_button = ttk.Button(turn_nav, text=">", width=3, command=self.next_turn)
-        self.turn_right_button.pack(side=tk.LEFT, padx=(6, 0))
-        turn_scroll = ttk.Scrollbar(turns_frame, orient=tk.HORIZONTAL, command=self.turn_canvas.xview)
-        turn_scroll.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
-        self.turn_canvas.configure(xscrollcommand=turn_scroll.set)
-        self.turn_chip_frame = ttk.Frame(self.turn_canvas, style="Panel.TFrame")
-        self.turn_canvas_window = self.turn_canvas.create_window((0, 0), window=self.turn_chip_frame, anchor="nw")
-        self.turn_chip_frame.bind("<Configure>", self.on_turn_chip_frame_configure)
-        self.turn_canvas.bind("<Configure>", self.on_turn_canvas_configure)
-
         self.loading_overlay = ttk.Frame(self.battle_surface, style="Panel.TFrame")
         self.loading_label = ttk.Label(self.loading_overlay, textvariable=self.loading_var, style="Header.TLabel")
         self.loading_label.place(relx=0.5, rely=0.45, anchor="center")
@@ -621,8 +607,10 @@ class ReplayStateViewer(tk.Tk):
         self.browse_button.configure(state=state)
         self.prev_button.configure(state=state)
         self.next_button.configure(state=state)
-        self.turn_left_button.configure(state=state)
-        self.turn_right_button.configure(state=state)
+        if self.turn_left_button is not None:
+            self.turn_left_button.configure(state=state)
+        if self.turn_right_button is not None:
+            self.turn_right_button.configure(state=state)
         self.update_idletasks()
 
     def scan_replay(self) -> None:
@@ -725,6 +713,9 @@ class ReplayStateViewer(tk.Tk):
             self.set_loading(False)
 
     def populate_turn_list(self) -> None:
+        if self.turn_chip_frame is None or self.turn_canvas is None:
+            self.turn_chip_buttons = []
+            return
         for child in self.turn_chip_frame.winfo_children():
             child.destroy()
         self.turn_chip_buttons = []
@@ -799,10 +790,12 @@ class ReplayStateViewer(tk.Tk):
         return
 
     def on_turn_chip_frame_configure(self, _event: object | None = None) -> None:
+        if self.turn_canvas is None:
+            return
         self.turn_canvas.configure(scrollregion=self.turn_canvas.bbox("all"))
 
     def on_turn_canvas_configure(self, event: object | None = None) -> None:
-        if event is not None:
+        if event is not None and self.turn_canvas is not None and self.turn_canvas_window is not None:
             self.turn_canvas.itemconfigure(self.turn_canvas_window, height=max(1, getattr(event, "height", 78) - 2))
 
     def refresh_turn_chip_selection(self) -> None:
@@ -817,6 +810,8 @@ class ReplayStateViewer(tk.Tk):
         self.scroll_selected_turn_into_view()
 
     def scroll_selected_turn_into_view(self) -> None:
+        if self.turn_chip_frame is None or self.turn_canvas is None:
+            return
         if not (0 <= self.current_turn_idx < len(self.turn_chip_buttons)):
             return
         self.update_idletasks()
