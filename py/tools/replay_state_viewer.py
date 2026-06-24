@@ -64,39 +64,65 @@ def snapshot_turn_numbers(snapshots: list[dict]) -> list[int]:
     return turns
 
 
-def build_turn_index(snapshots: list[dict], turn_numbers: list[int]) -> list[tuple[int, int]]:
-    grouped: dict[int, list[tuple[int, dict]]] = {}
-    ordered_turns: list[int] = []
+def turn_group_key(snapshot: dict, turn: int) -> str:
+    if str(snapshot.get("message_type") or "").strip().lower() == "terminal":
+        return f"final:{turn}"
+    return str(turn)
+
+
+def parse_turn_group_number(turn_key: str) -> int:
+    if turn_key.startswith("final:"):
+        try:
+            return int(turn_key.split(":", 1)[1])
+        except ValueError:
+            return 0
+    try:
+        return int(turn_key)
+    except ValueError:
+        return 0
+
+
+def display_turn_label(turn_key: str) -> str:
+    if turn_key.startswith("final:"):
+        return "Final"
+    return f"Turn {parse_turn_group_number(turn_key)}"
+
+
+def build_turn_index(snapshots: list[dict], turn_numbers: list[int]) -> list[tuple[str, int]]:
+    grouped: dict[str, list[tuple[int, dict]]] = {}
+    ordered_turns: list[str] = []
     for idx, snapshot in enumerate(snapshots):
         turn = turn_numbers[idx] if idx < len(turn_numbers) else 0
-        if turn not in grouped:
-            grouped[turn] = []
-            ordered_turns.append(turn)
-        grouped[turn].append((idx, snapshot))
+        key = turn_group_key(snapshot, turn)
+        if key not in grouped:
+            grouped[key] = []
+            ordered_turns.append(key)
+        grouped[key].append((idx, snapshot))
 
-    turns: list[tuple[int, int]] = []
-    for turn in sorted(ordered_turns):
-        candidates = grouped[turn]
+    turns: list[tuple[str, int]] = []
+    for turn_key in ordered_turns:
+        candidates = grouped[turn_key]
         best_idx, _ = max(candidates, key=canonical_turn_snapshot_score)
-        turns.append((turn, best_idx))
+        turns.append((turn_key, best_idx))
     return turns
 
 
-def build_turn_groups(snapshots: list[dict], turn_numbers: list[int]) -> list[tuple[int, list[int], int]]:
-    grouped: dict[int, list[tuple[int, dict]]] = {}
-    ordered_turns: list[int] = []
+def build_turn_groups(snapshots: list[dict], turn_numbers: list[int]) -> list[tuple[str, list[int], int]]:
+    grouped: dict[str, list[tuple[int, dict]]] = {}
+    ordered_turns: list[str] = []
     for idx, snapshot in enumerate(snapshots):
         turn = turn_numbers[idx] if idx < len(turn_numbers) else 0
-        if turn not in grouped:
-            grouped[turn] = []
-            ordered_turns.append(turn)
-        grouped[turn].append((idx, snapshot))
+        key = turn_group_key(snapshot, turn)
+        if key not in grouped:
+            grouped[key] = []
+            ordered_turns.append(key)
+        grouped[key].append((idx, snapshot))
 
-    turn_groups: list[tuple[int, list[int], int]] = []
-    for turn in sorted(ordered_turns):
-        candidates = grouped[turn]
+    turn_groups: list[tuple[str, list[int], int]] = []
+    for turn_key in ordered_turns:
+        candidates = grouped[turn_key]
         best_idx, _ = max(candidates, key=canonical_turn_snapshot_score)
-        turn_groups.append((turn, [idx for idx, _ in candidates], best_idx))
+        turn_groups.append((turn_key, [idx for idx, _ in candidates], best_idx))
     return turn_groups
 
 
@@ -406,8 +432,8 @@ class ReplayStateViewer(tk.Tk):
         self.snapshot_path: Path | None = None
         self.snapshots: list[dict] = []
         self.snapshot_turns: list[int] = []
-        self.turns: list[tuple[int, int]] = []
-        self.turn_groups: list[tuple[int, list[int], int]] = []
+        self.turns: list[tuple[str, int]] = []
+        self.turn_groups: list[tuple[str, list[int], int]] = []
         self.battle_entries: list[dict[str, object]] = []
         self.visible_battle_ids: list[str] = []
         self.current_turn_idx = 0
@@ -661,11 +687,15 @@ class ReplayStateViewer(tk.Tk):
         for child in self.turn_chip_frame.winfo_children():
             child.destroy()
         self.turn_chip_buttons = []
-        for idx, (turn, snapshot_idx) in enumerate(self.turns):
+        for idx, (turn_key, snapshot_idx) in enumerate(self.turns):
             snapshot = self.snapshots[snapshot_idx]
             msg_type = snapshot.get("message_type", "")
             badge = short_result_label(snapshot)
-            label = f"T{turn:02d}\n{msg_type}{f' [{badge}]' if badge else ''}"
+            if turn_key.startswith("final:"):
+                label = f"Final\n{msg_type}{f' [{badge}]' if badge else ''}"
+            else:
+                turn = parse_turn_group_number(turn_key)
+                label = f"T{turn:02d}\n{msg_type}{f' [{badge}]' if badge else ''}"
             button = tk.Button(
                 self.turn_chip_frame,
                 text=label,
@@ -771,18 +801,20 @@ class ReplayStateViewer(tk.Tk):
     def render_current_turn(self) -> None:
         if not self.turns:
             return
-        turn, snapshot_idx = self.turns[self.current_turn_idx]
+        turn_key, snapshot_idx = self.turns[self.current_turn_idx]
         snapshot = self.snapshots[snapshot_idx]
         session = snapshot.get("session") or {}
         raw_state = session_state(session)
         debug_only = session.get("debug_only") or {}
         self_team = merge_team_debug(raw_state.get("self_team") or [], debug_only.get("self_team") or [])
         opp_team = merge_team_debug(raw_state.get("opp_team") or [], debug_only.get("opp_team") or [])
-        self.current_turn_var.set(f"Turn {turn}")
+        self.current_turn_var.set(display_turn_label(turn_key))
+        result = str(((snapshot.get("message") or {}).get("result")) or "").strip()
         self.current_meta_var.set(
             f"message={snapshot.get('message_type', '')}  "
             f"ready={session.get('ready_for_decision', 0)}  "
             f"terminal={session.get('terminal', 0)}"
+            f"{f'  result={result}' if result else ''}"
         )
         self.render_field_state(snapshot)
         self.render_side_section(
@@ -806,7 +838,7 @@ class ReplayStateViewer(tk.Tk):
         self.clear_frame(self.field_frame)
         session = snapshot.get("session") or {}
         raw_state = session_state(session)
-        turn, snapshot_indices, _ = self.turn_groups[self.current_turn_idx]
+        turn_key, snapshot_indices, _ = self.turn_groups[self.current_turn_idx]
 
         row = ttk.Frame(self.field_frame, style="CenterCard.TFrame")
         row.pack(fill=tk.X)
@@ -826,7 +858,7 @@ class ReplayStateViewer(tk.Tk):
 
         top = ttk.Frame(field_panel, style="CenterCard.TFrame")
         top.pack(fill=tk.X)
-        ttk.Label(top, text=f"Turn {turn}", style="Header.TLabel").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(top, text=display_turn_label(turn_key), style="Header.TLabel").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(top, text=f"Player active: {raw_state.get('self_active_count', 0)}", style="Meta.TLabel").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(top, text=f"Opp active: {raw_state.get('opp_active_count', 0)}", style="Meta.TLabel").pack(side=tk.LEFT)
 
