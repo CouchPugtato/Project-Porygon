@@ -74,6 +74,10 @@ def resolved_server_uri(explicit_uri: str | None) -> str:
     return default_showdown_uri()
 
 
+def shutdown_file_requested(shutdown_file: Path | None) -> bool:
+    return shutdown_file is not None and shutdown_file.exists()
+
+
 def should_refresh_guest(username: str, guest_refresh_seconds: float, session_started_at: float | None) -> bool:
     if username:
         return False
@@ -728,6 +732,7 @@ async def capture_mode(
     fmt: str,
     username: str,
     server_uri: str,
+    shutdown_file: Path | None = None,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
     guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
@@ -740,25 +745,27 @@ async def capture_mode(
     finished_battles = 0
     seq = 0
     stop_requested = False
+    shutdown_after_current = False
     refresh_requested = False
     session_started_at: float | None = None
 
     print(f"[capture] writing replay records to {out_path}")
 
     async def on_event(event: ShowdownEvent) -> None:
-        nonlocal finished_battles, seq, stop_requested, refresh_requested
+        nonlocal finished_battles, seq, stop_requested, shutdown_after_current, refresh_requested
 
-        if event.room_id.startswith("battle-") and event.room_id not in started_battles:
-            started_battles.add(event.room_id)
-            disconnect_or_forfeit_end[event.room_id] = False
-            writer.append(
-                event.room_id,
-                battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json(),
-            )
-            print(f"[capture] started {event.room_id}")
-            assert gateway is not None
-            await gateway.send_room_command(event.room_id, "/timer on")
-            print(f"[capture] timer enabled for {event.room_id}")
+        if event.room_id.startswith("battle-"):
+            if event.room_id not in started_battles:
+                started_battles.add(event.room_id)
+                disconnect_or_forfeit_end[event.room_id] = False
+                writer.append(
+                    event.room_id,
+                    battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json(),
+                )
+                print(f"[capture] started {event.room_id}")
+                assert gateway is not None
+                await gateway.send_room_command(event.room_id, "/timer on")
+                print(f"[capture] timer enabled for {event.room_id}")
 
         summary = event_summary(event)
         if summary:
@@ -790,6 +797,11 @@ async def capture_mode(
                 stop_requested = True
                 assert gateway is not None
                 await gateway.close()
+            elif shutdown_after_current:
+                print("[capture] current battle finished; stopping")
+                stop_requested = True
+                assert gateway is not None
+                await gateway.close()
             elif should_refresh_guest(username, guest_refresh_seconds, session_started_at):
                 print(f"[capture] refreshing guest session after {guest_refresh_seconds:.1f}s")
                 refresh_requested = True
@@ -803,12 +815,28 @@ async def capture_mode(
 
         seq += 1
 
+    async def shutdown_watcher() -> None:
+        nonlocal stop_requested, shutdown_after_current
+        while not stop_requested:
+            if shutdown_file_requested(shutdown_file):
+                if started_battles:
+                    if not shutdown_after_current:
+                        shutdown_after_current = True
+                        print("[capture] shutdown requested; will stop after current battles finish")
+                else:
+                    print("[capture] shutdown requested with no active battle; stopping now")
+                    stop_requested = True
+                    if gateway is not None:
+                        await gateway.close()
+                    return
+            await asyncio.sleep(1.0)
+
     while not stop_requested:
         gateway = ShowdownGateway(server_uri, username=username, fmt=fmt)
         try:
             await gateway.connect()
             session_started_at = time.monotonic()
-            await gateway.run(on_event)
+            await asyncio.gather(gateway.run(on_event), shutdown_watcher())
             if refresh_requested and not stop_requested:
                 refresh_requested = False
                 print("[capture] guest session refreshed; reconnecting now")
@@ -817,6 +845,8 @@ async def capture_mode(
                 print("[capture] gateway closed cleanly")
                 break
         except (OSError, ConnectionClosed, asyncio.TimeoutError, TimeoutError) as exc:
+            if stop_requested or shutdown_after_current:
+                break
             writer.discard_all(started_battles)
             started_battles.clear()
             disconnect_or_forfeit_end.clear()
@@ -829,6 +859,7 @@ async def random_mode(
     fmt: str,
     username: str,
     server_uri: str,
+    shutdown_file: Path | None = None,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
     guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
@@ -875,9 +906,19 @@ async def random_mode(
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
 
     def handle_sigint(_signum: int, _frame: object) -> None:
+        if shutdown_file is not None:
+            return
         loop.call_soon_threadsafe(lambda: asyncio.create_task(request_shutdown()))
 
     signal.signal(signal.SIGINT, handle_sigint)
+
+    async def shutdown_watcher() -> None:
+        nonlocal stop_requested
+        while not stop_requested:
+            if shutdown_file_requested(shutdown_file):
+                await request_shutdown()
+                return
+            await asyncio.sleep(1.0)
 
     async def send_random_choice(room_id: str, request_payload: dict, initial: bool) -> None:
         nonlocal fallback_used_count, accepted_count
@@ -906,6 +947,21 @@ async def random_mode(
 
     async def on_event(event: ShowdownEvent) -> None:
         nonlocal seq, finished_battles, invalid_choice_count, stop_requested, refresh_requested
+        if event.room_id.startswith("battle-"):
+            newly_active = event.room_id not in active_battles
+            active_battles.add(event.room_id)
+            disconnect_or_forfeit_end.setdefault(event.room_id, False)
+            if newly_active:
+                battle_current_turn[event.room_id] = 0
+                battle_first_tera_turn[event.room_id] = None
+                writer.append(
+                    event.room_id,
+                    battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json(),
+                )
+                print(f"[random] battle started {event.room_id}")
+                assert gateway is not None
+                await gateway.send_room_command(event.room_id, "/timer on")
+                print(f"[random] timer enabled for {event.room_id}")
         summary = event_summary(event)
         if summary:
             print(summary)
@@ -1020,20 +1076,7 @@ async def random_mode(
                 assert gateway is not None
                 await gateway.search_next_battle()
         else:
-            if event.room_id.startswith("battle-") and event.room_id not in active_battles and event.line.startswith("|init|battle"):
-                active_battles.add(event.room_id)
-                disconnect_or_forfeit_end[event.room_id] = False
-                battle_current_turn[event.room_id] = 0
-                battle_first_tera_turn[event.room_id] = None
-                writer.append(
-                    event.room_id,
-                    battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json(),
-                )
-                print(f"[random] battle started {event.room_id}")
-                assert gateway is not None
-                await gateway.send_room_command(event.room_id, "/timer on")
-                print(f"[random] timer enabled for {event.room_id}")
-            elif is_disconnect_or_forfeit_end(event.line):
+            if is_disconnect_or_forfeit_end(event.line):
                 disconnect_or_forfeit_end[event.room_id] = True
             elif event.line.startswith("|turn|"):
                 parts = event.line.split("|")
@@ -1051,7 +1094,7 @@ async def random_mode(
             try:
                 await gateway.connect()
                 session_started_at = time.monotonic()
-                await gateway.run(on_event)
+                await asyncio.gather(gateway.run(on_event), shutdown_watcher())
                 if refresh_requested and not stop_requested:
                     refresh_requested = False
                     print("[random] guest session refreshed; reconnecting now")
@@ -1060,6 +1103,8 @@ async def random_mode(
                     print("[random] gateway closed cleanly")
                     break
             except (OSError, ConnectionClosed, asyncio.TimeoutError, TimeoutError) as exc:
+                if stop_requested or stop_after_current_battle.is_set():
+                    break
                 writer.discard_all(active_battles)
                 active_battles.clear()
                 latest_requests.clear()
@@ -1082,6 +1127,7 @@ async def live_mode(
     fmt: str,
     username: str,
     server_uri: str,
+    shutdown_file: Path | None = None,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
     guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
@@ -1140,12 +1186,45 @@ async def live_mode(
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
 
     def handle_sigint(_signum: int, _frame: object) -> None:
+        if shutdown_file is not None:
+            return
         loop.call_soon_threadsafe(lambda: asyncio.create_task(request_shutdown()))
 
     signal.signal(signal.SIGINT, handle_sigint)
 
+    async def shutdown_watcher() -> None:
+        while not stop_requested:
+            if shutdown_file_requested(shutdown_file):
+                await request_shutdown()
+                return
+            await asyncio.sleep(1.0)
+
     async def on_event(event: ShowdownEvent) -> None:
         nonlocal seq, invalid_choice_count, fallback_used_count, learner_proposal_accepted_count, finished_battles, stop_requested, refresh_requested
+        if event.room_id.startswith("battle-"):
+            newly_active = event.room_id not in active_battles
+            active_battles.add(event.room_id)
+            disconnect_or_forfeit_end.setdefault(event.room_id, False)
+            if newly_active:
+                battle_current_turn[event.room_id] = 0
+                battle_first_tera_turn[event.room_id] = None
+                battle_invalid_choice_count[event.room_id] = 0
+                battle_fallback_used_count[event.room_id] = 0
+                battle_accepted_proposal_count[event.room_id] = 0
+                battle_action_counts[event.room_id] = empty_action_counts()
+                if writer is not None:
+                    writer.append(
+                        event.room_id,
+                        battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json(),
+                    )
+                assert learner is not None
+                await learner.send(
+                    battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).payload
+                )
+                print(f"[live] battle started {event.room_id}")
+                assert gateway is not None
+                await gateway.send_room_command(event.room_id, "/timer on")
+                print(f"[live] timer enabled for {event.room_id}")
         summary = event_summary(event)
         if summary:
             print(summary)
@@ -1397,29 +1476,7 @@ async def live_mode(
                 assert gateway is not None
                 await gateway.search_next_battle()
         else:
-            if event.room_id.startswith("battle-") and event.line.startswith("|init|battle"):
-                active_battles.add(event.room_id)
-                disconnect_or_forfeit_end[event.room_id] = False
-                battle_current_turn[event.room_id] = 0
-                battle_first_tera_turn[event.room_id] = None
-                battle_invalid_choice_count[event.room_id] = 0
-                battle_fallback_used_count[event.room_id] = 0
-                battle_accepted_proposal_count[event.room_id] = 0
-                battle_action_counts[event.room_id] = empty_action_counts()
-                if writer is not None:
-                    writer.append(
-                        event.room_id,
-                        battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).to_json(),
-                    )
-                assert learner is not None
-                await learner.send(
-                    battle_start(event.room_id, fmt, infer_is_doubles(event.room_id, fmt)).payload
-                )
-                print(f"[live] battle started {event.room_id}")
-                assert gateway is not None
-                await gateway.send_room_command(event.room_id, "/timer on")
-                print(f"[live] timer enabled for {event.room_id}")
-            elif is_disconnect_or_forfeit_end(event.line):
+            if is_disconnect_or_forfeit_end(event.line):
                 disconnect_or_forfeit_end[event.room_id] = True
             elif event.line.startswith("|turn|"):
                 parts = event.line.split("|")
@@ -1510,7 +1567,7 @@ async def live_mode(
             try:
                 await gateway.connect()
                 session_started_at = time.monotonic()
-                await asyncio.gather(gateway.run(on_event), action_loop(), stderr_loop())
+                await asyncio.gather(gateway.run(on_event), action_loop(), stderr_loop(), shutdown_watcher())
                 if refresh_requested and not stop_requested:
                     refresh_requested = False
                     learner_stopping.clear()
@@ -1520,6 +1577,9 @@ async def live_mode(
                     print("[live] gateway/learner session ended cleanly")
                     break
             except (OSError, ConnectionClosed, asyncio.TimeoutError, TimeoutError) as exc:
+                if stop_requested or stop_after_current_battle.is_set():
+                    await learner.terminate()
+                    break
                 if writer is not None:
                     writer.discard_all(active_battles)
                 active_battles.clear()
@@ -1554,6 +1614,7 @@ def main() -> None:
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--username", default="")
     parser.add_argument("--server-uri", default="")
+    parser.add_argument("--shutdown-file", default="")
     parser.add_argument("--games", type=int, default=0)
     parser.add_argument("--reconnect-seconds", type=float, default=DEFAULT_RECONNECT_SECONDS)
     parser.add_argument("--guest-refresh-seconds", type=float, default=DEFAULT_GUEST_REFRESH_SECONDS)
@@ -1564,6 +1625,7 @@ def main() -> None:
     max_games = args.games if args.games > 0 else None
     replay_path = resolve_replay_save_path(args.replay_save)
     server_uri = resolved_server_uri(args.server_uri)
+    shutdown_file = Path(args.shutdown_file) if args.shutdown_file else None
 
     if args.mode == "capture":
         asyncio.run(
@@ -1572,6 +1634,7 @@ def main() -> None:
                 args.format,
                 args.username,
                 server_uri,
+                shutdown_file=shutdown_file,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
                 guest_refresh_seconds=args.guest_refresh_seconds,
@@ -1584,6 +1647,7 @@ def main() -> None:
                 args.format,
                 args.username,
                 server_uri,
+                shutdown_file=shutdown_file,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
                 guest_refresh_seconds=args.guest_refresh_seconds,
@@ -1601,6 +1665,7 @@ def main() -> None:
                 args.format,
                 args.username,
                 server_uri,
+                shutdown_file=shutdown_file,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
                 guest_refresh_seconds=args.guest_refresh_seconds,

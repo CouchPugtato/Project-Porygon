@@ -66,6 +66,13 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
 def nonnegative_float(value: str) -> float:
     parsed = float(value)
     if parsed < 0.0:
@@ -113,6 +120,17 @@ def parse_server_start_command(command: str, port: int) -> list[str]:
     return shlex.split(command, posix=os.name != "nt")
 
 
+def child_creationflags() -> int:
+    if os.name != "nt":
+        return 0
+    flags = 0
+    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+    if hasattr(subprocess, "DETACHED_PROCESS"):
+        flags |= subprocess.DETACHED_PROCESS
+    return flags
+
+
 @dataclass(frozen=True)
 class WorkerSpec:
     worker_id: int
@@ -123,6 +141,7 @@ class WorkerSpec:
     replay_save_token: str
     replay_path: Path
     stdout_log_path: Path
+    shutdown_path: Path
 
     @property
     def worker_token(self) -> str:
@@ -162,6 +181,7 @@ class ServerProcess:
             cwd=str(self.showdown_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            creationflags=child_creationflags(),
         )
         self._stdout_task = asyncio.create_task(self._pipe_output())
 
@@ -237,6 +257,7 @@ class ClientProcess:
             cwd=str(self.client_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            creationflags=child_creationflags(),
         )
         self._stdout_task = asyncio.create_task(self._pipe_output())
 
@@ -327,6 +348,8 @@ class WorkerProcess:
             self.battle_format,
             "--replay-save",
             self.spec.replay_save_token,
+            "--shutdown-file",
+            str(self.spec.shutdown_path),
             "--guest-refresh-seconds",
             "0",
             "--reconnect-seconds",
@@ -344,15 +367,12 @@ class WorkerProcess:
         command = self.command()
         self._log_handle.write(f"$ {' '.join(command)}\n")
         self._log_handle.flush()
-        creationflags = 0
-        if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         self.process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(self.repo_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            creationflags=creationflags,
+            creationflags=child_creationflags(),
         )
         self.graceful_stop_requested = False
         self.active_battles.clear()
@@ -392,12 +412,8 @@ class WorkerProcess:
         if self.graceful_stop_requested or not self.is_running():
             return
         self.graceful_stop_requested = True
-        if self.process is None:
-            return
-        if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
-            self.process.send_signal(signal.CTRL_BREAK_EVENT)
-        else:
-            self.process.send_signal(signal.SIGINT)
+        self.spec.shutdown_path.parent.mkdir(parents=True, exist_ok=True)
+        self.spec.shutdown_path.write_text("stop\n", encoding="utf-8")
 
     async def terminate(self) -> None:
         if self.process is not None and self.process.returncode is None:
@@ -511,10 +527,15 @@ class PoolOrchestrator:
         self._start_time = 0.0
         self._draining = False
         self._drain_started_at: float | None = None
+        self._last_drain_progress_at: float | None = None
         self._shutdown_requested = False
         self._wait_for_current_matches = False
         self._failed = False
         self._failure_reason = ""
+
+    @property
+    def target_games_label(self) -> str:
+        return "infinite" if self.args.games == 0 else str(self.args.games)
 
     def _build_worker_specs(self) -> list[WorkerSpec]:
         specs: list[WorkerSpec] = []
@@ -534,6 +555,7 @@ class PoolOrchestrator:
                         replay_save_token=worker_replay_save_token(self.args.run_name, worker_token),
                         replay_path=worker_replay_path(self.args.run_name, worker_token),
                         stdout_log_path=self.run_dir / f"{worker_token}.stdout.log",
+                        shutdown_path=self.run_dir / f"{worker_token}.shutdown",
                     )
                 )
                 worker_id += 1
@@ -574,12 +596,12 @@ class PoolOrchestrator:
             self.log(f"client entrypoint missing; local spectating disabled: {entrypoint_path}")
             return
         self.client = ClientProcess(client_dir, self.args.client_host, self.args.client_port, self.client_log_path)
-        self.log(f"starting local showdown client in {client_dir}")
         await self.client.start()
         await self.client.wait_until_ready(self.client_entrypoint, self.args.startup_timeout_seconds)
-        self.log(f"local client ready at {self.client_url}")
 
     async def _start_worker(self, spec: WorkerSpec) -> None:
+        if spec.shutdown_path.exists():
+            spec.shutdown_path.unlink()
         worker = WorkerProcess(
             spec=spec,
             repo_root=self.repo_root,
@@ -597,8 +619,10 @@ class PoolOrchestrator:
         self.log(f"started {spec.worker_token} user={spec.username} mode={spec.mode} agent={checkpoint_label}")
 
     async def _start_workers(self) -> None:
-        for spec in self.worker_specs:
+        for index, spec in enumerate(self.worker_specs):
             await self._start_worker(spec)
+            if index == len(self.worker_specs) - 1:
+                print()
 
     async def _respawn_if_needed(self) -> None:
         if self._draining:
@@ -619,6 +643,7 @@ class PoolOrchestrator:
             return
         self._draining = True
         self._drain_started_at = time.monotonic()
+        self._last_drain_progress_at = self._drain_started_at
         self._wait_for_current_matches = reason == "ctrl+c"
         self.log(f"draining worker pool: {reason}")
         for worker in list(self.worker_processes.values()):
@@ -680,7 +705,7 @@ class PoolOrchestrator:
             await self._start_client()
             await self._start_workers()
             self.log(
-                f"pool ready: target_games={self.args.games} concurrent_games={self.args.concurrent_games} "
+                f"pool ready: target_games={self.target_games_label} concurrent_games={self.args.concurrent_games} "
                 f"workers={self.total_workers} model_a_workers={self.model_a_workers} model_b_workers={self.model_b_workers}"
             )
             while True:
@@ -688,11 +713,10 @@ class PoolOrchestrator:
                 newly_completed = self.replay_monitor.poll(self.worker_specs)
                 if newly_completed:
                     self.log(
-                        f"completed_games={self.replay_monitor.completed_games}/{self.args.games} "
-                        f"active_battles={self._active_battle_count()}"
+                        f"completed_games={self.replay_monitor.completed_games}/{self.target_games_label}"
                     )
                 await self._check_server_health()
-                if not self._draining and self.replay_monitor.completed_games >= self.args.games:
+                if not self._draining and self.args.games > 0 and self.replay_monitor.completed_games >= self.args.games:
                     await self._request_drain("target games reached")
                 await self._respawn_if_needed()
                 if self._draining:
@@ -701,6 +725,16 @@ class PoolOrchestrator:
                         break
                     drain_elapsed = time.monotonic() - (self._drain_started_at or time.monotonic())
                     active_battles = self._active_battle_count()
+                    now = time.monotonic()
+                    if (
+                        self._last_drain_progress_at is None
+                        or (now - self._last_drain_progress_at) >= 10.0
+                    ):
+                        self.log(
+                            f"drain progress: active_battles={active_battles} "
+                            f"completed_games={self.replay_monitor.completed_games}/{self.target_games_label}"
+                        )
+                        self._last_drain_progress_at = now
                     if active_battles == 0:
                         for worker in self.worker_processes.values():
                             await worker.request_stop()
@@ -716,21 +750,21 @@ class PoolOrchestrator:
             await self._terminate_workers()
             return 1
         finally:
-            if self.client is not None:
-                await self.client.terminate()
             if self.server is not None:
                 await self.server.terminate()
             self._write_summary()
             if self._log_handle is not None:
                 self._log_handle.flush()
                 self._log_handle.close()
+            if self.client is not None:
+                await self.client.terminate()
             signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-name", required=True)
-    parser.add_argument("--games", required=True, type=positive_int)
+    parser.add_argument("--games", required=True, type=nonnegative_int)
     parser.add_argument("--concurrent-games", required=True, type=positive_int)
     parser.add_argument("--model-a", required=True)
     parser.add_argument("--model-b", required=True)
