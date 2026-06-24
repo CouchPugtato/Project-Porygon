@@ -512,6 +512,7 @@ class PoolOrchestrator:
         self._draining = False
         self._drain_started_at: float | None = None
         self._shutdown_requested = False
+        self._wait_for_current_matches = False
         self._failed = False
         self._failure_reason = ""
 
@@ -618,6 +619,7 @@ class PoolOrchestrator:
             return
         self._draining = True
         self._drain_started_at = time.monotonic()
+        self._wait_for_current_matches = reason == "ctrl+c"
         self.log(f"draining worker pool: {reason}")
         for worker in list(self.worker_processes.values()):
             await worker.request_stop()
@@ -702,7 +704,7 @@ class PoolOrchestrator:
                     if active_battles == 0:
                         for worker in self.worker_processes.values():
                             await worker.request_stop()
-                    if drain_elapsed >= self.args.shutdown_grace_seconds:
+                    if not self._wait_for_current_matches and drain_elapsed >= self.args.shutdown_grace_seconds:
                         self.log("shutdown grace expired; terminating remaining workers")
                         break
             await self._terminate_workers()
@@ -757,9 +759,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def async_main() -> int:
     parser = build_parser()
-    argv = sys.argv[1:]
-    if not argv:
-        argv = load_default_args(DEFAULT_ARGS_PATH)
+    default_argv = load_default_args(DEFAULT_ARGS_PATH)
+    argv = default_argv + sys.argv[1:]
     args = parser.parse_args(argv)
     orchestrator = PoolOrchestrator(args)
     return await orchestrator.run()
