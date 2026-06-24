@@ -26,6 +26,16 @@ def is_earned_victory_record(payload: dict) -> bool:
     return reward > 0.0
 
 
+def is_clean_terminal_breaker(payload: dict) -> bool:
+    record_type = str(payload.get("type") or payload.get("message_type") or "").strip().lower()
+    if record_type != "event":
+        return False
+    line = str(payload.get("line") or ((payload.get("message") or {}).get("line")) or "").strip().lower()
+    if not line:
+        return False
+    return "lost due to inactivity." in line or "forfeited." in line
+
+
 def scan_battle_entries(replay_path: Path) -> list[dict[str, object]]:
     battle_entries: list[dict[str, object]] = []
     by_battle_id: dict[str, dict[str, object]] = {}
@@ -41,11 +51,23 @@ def scan_battle_entries(replay_path: Path) -> list[dict[str, object]]:
             battle_id = str(battle_id)
             entry = by_battle_id.get(battle_id)
             if entry is None:
-                entry = {"battle_id": battle_id, "earned_win": False}
+                entry = {
+                    "battle_id": battle_id,
+                    "earned_win": False,
+                    "has_terminal": False,
+                    "clean_terminal_breaker": False,
+                }
                 by_battle_id[battle_id] = entry
                 battle_entries.append(entry)
             if is_earned_victory_record(payload):
                 entry["earned_win"] = True
+            record_type = str(payload.get("type") or payload.get("message_type") or "").strip().lower()
+            if record_type == "terminal":
+                entry["has_terminal"] = True
+            if is_clean_terminal_breaker(payload):
+                entry["clean_terminal_breaker"] = True
+    for entry in battle_entries:
+        entry["clean_match"] = bool(entry.get("has_terminal")) and not bool(entry.get("clean_terminal_breaker"))
     return battle_entries
 
 
@@ -437,6 +459,7 @@ class ReplayStateViewer(tk.Tk):
         self.current_turn_var = tk.StringVar(value="Turn 0")
         self.current_meta_var = tk.StringVar(value="")
         self.earned_victories_only_var = tk.BooleanVar(value=False)
+        self.clean_matches_only_var = tk.BooleanVar(value=False)
 
         self.snapshot_path: Path | None = None
         self.snapshots: list[dict] = []
@@ -503,6 +526,12 @@ class ReplayStateViewer(tk.Tk):
             self.left_panel,
             text="Earned victories only",
             variable=self.earned_victories_only_var,
+            command=self.on_filter_change,
+        ).pack(anchor="w", pady=(0, 8))
+        ttk.Checkbutton(
+            self.left_panel,
+            text="Clean matches only",
+            variable=self.clean_matches_only_var,
             command=self.on_filter_change,
         ).pack(anchor="w", pady=(0, 8))
         self.battle_list = tk.Listbox(
@@ -611,9 +640,12 @@ class ReplayStateViewer(tk.Tk):
 
     def filtered_battle_ids(self) -> list[str]:
         earned_only = bool(self.earned_victories_only_var.get())
+        clean_only = bool(self.clean_matches_only_var.get())
         battle_ids: list[str] = []
         for entry in self.battle_entries:
             if earned_only and not bool(entry.get("earned_win")):
+                continue
+            if clean_only and not bool(entry.get("clean_match")):
                 continue
             battle_ids.append(str(entry.get("battle_id") or ""))
         return [battle_id for battle_id in battle_ids if battle_id]
