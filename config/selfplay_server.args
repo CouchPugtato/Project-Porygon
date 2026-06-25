@@ -2,13 +2,13 @@
 # One token per line
 
 --run-name
-run_0015_random_pool
+run_0017_extreme_size1000
 
 --games
-10
+0
 
 --concurrent-games
-2
+1000
 
 --model-a
 random

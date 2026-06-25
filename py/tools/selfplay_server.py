@@ -330,6 +330,7 @@ class WorkerProcess:
         self._log_handle: TextIO | None = None
         self.graceful_stop_requested = False
         self.active_battles: set[str] = set()
+        self.reconnect_pending = False
 
     def command(self) -> list[str]:
         command = [
@@ -376,6 +377,7 @@ class WorkerProcess:
         )
         self.graceful_stop_requested = False
         self.active_battles.clear()
+        self.reconnect_pending = False
         self._stdout_task = asyncio.create_task(self._pipe_output())
 
     async def _pipe_output(self) -> None:
@@ -424,6 +426,7 @@ class WorkerProcess:
                 self.process.kill()
                 await self.process.wait()
         self.active_battles.clear()
+        self.reconnect_pending = False
         if self._stdout_task is not None:
             with contextlib.suppress(Exception):
                 await self._stdout_task
@@ -570,7 +573,13 @@ class PoolOrchestrator:
 
     def _on_worker_log_line(self, worker: WorkerProcess, line: str) -> None:
         if "connection lost:" in line:
-            self.log(f"{worker.spec.worker_token} reconnecting after disconnect")
+            if not worker.reconnect_pending:
+                worker.reconnect_pending = True
+                self.log(f"{worker.spec.worker_token} reconnecting after disconnect")
+            return
+        if worker.reconnect_pending and "[communicator] websocket connected" in line:
+            worker.reconnect_pending = False
+            self.log(f"{worker.spec.worker_token} reconnected successfully")
 
     async def _start_server(self) -> None:
         showdown_dir = (self.repo_root / self.args.showdown_dir).resolve()
@@ -634,6 +643,9 @@ class PoolOrchestrator:
             if worker.is_running():
                 continue
             return_code = worker.process.returncode if worker.process is not None else None
+            if worker.reconnect_pending:
+                worker.reconnect_pending = False
+                self.log(f"{spec.worker_token} failed to reconnect before exit")
             await worker.terminate()
             self.log(f"{spec.worker_token} exited unexpectedly with code {return_code}; respawning")
             await self._start_worker(spec)
