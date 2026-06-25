@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from pathlib import Path
+from typing import TextIO
 
 
 STAT_INT_KEYS = {
@@ -25,6 +27,9 @@ STAT_INT_KEYS = {
     "tera_battles",
 }
 
+PROGRESS_INTERVAL_BATTLES = 100
+PROGRESS_INTERVAL_SECONDS = 10.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
@@ -34,56 +39,69 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_battles(path: Path) -> list[list[str]]:
-    battles: list[list[str]] = []
-    current_battle: list[str] = []
-    current_battle_id: str | None = None
+class BattleStream:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle: TextIO | None = None
+        self._finished = False
+        self._battle_count = 0
 
-    with path.open(encoding="utf-8") as handle:
-        for raw_line in handle:
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    @property
+    def battle_count(self) -> int:
+        return self._battle_count
+
+    def _ensure_open(self) -> TextIO:
+        if self._handle is None:
+            self._handle = self.path.open(encoding="utf-8")
+        return self._handle
+
+    def next_battle(self) -> list[str] | None:
+        if self._finished:
+            return None
+        handle = self._ensure_open()
+        current_battle: list[str] = []
+        current_battle_id: str | None = None
+
+        while True:
+            raw_line = handle.readline()
+            if not raw_line:
+                self._finished = True
+                if current_battle:
+                    raise ValueError(f"{self.path}: file ended before battle_end for {current_battle_id}")
+                return None
             line = raw_line.rstrip("\n")
             if not line.strip():
                 continue
+
             record = json.loads(line)
             record_type = str(record.get("type", "")).strip()
             battle_id = str(record.get("battle_id", "")).strip()
 
-            if record_type == "battle_start":
-                if current_battle:
-                    raise ValueError(f"{path}: encountered battle_start before previous battle ended")
+            if not current_battle:
+                if record_type != "battle_start":
+                    raise ValueError(f"{self.path}: record outside battle block: {record_type}")
                 current_battle = [line]
                 current_battle_id = battle_id
                 continue
 
-            if not current_battle:
-                raise ValueError(f"{path}: record outside battle block: {record_type}")
-
             if battle_id != current_battle_id:
                 raise ValueError(
-                    f"{path}: battle_id changed inside block from {current_battle_id} to {battle_id}"
+                    f"{self.path}: battle_id changed inside block from {current_battle_id} to {battle_id}"
                 )
 
             current_battle.append(line)
             if record_type == "battle_end":
-                battles.append(current_battle)
-                current_battle = []
-                current_battle_id = None
+                self._battle_count += 1
+                return current_battle
 
-    if current_battle:
-        raise ValueError(f"{path}: file ended before battle_end for {current_battle_id}")
-
-    return battles
-
-
-def combine_battle_streams(per_file_battles: list[list[list[str]]], rng: random.Random) -> list[str]:
-    queues = [list(battles) for battles in per_file_battles if battles]
-    combined_lines: list[str] = []
-    while queues:
-        queue_index = rng.randrange(len(queues))
-        combined_lines.extend(queues[queue_index].pop(0))
-        if not queues[queue_index]:
-            queues.pop(queue_index)
-    return combined_lines
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
 
 
 def parse_stats_file(path: Path) -> dict[str, str]:
@@ -167,19 +185,77 @@ def main() -> None:
         raise SystemExit(f"no input files matched {args.pattern!r} in {run_dir}")
 
     rng = random.Random()
-    per_file_battles = [load_battles(path) for path in input_paths]
-    combined_lines = combine_battle_streams(per_file_battles, rng)
-    combined_stats = combine_stats(run_dir)
+    streams = [BattleStream(path) for path in input_paths]
+    active_streams: list[tuple[BattleStream, list[str]]] = []
+    total_records = 0
+    total_battles = 0
+    discovered_battles = 0
+    started_at = time.monotonic()
+    last_progress_at = started_at
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(combined_lines) + ("\n" if combined_lines else ""), encoding="utf-8")
+    try:
+        for stream in streams:
+            battle = stream.next_battle()
+            if battle is not None:
+                active_streams.append((stream, battle))
+                discovered_battles += 1
+
+        print(
+            f"[combine_match_jsons] starting run={args.run} inputs={len(input_paths)} "
+            f"active_streams={len(active_streams)} output={output_path}",
+            flush=True,
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as out_handle:
+            while active_streams:
+                stream_index = rng.randrange(len(active_streams))
+                stream, battle = active_streams[stream_index]
+                for line in battle:
+                    out_handle.write(line + "\n")
+                total_records += len(battle)
+                total_battles += 1
+
+                next_battle = stream.next_battle()
+                if next_battle is None:
+                    active_streams.pop(stream_index)
+                else:
+                    active_streams[stream_index] = (stream, next_battle)
+                    discovered_battles += 1
+
+                now = time.monotonic()
+                if (
+                    total_battles % PROGRESS_INTERVAL_BATTLES == 0
+                    or (now - last_progress_at) >= PROGRESS_INTERVAL_SECONDS
+                ):
+                    elapsed = max(now - started_at, 1e-9)
+                    bpm = (total_battles * 60.0) / elapsed
+                    eta_seconds: float | None = None
+                    remaining_known_battles = discovered_battles - total_battles
+                    if bpm > 0.0 and remaining_known_battles > 0:
+                        eta_seconds = (remaining_known_battles * 60.0) / bpm
+                    eta_text = "unknown"
+                    if eta_seconds is not None:
+                        eta_minutes = eta_seconds / 60.0
+                        eta_text = f"{eta_minutes:.1f}m"
+                    print(
+                        f"[combine_match_jsons] progress battles={total_battles} "
+                        f"records={total_records} active_streams={len(active_streams)} "
+                        f"battles_per_minute={bpm:.1f} "
+                        f"known_remaining_battles={remaining_known_battles} eta={eta_text}",
+                        flush=True,
+                    )
+                    last_progress_at = now
+    finally:
+        for stream in streams:
+            stream.close()
+
+    combined_stats = combine_stats(run_dir)
     write_stats_file(output_path.with_suffix(".stats.txt"), combined_stats)
 
-    print(f"[combine_match_jsons] wrote {len(combined_lines)} records to {output_path}")
-    print(f"[combine_match_jsons] wrote combined stats to {output_path.with_suffix('.stats.txt')}")
-    print(
-        f"[combine_match_jsons] inputs={len(input_paths)} total_battles={sum(len(battles) for battles in per_file_battles)}"
-    )
+    print(f"[combine_match_jsons] wrote {total_records} records to {output_path}", flush=True)
+    print(f"[combine_match_jsons] wrote combined stats to {output_path.with_suffix('.stats.txt')}", flush=True)
+    print(f"[combine_match_jsons] inputs={len(input_paths)} total_battles={total_battles}", flush=True)
 
 
 if __name__ == "__main__":
