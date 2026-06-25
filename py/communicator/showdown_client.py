@@ -75,11 +75,19 @@ class ShowdownGateway:
         self._search_sent = False
         await self.search_battle()
 
+    async def cancel_search(self) -> None:
+        if not self._search_sent:
+            return
+        print("[communicator] canceling active search")
+        await self.send("|/cancelsearch")
+        self._search_sent = False
+
     async def close(self) -> None:
         if self._ws is None:
             return
         await self._ws.close()
         self._ws = None
+        self._search_sent = False
 
     async def handle_control_line(self, line: str) -> None:
         if line.startswith("|challstr|"):
@@ -104,6 +112,8 @@ class ShowdownGateway:
 
         if line.startswith("|updatesearch|"):
             print(f"[communicator] search update: {line}")
+            if line.strip() == "|updatesearch|":
+                self._search_sent = False
             return
 
         if line.startswith("|popup|"):

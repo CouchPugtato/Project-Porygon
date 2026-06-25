@@ -751,6 +751,20 @@ async def capture_mode(
 
     print(f"[capture] writing replay records to {out_path}")
 
+    async def request_shutdown() -> None:
+        nonlocal stop_requested, shutdown_after_current
+        if gateway is not None:
+            await gateway.cancel_search()
+        if started_battles:
+            if not shutdown_after_current:
+                shutdown_after_current = True
+                print("[capture] shutdown requested; will stop after current battles finish")
+            return
+        print("[capture] shutdown requested with no active battle; stopping now")
+        stop_requested = True
+        if gateway is not None:
+            await gateway.close()
+
     async def on_event(event: ShowdownEvent) -> None:
         nonlocal finished_battles, seq, stop_requested, shutdown_after_current, refresh_requested
 
@@ -816,19 +830,10 @@ async def capture_mode(
         seq += 1
 
     async def shutdown_watcher() -> None:
-        nonlocal stop_requested, shutdown_after_current
         while not stop_requested:
             if shutdown_file_requested(shutdown_file):
-                if started_battles:
-                    if not shutdown_after_current:
-                        shutdown_after_current = True
-                        print("[capture] shutdown requested; will stop after current battles finish")
-                else:
-                    print("[capture] shutdown requested with no active battle; stopping now")
-                    stop_requested = True
-                    if gateway is not None:
-                        await gateway.close()
-                    return
+                await request_shutdown()
+                return
             await asyncio.sleep(1.0)
 
     while not stop_requested:
@@ -892,6 +897,8 @@ async def random_mode(
 
     async def request_shutdown() -> None:
         nonlocal stop_requested
+        if gateway is not None:
+            await gateway.cancel_search()
         if active_battles:
             if not stop_after_current_battle.is_set():
                 stop_after_current_battle.set()
@@ -1169,6 +1176,8 @@ async def live_mode(
 
     async def request_shutdown() -> None:
         nonlocal stop_requested
+        if gateway is not None:
+            await gateway.cancel_search()
         if active_battles:
             if not stop_after_current_battle.is_set():
                 stop_after_current_battle.set()
