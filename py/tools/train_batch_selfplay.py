@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import random
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 
 DEFAULT_RUNS_ROOT = Path("matches") / "runs"
 DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
+DEFAULT_ARGS_PATH = Path("config/train_batch_selfplay.args")
 
 
 def positive_int(value: str) -> int:
@@ -22,6 +24,18 @@ def parse_bool01(value: str) -> bool:
     if value not in {"0", "1"}:
         raise argparse.ArgumentTypeError("value must be 0 or 1")
     return value == "1"
+
+
+def load_default_args(path: Path) -> list[str]:
+    args: list[str] = []
+    if not path.exists():
+        return args
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        args.append(line)
+    return args
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,7 +76,9 @@ def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> lis
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    argv = load_default_args(DEFAULT_ARGS_PATH) + sys.argv[1:]
+    args = parser.parse_args(argv)
     repo_root = Path.cwd()
     run_dir = repo_root / DEFAULT_RUNS_ROOT / args.run
     trainer_exe = repo_root / Path(args.trainer_exe)

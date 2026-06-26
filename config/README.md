@@ -12,6 +12,8 @@ Files:
   - consumed by `py/communicator/main.py` when launched with no CLI args
 - `selfplay_server.args`
   - consumed by `py/tools/selfplay_server.py` when launched with no CLI args
+- `train_batch_selfplay.args`
+  - consumed by `py/tools/train_batch_selfplay.py` before CLI args are applied
 
 Examples:
 
@@ -19,6 +21,7 @@ Examples:
 .\build-fresh\showdown_client.exe
 python -m py.communicator.main
 python py/tools/selfplay_server.py
+python py/tools/train_batch_selfplay.py
 ```
 
 Those commands will use the tokens from these files automatically.

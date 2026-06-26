@@ -1,0 +1,19 @@
+# Default batch self-play training config.
+
+--run
+run_0017_extreme_size1000
+
+--checkpoint
+first_selfplay_model.chk
+
+--mode
+supervised
+
+--epochs
+1
+
+--epochs-per-file
+1
+
+--shuffle
+1
