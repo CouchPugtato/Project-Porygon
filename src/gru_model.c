@@ -258,37 +258,24 @@ void gru_model_zero_state(const GruModel* model, float* hidden_state_out) {
     memset(hidden_state_out, 0, model->hidden_dim * sizeof(float));
 }
 
-void gru_model_forward_step(
+static int gru_model_forward_step_with_buffers(
     const GruModel* model,
     const float* input,
     const float* hidden_state_in,
     float* hidden_state_out,
     float* policy_out,
-    float* value_out
+    float* value_out,
+    float* z,
+    float* r,
+    float* n,
+    float* gated_hidden,
+    float* logits
 ) {
     size_t h;
-    float* z;
-    float* r;
-    float* n;
-    float* gated_hidden;
-    float* logits;
 
-    if (!model || !input || !hidden_state_in || !hidden_state_out || !policy_out || !value_out) {
-        return;
-    }
-
-    z = (float*)calloc(model->hidden_dim, sizeof(float));
-    r = (float*)calloc(model->hidden_dim, sizeof(float));
-    n = (float*)calloc(model->hidden_dim, sizeof(float));
-    gated_hidden = (float*)calloc(model->hidden_dim, sizeof(float));
-    logits = (float*)calloc(model->num_actions, sizeof(float));
-    if (!z || !r || !n || !gated_hidden || !logits) {
-        free(z);
-        free(r);
-        free(n);
-        free(gated_hidden);
-        free(logits);
-        return;
+    if (!model || !input || !hidden_state_in || !hidden_state_out || !policy_out || !value_out ||
+        !z || !r || !n || !gated_hidden || !logits) {
+        return 0;
     }
 
     memcpy(z, model->bz, model->hidden_dim * sizeof(float));
@@ -313,12 +300,47 @@ void gru_model_forward_step(
     }
 
     evaluate_hidden_internal(model, hidden_state_out, NULL, logits, policy_out, value_out);
+    return 1;
+}
 
-    free(z);
-    free(r);
-    free(n);
-    free(gated_hidden);
-    free(logits);
+void gru_model_forward_step(
+    const GruModel* model,
+    const float* input,
+    const float* hidden_state_in,
+    float* hidden_state_out,
+    float* policy_out,
+    float* value_out
+) {
+    float* scratch;
+    float* z;
+    float* r;
+    float* n;
+    float* gated_hidden;
+    float* logits;
+    size_t hidden_bytes;
+    size_t action_bytes;
+
+    if (!model || !input || !hidden_state_in || !hidden_state_out || !policy_out || !value_out) {
+        return;
+    }
+
+    hidden_bytes = model->hidden_dim * sizeof(float);
+    action_bytes = model->num_actions * sizeof(float);
+    scratch = (float*)calloc((model->hidden_dim * 4u) + model->num_actions, sizeof(float));
+    if (!scratch) {
+        return;
+    }
+    z = scratch;
+    r = z + model->hidden_dim;
+    n = r + model->hidden_dim;
+    gated_hidden = n + model->hidden_dim;
+    logits = gated_hidden + model->hidden_dim;
+
+    (void)hidden_bytes;
+    (void)action_bytes;
+    gru_model_forward_step_with_buffers(model, input, hidden_state_in, hidden_state_out, policy_out, value_out,
+        z, r, n, gated_hidden, logits);
+    free(scratch);
 }
 
 void gru_model_forward_sequence(
@@ -331,22 +353,42 @@ void gru_model_forward_sequence(
 ) {
     size_t t;
     float* next_hidden;
+    float* scratch;
+    float* z;
+    float* r;
+    float* n;
+    float* gated_hidden;
+    float* logits;
 
     if (!model || !sequence || !hidden_state_io || !policy_out || !value_out) {
         return;
     }
 
     next_hidden = (float*)malloc(model->hidden_dim * sizeof(float));
-    if (!next_hidden) {
+    scratch = (float*)calloc((model->hidden_dim * 4u) + model->num_actions, sizeof(float));
+    if (!next_hidden || !scratch) {
+        free(next_hidden);
+        free(scratch);
         return;
     }
+    z = scratch;
+    r = z + model->hidden_dim;
+    n = r + model->hidden_dim;
+    gated_hidden = n + model->hidden_dim;
+    logits = gated_hidden + model->hidden_dim;
 
     for (t = 0; t < steps; ++t) {
         const float* input = sequence + (t * model->input_dim);
-        gru_model_forward_step(model, input, hidden_state_io, next_hidden, policy_out, value_out);
+        if (!gru_model_forward_step_with_buffers(model, input, hidden_state_io, next_hidden, policy_out, value_out,
+                z, r, n, gated_hidden, logits)) {
+            free(next_hidden);
+            free(scratch);
+            return;
+        }
         memcpy(hidden_state_io, next_hidden, model->hidden_dim * sizeof(float));
     }
     free(next_hidden);
+    free(scratch);
 }
 
 int gru_model_evaluate_sequence_step(
