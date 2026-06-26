@@ -969,7 +969,7 @@ async def random_mode(
         await gateway.send_room_command(room_id, candidate)
 
     async def on_event(event: ShowdownEvent) -> None:
-        nonlocal seq, finished_battles, invalid_choice_count, stop_requested, refresh_requested
+        nonlocal seq, finished_battles, invalid_choice_count, accepted_count, stop_requested, refresh_requested
         if event.room_id.startswith("battle-"):
             newly_active = event.room_id not in active_battles
             active_battles.add(event.room_id)

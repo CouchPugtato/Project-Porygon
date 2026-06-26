@@ -126,9 +126,35 @@ def child_creationflags() -> int:
     flags = 0
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         flags |= subprocess.CREATE_NEW_PROCESS_GROUP
-    if hasattr(subprocess, "DETACHED_PROCESS"):
-        flags |= subprocess.DETACHED_PROCESS
     return flags
+
+
+async def terminate_process(process: asyncio.subprocess.Process | None, timeout_seconds: float = 5.0) -> None:
+    if process is None or process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    if os.name == "nt" and process.pid:
+        with contextlib.suppress(Exception):
+            completed = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(process.pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(completed.wait(), timeout=5.0)
+    else:
+        process.kill()
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(process.wait(), timeout=5.0)
 
 
 @dataclass(frozen=True)
@@ -209,13 +235,7 @@ class ServerProcess:
         raise TimeoutError(f"timed out waiting for showdown server at {self.server_uri}")
 
     async def terminate(self) -> None:
-        if self.process is not None and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+        await terminate_process(self.process)
         if self._stdout_task is not None:
             with contextlib.suppress(Exception):
                 await self._stdout_task
@@ -287,13 +307,7 @@ class ClientProcess:
         raise TimeoutError(f"timed out waiting for client server at {url}")
 
     async def terminate(self) -> None:
-        if self.process is not None and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+        await terminate_process(self.process)
         if self._stdout_task is not None:
             with contextlib.suppress(Exception):
                 await self._stdout_task
@@ -418,13 +432,7 @@ class WorkerProcess:
         self.spec.shutdown_path.write_text("stop\n", encoding="utf-8")
 
     async def terminate(self) -> None:
-        if self.process is not None and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+        await terminate_process(self.process)
         self.active_battles.clear()
         self.reconnect_pending = False
         if self._stdout_task is not None:
