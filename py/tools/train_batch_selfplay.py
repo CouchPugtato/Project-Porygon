@@ -38,6 +38,18 @@ def load_default_args(path: Path) -> list[str]:
     return args
 
 
+def has_path_separator(path: str) -> bool:
+    return "/" in path or "\\" in path
+
+
+def resolve_batch_checkpoint(run_name: str, checkpoint_arg: str) -> Path:
+    checkpoint_path = Path(checkpoint_arg)
+    if has_path_separator(checkpoint_arg):
+        return checkpoint_path
+    stem = checkpoint_path.stem or checkpoint_path.name
+    return Path("models") / "runs" / run_name / stem / checkpoint_path.name
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True, help="Run name under matches/runs/")
@@ -58,7 +70,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> list[str]:
-    command = [str(Path(args.trainer_exe)), f"--train-{args.mode}", str(replay_path), args.checkpoint, "--epochs", str(args.epochs_per_file)]
+    command = [
+        str(Path(args.trainer_exe)),
+        f"--train-{args.mode}",
+        str(replay_path),
+        str(args.resolved_checkpoint),
+        "--epochs",
+        str(args.epochs_per_file),
+    ]
     if args.mode == "rl":
         command.extend(
             [
@@ -82,11 +101,13 @@ def main() -> None:
     repo_root = Path.cwd()
     run_dir = repo_root / DEFAULT_RUNS_ROOT / args.run
     trainer_exe = repo_root / Path(args.trainer_exe)
+    args.resolved_checkpoint = resolve_batch_checkpoint(args.run, args.checkpoint)
 
     if not run_dir.exists():
         raise SystemExit(f"run dir not found: {run_dir}")
     if not trainer_exe.exists():
         raise SystemExit(f"trainer executable not found: {trainer_exe}")
+    args.resolved_checkpoint.parent.mkdir(parents=True, exist_ok=True)
 
     all_files = sorted(run_dir.glob(args.pattern))
     if args.start_index > 0:
@@ -100,7 +121,7 @@ def main() -> None:
     total_shards = len(all_files)
     print(
         f"[train_batch_selfplay] run={args.run} mode={args.mode} epochs={args.epochs} "
-        f"epochs_per_file={args.epochs_per_file} shards={total_shards} checkpoint={args.checkpoint}",
+        f"epochs_per_file={args.epochs_per_file} shards={total_shards} checkpoint={args.resolved_checkpoint}",
         flush=True,
     )
 
@@ -151,7 +172,7 @@ def main() -> None:
     total_elapsed = time.monotonic() - started_at
     print(
         f"[train_batch_selfplay] complete files={completed_files} total_elapsed={total_elapsed:.1f}s "
-        f"checkpoint={args.checkpoint}",
+        f"checkpoint={args.resolved_checkpoint}",
         flush=True,
     )
 

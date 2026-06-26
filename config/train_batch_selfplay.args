@@ -1,13 +1,13 @@
 # Default batch self-play training config.
 
 --run
-run_0017_extreme_size1000
+run_0018_recorded_action_sp1000
 
 --checkpoint
 first_selfplay_model.chk
 
 --mode
-supervised
+rl
 
 --epochs
 1
