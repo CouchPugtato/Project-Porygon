@@ -15,10 +15,20 @@ if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[1]))
     from communicator.ipc import LearnerProcess
     from communicator.protocol import battle_end, battle_start, decision_message, event_message, request_message, terminal_message
+    from communicator.protocol import action_taken_message, action_rejected_message
     from communicator.showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
 else:
     from .ipc import LearnerProcess
-    from .protocol import battle_end, battle_start, decision_message, event_message, request_message, terminal_message
+    from .protocol import (
+        action_rejected_message,
+        action_taken_message,
+        battle_end,
+        battle_start,
+        decision_message,
+        event_message,
+        request_message,
+        terminal_message,
+    )
     from .showdown_client import ShowdownEvent, ShowdownGateway, default_showdown_uri, infer_is_doubles
 
 THINK_DELAY_MIN_SECONDS = 0.8
@@ -875,7 +885,9 @@ async def random_mode(
     seq = 0
     latest_requests: dict[str, dict] = {}
     latest_request_identity: dict[str, tuple[int | None, str]] = {}
+    latest_request_seq: dict[str, int] = {}
     attempted_commands: dict[str, set[str]] = {}
+    pending_decisions: dict[str, dict] = {}
     request_open: dict[str, bool] = {}
     invalid_retry_count: dict[str, int] = {}
     battle_players: dict[str, dict[str, str]] = {}
@@ -928,7 +940,7 @@ async def random_mode(
             await asyncio.sleep(1.0)
 
     async def send_random_choice(room_id: str, request_payload: dict, initial: bool) -> None:
-        nonlocal fallback_used_count, accepted_count
+        nonlocal fallback_used_count
         candidate = weighted_random_command(request_payload, attempted_commands.setdefault(room_id, set()))
         if candidate is None:
             print(
@@ -939,11 +951,15 @@ async def random_mode(
             return
         if not initial:
             fallback_used_count += 1
-        else:
-            accepted_count += 1
         if command_uses_tera(candidate) and battle_first_tera_turn.get(room_id) is None:
             battle_first_tera_turn[room_id] = battle_current_turn.get(room_id, 0)
         tally_command_categories(request_payload, candidate, total_action_counts)
+        pending_decisions[room_id] = {
+            "request_id": latest_request_seq.get(room_id, seq),
+            "action": -1,
+            "action2": -1,
+            "command": candidate,
+        }
         print(f"[random] action for {battle_label(room_id)}: {candidate}")
         await randomized_send_delay(
             THINK_DELAY_MIN_SECONDS if initial else FALLBACK_DELAY_MIN_SECONDS,
@@ -972,6 +988,23 @@ async def random_mode(
         summary = event_summary(event)
         if summary:
             print(summary)
+        if (
+            event.room_id in pending_decisions
+            and not event.line.startswith("|error|")
+            and not event.line.startswith("|request|")
+        ):
+            pending = pending_decisions.pop(event.room_id)
+            accepted_count += 1
+            writer.append(
+                event.room_id,
+                action_taken_message(
+                    event.room_id,
+                    pending["request_id"],
+                    pending["action"],
+                    pending.get("action2", -1),
+                    pending["command"],
+                ).to_json(),
+            )
         player_info = parse_player_metadata(event.line)
         if player_info is not None:
             side, username_found, rating = player_info
@@ -1004,6 +1037,7 @@ async def random_mode(
                 return
             latest_requests[event.room_id] = request_payload
             latest_request_identity[event.room_id] = request_identity
+            latest_request_seq[event.room_id] = seq
             attempted_commands[event.room_id] = set()
             request_open[event.room_id] = True
             invalid_retry_count[event.room_id] = 0
@@ -1012,6 +1046,19 @@ async def random_mode(
             await send_random_choice(event.room_id, request_payload, initial=True)
         elif event.line.startswith("|error|") and "Invalid choice" in event.line:
             invalid_choice_count += 1
+            pending = pending_decisions.pop(event.room_id, None)
+            if pending is not None:
+                writer.append(
+                    event.room_id,
+                    action_rejected_message(
+                        event.room_id,
+                        pending["request_id"],
+                        pending["action"],
+                        pending.get("action2", -1),
+                        pending["command"],
+                        reason=event.line,
+                    ).to_json(),
+                )
             request_payload = latest_requests.get(event.room_id)
             if "There's nothing to choose" in event.line:
                 request_open[event.room_id] = False
@@ -1060,6 +1107,8 @@ async def random_mode(
             print(f"[random] battle ended {event.room_id} result={final_result}")
             request_open[event.room_id] = False
             latest_request_identity.pop(event.room_id, None)
+            latest_request_seq.pop(event.room_id, None)
+            pending_decisions.pop(event.room_id, None)
             disconnect_or_forfeit_end.pop(event.room_id, None)
             battle_current_turn.pop(event.room_id, None)
             active_battles.discard(event.room_id)
@@ -1116,7 +1165,9 @@ async def random_mode(
                 active_battles.clear()
                 latest_requests.clear()
                 latest_request_identity.clear()
+                latest_request_seq.clear()
                 attempted_commands.clear()
+                pending_decisions.clear()
                 request_open.clear()
                 invalid_retry_count.clear()
                 disconnect_or_forfeit_end.clear()

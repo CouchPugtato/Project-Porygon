@@ -159,6 +159,8 @@ int runtime_message_parse(RuntimeMessage* msg, const char* json_line) {
     else if (strcmp(type, "decision_proposed") == 0) { msg->type = RUNTIME_MSG_DECISION; msg->accepted = -1; }
     else if (strcmp(type, "decision_accepted") == 0) { msg->type = RUNTIME_MSG_DECISION; msg->accepted = 1; }
     else if (strcmp(type, "decision_rejected") == 0) { msg->type = RUNTIME_MSG_DECISION; msg->accepted = 0; }
+    else if (strcmp(type, "action_taken") == 0) { msg->type = RUNTIME_MSG_DECISION; msg->accepted = 1; }
+    else if (strcmp(type, "action_rejected") == 0) { msg->type = RUNTIME_MSG_DECISION; msg->accepted = 0; }
     else msg->type = RUNTIME_MSG_UNKNOWN;
 
     extract_json_string(json_line, "battle_id", msg->battle_id, sizeof(msg->battle_id));
@@ -171,8 +173,12 @@ int runtime_message_parse(RuntimeMessage* msg, const char* json_line) {
     msg->action2 = extract_json_number(json_line, "action2", -1);
     if (msg->accepted == 0 && strcmp(type, "decision_rejected") == 0) {
         /* keep explicit rejected marker */
+    } else if (msg->accepted == 0 && strcmp(type, "action_rejected") == 0) {
+        /* keep explicit action rejection marker */
     } else if (msg->accepted == 1 && strcmp(type, "decision_accepted") == 0) {
         /* keep explicit accepted marker */
+    } else if (msg->accepted == 1 && strcmp(type, "action_taken") == 0) {
+        /* keep explicit action taken marker */
     } else if (msg->accepted == -1 && strcmp(type, "decision_proposed") == 0) {
         /* keep explicit proposed marker */
     } else {

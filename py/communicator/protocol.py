@@ -37,6 +37,46 @@ def battle_end(battle_id: str) -> RuntimeMessage:
     return RuntimeMessage({"type": "battle_end", "battle_id": battle_id})
 
 
+def action_taken_message(
+    battle_id: str,
+    request_id: int,
+    action: int,
+    action2: int,
+    command: str,
+) -> RuntimeMessage:
+    return RuntimeMessage(
+        {
+            "type": "action_taken",
+            "battle_id": battle_id,
+            "request_id": request_id,
+            "action": action,
+            "action2": action2,
+            "command": command,
+        }
+    )
+
+
+def action_rejected_message(
+    battle_id: str,
+    request_id: int,
+    action: int,
+    action2: int,
+    command: str,
+    reason: str = "",
+) -> RuntimeMessage:
+    payload: Dict[str, Any] = {
+        "type": "action_rejected",
+        "battle_id": battle_id,
+        "request_id": request_id,
+        "action": action,
+        "action2": action2,
+        "command": command,
+    }
+    if reason:
+        payload["message"] = reason
+    return RuntimeMessage(payload)
+
+
 def decision_message(
     battle_id: str,
     request_id: int,
