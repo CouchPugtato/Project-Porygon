@@ -8,7 +8,7 @@ run_0018_recorded_action_sp1000
 0
 
 --concurrent-games
-1000
+1
 
 --model-a
 random

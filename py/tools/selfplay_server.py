@@ -59,6 +59,19 @@ def worker_replay_path(run_name: str, worker_token: str) -> Path:
     return run_dir_for_name(run_name) / f"{worker_token}_raw.jsonl"
 
 
+def parse_stats_file(path: Path) -> dict[str, str]:
+    stats: dict[str, str] = {}
+    if not path.exists():
+        return stats
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        stats[key.strip()] = value.strip()
+    return stats
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -685,6 +698,125 @@ class PoolOrchestrator:
             self._failure_reason = f"showdown server exited unexpectedly with code {code}"
             raise RuntimeError(self._failure_reason)
 
+    def _build_group_stats_summary(self) -> dict[str, dict[str, object]]:
+        groups: dict[str, dict[str, object]] = {
+            "a": {
+                "matches_played": 0,
+                "wins": 0,
+                "earned_wins": 0,
+                "losses": 0,
+                "draws": 0,
+                "total_moves": 0,
+                "total_protects": 0,
+                "total_passes": 0,
+                "total_teras": 0,
+                "tera_battles": 0,
+                "total_move_slot_1": 0,
+                "total_move_slot_2": 0,
+                "total_move_slot_3": 0,
+                "total_move_slot_4": 0,
+                "total_switch_slot_1": 0,
+                "total_switch_slot_2": 0,
+                "total_switch_slot_3": 0,
+                "total_switch_slot_4": 0,
+                "total_switch_slot_5": 0,
+                "total_switch_slot_6": 0,
+                "_weighted_tera_turns": 0.0,
+            },
+            "b": {
+                "matches_played": 0,
+                "wins": 0,
+                "earned_wins": 0,
+                "losses": 0,
+                "draws": 0,
+                "total_moves": 0,
+                "total_protects": 0,
+                "total_passes": 0,
+                "total_teras": 0,
+                "tera_battles": 0,
+                "total_move_slot_1": 0,
+                "total_move_slot_2": 0,
+                "total_move_slot_3": 0,
+                "total_move_slot_4": 0,
+                "total_switch_slot_1": 0,
+                "total_switch_slot_2": 0,
+                "total_switch_slot_3": 0,
+                "total_switch_slot_4": 0,
+                "total_switch_slot_5": 0,
+                "total_switch_slot_6": 0,
+                "_weighted_tera_turns": 0.0,
+            },
+        }
+        sum_keys = [
+            "matches_played",
+            "wins",
+            "earned_wins",
+            "losses",
+            "draws",
+            "total_moves",
+            "total_protects",
+            "total_passes",
+            "total_teras",
+            "tera_battles",
+            "total_move_slot_1",
+            "total_move_slot_2",
+            "total_move_slot_3",
+            "total_move_slot_4",
+            "total_switch_slot_1",
+            "total_switch_slot_2",
+            "total_switch_slot_3",
+            "total_switch_slot_4",
+            "total_switch_slot_5",
+            "total_switch_slot_6",
+        ]
+        for spec in self.worker_specs:
+            stats = parse_stats_file(spec.replay_path.with_suffix(".stats.txt"))
+            group = groups[spec.model_group]
+            for key in sum_keys:
+                group[key] = int(group[key]) + int(stats.get(key, "0"))
+            tera_battles = int(stats.get("tera_battles", "0"))
+            avg_turns = float(stats.get("avg_turns_until_tera", "0"))
+            group["_weighted_tera_turns"] = float(group["_weighted_tera_turns"]) + (tera_battles * avg_turns)
+        for group in groups.values():
+            matches_played = int(group["matches_played"])
+            tera_battles = int(group["tera_battles"])
+            total_move_slots = (
+                int(group["total_move_slot_1"])
+                + int(group["total_move_slot_2"])
+                + int(group["total_move_slot_3"])
+                + int(group["total_move_slot_4"])
+            )
+            total_switch_slots = (
+                int(group["total_switch_slot_1"])
+                + int(group["total_switch_slot_2"])
+                + int(group["total_switch_slot_3"])
+                + int(group["total_switch_slot_4"])
+                + int(group["total_switch_slot_5"])
+                + int(group["total_switch_slot_6"])
+            )
+            group["win_rate"] = (float(group["wins"]) / matches_played) if matches_played > 0 else 0.0
+            group["earned_win_rate"] = (float(group["earned_wins"]) / matches_played) if matches_played > 0 else 0.0
+            group["tera_rate"] = (tera_battles / matches_played) if matches_played > 0 else 0.0
+            group["avg_turns_until_tera"] = (
+                float(group["_weighted_tera_turns"]) / tera_battles if tera_battles > 0 else 0.0
+            )
+            group["move_slot_rates"] = {
+                "slot_1": (int(group["total_move_slot_1"]) / total_move_slots) if total_move_slots > 0 else 0.0,
+                "slot_2": (int(group["total_move_slot_2"]) / total_move_slots) if total_move_slots > 0 else 0.0,
+                "slot_3": (int(group["total_move_slot_3"]) / total_move_slots) if total_move_slots > 0 else 0.0,
+                "slot_4": (int(group["total_move_slot_4"]) / total_move_slots) if total_move_slots > 0 else 0.0,
+            }
+            group["switch_slot_rates"] = {
+                "slot_1": (int(group["total_switch_slot_1"]) / total_switch_slots) if total_switch_slots > 0 else 0.0,
+                "slot_2": (int(group["total_switch_slot_2"]) / total_switch_slots) if total_switch_slots > 0 else 0.0,
+                "slot_3": (int(group["total_switch_slot_3"]) / total_switch_slots) if total_switch_slots > 0 else 0.0,
+                "slot_4": (int(group["total_switch_slot_4"]) / total_switch_slots) if total_switch_slots > 0 else 0.0,
+                "slot_5": (int(group["total_switch_slot_5"]) / total_switch_slots) if total_switch_slots > 0 else 0.0,
+                "slot_6": (int(group["total_switch_slot_6"]) / total_switch_slots) if total_switch_slots > 0 else 0.0,
+            }
+            del group["_weighted_tera_turns"]
+        return groups
+
     def _write_summary(self) -> None:
         group_modes = {
             "a": sorted({spec.mode for spec in self.worker_specs if spec.model_group == "a"}),
@@ -704,6 +836,7 @@ class PoolOrchestrator:
             "server_uri": self.server_uri,
             "format": self.args.format,
             "model_group_modes": group_modes,
+            "group_stats": self._build_group_stats_summary(),
             "run_duration_seconds": max(time.monotonic() - self._start_time, 0.0),
             "per_worker_completed_perspectives": dict(sorted(self.replay_monitor.completed_perspectives_by_worker.items())),
         }

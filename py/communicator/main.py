@@ -469,6 +469,16 @@ def empty_action_counts() -> dict[str, int]:
         "protects": 0,
         "passes": 0,
         "teras": 0,
+        "move_slot_1": 0,
+        "move_slot_2": 0,
+        "move_slot_3": 0,
+        "move_slot_4": 0,
+        "switch_slot_1": 0,
+        "switch_slot_2": 0,
+        "switch_slot_3": 0,
+        "switch_slot_4": 0,
+        "switch_slot_5": 0,
+        "switch_slot_6": 0,
     }
 
 
@@ -504,12 +514,30 @@ def tally_command_categories(request_payload: dict, command: str, counts: dict[s
         slot_index = slot_indices[idx] if idx < len(slot_indices) else idx
         forced_slot = idx < len(force_flags) and force_flags[slot_index if slot_index < len(force_flags) else idx]
         if part.startswith("switch "):
+            switch_tokens = part.split()
+            if len(switch_tokens) >= 2:
+                try:
+                    switch_slot = int(switch_tokens[1])
+                    switch_key = f"switch_slot_{switch_slot}"
+                    if switch_key in counts:
+                        counts[switch_key] += 1
+                except ValueError:
+                    pass
             if forced_slot:
                 counts["forced_switches"] += 1
             else:
                 counts["voluntary_switches"] += 1
             continue
         if part.startswith("move "):
+            move_tokens = part.split()
+            if len(move_tokens) >= 2:
+                try:
+                    move_slot = int(move_tokens[1])
+                    move_key = f"move_slot_{move_slot}"
+                    if move_key in counts:
+                        counts[move_key] += 1
+                except ValueError:
+                    pass
             move_name = move_name_for_part(request_payload, slot_index, part)
             if move_name in PROTECT_MOVE_NAMES:
                 counts["protects"] += 1
@@ -580,6 +608,16 @@ class MatchStats:
         self.total_passes = 0
         self.total_teras = 0
         self.tera_battles = 0
+        self.total_move_slot_1 = 0
+        self.total_move_slot_2 = 0
+        self.total_move_slot_3 = 0
+        self.total_move_slot_4 = 0
+        self.total_switch_slot_1 = 0
+        self.total_switch_slot_2 = 0
+        self.total_switch_slot_3 = 0
+        self.total_switch_slot_4 = 0
+        self.total_switch_slot_5 = 0
+        self.total_switch_slot_6 = 0
         self._avg_turns_until_tera = 0.0
         self._load()
 
@@ -632,6 +670,26 @@ class MatchStats:
                     self.total_teras = int(stripped)
                 elif key == "tera_battles":
                     self.tera_battles = int(stripped)
+                elif key == "total_move_slot_1":
+                    self.total_move_slot_1 = int(stripped)
+                elif key == "total_move_slot_2":
+                    self.total_move_slot_2 = int(stripped)
+                elif key == "total_move_slot_3":
+                    self.total_move_slot_3 = int(stripped)
+                elif key == "total_move_slot_4":
+                    self.total_move_slot_4 = int(stripped)
+                elif key == "total_switch_slot_1":
+                    self.total_switch_slot_1 = int(stripped)
+                elif key == "total_switch_slot_2":
+                    self.total_switch_slot_2 = int(stripped)
+                elif key == "total_switch_slot_3":
+                    self.total_switch_slot_3 = int(stripped)
+                elif key == "total_switch_slot_4":
+                    self.total_switch_slot_4 = int(stripped)
+                elif key == "total_switch_slot_5":
+                    self.total_switch_slot_5 = int(stripped)
+                elif key == "total_switch_slot_6":
+                    self.total_switch_slot_6 = int(stripped)
                 elif key == "avg_turns_until_tera":
                     self._avg_turns_until_tera = float(stripped)
             except ValueError:
@@ -659,6 +717,16 @@ class MatchStats:
                     f"total_passes={self.total_passes}",
                     f"total_teras={self.total_teras}",
                     f"tera_battles={self.tera_battles}",
+                    f"total_move_slot_1={self.total_move_slot_1}",
+                    f"total_move_slot_2={self.total_move_slot_2}",
+                    f"total_move_slot_3={self.total_move_slot_3}",
+                    f"total_move_slot_4={self.total_move_slot_4}",
+                    f"total_switch_slot_1={self.total_switch_slot_1}",
+                    f"total_switch_slot_2={self.total_switch_slot_2}",
+                    f"total_switch_slot_3={self.total_switch_slot_3}",
+                    f"total_switch_slot_4={self.total_switch_slot_4}",
+                    f"total_switch_slot_5={self.total_switch_slot_5}",
+                    f"total_switch_slot_6={self.total_switch_slot_6}",
                     f"avg_turns_until_tera={self.avg_turns_until_tera:.3f}",
                 ]
             )
@@ -697,6 +765,16 @@ class MatchStats:
         self.total_protects = action_counts.get("protects", 0)
         self.total_passes = action_counts.get("passes", 0)
         self.total_teras = action_counts.get("teras", 0)
+        self.total_move_slot_1 = action_counts.get("move_slot_1", 0)
+        self.total_move_slot_2 = action_counts.get("move_slot_2", 0)
+        self.total_move_slot_3 = action_counts.get("move_slot_3", 0)
+        self.total_move_slot_4 = action_counts.get("move_slot_4", 0)
+        self.total_switch_slot_1 = action_counts.get("switch_slot_1", 0)
+        self.total_switch_slot_2 = action_counts.get("switch_slot_2", 0)
+        self.total_switch_slot_3 = action_counts.get("switch_slot_3", 0)
+        self.total_switch_slot_4 = action_counts.get("switch_slot_4", 0)
+        self.total_switch_slot_5 = action_counts.get("switch_slot_5", 0)
+        self.total_switch_slot_6 = action_counts.get("switch_slot_6", 0)
         if first_tera_turn is not None:
             total_tera_turns = (self._avg_turns_until_tera * self.tera_battles) + first_tera_turn
             self.tera_battles += 1

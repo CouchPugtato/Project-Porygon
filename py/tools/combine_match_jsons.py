@@ -25,6 +25,16 @@ STAT_INT_KEYS = {
     "total_passes",
     "total_teras",
     "tera_battles",
+    "total_move_slot_1",
+    "total_move_slot_2",
+    "total_move_slot_3",
+    "total_move_slot_4",
+    "total_switch_slot_1",
+    "total_switch_slot_2",
+    "total_switch_slot_3",
+    "total_switch_slot_4",
+    "total_switch_slot_5",
+    "total_switch_slot_6",
 }
 
 PROGRESS_INTERVAL_BATTLES = 100
@@ -165,6 +175,16 @@ def write_stats_file(path: Path, stats: dict[str, str]) -> None:
         "total_passes",
         "total_teras",
         "tera_battles",
+        "total_move_slot_1",
+        "total_move_slot_2",
+        "total_move_slot_3",
+        "total_move_slot_4",
+        "total_switch_slot_1",
+        "total_switch_slot_2",
+        "total_switch_slot_3",
+        "total_switch_slot_4",
+        "total_switch_slot_5",
+        "total_switch_slot_6",
         "avg_turns_until_tera",
     ]
     lines = [f"{key}={stats[key]}" for key in ordered_keys if key in stats]

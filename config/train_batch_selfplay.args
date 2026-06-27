@@ -4,7 +4,7 @@
 run_0018_recorded_action_sp1000
 
 --checkpoint
-first_selfplay_model.chk
+run18_200shards.chk
 
 --mode
 rl
