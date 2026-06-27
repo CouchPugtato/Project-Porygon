@@ -15,6 +15,7 @@ Files:
 - `train_batch_selfplay.args`
   - consumed by `py/tools/train_batch_selfplay.py` before CLI args are applied
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
+  - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
 
 Examples:
 

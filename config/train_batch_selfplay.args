@@ -9,6 +9,9 @@ run18_200shards.chk
 --mode
 rl
 
+--reward-mode
+dense_additive
+
 --epochs
 1
 

@@ -3,8 +3,20 @@
 #include "observation_builder.h"
 #include "request_parser.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define ENV_DENSE_HP_SWING_WEIGHT 0.30f
+#define ENV_DENSE_FAINT_SWING_WEIGHT 0.40f
+#define ENV_DENSE_REWARD_CLIP 0.75f
+
+typedef struct {
+    float self_hp_frac_sum;
+    float opp_hp_frac_sum;
+    int self_fainted_count;
+    int opp_fainted_count;
+} EnvRewardSnapshot;
 
 static EnvSession* find_session(EnvRuntime* runtime, const char* battle_id) {
     size_t i;
@@ -75,7 +87,101 @@ static int queue_prestart_message(EnvSession* session, const RuntimeMessage* msg
     return 1;
 }
 
-int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, int replay_only) {
+static float clamp_dense_reward(float reward) {
+    if (reward > ENV_DENSE_REWARD_CLIP) {
+        return ENV_DENSE_REWARD_CLIP;
+    }
+    if (reward < -ENV_DENSE_REWARD_CLIP) {
+        return -ENV_DENSE_REWARD_CLIP;
+    }
+    return reward;
+}
+
+static void compute_reward_snapshot(const RawBattleState* state, EnvRewardSnapshot* snapshot) {
+    int i;
+    if (!state || !snapshot) {
+        return;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        const RawPokemon* self = &state->self_team[i];
+        const RawPokemon* opp = &state->opp_team[i];
+        if (self->fainted) {
+            snapshot->self_fainted_count += 1;
+        } else if (self->max_hp > 0 && self->current_hp > 0) {
+            snapshot->self_hp_frac_sum += (float)self->current_hp / (float)self->max_hp;
+        }
+        if (opp->fainted) {
+            snapshot->opp_fainted_count += 1;
+        } else if (opp->max_hp > 0 && opp->current_hp > 0) {
+            snapshot->opp_hp_frac_sum += (float)opp->current_hp / (float)opp->max_hp;
+        }
+    }
+}
+
+static float compute_dense_reward_delta(const EnvRewardSnapshot* previous, const EnvRewardSnapshot* current) {
+    float opp_hp_loss;
+    float self_hp_loss;
+    int opp_faints_gained;
+    int self_faints_gained;
+    float reward;
+
+    if (!previous || !current) {
+        return 0.0f;
+    }
+    opp_hp_loss = previous->opp_hp_frac_sum - current->opp_hp_frac_sum;
+    self_hp_loss = previous->self_hp_frac_sum - current->self_hp_frac_sum;
+    opp_faints_gained = current->opp_fainted_count - previous->opp_fainted_count;
+    self_faints_gained = current->self_fainted_count - previous->self_fainted_count;
+    reward =
+        ENV_DENSE_HP_SWING_WEIGHT * (opp_hp_loss - self_hp_loss) +
+        ENV_DENSE_FAINT_SWING_WEIGHT * (float)(opp_faints_gained - self_faints_gained);
+    return clamp_dense_reward(reward);
+}
+
+static float compute_request_reward(const EnvRuntime* runtime, const EnvSession* session) {
+    EnvRewardSnapshot current;
+    EnvRewardSnapshot previous;
+
+    if (!runtime || !session || runtime->reward_mode != ENV_REWARD_DENSE_ADDITIVE) {
+        return 0.0f;
+    }
+    compute_reward_snapshot(&session->raw_state, &current);
+    if (!session->reward_snapshot_valid) {
+        return 0.0f;
+    }
+    previous.self_hp_frac_sum = session->prev_self_hp_frac_sum;
+    previous.opp_hp_frac_sum = session->prev_opp_hp_frac_sum;
+    previous.self_fainted_count = session->prev_self_fainted_count;
+    previous.opp_fainted_count = session->prev_opp_fainted_count;
+    return compute_dense_reward_delta(&previous, &current);
+}
+
+static void update_request_reward_snapshot(EnvSession* session) {
+    EnvRewardSnapshot current;
+    if (!session) {
+        return;
+    }
+    compute_reward_snapshot(&session->raw_state, &current);
+    session->prev_self_hp_frac_sum = current.self_hp_frac_sum;
+    session->prev_opp_hp_frac_sum = current.opp_hp_frac_sum;
+    session->prev_self_fainted_count = current.self_fainted_count;
+    session->prev_opp_fainted_count = current.opp_fainted_count;
+    session->reward_snapshot_valid = 1;
+}
+
+static void clear_request_reward_snapshot(EnvSession* session) {
+    if (!session) {
+        return;
+    }
+    session->reward_snapshot_valid = 0;
+    session->prev_self_hp_frac_sum = 0.0f;
+    session->prev_opp_hp_frac_sum = 0.0f;
+    session->prev_self_fainted_count = 0;
+    session->prev_opp_fainted_count = 0;
+}
+
+int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, int replay_only, EnvRewardMode reward_mode) {
     if (!runtime || !model) {
         return 0;
     }
@@ -84,6 +190,7 @@ int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, in
     runtime->obs_dim = gru_model_input_dim(model);
     runtime->replay_file = replay_file;
     runtime->replay_only = replay_only;
+    runtime->reward_mode = reward_mode;
     return 1;
 }
 
@@ -269,24 +376,33 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 session->ready_for_decision = 0;
                 return 1;
             }
-            if (!episode_append(&session->episode, session->flat_observation, -1, 0.0f, 0)) {
-                if (out) {
-                    runtime_emit_error_json(json, sizeof(json), msg->battle_id, "episode_append failed");
-                    fputs(json, out);
-                    fputc('\n', out);
-                    fflush(out);
+            {
+                float step_reward = compute_request_reward(runtime, session);
+                if (!episode_append(&session->episode, session->flat_observation, -1, step_reward, 0)) {
+                    if (out) {
+                        runtime_emit_error_json(json, sizeof(json), msg->battle_id, "episode_append failed");
+                        fputs(json, out);
+                        fputc('\n', out);
+                        fflush(out);
+                    }
+                    return 0;
                 }
-                return 0;
             }
+            update_request_reward_snapshot(session);
             session->ready_for_decision = 1;
             return write_action(runtime, session, out);
         case RUNTIME_MSG_TERMINAL:
             session = find_session(runtime, msg->battle_id);
             if (!session) return 1;
             if (session->episode.count > 0) {
-                session->episode.rewards[session->episode.count - 1] = msg->reward;
+                if (runtime->reward_mode == ENV_REWARD_DENSE_ADDITIVE) {
+                    session->episode.rewards[session->episode.count - 1] += msg->reward;
+                } else {
+                    session->episode.rewards[session->episode.count - 1] = msg->reward;
+                }
                 session->episode.dones[session->episode.count - 1] = 1;
             }
+            clear_request_reward_snapshot(session);
             session->terminal = 1;
             return 1;
         case RUNTIME_MSG_DECISION:

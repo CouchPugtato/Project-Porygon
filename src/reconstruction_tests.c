@@ -558,7 +558,7 @@ static int test_runtime_request_session_not_forced_doubles(void) {
 
     model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
     if (!assert_true(model != NULL, "create minimal gru model")) return 0;
-    if (!assert_true(env_runtime_init(&runtime, model, NULL, 1), "init runtime")) {
+    if (!assert_true(env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_TERMINAL), "init runtime")) {
         gru_model_destroy(model);
         return 0;
     }
@@ -604,6 +604,185 @@ static int test_runtime_request_session_not_forced_doubles(void) {
         gru_model_destroy(model);
         return 0;
     }
+    env_runtime_free(&runtime);
+    gru_model_destroy(model);
+    return 1;
+}
+
+static int test_runtime_dense_additive_rewards(void) {
+    const char* request_payload =
+        "{\"active\":["
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false}],\"trapped\":false},"
+        "{\"moves\":[{\"id\":\"leafstorm\",\"pp\":8,\"maxpp\":8,\"target\":\"normal\",\"disabled\":false}],\"trapped\":false}"
+        "],"
+        "\"side\":{\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/100\",\"active\":true},"
+        "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77, M\",\"condition\":\"100/100\",\"active\":true}"
+        "]}}";
+    GruModel* model;
+    EnvRuntime runtime;
+    RuntimeMessage msg;
+    EnvSession* session;
+    static const char* const setup_events[] = {
+        "|switch|p1a: A|Sawsbuck, L91, M|100/100",
+        "|switch|p1b: B|Kingambit, L77, M|100/100",
+        "|switch|p2a: X|Armarouge, L80, M|100/100",
+        "|switch|p2b: Y|Dodrio, L85, M|100/100"
+    };
+    size_t i;
+
+    model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    if (!assert_true(model != NULL, "create minimal gru model for dense rewards")) return 0;
+    if (!assert_true(env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_DENSE_ADDITIVE), "init dense runtime")) {
+        gru_model_destroy(model);
+        return 0;
+    }
+
+    runtime_message_init(&msg);
+    msg.type = RUNTIME_MSG_BATTLE_START;
+    strncpy(msg.battle_id, "battle-dense", sizeof(msg.battle_id) - 1);
+    msg.is_doubles = 1;
+    if (!assert_true(env_runtime_handle_message(&runtime, &msg, NULL), "dense battle_start")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+
+    for (i = 0; i < sizeof(setup_events) / sizeof(setup_events[0]); ++i) {
+        runtime_message_init(&msg);
+        msg.type = RUNTIME_MSG_EVENT;
+        strncpy(msg.battle_id, "battle-dense", sizeof(msg.battle_id) - 1);
+        strncpy(msg.line, setup_events[i], sizeof(msg.line) - 1);
+        msg.is_doubles = 1;
+        if (!assert_true(env_runtime_handle_message(&runtime, &msg, NULL), "dense setup event")) {
+            env_runtime_free(&runtime);
+            gru_model_destroy(model);
+            return 0;
+        }
+    }
+
+    runtime_message_init(&msg);
+    msg.type = RUNTIME_MSG_REQUEST;
+    strncpy(msg.battle_id, "battle-dense", sizeof(msg.battle_id) - 1);
+    strncpy(msg.payload, request_payload, sizeof(msg.payload) - 1);
+    msg.request_id = 1;
+    msg.is_doubles = 1;
+    if (!assert_true(env_runtime_handle_message(&runtime, &msg, NULL), "first dense request")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+    session = &runtime.sessions[0];
+    if (!assert_true(session->episode.count == 1, "first dense request appends one step")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+    if (!assert_true(fabs((double)session->episode.rewards[0]) < 0.0001, "first dense request reward is zero")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+
+    runtime_message_init(&msg);
+    msg.type = RUNTIME_MSG_EVENT;
+    strncpy(msg.battle_id, "battle-dense", sizeof(msg.battle_id) - 1);
+    strncpy(msg.line, "|-damage|p2a: X|50/100", sizeof(msg.line) - 1);
+    msg.is_doubles = 1;
+    if (!assert_true(env_runtime_handle_message(&runtime, &msg, NULL), "dense opponent chip event")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+    runtime_message_init(&msg);
+    msg.type = RUNTIME_MSG_EVENT;
+    strncpy(msg.battle_id, "battle-dense", sizeof(msg.battle_id) - 1);
+    strncpy(msg.line, "|faint|p2b: Y", sizeof(msg.line) - 1);
+    msg.is_doubles = 1;
+    if (!assert_true(env_runtime_handle_message(&runtime, &msg, NULL), "dense opponent faint event")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+
+    runtime_message_init(&msg);
+    msg.type = RUNTIME_MSG_REQUEST;
+    strncpy(msg.battle_id, "battle-dense", sizeof(msg.battle_id) - 1);
+    strncpy(msg.payload, request_payload, sizeof(msg.payload) - 1);
+    msg.request_id = 2;
+    msg.is_doubles = 1;
+    if (!assert_true(env_runtime_handle_message(&runtime, &msg, NULL), "second dense request")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+    if (!assert_true(session->episode.count == 2, "second dense request appends second step")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+    if (!assert_true(fabs((double)(session->episode.rewards[1] - 0.75f)) < 0.0001, "dense reward clips hp and faint swing at configured maximum")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+
+    session->reward_snapshot_valid = 1;
+    session->prev_self_hp_frac_sum = 6.0f;
+    session->prev_opp_hp_frac_sum = 6.0f;
+    session->prev_self_fainted_count = 0;
+    session->prev_opp_fainted_count = 0;
+    for (i = 0; i < RAW_TEAM_SIZE; ++i) {
+        session->raw_state.self_team[i].max_hp = 100;
+        session->raw_state.self_team[i].current_hp = 100;
+        session->raw_state.self_team[i].fainted = 0;
+        session->raw_state.opp_team[i].max_hp = 100;
+        session->raw_state.opp_team[i].current_hp = 0;
+        session->raw_state.opp_team[i].fainted = 1;
+    }
+
+    runtime_message_init(&msg);
+    msg.type = RUNTIME_MSG_REQUEST;
+    strncpy(msg.battle_id, "battle-dense", sizeof(msg.battle_id) - 1);
+    strncpy(msg.payload, request_payload, sizeof(msg.payload) - 1);
+    msg.request_id = 3;
+    msg.is_doubles = 1;
+    if (!assert_true(env_runtime_handle_message(&runtime, &msg, NULL), "third dense request")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+    if (!assert_true(session->episode.count == 3, "third dense request appends third step")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+    if (!assert_true(fabs((double)(session->episode.rewards[2] - 0.75f)) < 0.0001, "dense reward clips at configured maximum")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+
+    runtime_message_init(&msg);
+    msg.type = RUNTIME_MSG_TERMINAL;
+    strncpy(msg.battle_id, "battle-dense", sizeof(msg.battle_id) - 1);
+    msg.reward = 1.0f;
+    if (!assert_true(env_runtime_handle_message(&runtime, &msg, NULL), "dense terminal")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+    if (!assert_true(fabs((double)(session->episode.rewards[2] - 1.75f)) < 0.0001, "terminal reward adds onto dense reward")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+    if (!assert_true(session->episode.dones[2] == 1, "dense terminal marks final step done")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
+
     env_runtime_free(&runtime);
     gru_model_destroy(model);
     return 1;
@@ -2711,6 +2890,7 @@ int main(int argc, char** argv) {
     if (!test_condition_status_without_hp_preserves_hp()) return 1;
     if (!test_turn_number_not_overwritten_by_request()) return 1;
     if (!test_runtime_request_session_not_forced_doubles()) return 1;
+    if (!test_runtime_dense_additive_rewards()) return 1;
     if (!test_single_turn_side_guards_reconstructed()) return 1;
     if (!test_switch_clears_volatile_state()) return 1;
     if (!test_hazard_layers_are_capped()) return 1;

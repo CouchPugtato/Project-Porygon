@@ -13,6 +13,11 @@
 
 #define ENV_PRESTART_QUEUE_MAX 32
 
+typedef enum {
+    ENV_REWARD_TERMINAL = 0,
+    ENV_REWARD_DENSE_ADDITIVE = 1
+} EnvRewardMode;
+
 typedef struct {
     char battle_id[RUNTIME_BATTLE_ID_LEN];
     RawBattleState raw_state;
@@ -28,6 +33,11 @@ typedef struct {
     size_t pending_prestart_count;
     int terminal;
     int ready_for_decision;
+    int reward_snapshot_valid;
+    float prev_self_hp_frac_sum;
+    float prev_opp_hp_frac_sum;
+    int prev_self_fainted_count;
+    int prev_opp_fainted_count;
     int pending_action;
     int pending_action2;
     char pending_command[RUNTIME_COMMAND_LEN];
@@ -41,12 +51,13 @@ typedef struct {
     size_t obs_dim;
     FILE* replay_file;
     int replay_only;
+    EnvRewardMode reward_mode;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;
 } EnvRuntime;
 
-int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, int replay_only);
+int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, int replay_only, EnvRewardMode reward_mode);
 void env_runtime_free(EnvRuntime* runtime);
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);
 

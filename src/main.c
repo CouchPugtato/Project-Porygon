@@ -263,6 +263,21 @@ static int parse_int_flag(int argc, char** argv, const char* name, int default_v
     return default_value;
 }
 
+static int parse_reward_mode(const char* reward_mode_name, EnvRewardMode* reward_mode_out) {
+    if (!reward_mode_name || !reward_mode_out) {
+        return 0;
+    }
+    if (strcmp(reward_mode_name, "terminal") == 0) {
+        *reward_mode_out = ENV_REWARD_TERMINAL;
+        return 1;
+    }
+    if (strcmp(reward_mode_name, "dense_additive") == 0) {
+        *reward_mode_out = ENV_REWARD_DENSE_ADDITIVE;
+        return 1;
+    }
+    return 0;
+}
+
 static const char* parse_string_flag(int argc, char** argv, const char* name, const char* default_value) {
     int i;
     for (i = 1; i + 1 < argc; ++i) {
@@ -574,7 +589,12 @@ static int evaluate_supervised_split(
     return 1;
 }
 
-static int load_runtime_from_replay_file(const char* replay_path, GruModel* model, EnvRuntime* runtime) {
+static int load_runtime_from_replay_file(
+    const char* replay_path,
+    GruModel* model,
+    EnvRuntime* runtime,
+    EnvRewardMode reward_mode
+) {
     FILE* f;
     char line[16384];
     size_t lines_read = 0;
@@ -590,7 +610,7 @@ static int load_runtime_from_replay_file(const char* replay_path, GruModel* mode
         fprintf(stderr, "Failed to open replay file '%s': %s\n", replay_path, strerror(errno));
         return 0;
     }
-    if (!env_runtime_init(runtime, model, NULL, 1)) {
+    if (!env_runtime_init(runtime, model, NULL, 1, reward_mode)) {
         fclose(f);
         return 0;
     }
@@ -1158,7 +1178,7 @@ static int export_battle_snapshots(const char* replay_path, const char* battle_i
         fprintf(stderr, "Failed to create model for battle export\n");
         return 1;
     }
-    if (!env_runtime_init(&runtime, model, NULL, 1)) {
+    if (!env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_TERMINAL)) {
         fprintf(stderr, "Failed to initialize runtime for battle export\n");
         gru_model_destroy(model);
         return 1;
@@ -1303,7 +1323,7 @@ static int evaluate_checkpoint_on_replay_file(const char* replay_path, const cha
         checkpoint_state.seed);
     trainer.step = checkpoint_state.step;
 
-    if (!load_runtime_from_replay_file(replay_path, model, &runtime)) {
+    if (!load_runtime_from_replay_file(replay_path, model, &runtime, ENV_REWARD_TERMINAL)) {
         gru_model_destroy(model);
         free(resolved_checkpoint_path);
         return 1;
@@ -1461,7 +1481,7 @@ static int run_runtime_mode(const char* checkpoint_path) {
     if (replay_path && *replay_path) {
         replay_file = fopen(replay_path, "a");
     }
-    if (!env_runtime_init(&runtime, model, replay_file, 0)) {
+    if (!env_runtime_init(&runtime, model, replay_file, 0, ENV_REWARD_TERMINAL)) {
         fprintf(stderr, "Failed to initialize runtime\n");
         fclose(replay_file);
         gru_model_destroy(model);
@@ -1511,6 +1531,7 @@ static int train_from_replay_file(
     GruModel* model = NULL;
     GruTrainer trainer;
     EnvRuntime runtime;
+    EnvRewardMode reward_mode;
     TrainerCheckpointState checkpoint_state;
     size_t* train_indices = NULL;
     size_t* val_indices = NULL;
@@ -1525,14 +1546,16 @@ static int train_from_replay_file(
         return 1;
     }
     if (rl_mode) {
-        if (!rl_reward_mode || strcmp(rl_reward_mode, "terminal") != 0) {
-            fprintf(stderr, "Unsupported --reward-mode '%s'. Only 'terminal' is implemented in phase 1.\n",
+        if (!parse_reward_mode(rl_reward_mode, &reward_mode)) {
+            fprintf(stderr, "Unsupported --reward-mode '%s'. Supported modes: terminal, dense_additive.\n",
                 rl_reward_mode ? rl_reward_mode : "");
             return 1;
         }
         if (strstr(replay_path, "legacy") != NULL) {
             printf("[train-rl] warning: replay path contains 'legacy'; RL is intended for fresh post-fix runs only\n");
         }
+    } else {
+        reward_mode = ENV_REWARD_TERMINAL;
     }
     resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path);
     if (!resolved_checkpoint_path) {
@@ -1563,7 +1586,7 @@ static int train_from_replay_file(
         trainer.advantage_norm = rl_advantage_norm ? 1 : 0;
     }
 
-    if (!load_runtime_from_replay_file(replay_path, model, &runtime)) {
+    if (!load_runtime_from_replay_file(replay_path, model, &runtime, reward_mode)) {
         gru_model_destroy(model);
         free(resolved_checkpoint_path);
         return 1;
@@ -1895,7 +1918,7 @@ static int showdown_client_main(int argc, char** argv) {
         "Usage:\n"
         "  showdown_client --battle-agent [checkpoint]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N]\n"
-        "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal]\n"
+        "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
         "  showdown_client --export-battle <replay.jsonl> <battle_id> <output.json>\n"
