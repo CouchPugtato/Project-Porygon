@@ -1669,7 +1669,7 @@ static int train_from_replay_file(
                     episodes_per_sec,
                     eta);
             }
-            if ((trained_in_epoch % 500u) == 0u || trained_in_epoch == train_sessions) {
+            if (!rl_mode && ((trained_in_epoch % 500u) == 0u || trained_in_epoch == train_sessions)) {
                 TrainerCheckpointState periodic_state = gru_trainer_checkpoint_state(&trainer);
                 char* periodic_path = make_periodic_checkpoint_path(resolved_checkpoint_path, ((size_t)(epoch - 1) * train_sessions) + trained_in_epoch);
                 if (periodic_path) {
@@ -1745,7 +1745,7 @@ static int train_from_replay_file(
             }
         }
 
-        {
+        if (!rl_mode) {
             TrainerCheckpointState epoch_state = gru_trainer_checkpoint_state(&trainer);
             char* epoch_path = make_epoch_checkpoint_path(resolved_checkpoint_path, (size_t)epoch);
             if (epoch_path) {
