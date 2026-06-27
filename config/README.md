@@ -14,6 +14,7 @@ Files:
   - consumed by `py/tools/selfplay_server.py` when launched with no CLI args
 - `train_batch_selfplay.args`
   - consumed by `py/tools/train_batch_selfplay.py` before CLI args are applied
+  - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
 
 Examples:
 

@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shuffle", type=parse_bool01, default=True, help="Shuffle shard order each epoch")
     parser.add_argument("--start-index", type=int, default=0, help="Skip the first N matched files")
     parser.add_argument("--limit-files", type=positive_int, default=0, help="Optional cap on matched files")
+    parser.add_argument("--sample-files", type=positive_int, default=0, help="Train on a random subset of up to N shards per epoch")
     parser.add_argument("--epochs-per-file", type=positive_int, default=1, help="Epochs to pass to showdown_client for each shard")
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--entropy-coef", type=float, default=0.001)
@@ -121,18 +122,28 @@ def main() -> None:
     total_shards = len(all_files)
     print(
         f"[train_batch_selfplay] run={args.run} mode={args.mode} epochs={args.epochs} "
-        f"epochs_per_file={args.epochs_per_file} shards={total_shards} checkpoint={args.resolved_checkpoint}",
+        f"epochs_per_file={args.epochs_per_file} shards={total_shards} "
+        f"sample_files={args.sample_files if args.sample_files > 0 else 'all'} "
+        f"checkpoint={args.resolved_checkpoint}",
         flush=True,
     )
 
     completed_files = 0
+    planned_total_shards = (
+        args.epochs * min(total_shards, args.sample_files)
+        if args.sample_files > 0
+        else args.epochs * total_shards
+    )
     for epoch in range(1, args.epochs + 1):
         epoch_files = list(all_files)
         if args.shuffle:
             random.shuffle(epoch_files)
+        if args.sample_files > 0 and len(epoch_files) > args.sample_files:
+            epoch_files = epoch_files[: args.sample_files]
         epoch_started_at = time.monotonic()
         print(
-            f"[train_batch_selfplay] epoch {epoch}/{args.epochs} start shards={len(epoch_files)} shuffle={int(args.shuffle)}",
+            f"[train_batch_selfplay] epoch {epoch}/{args.epochs} start shards={len(epoch_files)} "
+            f"shuffle={int(args.shuffle)} sample_files={args.sample_files if args.sample_files > 0 else 'all'}",
             flush=True,
         )
 
@@ -154,11 +165,11 @@ def main() -> None:
             shard_elapsed = time.monotonic() - shard_started_at
             total_elapsed = time.monotonic() - started_at
             shards_per_minute = (completed_files * 60.0) / total_elapsed if total_elapsed > 0.0 else 0.0
-            remaining_shards = (args.epochs * total_shards) - completed_files
+            remaining_shards = planned_total_shards - completed_files
             eta_seconds = remaining_shards / (completed_files / total_elapsed) if completed_files > 0 and total_elapsed > 0.0 else 0.0
             print(
                 f"[train_batch_selfplay] shard complete elapsed={shard_elapsed:.1f}s "
-                f"overall={completed_files}/{args.epochs * total_shards} "
+                f"overall={completed_files}/{planned_total_shards} "
                 f"shards_per_minute={shards_per_minute:.2f} eta_minutes={eta_seconds / 60.0:.1f}",
                 flush=True,
             )
