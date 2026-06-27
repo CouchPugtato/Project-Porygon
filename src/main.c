@@ -333,6 +333,41 @@ static int build_split_indices(
     return 1;
 }
 
+static int episode_has_labels(const Episode* episode) {
+    size_t t;
+    if (!episode) {
+        return 0;
+    }
+    for (t = 0; t < episode->count; ++t) {
+        if (episode->actions[t] >= 0 || episode->actions2[t] >= 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void filter_labeled_train_indices(
+    const EnvRuntime* runtime,
+    size_t* train_indices,
+    size_t* train_count_io
+) {
+    size_t read_i;
+    size_t write_i = 0;
+
+    if (!runtime || !train_indices || !train_count_io) {
+        return;
+    }
+
+    for (read_i = 0; read_i < *train_count_io; ++read_i) {
+        size_t session_index = train_indices[read_i];
+        if (session_index < runtime->count && episode_has_labels(&runtime->sessions[session_index].episode)) {
+            train_indices[write_i++] = session_index;
+        }
+    }
+
+    *train_count_io = write_i;
+}
+
 static int evaluate_supervised_episode(
     const GruTrainer* trainer,
     const GruModel* model,
@@ -1539,6 +1574,12 @@ static int train_from_replay_file(
         gru_model_destroy(model);
         free(resolved_checkpoint_path);
         return 1;
+    }
+    if (rl_mode) {
+        size_t train_sessions_before_filter = train_sessions;
+        filter_labeled_train_indices(&runtime, train_indices, &train_sessions);
+        printf("[train-rl] filtered train_sessions labeled_only=%zu/%zu\n",
+            train_sessions, train_sessions_before_filter);
     }
     printf("[train] split train_sessions=%zu val_sessions=%zu epochs=%d\n", train_sessions, val_sessions, epochs);
     printf("[train] accepted_labels direct=%zu reconstructed=%zu failed=%zu\n",
