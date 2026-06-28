@@ -1511,7 +1511,9 @@ static int run_runtime_mode(const char* checkpoint_path) {
         }
     }
     env_runtime_free(&runtime);
-    fclose(replay_file);
+    if (replay_file) {
+        fclose(replay_file);
+    }
     gru_model_destroy(model);
     free(resolved_checkpoint_path);
     return 0;

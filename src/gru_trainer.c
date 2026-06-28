@@ -1,8 +1,16 @@
 #include "gru_trainer.h"
+#include "action_mapper.h"
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+static void build_step_slot_legal_mask(const Episode* episode, size_t step_index, int slot, uint8_t* out) {
+    if (!episode || !out || step_index >= episode->count) {
+        return;
+    }
+    build_slot_legal_mask(episode->legal_masks + (step_index * OBS_NUM_ACTIONS), slot, out);
+}
 
 static int train_prefix(
     GruTrainer* trainer,
@@ -10,13 +18,14 @@ static int train_prefix(
     const float* observations,
     size_t obs_dim,
     size_t steps,
+    const unsigned char* legal_mask,
     int target_action,
     float target_value,
     float* action_loss,
     float* value_loss,
     float* accuracy
 ) {
-    if (!gru_model_supervised_update_sequence(model, observations, steps, target_action, target_value,
+    if (!gru_model_supervised_update_sequence(model, observations, steps, legal_mask, target_action, target_value,
         trainer->learning_rate, action_loss, value_loss, accuracy)) {
         return 0;
     }
@@ -57,6 +66,7 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
     float value_loss_sum = 0.0f;
     float accuracy_sum = 0.0f;
     size_t trained = 0;
+    uint8_t slot_mask[OBS_NUM_ACTIONS];
     if (!trainer || !model || !episode) {
         return 0;
     }
@@ -66,33 +76,42 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         float action_loss = 0.0f;
         float value_loss = 0.0f;
         float accuracy = 0.0f;
-        if (episode->actions[t] < 0) {
+        int slot;
+        if (episode->actions[t] < 0 && episode->actions2[t] < 0) {
             continue;
         }
-        if (!train_prefix(trainer, model,
-                episode->observations + (start * episode->obs_dim),
-                episode->obs_dim,
-                steps,
-                episode->actions[t],
-                episode->rewards[t],
-                &action_loss,
-                &value_loss,
-                &accuracy)) {
-            return 0;
-        }
-        action_loss_sum += action_loss;
-        value_loss_sum += value_loss;
-        accuracy_sum += accuracy;
-        ++trained;
-        ++trainer->step;
-        if (episode->actions2[t] >= 0) {
-            action_loss = 0.0f;
-            value_loss = 0.0f;
-            accuracy = 0.0f;
+        if (episode->actions[t] >= 0) {
+            slot = obs_action_slot((enum ObsAction)episode->actions[t]);
+            build_step_slot_legal_mask(episode, t, slot, slot_mask);
             if (!train_prefix(trainer, model,
                     episode->observations + (start * episode->obs_dim),
                     episode->obs_dim,
                     steps,
+                    slot_mask,
+                    episode->actions[t],
+                    episode->rewards[t],
+                    &action_loss,
+                    &value_loss,
+                    &accuracy)) {
+                return 0;
+            }
+            action_loss_sum += action_loss;
+            value_loss_sum += value_loss;
+            accuracy_sum += accuracy;
+            ++trained;
+            ++trainer->step;
+        }
+        if (episode->actions2[t] >= 0) {
+            action_loss = 0.0f;
+            value_loss = 0.0f;
+            accuracy = 0.0f;
+            slot = obs_action_slot((enum ObsAction)episode->actions2[t]);
+            build_step_slot_legal_mask(episode, t, slot, slot_mask);
+            if (!train_prefix(trainer, model,
+                    episode->observations + (start * episode->obs_dim),
+                    episode->obs_dim,
+                    steps,
+                    slot_mask,
                     episode->actions2[t],
                     episode->rewards[t],
                     &action_loss,
@@ -137,6 +156,7 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     float advantage_std = 0.0f;
     size_t action_dim;
     size_t hidden_dim;
+    uint8_t slot_mask[OBS_NUM_ACTIONS];
 
     if (!trainer || !model || !episode) {
         return 0;
@@ -252,32 +272,32 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     for (t = 0; t < labeled_steps; ++t) {
         size_t episode_t = labeled_indices[t];
         const float* stored_hidden = hidden_states + (t * hidden_dim);
-        const uint8_t* legal_mask = episode->legal_masks + (episode_t * action_dim);
-        float entropy = 0.0f;
         float prob_action = 0.0f;
         float prob_action2 = 0.0f;
         size_t a;
-
-        gru_model_evaluate_hidden(model, stored_hidden, legal_mask, masked_policy, &values[t]);
-
-        for (a = 0; a < action_dim; ++a) {
-            float p;
-            if (legal_mask && !legal_mask[a]) {
-                continue;
-            }
-            p = masked_policy[a] > 1.0e-8f ? masked_policy[a] : 1.0e-8f;
-            entropy -= p * logf(p);
-        }
         if (episode->actions[episode_t] >= 0) {
+            build_step_slot_legal_mask(episode, episode_t, 0, slot_mask);
+            gru_model_evaluate_hidden(model, stored_hidden, slot_mask, masked_policy, &values[t]);
             prob_action = masked_policy[episode->actions[episode_t]] > 1.0e-8f ? masked_policy[episode->actions[episode_t]] : 1.0e-8f;
             policy_loss_sum += -logf(prob_action) * advantages[t];
             value_loss_sum += 0.5f * (values[t] - returns[episode_t]) * (values[t] - returns[episode_t]);
-            entropy_sum += entropy;
+            {
+                float slot_entropy = 0.0f;
+                for (a = 0; a < action_dim; ++a) {
+                    float p;
+                    if (!slot_mask[a]) {
+                        continue;
+                    }
+                    p = masked_policy[a] > 1.0e-8f ? masked_policy[a] : 1.0e-8f;
+                    slot_entropy -= p * logf(p);
+                }
+                entropy_sum += slot_entropy;
+            }
             advantage_sum += advantages[t];
             ++trained_labels;
             if (!gru_model_policy_gradient_update_heads(model,
                     stored_hidden,
-                    legal_mask,
+                    slot_mask,
                     episode->actions[episode_t],
                     advantages[t],
                     returns[episode_t],
@@ -297,15 +317,28 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
             ++trainer->step;
         }
         if (episode->actions2[episode_t] >= 0) {
+            build_step_slot_legal_mask(episode, episode_t, 1, slot_mask);
+            gru_model_evaluate_hidden(model, stored_hidden, slot_mask, masked_policy, &values[t]);
             prob_action2 = masked_policy[episode->actions2[episode_t]] > 1.0e-8f ? masked_policy[episode->actions2[episode_t]] : 1.0e-8f;
             policy_loss_sum += -logf(prob_action2) * advantages[t];
             value_loss_sum += 0.5f * (values[t] - returns[episode_t]) * (values[t] - returns[episode_t]);
-            entropy_sum += entropy;
+            {
+                float slot_entropy = 0.0f;
+                for (a = 0; a < action_dim; ++a) {
+                    float p;
+                    if (!slot_mask[a]) {
+                        continue;
+                    }
+                    p = masked_policy[a] > 1.0e-8f ? masked_policy[a] : 1.0e-8f;
+                    slot_entropy -= p * logf(p);
+                }
+                entropy_sum += slot_entropy;
+            }
             advantage_sum += advantages[t];
             ++trained_labels;
             if (!gru_model_policy_gradient_update_heads(model,
                     stored_hidden,
-                    legal_mask,
+                    slot_mask,
                     episode->actions2[episode_t],
                     advantages[t],
                     returns[episode_t],

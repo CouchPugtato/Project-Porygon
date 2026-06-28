@@ -20,6 +20,8 @@ typedef struct {
 
 void action_mask_init(ActionMask* mask);
 int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req);
+int obs_action_slot(enum ObsAction action);
+void build_slot_legal_mask(const unsigned char* legal_mask, int slot, unsigned char* out);
 int action_to_showdown_command(
     char* out,
     size_t out_len,

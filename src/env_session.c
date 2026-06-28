@@ -207,12 +207,17 @@ void env_runtime_free(EnvRuntime* runtime) {
 }
 
 static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
-    float* policy;
-    float* unmasked_policy;
+    float* slot0_policy;
+    float* slot1_policy;
+    float* pair_policy;
     float value;
     int action = -1;
     int action2 = -1;
     int legal_count = 0;
+    int slot0_needs_action;
+    int slot1_needs_action;
+    unsigned char slot0_mask[OBS_NUM_ACTIONS];
+    unsigned char slot1_mask[OBS_NUM_ACTIONS];
     char command[256];
     char json[512];
     int i;
@@ -220,11 +225,13 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     if (!runtime || !session || !out || runtime->replay_only) {
         return 1;
     }
-    policy = (float*)malloc(OBS_NUM_ACTIONS * sizeof(float));
-    unmasked_policy = (float*)malloc(OBS_NUM_ACTIONS * sizeof(float));
-    if (!policy || !unmasked_policy) {
-        free(policy);
-        free(unmasked_policy);
+    slot0_policy = (float*)malloc(OBS_NUM_ACTIONS * sizeof(float));
+    slot1_policy = (float*)malloc(OBS_NUM_ACTIONS * sizeof(float));
+    pair_policy = (float*)calloc(OBS_NUM_ACTIONS, sizeof(float));
+    if (!slot0_policy || !slot1_policy || !pair_policy) {
+        free(slot0_policy);
+        free(slot1_policy);
+        free(pair_policy);
         return 0;
     }
     for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
@@ -237,35 +244,59 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         fputs(json, out);
         fputc('\n', out);
         fflush(out);
-        free(policy);
-        free(unmasked_policy);
+        free(slot0_policy);
+        free(slot1_policy);
+        free(pair_policy);
         return 0;
     }
-    gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, unmasked_policy, &value);
-    gru_model_evaluate_hidden(runtime->model, session->hidden_state, session->observation.legal_mask, policy, &value);
+    slot0_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 0);
+    slot1_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 1);
+    build_slot_legal_mask(session->observation.legal_mask, 0, slot0_mask);
+    build_slot_legal_mask(session->observation.legal_mask, 1, slot1_mask);
+    gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, slot0_policy, &value);
+    if (slot0_needs_action) {
+        gru_model_evaluate_hidden(runtime->model, session->hidden_state, slot0_mask, slot0_policy, &value);
+        for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
+            if (slot0_mask[i]) {
+                pair_policy[i] = slot0_policy[i];
+            }
+        }
+        action = gru_model_sample_action(slot0_policy, slot0_mask, OBS_NUM_ACTIONS);
+    }
+    if (slot1_needs_action) {
+        gru_model_evaluate_hidden(runtime->model, session->hidden_state, slot1_mask, slot1_policy, &value);
+        for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
+            if (slot1_mask[i]) {
+                pair_policy[i] = slot1_policy[i];
+            }
+        }
+        action2 = gru_model_sample_action(slot1_policy, slot1_mask, OBS_NUM_ACTIONS);
+    }
     if (!validate_or_resample_request_choice(
             &session->parsed_request,
             &session->action_mask,
-            policy,
-            1,
-            (enum ObsAction)gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A1_MOVE1, OBS_A1_SWITCH6, OBS_NUM_ACTIONS),
-            1,
-            (enum ObsAction)gru_model_sample_action_range(policy, session->observation.legal_mask, OBS_A2_MOVE1, OBS_A2_SWITCH6, OBS_NUM_ACTIONS),
+            pair_policy,
+            slot0_needs_action,
+            (enum ObsAction)(action >= 0 ? action : OBS_A1_MOVE1),
+            slot1_needs_action,
+            (enum ObsAction)(action2 >= 0 ? action2 : OBS_A2_MOVE1),
             &validated)) {
-        free(policy);
+        free(slot0_policy);
+        free(slot1_policy);
+        free(pair_policy);
         runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to validate or resample request choice");
         fputs(json, out);
         fputc('\n', out);
         fflush(out);
-        free(unmasked_policy);
         return 0;
     }
     action = validated.slot0_has_action ? (int)validated.action0 : -1;
     action2 = validated.slot1_has_action ? (int)validated.action1 : -1;
     strncpy(command, validated.command, sizeof(command) - 1);
     command[sizeof(command) - 1] = '\0';
-    free(policy);
-    free(unmasked_policy);
+    free(slot0_policy);
+    free(slot1_policy);
+    free(pair_policy);
     session->pending_action = action;
     session->pending_action2 = action2;
     strncpy(session->pending_command, command, sizeof(session->pending_command) - 1);

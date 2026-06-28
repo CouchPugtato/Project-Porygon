@@ -551,6 +551,7 @@ static int recurrent_update_sequence(
     GruModel* model,
     const float* sequence,
     size_t steps,
+    const unsigned char* legal_mask,
     int target_action,
     float policy_scale,
     float target_value,
@@ -664,7 +665,7 @@ static int recurrent_update_sequence(
         }
     }
 
-    evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), NULL, logits, policy, &value);
+    evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), legal_mask, logits, policy, &value);
     if (action_loss_out) {
         *action_loss_out = -logf(policy[target_action] > 1.0e-8f ? policy[target_action] : 1.0e-8f);
     }
@@ -761,6 +762,7 @@ int gru_model_supervised_update_sequence(
     GruModel* model,
     const float* sequence,
     size_t steps,
+    const unsigned char* legal_mask,
     int target_action,
     float target_value,
     float learning_rate,
@@ -768,7 +770,7 @@ int gru_model_supervised_update_sequence(
     float* value_loss_out,
     float* accuracy_out
 ) {
-    return recurrent_update_sequence(model, sequence, steps, target_action, 1.0f, target_value, 0.0f,
+    return recurrent_update_sequence(model, sequence, steps, legal_mask, target_action, 1.0f, target_value, 0.0f,
         learning_rate, action_loss_out, value_loss_out, accuracy_out);
 }
 
@@ -893,13 +895,14 @@ int gru_model_policy_gradient_update_sequence(
     GruModel* model,
     const float* sequence,
     size_t steps,
+    const unsigned char* legal_mask,
     int action,
     float advantage,
     float target_value,
     float entropy_coef,
     float learning_rate
 ) {
-    return recurrent_update_sequence(model, sequence, steps, action, advantage, target_value, entropy_coef,
+    return recurrent_update_sequence(model, sequence, steps, legal_mask, action, advantage, target_value, entropy_coef,
         learning_rate, NULL, NULL, NULL);
 }
 

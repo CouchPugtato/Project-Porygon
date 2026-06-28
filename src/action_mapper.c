@@ -4,11 +4,44 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int is_move_action(enum ObsAction action, int* active_slot, int* move_slot, int* tera);
+static int is_switch_action(enum ObsAction action, int* active_slot, int* switch_slot);
+
 void action_mask_init(ActionMask* mask) {
     if (!mask) {
         return;
     }
     memset(mask, 0, sizeof(*mask));
+}
+
+int obs_action_slot(enum ObsAction action) {
+    int active_slot = -1;
+    int move_slot = 0;
+    int switch_slot = 0;
+    int tera = 0;
+    if (is_move_action(action, &active_slot, &move_slot, &tera)) {
+        return active_slot;
+    }
+    if (is_switch_action(action, &active_slot, &switch_slot)) {
+        return active_slot;
+    }
+    return -1;
+}
+
+void build_slot_legal_mask(const unsigned char* legal_mask, int slot, unsigned char* out) {
+    int action;
+    if (!out) {
+        return;
+    }
+    memset(out, 0, OBS_NUM_ACTIONS * sizeof(unsigned char));
+    if (!legal_mask || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS) {
+        return;
+    }
+    for (action = 0; action < OBS_NUM_ACTIONS; ++action) {
+        if (legal_mask[action] && obs_action_slot((enum ObsAction)action) == slot) {
+            out[action] = 1;
+        }
+    }
 }
 
 static int is_move_action(enum ObsAction action, int* active_slot, int* move_slot, int* tera) {
