@@ -1424,7 +1424,7 @@ static int run_demo_gru(void) {
                 free(flat);
                 return 1;
             }
-            episode_append(&episode, flat, -1, 0.0f, (uint8_t)(t == 2));
+            episode_append(&episode, flat, obs.legal_mask, -1, 0.0f, (uint8_t)(t == 2));
         }
 
         gru_model_forward_sequence(model, episode.observations, episode.count, hidden, policy, &value);

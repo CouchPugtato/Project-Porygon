@@ -6,6 +6,7 @@
 
 typedef struct {
     float* observations;
+    uint8_t* legal_masks;
     int* actions;
     int* actions2;
     float* rewards;
@@ -17,7 +18,14 @@ typedef struct {
 
 int episode_init(Episode* episode, size_t capacity, size_t obs_dim);
 void episode_free(Episode* episode);
-int episode_append(Episode* episode, const float* observation, int action, float reward, uint8_t done);
+int episode_append(
+    Episode* episode,
+    const float* observation,
+    const uint8_t* legal_mask,
+    int action,
+    float reward,
+    uint8_t done
+);
 const float* episode_observation_at(const Episode* episode, size_t index);
 
 #endif

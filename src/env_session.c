@@ -208,6 +208,7 @@ void env_runtime_free(EnvRuntime* runtime) {
 
 static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     float* policy;
+    float* unmasked_policy;
     float value;
     int action = -1;
     int action2 = -1;
@@ -220,7 +221,10 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         return 1;
     }
     policy = (float*)malloc(OBS_NUM_ACTIONS * sizeof(float));
-    if (!policy) {
+    unmasked_policy = (float*)malloc(OBS_NUM_ACTIONS * sizeof(float));
+    if (!policy || !unmasked_policy) {
+        free(policy);
+        free(unmasked_policy);
         return 0;
     }
     for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
@@ -234,9 +238,11 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         fputc('\n', out);
         fflush(out);
         free(policy);
+        free(unmasked_policy);
         return 0;
     }
-    gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, policy, &value);
+    gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, unmasked_policy, &value);
+    gru_model_evaluate_hidden(runtime->model, session->hidden_state, session->observation.legal_mask, policy, &value);
     if (!validate_or_resample_request_choice(
             &session->parsed_request,
             &session->action_mask,
@@ -251,6 +257,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         fputs(json, out);
         fputc('\n', out);
         fflush(out);
+        free(unmasked_policy);
         return 0;
     }
     action = validated.slot0_has_action ? (int)validated.action0 : -1;
@@ -258,6 +265,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     strncpy(command, validated.command, sizeof(command) - 1);
     command[sizeof(command) - 1] = '\0';
     free(policy);
+    free(unmasked_policy);
     session->pending_action = action;
     session->pending_action2 = action2;
     strncpy(session->pending_command, command, sizeof(session->pending_command) - 1);
@@ -378,7 +386,7 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
             }
             {
                 float step_reward = compute_request_reward(runtime, session);
-                if (!episode_append(&session->episode, session->flat_observation, -1, step_reward, 0)) {
+                if (!episode_append(&session->episode, session->flat_observation, session->observation.legal_mask, -1, step_reward, 0)) {
                     if (out) {
                         runtime_emit_error_json(json, sizeof(json), msg->battle_id, "episode_append failed");
                         fputs(json, out);

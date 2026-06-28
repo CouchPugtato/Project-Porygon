@@ -125,8 +125,8 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     float* hidden = NULL;
     float* next_hidden = NULL;
     float* hidden_states = NULL;
-    float* policies = NULL;
     float* policy_step = NULL;
+    float* masked_policy = NULL;
     size_t* labeled_indices = NULL;
     float return_sum = 0.0f;
     float advantage_sum = 0.0f;
@@ -159,18 +159,18 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     hidden = (float*)malloc(hidden_dim * sizeof(float));
     next_hidden = (float*)malloc(hidden_dim * sizeof(float));
     hidden_states = (float*)calloc(episode->count * hidden_dim, sizeof(float));
-    policies = (float*)calloc(episode->count * action_dim, sizeof(float));
     policy_step = (float*)malloc(action_dim * sizeof(float));
+    masked_policy = (float*)malloc(action_dim * sizeof(float));
     labeled_indices = (size_t*)calloc(episode->count, sizeof(size_t));
-    if (!returns || !advantages || !values || !hidden || !next_hidden || !hidden_states || !policies || !policy_step || !labeled_indices) {
+    if (!returns || !advantages || !values || !hidden || !next_hidden || !hidden_states || !policy_step || !masked_policy || !labeled_indices) {
         free(returns);
         free(advantages);
         free(values);
         free(hidden);
         free(next_hidden);
         free(hidden_states);
-        free(policies);
         free(policy_step);
+        free(masked_policy);
         free(labeled_indices);
         return 0;
     }
@@ -187,7 +187,6 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     for (t = 0; t < episode->count; ++t) {
         float value = 0.0f;
         float* stored_hidden;
-        float* stored_policy;
         gru_model_forward_step(
             model,
             episode->observations + (t * episode->obs_dim),
@@ -200,9 +199,7 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
             continue;
         }
         stored_hidden = hidden_states + (labeled_steps * hidden_dim);
-        stored_policy = policies + (labeled_steps * action_dim);
         memcpy(stored_hidden, next_hidden, hidden_dim * sizeof(float));
-        memcpy(stored_policy, policy_step, action_dim * sizeof(float));
         values[labeled_steps] = value;
         labeled_indices[labeled_steps] = t;
         advantages[labeled_steps] = returns[t] - values[labeled_steps];
@@ -225,8 +222,8 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
         free(hidden);
         free(next_hidden);
         free(hidden_states);
-        free(policies);
         free(policy_step);
+        free(masked_policy);
         free(labeled_indices);
         return 1;
     }
@@ -255,18 +252,24 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     for (t = 0; t < labeled_steps; ++t) {
         size_t episode_t = labeled_indices[t];
         const float* stored_hidden = hidden_states + (t * hidden_dim);
-        const float* stored_policy = policies + (t * action_dim);
+        const uint8_t* legal_mask = episode->legal_masks + (episode_t * action_dim);
         float entropy = 0.0f;
         float prob_action = 0.0f;
         float prob_action2 = 0.0f;
         size_t a;
 
+        gru_model_evaluate_hidden(model, stored_hidden, legal_mask, masked_policy, &values[t]);
+
         for (a = 0; a < action_dim; ++a) {
-            float p = stored_policy[a] > 1.0e-8f ? stored_policy[a] : 1.0e-8f;
+            float p;
+            if (legal_mask && !legal_mask[a]) {
+                continue;
+            }
+            p = masked_policy[a] > 1.0e-8f ? masked_policy[a] : 1.0e-8f;
             entropy -= p * logf(p);
         }
         if (episode->actions[episode_t] >= 0) {
-            prob_action = stored_policy[episode->actions[episode_t]] > 1.0e-8f ? stored_policy[episode->actions[episode_t]] : 1.0e-8f;
+            prob_action = masked_policy[episode->actions[episode_t]] > 1.0e-8f ? masked_policy[episode->actions[episode_t]] : 1.0e-8f;
             policy_loss_sum += -logf(prob_action) * advantages[t];
             value_loss_sum += 0.5f * (values[t] - returns[episode_t]) * (values[t] - returns[episode_t]);
             entropy_sum += entropy;
@@ -274,7 +277,7 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
             ++trained_labels;
             if (!gru_model_policy_gradient_update_heads(model,
                     stored_hidden,
-                    NULL,
+                    legal_mask,
                     episode->actions[episode_t],
                     advantages[t],
                     returns[episode_t],
@@ -286,15 +289,15 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                 free(hidden);
                 free(next_hidden);
                 free(hidden_states);
-                free(policies);
                 free(policy_step);
+                free(masked_policy);
                 free(labeled_indices);
                 return 0;
             }
             ++trainer->step;
         }
         if (episode->actions2[episode_t] >= 0) {
-            prob_action2 = stored_policy[episode->actions2[episode_t]] > 1.0e-8f ? stored_policy[episode->actions2[episode_t]] : 1.0e-8f;
+            prob_action2 = masked_policy[episode->actions2[episode_t]] > 1.0e-8f ? masked_policy[episode->actions2[episode_t]] : 1.0e-8f;
             policy_loss_sum += -logf(prob_action2) * advantages[t];
             value_loss_sum += 0.5f * (values[t] - returns[episode_t]) * (values[t] - returns[episode_t]);
             entropy_sum += entropy;
@@ -302,7 +305,7 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
             ++trained_labels;
             if (!gru_model_policy_gradient_update_heads(model,
                     stored_hidden,
-                    NULL,
+                    legal_mask,
                     episode->actions2[episode_t],
                     advantages[t],
                     returns[episode_t],
@@ -314,8 +317,8 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                 free(hidden);
                 free(next_hidden);
                 free(hidden_states);
-                free(policies);
                 free(policy_step);
+                free(masked_policy);
                 free(labeled_indices);
                 return 0;
             }
@@ -336,8 +339,8 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     free(hidden);
     free(next_hidden);
     free(hidden_states);
-    free(policies);
     free(policy_step);
+    free(masked_policy);
     free(labeled_indices);
     return 1;
 }
