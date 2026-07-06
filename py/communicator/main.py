@@ -35,7 +35,7 @@ THINK_DELAY_MIN_SECONDS = 0.8
 THINK_DELAY_MAX_SECONDS = 5.0
 FALLBACK_DELAY_MIN_SECONDS = 0.4
 FALLBACK_DELAY_MAX_SECONDS = 1.2
-DEFAULT_ARGS_PATH = Path("config/communicator.args")
+DEFAULT_ARGS_PATH = Path("config/communicator.toml")
 DEFAULT_RECONNECT_SECONDS = 5.0
 DEFAULT_LEARNER_COMMAND = r".\build-fresh\showdown_client.exe"
 DEFAULT_GUEST_REFRESH_SECONDS = 0.0
@@ -53,14 +53,36 @@ PROTECT_MOVE_NAMES = {
 
 
 def load_default_args(path: Path) -> list[str]:
-    args: list[str] = []
     if not path.exists():
-        return args
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+        return []
+    bare_flags = {"battle_agent"}
+    args: list[str] = []
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
             continue
-        args.append(line)
+        if "=" not in line:
+            raise SystemExit(f"invalid config {path}:{line_number}: expected key = value")
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip()
+        value_text = raw_value.strip()
+        if not key:
+            raise SystemExit(f"invalid config {path}:{line_number}: empty key")
+        flag = "--" + key.replace("_", "-")
+        lowered = value_text.lower()
+        if lowered in {"true", "false"}:
+            value = lowered == "true"
+            if key in bare_flags:
+                if value:
+                    args.append(flag)
+            else:
+                args.extend([flag, "1" if value else "0"])
+            continue
+        if len(value_text) >= 2 and value_text[0] == '"' and value_text[-1] == '"':
+            value = bytes(value_text[1:-1], "utf-8").decode("unicode_escape")
+        else:
+            value = value_text
+        args.extend([flag, value])
     return args
 
 

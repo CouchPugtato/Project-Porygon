@@ -1,0 +1,8 @@
+run = "run_0018_recorded_action_sp1000"
+checkpoint = "run18_200shards.chk"
+mode = "rl" # supervised | rl
+reward_mode = "dense_additive" # terminal | dense_additive
+epochs = 1
+epochs_per_file = 1
+shuffle = true
+sample_files = 200

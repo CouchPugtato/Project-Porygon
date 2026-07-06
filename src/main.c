@@ -17,7 +17,7 @@
 #include "showdown_client.h"
 #endif
 
-#define SHOWDOWN_CLIENT_DEFAULT_ARGS_PATH "config/showdown_client.args"
+#define SHOWDOWN_CLIENT_DEFAULT_ARGS_PATH "config/showdown_client.toml"
 
 static GruModel* create_default_model(void) {
     return gru_model_create(observation_flat_size(), 128, OBS_NUM_ACTIONS);
@@ -163,6 +163,26 @@ static char* trim_whitespace(char* text) {
     return text;
 }
 
+static int append_default_arg(char*** args, int* count, int* capacity, const char* token) {
+    char* copy;
+    if (*count >= *capacity) {
+        int new_capacity = *capacity > 0 ? (*capacity * 2) : 8;
+        char** resized = (char**)realloc(*args, (size_t)new_capacity * sizeof(char*));
+        if (!resized) {
+            return 0;
+        }
+        *args = resized;
+        *capacity = new_capacity;
+    }
+    copy = (char*)malloc(strlen(token) + 1);
+    if (!copy) {
+        return 0;
+    }
+    strcpy(copy, token);
+    (*args)[(*count)++] = copy;
+    return 1;
+}
+
 static char** load_default_args_file(const char* path, int* out_argc) {
     FILE* fp;
     char line[1024];
@@ -180,44 +200,110 @@ static char** load_default_args_file(const char* path, int* out_argc) {
         return NULL;
     }
     while (fgets(line, sizeof(line), fp)) {
-        char* token = trim_whitespace(line);
-        char* copy;
-        if (!token || !*token || *token == '#') {
+        char* comment = strchr(line, '#');
+        char* key;
+        char* value;
+        char* end;
+        char flag[256];
+        size_t i;
+        if (comment) {
+            *comment = '\0';
+        }
+        key = trim_whitespace(line);
+        if (!key || !*key) {
             continue;
         }
-        if (count >= capacity) {
-            int new_capacity = capacity > 0 ? capacity * 2 : 8;
-            char** resized = (char**)realloc(args, (size_t)new_capacity * sizeof(char*));
-            if (!resized) {
-                int i;
-                for (i = 0; i < count; ++i) {
-                    free(args[i]);
+        value = strchr(key, '=');
+        if (!value) {
+            goto fail;
+        }
+        *value++ = '\0';
+        key = trim_whitespace(key);
+        value = trim_whitespace(value);
+        if (!key || !*key || !value || !*value) {
+            goto fail;
+        }
+        snprintf(flag, sizeof(flag), "--%s", key);
+        for (i = 2; flag[i]; ++i) {
+            if (flag[i] == '_') {
+                flag[i] = '-';
+            }
+        }
+        if (strcmp(key, "battle_agent") == 0) {
+            if (_stricmp(value, "true") == 0) {
+                if (!append_default_arg(&args, &count, &capacity, flag)) {
+                    goto fail;
                 }
-                free(args);
-                fclose(fp);
-                return NULL;
+            } else if (_stricmp(value, "false") != 0) {
+                goto fail;
             }
-            args = resized;
-            capacity = new_capacity;
+            continue;
         }
-        copy = (char*)malloc(strlen(token) + 1);
-        if (!copy) {
-            int i;
-            for (i = 0; i < count; ++i) {
-                free(args[i]);
+        if (!append_default_arg(&args, &count, &capacity, flag)) {
+            goto fail;
+        }
+        if (*value == '"') {
+            char token[1024];
+            size_t token_len = 0;
+            int closed = 0;
+            ++value;
+            while (*value) {
+                char ch = *value++;
+                if (ch == '"') {
+                    closed = 1;
+                    break;
+                }
+                if (ch == '\\') {
+                    char escaped = *value++;
+                    if (!escaped) {
+                        goto fail;
+                    }
+                    if (escaped == 'n') ch = '\n';
+                    else if (escaped == 't') ch = '\t';
+                    else if (escaped == '"' || escaped == '\\') ch = escaped;
+                    else ch = escaped;
+                }
+                if (token_len + 1 >= sizeof(token)) {
+                    goto fail;
+                }
+                token[token_len++] = ch;
             }
-            free(args);
-            fclose(fp);
-            return NULL;
+            if (!closed) {
+                goto fail;
+            }
+            token[token_len] = '\0';
+            end = trim_whitespace(value);
+            if (end && *end) {
+                goto fail;
+            }
+            if (!append_default_arg(&args, &count, &capacity, token)) {
+                goto fail;
+            }
+        } else if (_stricmp(value, "true") == 0 || _stricmp(value, "false") == 0) {
+            if (!append_default_arg(&args, &count, &capacity, _stricmp(value, "true") == 0 ? "1" : "0")) {
+                goto fail;
+            }
+        } else {
+            if (!append_default_arg(&args, &count, &capacity, value)) {
+                goto fail;
+            }
         }
-        strcpy(copy, token);
-        args[count++] = copy;
     }
     fclose(fp);
     if (out_argc) {
         *out_argc = count;
     }
     return args;
+fail:
+    fclose(fp);
+    if (args) {
+        int i;
+        for (i = 0; i < count; ++i) {
+            free(args[i]);
+        }
+        free(args);
+    }
+    return NULL;
 }
 
 static void free_default_args(char** args, int argc) {

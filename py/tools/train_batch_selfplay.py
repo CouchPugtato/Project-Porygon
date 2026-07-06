@@ -10,7 +10,7 @@ from pathlib import Path
 
 DEFAULT_RUNS_ROOT = Path("matches") / "runs"
 DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
-DEFAULT_ARGS_PATH = Path("config/train_batch_selfplay.args")
+DEFAULT_ARGS_PATH = Path("config/train_batch_selfplay.toml")
 
 
 def positive_int(value: str) -> int:
@@ -27,14 +27,30 @@ def parse_bool01(value: str) -> bool:
 
 
 def load_default_args(path: Path) -> list[str]:
-    args: list[str] = []
     if not path.exists():
-        return args
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+        return []
+    args: list[str] = []
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
             continue
-        args.append(line)
+        if "=" not in line:
+            raise SystemExit(f"invalid config {path}:{line_number}: expected key = value")
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip()
+        value_text = raw_value.strip()
+        if not key:
+            raise SystemExit(f"invalid config {path}:{line_number}: empty key")
+        flag = "--" + key.replace("_", "-")
+        lowered = value_text.lower()
+        if lowered in {"true", "false"}:
+            args.extend([flag, "1" if lowered == "true" else "0"])
+            continue
+        if len(value_text) >= 2 and value_text[0] == '"' and value_text[-1] == '"':
+            value = bytes(value_text[1:-1], "utf-8").decode("unicode_escape")
+        else:
+            value = value_text
+        args.extend([flag, value])
     return args
 
 

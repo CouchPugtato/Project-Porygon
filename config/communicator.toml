@@ -1,0 +1,6 @@
+mode = "random" # live | capture | random
+replay_save = "run_0011_new_random"
+format = "gen9randomdoublesbattle"
+reconnect_seconds = 15
+guest_refresh_seconds = 21600
+battle_agent = true

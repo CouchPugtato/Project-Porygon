@@ -1,0 +1,6 @@
+run_name = "run_0018_recorded_action_sp1000"
+games = 0
+concurrent_games = 1
+model_a = "random" # random | <checkpoint path>
+model_b = "random" # random | <checkpoint path>
+format = "gen9randomdoublesbattle"

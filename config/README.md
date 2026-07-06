@@ -1,21 +1,38 @@
-Default argument files for entrypoints.
+Default entrypoint config files.
 
-Rules:
-- One token per line.
-- Blank lines are ignored.
-- Lines starting with `#` are comments.
+Format:
+- TOML
+- Each entrypoint config uses top-level key/value defaults
+- Keys map to CLI flags by converting `_` to `-`
+- CLI args are appended after config-derived defaults, so explicit CLI args override config values
 
 Files:
-- `showdown_client.args`
+- `showdown_client.toml`
   - consumed by `showdown_client` when launched with no CLI args
-- `communicator.args`
+- `communicator.toml`
   - consumed by `py/communicator/main.py` when launched with no CLI args
-- `selfplay_server.args`
+- `selfplay_server.toml`
   - consumed by `py/tools/selfplay_server.py` when launched with no CLI args
-- `train_batch_selfplay.args`
+- `train_batch_selfplay.toml`
   - consumed by `py/tools/train_batch_selfplay.py` before CLI args are applied
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
   - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
+
+Example:
+
+```toml
+run = "run_0018_recorded_action_sp1000"
+checkpoint = "run18_200shards.chk"
+mode = "rl"
+epochs = 1
+```
+
+Notes:
+
+- strings should be quoted
+- numbers can be written as numbers
+- ordinary boolean options become `1`/`0` on the generated CLI
+- bare passthrough flags like `battle_agent = true` emit `--battle-agent`
 
 Examples:
 

@@ -30,7 +30,7 @@ DEFAULT_RECONNECT_SECONDS = 5.0
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_SHUTDOWN_GRACE_SECONDS = 20.0
 DEFAULT_USERNAME_PREFIX = "PoryPool"
-DEFAULT_ARGS_PATH = Path("config/selfplay_server.args")
+DEFAULT_ARGS_PATH = Path("config/selfplay_server.toml")
 
 BATTLE_STARTED_RE = re.compile(r"\[(?:live|random)\] battle started (battle-[^\s]+)")
 BATTLE_ENDED_RE = re.compile(r"\[(?:live|random)\] battle ended (battle-[^\s]+) result=")
@@ -101,14 +101,30 @@ def parse_bool01(value: str) -> bool:
 
 
 def load_default_args(path: Path) -> list[str]:
-    args: list[str] = []
     if not path.exists():
-        return args
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+        return []
+    args: list[str] = []
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
             continue
-        args.append(line)
+        if "=" not in line:
+            raise SystemExit(f"invalid config {path}:{line_number}: expected key = value")
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip()
+        value_text = raw_value.strip()
+        if not key:
+            raise SystemExit(f"invalid config {path}:{line_number}: empty key")
+        flag = "--" + key.replace("_", "-")
+        lowered = value_text.lower()
+        if lowered in {"true", "false"}:
+            args.extend([flag, "1" if lowered == "true" else "0"])
+            continue
+        if len(value_text) >= 2 and value_text[0] == '"' and value_text[-1] == '"':
+            value = bytes(value_text[1:-1], "utf-8").decode("unicode_escape")
+        else:
+            value = value_text
+        args.extend([flag, value])
     return args
 
 
