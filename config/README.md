@@ -116,3 +116,39 @@ Examples:
 python py/tools/selfplay_server.py --run-name run_pool_test --games 100 --concurrent-games 8 --model-a-pool config/pools/a_pool.json --model-b random
 python py/tools/selfplay_server.py --run-name run_pool_vs_pool --games 100 --concurrent-games 8 --model-a-pool config/pools/a_pool.json --model-b-pool config/pools/b_pool.json --pool-seed 123
 ```
+
+### League registry workflow
+
+`py/tools/league_manage.py` manages a filesystem-backed checkpoint league and emits pool JSON files for `selfplay_server.py`.
+
+Default registry path:
+
+```text
+models/league/league_registry.json
+```
+
+Notes:
+
+- the league registry is JSON, not TOML
+- generated pool files use the same JSON schema already supported by `selfplay_server.py`
+- `random` is not stored as a registry member; it is injected during pool build when requested
+
+Supported commands:
+
+- `init`
+- `show`
+- `add-checkpoint`
+- `update-member`
+- `promote`
+- `deactivate`
+- `build-pool`
+
+Examples:
+
+```powershell
+python py/tools/league_manage.py init
+python py/tools/league_manage.py add-checkpoint --id g1_seed --path models/runs/run_x/seed/seed.chk
+python py/tools/league_manage.py promote --id g1_seed
+python py/tools/league_manage.py build-pool --output models/league/pools/active_pool.json --include-random 1 --random-weight 1.0
+python py/tools/selfplay_server.py --run-name run_league_smoke --games 100 --concurrent-games 8 --model-a-pool models/league/pools/active_pool.json --model-b random
+```
