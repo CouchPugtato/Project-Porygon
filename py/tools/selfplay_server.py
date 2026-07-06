@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import os
+import random
 import re
 import shlex
 import signal
@@ -14,7 +15,7 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TextIO
+from typing import Literal, TextIO
 
 import websockets
 
@@ -187,6 +188,51 @@ class WorkerSpec:
         return f"worker_{self.worker_id:03d}_{self.model_group}"
 
 
+@dataclass(frozen=True)
+class PoolMember:
+    name: str
+    kind: Literal["random", "checkpoint"]
+    path: str | None
+    weight: float
+
+
+@dataclass(frozen=True)
+class ResolvedPool:
+    source_path: str
+    members: list[PoolMember]
+    cumulative_weights: list[float]
+    total_weight: float
+
+
+@dataclass(frozen=True)
+class SampledIdentity:
+    member_name: str
+    kind: Literal["random", "checkpoint"]
+    path: str | None
+
+
+@dataclass(frozen=True)
+class SingleSideSpec:
+    model_spec: str
+
+
+@dataclass(frozen=True)
+class PoolSideSpec:
+    side: str
+    pool: ResolvedPool
+
+
+@dataclass(frozen=True)
+class WorkerLaunchIdentity:
+    mode: str
+    checkpoint_path: str
+    agent_label: str
+    sampled_member_name: str | None = None
+    sampled_member_kind: str | None = None
+    sampled_member_path: str | None = None
+    sampled_from_pool: bool = False
+
+
 def worker_mode_for_model_spec(default_mode: str, model_spec: str) -> str:
     if (model_spec or "").strip().lower() == "random":
         return "random"
@@ -197,6 +243,75 @@ def checkpoint_for_model_spec(model_spec: str) -> str:
     if (model_spec or "").strip().lower() == "random":
         return ""
     return model_spec
+
+
+def validate_pool_member(raw: dict, pool_path: Path, seen_names: set[str]) -> PoolMember:
+    if not isinstance(raw, dict):
+        raise SystemExit(f"invalid pool member in {pool_path}: expected object")
+    name = str(raw.get("name", "")).strip()
+    if not name:
+        raise SystemExit(f"invalid pool member in {pool_path}: missing non-empty 'name'")
+    if name in seen_names:
+        raise SystemExit(f"invalid pool member in {pool_path}: duplicate name '{name}'")
+    kind = str(raw.get("kind", "")).strip().lower()
+    if kind not in {"random", "checkpoint"}:
+        raise SystemExit(f"invalid pool member '{name}' in {pool_path}: unknown kind '{kind}'")
+    try:
+        weight = float(raw.get("weight"))
+    except Exception as exc:
+        raise SystemExit(f"invalid pool member '{name}' in {pool_path}: bad weight") from exc
+    if weight <= 0.0:
+        raise SystemExit(f"invalid pool member '{name}' in {pool_path}: weight must be > 0")
+    member_path: str | None = None
+    if kind == "checkpoint":
+        raw_path = str(raw.get("path", "")).strip()
+        if not raw_path:
+            raise SystemExit(f"invalid pool member '{name}' in {pool_path}: missing checkpoint 'path'")
+        resolved = Path(raw_path).resolve()
+        if not resolved.exists():
+            raise SystemExit(
+                f"invalid pool member '{name}' in {pool_path}: checkpoint path not found: {resolved}"
+            )
+        member_path = str(resolved)
+    seen_names.add(name)
+    return PoolMember(name=name, kind=kind, path=member_path, weight=weight)
+
+
+def load_model_pool(path: Path) -> ResolvedPool:
+    resolved_path = path.resolve()
+    if not resolved_path.exists():
+        raise SystemExit(f"pool file not found: {resolved_path}")
+    try:
+        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"failed to parse pool file {resolved_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"invalid pool file {resolved_path}: expected top-level object")
+    members_raw = payload.get("members")
+    if not isinstance(members_raw, list) or not members_raw:
+        raise SystemExit(f"invalid pool file {resolved_path}: 'members' must be a non-empty list")
+    seen_names: set[str] = set()
+    members = [validate_pool_member(raw, resolved_path, seen_names) for raw in members_raw]
+    cumulative_weights: list[float] = []
+    total_weight = 0.0
+    for member in members:
+        total_weight += member.weight
+        cumulative_weights.append(total_weight)
+    return ResolvedPool(
+        source_path=str(resolved_path),
+        members=members,
+        cumulative_weights=cumulative_weights,
+        total_weight=total_weight,
+    )
+
+
+def sample_pool_member(pool: ResolvedPool, rng: random.Random) -> SampledIdentity:
+    roll = rng.uniform(0.0, pool.total_weight)
+    for member, cumulative_weight in zip(pool.members, pool.cumulative_weights):
+        if roll <= cumulative_weight:
+            return SampledIdentity(member_name=member.name, kind=member.kind, path=member.path)
+    member = pool.members[-1]
+    return SampledIdentity(member_name=member.name, kind=member.kind, path=member.path)
 
 
 class ServerProcess:
@@ -336,6 +451,7 @@ class WorkerProcess:
     def __init__(
         self,
         spec: WorkerSpec,
+        launch_identity: WorkerLaunchIdentity,
         repo_root: Path,
         python_exe: str,
         server_uri: str,
@@ -345,6 +461,7 @@ class WorkerProcess:
         worker_log_stdout: bool,
     ) -> None:
         self.spec = spec
+        self.launch_identity = launch_identity
         self.repo_root = repo_root
         self.python_exe = python_exe
         self.server_uri = server_uri
@@ -365,7 +482,7 @@ class WorkerProcess:
             "-m",
             "py.communicator.main",
             "--mode",
-            self.spec.mode,
+            self.launch_identity.mode,
             "--games",
             "0",
             "--server-uri",
@@ -383,10 +500,10 @@ class WorkerProcess:
             "--reconnect-seconds",
             str(self.reconnect_seconds),
         ]
-        if self.spec.mode == "live":
+        if self.launch_identity.mode == "live":
             command.append("--battle-agent")
-            if self.spec.checkpoint_path:
-                command.append(self.spec.checkpoint_path)
+            if self.launch_identity.checkpoint_path:
+                command.append(self.launch_identity.checkpoint_path)
         return command
 
     async def start(self) -> None:
@@ -465,6 +582,7 @@ class ReplayTailMonitor:
         self.completed_perspectives_by_worker: dict[str, int] = {}
         self.completed_games = 0
         self.completed_worker_perspectives = 0
+        self.last_terminal_records: list[dict[str, str]] = []
 
     def register_worker(self, worker_token: str, replay_path: Path) -> None:
         self._offsets.setdefault(replay_path, 0)
@@ -474,6 +592,7 @@ class ReplayTailMonitor:
 
     def poll(self, worker_specs: list[WorkerSpec]) -> int:
         newly_completed = 0
+        self.last_terminal_records = []
         for spec in worker_specs:
             replay_path = spec.replay_path
             if not replay_path.exists():
@@ -509,6 +628,10 @@ class ReplayTailMonitor:
                 self.completed_perspectives_by_worker[spec.worker_token] = (
                     self.completed_perspectives_by_worker.get(spec.worker_token, 0) + 1
                 )
+                result = str(record.get("result", "")).strip()
+                self.last_terminal_records.append(
+                    {"worker_token": spec.worker_token, "battle_id": battle_id, "result": result}
+                )
                 if battle_id not in self._seen_global_battle_ids:
                     self._seen_global_battle_ids.add(battle_id)
                     self.completed_games += 1
@@ -542,8 +665,11 @@ class PoolOrchestrator:
             args.model_b_weight,
         )
         self.model_b_workers = self.total_workers - self.model_a_workers
+        self.pool_rng = random.Random(args.pool_seed) if args.pool_seed is not None else random.Random()
+        self.side_configs = self._resolve_side_configs()
         self.worker_specs = self._build_worker_specs()
         self.worker_processes: dict[str, WorkerProcess] = {}
+        self.group_modes_seen: dict[str, set[str]] = {"a": set(), "b": set()}
         self.replay_monitor = ReplayTailMonitor()
         self.server: ServerProcess | None = None
         self.client: ClientProcess | None = None
@@ -556,16 +682,31 @@ class PoolOrchestrator:
         self._wait_for_current_matches = False
         self._failed = False
         self._failure_reason = ""
+        self._group_member_stats: dict[str, dict[str, dict[str, int]]] = {"a": {}, "b": {}}
 
     @property
     def target_games_label(self) -> str:
         return "infinite" if self.args.games == 0 else str(self.args.games)
 
+    def _resolve_side_configs(self) -> dict[str, SingleSideSpec | PoolSideSpec]:
+        configs: dict[str, SingleSideSpec | PoolSideSpec] = {}
+        if self.args.model_a_pool:
+            configs["a"] = PoolSideSpec(side="a", pool=load_model_pool(Path(self.args.model_a_pool)))
+        else:
+            configs["a"] = SingleSideSpec(model_spec=self.args.model_a)
+        if self.args.model_b_pool:
+            configs["b"] = PoolSideSpec(side="b", pool=load_model_pool(Path(self.args.model_b_pool)))
+        else:
+            configs["b"] = SingleSideSpec(model_spec=self.args.model_b)
+        return configs
+
     def _build_worker_specs(self) -> list[WorkerSpec]:
         specs: list[WorkerSpec] = []
         worker_id = 0
-        group_counts = [("a", self.model_a_workers, self.args.model_a), ("b", self.model_b_workers, self.args.model_b)]
-        for group_name, count, model_spec in group_counts:
+        group_counts = [("a", self.model_a_workers), ("b", self.model_b_workers)]
+        for group_name, count in group_counts:
+            side_config = self.side_configs[group_name]
+            default_model_spec = side_config.model_spec if isinstance(side_config, SingleSideSpec) else "random"
             for group_index in range(count):
                 worker_token = f"worker_{worker_id:03d}_{group_name}"
                 username = f"{self.args.username_prefix}{group_name.upper()}{group_index:03d}"
@@ -573,8 +714,8 @@ class PoolOrchestrator:
                     WorkerSpec(
                         worker_id=worker_id,
                         model_group=group_name,
-                        checkpoint_path=checkpoint_for_model_spec(model_spec),
-                        mode=worker_mode_for_model_spec(self.args.worker_think_mode, model_spec),
+                        checkpoint_path=checkpoint_for_model_spec(default_model_spec),
+                        mode=worker_mode_for_model_spec(self.args.worker_think_mode, default_model_spec),
                         username=username,
                         replay_save_token=worker_replay_save_token(self.args.run_name, worker_token),
                         replay_path=worker_replay_path(self.args.run_name, worker_token),
@@ -601,6 +742,59 @@ class PoolOrchestrator:
         if worker.reconnect_pending and "[communicator] websocket connected" in line:
             worker.reconnect_pending = False
             self.log(f"{worker.spec.worker_token} reconnected successfully")
+
+    def _sample_launch_identity(self, spec: WorkerSpec) -> WorkerLaunchIdentity:
+        side_config = self.side_configs[spec.model_group]
+        if isinstance(side_config, SingleSideSpec):
+            model_spec = side_config.model_spec
+            checkpoint_path = checkpoint_for_model_spec(model_spec)
+            return WorkerLaunchIdentity(
+                mode=worker_mode_for_model_spec(self.args.worker_think_mode, model_spec),
+                checkpoint_path=checkpoint_path,
+                agent_label=checkpoint_path if checkpoint_path else "random",
+            )
+        sampled = sample_pool_member(side_config.pool, self.pool_rng)
+        sampled_spec = "random" if sampled.kind == "random" else (sampled.path or "")
+        checkpoint_path = checkpoint_for_model_spec(sampled_spec)
+        return WorkerLaunchIdentity(
+            mode=worker_mode_for_model_spec(self.args.worker_think_mode, sampled_spec),
+            checkpoint_path=checkpoint_path,
+            agent_label=checkpoint_path if checkpoint_path else "random",
+            sampled_member_name=sampled.member_name,
+            sampled_member_kind=sampled.kind,
+            sampled_member_path=sampled.path,
+            sampled_from_pool=True,
+        )
+
+    def _touch_member_stats(self, side: str, member_name: str) -> dict[str, int]:
+        side_stats = self._group_member_stats.setdefault(side, {})
+        if member_name not in side_stats:
+            side_stats[member_name] = {
+                "worker_starts": 0,
+                "completed_games": 0,
+                "wins": 0,
+                "losses": 0,
+                "draws": 0,
+            }
+        return side_stats[member_name]
+
+    def _record_terminal_records(self) -> None:
+        for record in self.replay_monitor.last_terminal_records:
+            worker = self.worker_processes.get(record["worker_token"])
+            if worker is None:
+                continue
+            identity = worker.launch_identity
+            if not identity.sampled_from_pool or not identity.sampled_member_name:
+                continue
+            member_stats = self._touch_member_stats(worker.spec.model_group, identity.sampled_member_name)
+            member_stats["completed_games"] += 1
+            result = record["result"]
+            if result == "win":
+                member_stats["wins"] += 1
+            elif result == "loss":
+                member_stats["losses"] += 1
+            elif result == "draw":
+                member_stats["draws"] += 1
 
     async def _start_server(self) -> None:
         showdown_dir = (self.repo_root / self.args.showdown_dir).resolve()
@@ -632,8 +826,10 @@ class PoolOrchestrator:
     async def _start_worker(self, spec: WorkerSpec) -> None:
         if spec.shutdown_path.exists():
             spec.shutdown_path.unlink()
+        launch_identity = self._sample_launch_identity(spec)
         worker = WorkerProcess(
             spec=spec,
+            launch_identity=launch_identity,
             repo_root=self.repo_root,
             python_exe=self.args.python_exe,
             server_uri=self.server_uri,
@@ -645,8 +841,16 @@ class PoolOrchestrator:
         self.replay_monitor.register_worker(spec.worker_token, spec.replay_path)
         await worker.start()
         self.worker_processes[spec.worker_token] = worker
-        checkpoint_label = spec.checkpoint_path if spec.checkpoint_path else "random"
-        self.log(f"started {spec.worker_token} user={spec.username} mode={spec.mode} agent={checkpoint_label}")
+        self.group_modes_seen[spec.model_group].add(launch_identity.mode)
+        if launch_identity.sampled_from_pool and launch_identity.sampled_member_name:
+            member_stats = self._touch_member_stats(spec.model_group, launch_identity.sampled_member_name)
+            member_stats["worker_starts"] += 1
+            self.log(
+                f"started {spec.worker_token} user={spec.username} mode={launch_identity.mode} "
+                f"agent={launch_identity.agent_label} member={launch_identity.sampled_member_name}"
+            )
+        else:
+            self.log(f"started {spec.worker_token} user={spec.username} mode={launch_identity.mode} agent={launch_identity.agent_label}")
 
     async def _start_workers(self) -> None:
         for index, spec in enumerate(self.worker_specs):
@@ -817,11 +1021,31 @@ class PoolOrchestrator:
             del group["_weighted_tera_turns"]
         return groups
 
+    def _build_group_pool_members_summary(self) -> dict[str, list[dict[str, object]]]:
+        summary: dict[str, list[dict[str, object]]] = {}
+        for side, side_config in self.side_configs.items():
+            if not isinstance(side_config, PoolSideSpec):
+                continue
+            members: list[dict[str, object]] = []
+            for member in side_config.pool.members:
+                payload: dict[str, object] = {
+                    "name": member.name,
+                    "kind": member.kind,
+                    "weight": member.weight,
+                }
+                if member.path:
+                    payload["path"] = member.path
+                members.append(payload)
+            summary[side] = members
+        return summary
+
     def _write_summary(self) -> None:
         group_modes = {
-            "a": sorted({spec.mode for spec in self.worker_specs if spec.model_group == "a"}),
-            "b": sorted({spec.mode for spec in self.worker_specs if spec.model_group == "b"}),
+            "a": sorted(self.group_modes_seen["a"] or {spec.mode for spec in self.worker_specs if spec.model_group == "a"}),
+            "b": sorted(self.group_modes_seen["b"] or {spec.mode for spec in self.worker_specs if spec.model_group == "b"}),
         }
+        pool_members = self._build_group_pool_members_summary()
+        pool_mode = bool(pool_members)
         summary = {
             "status": "failed" if self._failed else "completed",
             "failure_reason": self._failure_reason,
@@ -837,9 +1061,17 @@ class PoolOrchestrator:
             "format": self.args.format,
             "model_group_modes": group_modes,
             "group_stats": self._build_group_stats_summary(),
+            "pool_mode": pool_mode,
             "run_duration_seconds": max(time.monotonic() - self._start_time, 0.0),
             "per_worker_completed_perspectives": dict(sorted(self.replay_monitor.completed_perspectives_by_worker.items())),
         }
+        if pool_mode:
+            summary["group_pool_members"] = pool_members
+            summary["group_member_stats"] = self._group_member_stats
+            if self.args.model_a_pool:
+                summary["model_a_pool_path"] = str(Path(self.args.model_a_pool).resolve())
+            if self.args.model_b_pool:
+                summary["model_b_pool_path"] = str(Path(self.args.model_b_pool).resolve())
         self.summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
     async def run(self) -> int:
@@ -864,6 +1096,8 @@ class PoolOrchestrator:
             while True:
                 await asyncio.sleep(1.0)
                 newly_completed = self.replay_monitor.poll(self.worker_specs)
+                if self.replay_monitor.last_terminal_records:
+                    self._record_terminal_records()
                 if newly_completed:
                     self.log(
                         f"completed_games={self.replay_monitor.completed_games}/{self.target_games_label}"
@@ -919,8 +1153,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--games", required=True, type=nonnegative_int)
     parser.add_argument("--concurrent-games", required=True, type=positive_int)
-    parser.add_argument("--model-a", required=True)
-    parser.add_argument("--model-b", required=True)
+    parser.add_argument("--model-a", default="")
+    parser.add_argument("--model-b", default="")
+    parser.add_argument("--model-a-pool", default="")
+    parser.add_argument("--model-b-pool", default="")
+    parser.add_argument("--pool-seed", type=int, default=None)
     parser.add_argument("--showdown-dir", default=str(DEFAULT_SHOWDOWN_DIR))
     parser.add_argument("--client-dir", default=str(DEFAULT_CLIENT_DIR))
     parser.add_argument("--server-host", default=DEFAULT_HOST)
@@ -949,6 +1186,14 @@ async def async_main() -> int:
     default_argv = load_default_args(DEFAULT_ARGS_PATH)
     argv = default_argv + sys.argv[1:]
     args = parser.parse_args(argv)
+    if args.model_a and args.model_a_pool:
+        raise SystemExit("--model-a and --model-a-pool are mutually exclusive")
+    if args.model_b and args.model_b_pool:
+        raise SystemExit("--model-b and --model-b-pool are mutually exclusive")
+    if not args.model_a and not args.model_a_pool:
+        raise SystemExit("side A requires either --model-a or --model-a-pool")
+    if not args.model_b and not args.model_b_pool:
+        raise SystemExit("side B requires either --model-b or --model-b-pool")
     orchestrator = PoolOrchestrator(args)
     return await orchestrator.run()
 
