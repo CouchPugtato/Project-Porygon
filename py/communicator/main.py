@@ -1416,6 +1416,17 @@ async def live_mode(
             pending = pending_decisions.pop(event.room_id)
             learner_proposal_accepted_count += 1
             battle_accepted_proposal_count[event.room_id] = battle_accepted_proposal_count.get(event.room_id, 0) + 1
+            if writer is not None:
+                writer.append(
+                    event.room_id,
+                    action_taken_message(
+                        event.room_id,
+                        pending["request_id"],
+                        pending["action"],
+                        pending.get("action2", -1),
+                        pending["command"],
+                    ).to_json(),
+                )
             await learner.send(
                 decision_message(
                     event.room_id,
@@ -1440,6 +1451,17 @@ async def live_mode(
             if pending is not None:
                 learner_proposal_accepted_count += 1
                 battle_accepted_proposal_count[event.room_id] = battle_accepted_proposal_count.get(event.room_id, 0) + 1
+                if writer is not None:
+                    writer.append(
+                        event.room_id,
+                        action_taken_message(
+                            event.room_id,
+                            pending["request_id"],
+                            pending["action"],
+                            pending.get("action2", -1),
+                            pending["command"],
+                        ).to_json(),
+                    )
                 await learner.send(
                     decision_message(
                         event.room_id,
@@ -1468,6 +1490,18 @@ async def live_mode(
             battle_invalid_choice_count[event.room_id] = battle_invalid_choice_count.get(event.room_id, 0) + 1
             pending = pending_decisions.pop(event.room_id, None)
             if pending is not None:
+                if writer is not None:
+                    writer.append(
+                        event.room_id,
+                        action_rejected_message(
+                            event.room_id,
+                            pending["request_id"],
+                            pending["action"],
+                            pending.get("action2", -1),
+                            pending["command"],
+                            reason=event.line,
+                        ).to_json(),
+                    )
                 await learner.send(
                     decision_message(
                         event.room_id,
