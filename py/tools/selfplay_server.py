@@ -32,7 +32,7 @@ DEFAULT_SHUTDOWN_GRACE_SECONDS = 20.0
 DEFAULT_USERNAME_PREFIX = "PoryPool"
 DEFAULT_ARGS_PATH = Path("config/selfplay_server.toml")
 
-BATTLE_STARTED_RE = re.compile(r"\[(?:live|random)\] battle started (battle-[^\s]+)")
+JOINED_BATTLE_RE = re.compile(r"\[communicator\] joined battle room (battle-[^\s]+)")
 BATTLE_ENDED_RE = re.compile(r"\[(?:live|random)\] battle ended (battle-[^\s]+) result=")
 
 
@@ -198,6 +198,9 @@ class WorkerSpec:
     replay_path: Path
     stdout_log_path: Path
     shutdown_path: Path
+    challenge_target: str = ""
+    accept_challenges: bool = False
+    accept_challenge_from: str = ""
 
     @property
     def worker_token(self) -> str:
@@ -516,6 +519,12 @@ class WorkerProcess:
             "--reconnect-seconds",
             str(self.reconnect_seconds),
         ]
+        if self.spec.challenge_target:
+            command.extend(["--challenge-target", self.spec.challenge_target])
+        if self.spec.accept_challenges:
+            command.extend(["--accept-challenges", "1"])
+        if self.spec.accept_challenge_from:
+            command.extend(["--accept-challenge-from", self.spec.accept_challenge_from])
         if self.launch_identity.mode == "live":
             command.append("--battle-agent")
             if self.launch_identity.checkpoint_path:
@@ -555,7 +564,7 @@ class WorkerProcess:
                 print(f"[{self.spec.worker_token}] {decoded}")
 
     def _consume_runtime_line(self, line: str) -> None:
-        started = BATTLE_STARTED_RE.search(line)
+        started = JOINED_BATTLE_RE.search(line)
         if started:
             self.active_battles.add(started.group(1))
         ended = BATTLE_ENDED_RE.search(line)
@@ -719,13 +728,20 @@ class PoolOrchestrator:
     def _build_worker_specs(self) -> list[WorkerSpec]:
         specs: list[WorkerSpec] = []
         worker_id = 0
+        group_usernames: dict[str, list[str]] = {
+            "a": [f"{self.args.username_prefix}A{index:03d}" for index in range(self.model_a_workers)],
+            "b": [f"{self.args.username_prefix}B{index:03d}" for index in range(self.model_b_workers)],
+        }
         group_counts = [("a", self.model_a_workers), ("b", self.model_b_workers)]
         for group_name, count in group_counts:
             side_config = self.side_configs[group_name]
             default_model_spec = side_config.model_spec if isinstance(side_config, SingleSideSpec) else "random"
+            opponent_group = "b" if group_name == "a" else "a"
+            opponent_usernames = group_usernames[opponent_group]
             for group_index in range(count):
                 worker_token = f"worker_{worker_id:03d}_{group_name}"
-                username = f"{self.args.username_prefix}{group_name.upper()}{group_index:03d}"
+                username = group_usernames[group_name][group_index]
+                paired_username = opponent_usernames[group_index % len(opponent_usernames)] if opponent_usernames else ""
                 specs.append(
                     WorkerSpec(
                         worker_id=worker_id,
@@ -737,6 +753,9 @@ class PoolOrchestrator:
                         replay_path=worker_replay_path(self.args.run_name, worker_token),
                         stdout_log_path=self.run_dir / f"{worker_token}.stdout.log",
                         shutdown_path=self.run_dir / f"{worker_token}.shutdown",
+                        challenge_target=paired_username if group_name == "a" else "",
+                        accept_challenges=(group_name == "b"),
+                        accept_challenge_from=paired_username if group_name == "b" else "",
                     )
                 )
                 worker_id += 1
@@ -796,6 +815,9 @@ class PoolOrchestrator:
 
     def _record_terminal_records(self) -> None:
         for record in self.replay_monitor.last_terminal_records:
+            battle_id = record["battle_id"]
+            for process in self.worker_processes.values():
+                process.active_battles.discard(battle_id)
             worker = self.worker_processes.get(record["worker_token"])
             if worker is None:
                 continue
@@ -869,9 +891,10 @@ class PoolOrchestrator:
             self.log(f"started {spec.worker_token} user={spec.username} mode={launch_identity.mode} agent={launch_identity.agent_label}")
 
     async def _start_workers(self) -> None:
-        for index, spec in enumerate(self.worker_specs):
+        ordered_specs = sorted(self.worker_specs, key=lambda spec: 0 if spec.model_group == "b" else 1)
+        for index, spec in enumerate(ordered_specs):
             await self._start_worker(spec)
-            if index == len(self.worker_specs) - 1:
+            if index == len(ordered_specs) - 1:
                 print()
 
     async def _respawn_if_needed(self) -> None:
@@ -903,7 +926,10 @@ class PoolOrchestrator:
             await worker.request_stop()
 
     def _active_battle_count(self) -> int:
-        return sum(worker.active_battle_count for worker in self.worker_processes.values())
+        active_battles: set[str] = set()
+        for worker in self.worker_processes.values():
+            active_battles.update(worker.active_battles)
+        return len(active_battles)
 
     async def _terminate_workers(self) -> None:
         for worker in list(self.worker_processes.values()):

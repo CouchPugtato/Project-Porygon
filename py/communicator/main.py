@@ -974,6 +974,9 @@ async def random_mode(
     fmt: str,
     username: str,
     server_uri: str,
+    challenge_target: str = "",
+    accept_challenges: bool = False,
+    accept_challenge_from: str = "",
     shutdown_file: Path | None = None,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
@@ -1246,7 +1249,14 @@ async def random_mode(
 
     try:
         while not stop_requested:
-            gateway = ShowdownGateway(server_uri, username=username, fmt=fmt)
+            gateway = ShowdownGateway(
+                server_uri,
+                username=username,
+                fmt=fmt,
+                challenge_target=challenge_target,
+                accept_challenges=accept_challenges,
+                accept_challenge_from=accept_challenge_from,
+            )
             try:
                 await gateway.connect()
                 session_started_at = time.monotonic()
@@ -1285,6 +1295,9 @@ async def live_mode(
     fmt: str,
     username: str,
     server_uri: str,
+    challenge_target: str = "",
+    accept_challenges: bool = False,
+    accept_challenge_from: str = "",
     shutdown_file: Path | None = None,
     max_games: int | None = None,
     reconnect_seconds: float = DEFAULT_RECONNECT_SECONDS,
@@ -1754,7 +1767,14 @@ async def live_mode(
 
     try:
         while not stop_requested:
-            gateway = ShowdownGateway(server_uri, username=username, fmt=fmt)
+            gateway = ShowdownGateway(
+                server_uri,
+                username=username,
+                fmt=fmt,
+                challenge_target=challenge_target,
+                accept_challenges=accept_challenges,
+                accept_challenge_from=accept_challenge_from,
+            )
             learner = LearnerProcess(learner_command, None)
             await learner.start()
             print(f"[live] started learner: {' '.join(learner_command)}")
@@ -1808,6 +1828,9 @@ def main() -> None:
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--username", default="")
     parser.add_argument("--server-uri", default="")
+    parser.add_argument("--challenge-target", default="")
+    parser.add_argument("--accept-challenges", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--accept-challenge-from", default="")
     parser.add_argument("--shutdown-file", default="")
     parser.add_argument("--games", type=int, default=0)
     parser.add_argument("--reconnect-seconds", type=float, default=DEFAULT_RECONNECT_SECONDS)
@@ -1828,6 +1851,9 @@ def main() -> None:
                 args.format,
                 args.username,
                 server_uri,
+                challenge_target=args.challenge_target,
+                accept_challenges=bool(args.accept_challenges),
+                accept_challenge_from=args.accept_challenge_from,
                 shutdown_file=shutdown_file,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
@@ -1841,6 +1867,9 @@ def main() -> None:
                 args.format,
                 args.username,
                 server_uri,
+                challenge_target=args.challenge_target,
+                accept_challenges=bool(args.accept_challenges),
+                accept_challenge_from=args.accept_challenge_from,
                 shutdown_file=shutdown_file,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
@@ -1859,6 +1888,9 @@ def main() -> None:
                 args.format,
                 args.username,
                 server_uri,
+                challenge_target=args.challenge_target,
+                accept_challenges=bool(args.accept_challenges),
+                accept_challenge_from=args.accept_challenge_from,
                 shutdown_file=shutdown_file,
                 max_games=max_games,
                 reconnect_seconds=args.reconnect_seconds,
