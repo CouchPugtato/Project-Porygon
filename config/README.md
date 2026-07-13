@@ -17,6 +17,9 @@ Files:
   - consumed by `py/tools/train_batch_selfplay.py` before CLI args are applied
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
   - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
+- `reward_weights.toml`
+  - human-readable source-of-truth for current reward weights and examples
+  - not auto-loaded by the trainer today
 
 Example:
 
@@ -64,6 +67,17 @@ matches/runs/run_0013_random_pool/worker_000_a_raw.jsonl
 ```
 
 `--server-uri <ws://...>` overrides the websocket endpoint directly. If omitted, the communicator falls back to `PS_URI`, then `PS_SERVER`, then the public default server.
+
+### Reward weights
+
+`config/reward_weights.toml` documents the current reward stack:
+
+- terminal rewards
+- dense additive shaping weights
+- per-request reward clip
+- a few example event-to-reward mappings
+
+It is intended to make the current training incentives explicit without reading C/Python source.
 
 `--reconnect-seconds <n>` controls how long the communicator waits before reconnecting after an unexpected websocket/network drop.
 
