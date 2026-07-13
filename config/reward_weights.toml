@@ -1,53 +1,8 @@
-# Reward and shaping constants used by the current training setup.
-# This file is documentation/source-of-truth for humans.
-# It is not auto-loaded by the trainer binaries today.
+terminal_win = 1.0
+terminal_loss = -1.0
+terminal_draw = 0.0
+terminal_disconnect_or_forfeit = 0.0
 
-[terminal]
-# Final battle result reward for a clean earned win.
-win = 1.0
-
-# Final battle result reward for a clean loss.
-loss = -1.0
-
-# Final battle result reward for a tie/draw.
-draw = 0.0
-
-# Terminal reward used when the battle ended through disconnect/forfeit flow.
-# The communicator keeps the win/loss label but zeroes the reward.
-disconnect_or_forfeit = 0.0
-
-[dense_additive]
-# Weight applied to net HP-fraction swing per request:
-#   opponent_hp_loss - self_hp_loss
-hp_swing_weight = 0.30
-
-# Weight applied to net faint swing per request:
-#   opponent_faints_gained - self_faints_gained
-faint_swing_weight = 0.40
-
-# Per-request clip applied after dense reward is computed.
-reward_clip = 0.75
-
-[dense_additive.examples]
-# Approximate dense reward if you KO one opponent from full and take no damage.
-ko_one_opponent_from_full = 0.70
-
-# Approximate dense reward if one of your mons is KO'd from full and you deal no damage.
-lose_one_mon_from_full = -0.70
-
-# Approximate dense reward if you deal 50% HP and take no damage.
-deal_half_hp_no_damage_taken = 0.15
-
-# Approximate dense reward if both sides trade equal HP damage.
-equal_hp_trade = 0.0
-
-# Approximate dense reward if both sides trade one faint and no other HP delta matters.
-equal_faint_trade = 0.0
-
-[relative_priority]
-# Relative interpretation of the current reward stack.
-# Terminal reward is larger than any single clipped dense request reward.
-terminal_vs_dense_clip = "terminal reward (1.0) is larger than max per-request dense reward (0.75)"
-
-# A single faint swing is currently weighted more strongly than a full-team HP-fraction swing of 1.0.
-faint_vs_full_hp_swing = "one faint swing (0.40) is about 1.33x a full 1.0 HP-fraction swing (0.30)"
+dense_additive_hp_swing_weight = 0.10 # Weight applied to net HP-fraction swing per request: opponent_hp_loss - self_hp_loss
+dense_additive_faint_swing_weight = 0.25 # Weight applied to net faint swing per request: opponent_faints_gained - self_faints_gained
+dense_additive_reward_clip = 0.40 # Per-request clip applied after dense reward is computed

@@ -18,6 +18,15 @@
 #endif
 
 #define SHOWDOWN_CLIENT_DEFAULT_ARGS_PATH "config/showdown_client.toml"
+#define SHOWDOWN_CLIENT_REWARD_CONFIG_PATH "config/reward_weights.toml"
+
+typedef struct {
+    float terminal_win;
+    float terminal_loss;
+    float terminal_draw;
+    float terminal_disconnect_or_forfeit;
+    EnvDenseRewardConfig dense_additive;
+} RewardConfig;
 
 static GruModel* create_default_model(void) {
     return gru_model_create(observation_flat_size(), 128, OBS_NUM_ACTIONS);
@@ -322,6 +331,111 @@ static void free_default_args(char** args, int argc) {
         free(args[i]);
     }
     free(args);
+}
+
+static void reward_config_defaults(RewardConfig* config) {
+    if (!config) {
+        return;
+    }
+    config->terminal_win = 1.0f;
+    config->terminal_loss = -1.0f;
+    config->terminal_draw = 0.0f;
+    config->terminal_disconnect_or_forfeit = 0.0f;
+    config->dense_additive.hp_swing_weight = 0.10f;
+    config->dense_additive.faint_swing_weight = 0.25f;
+    config->dense_additive.reward_clip = 0.40f;
+}
+
+static int assign_reward_config_value(RewardConfig* config, const char* key, const char* value_text) {
+    float value;
+    char* endptr = NULL;
+    if (!config || !key || !value_text) {
+        return 0;
+    }
+    value = strtof(value_text, &endptr);
+    if (endptr == value_text || (endptr && *trim_whitespace(endptr) != '\0')) {
+        return 0;
+    }
+    if (strcmp(key, "terminal_win") == 0) {
+        config->terminal_win = value;
+        return 1;
+    }
+    if (strcmp(key, "terminal_loss") == 0) {
+        config->terminal_loss = value;
+        return 1;
+    }
+    if (strcmp(key, "terminal_draw") == 0) {
+        config->terminal_draw = value;
+        return 1;
+    }
+    if (strcmp(key, "terminal_disconnect_or_forfeit") == 0) {
+        config->terminal_disconnect_or_forfeit = value;
+        return 1;
+    }
+    if (strcmp(key, "dense_additive_hp_swing_weight") == 0) {
+        config->dense_additive.hp_swing_weight = value;
+        return 1;
+    }
+    if (strcmp(key, "dense_additive_faint_swing_weight") == 0) {
+        config->dense_additive.faint_swing_weight = value;
+        return 1;
+    }
+    if (strcmp(key, "dense_additive_reward_clip") == 0) {
+        config->dense_additive.reward_clip = value;
+        return 1;
+    }
+    return 1;
+}
+
+static int load_reward_config_file(const char* path, RewardConfig* out_config) {
+    FILE* fp;
+    char line[1024];
+    int line_number = 0;
+    if (!out_config) {
+        return 0;
+    }
+    reward_config_defaults(out_config);
+    if (!path) {
+        return 1;
+    }
+    fp = fopen(path, "r");
+    if (!fp) {
+        return 1;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        char* comment = strchr(line, '#');
+        char* key;
+        char* value;
+        line_number += 1;
+        if (comment) {
+            *comment = '\0';
+        }
+        key = trim_whitespace(line);
+        if (!key || !*key) {
+            continue;
+        }
+        value = strchr(key, '=');
+        if (!value) {
+            fclose(fp);
+            fprintf(stderr, "invalid reward config %s:%d: expected key = value\n", path, line_number);
+            return 0;
+        }
+        *value++ = '\0';
+        key = trim_whitespace(key);
+        value = trim_whitespace(value);
+        if (!key || !*key || !value || !*value) {
+            fclose(fp);
+            fprintf(stderr, "invalid reward config %s:%d: empty key or value\n", path, line_number);
+            return 0;
+        }
+        if (!assign_reward_config_value(out_config, key, value)) {
+            fclose(fp);
+            fprintf(stderr, "invalid reward config %s:%d: bad value for %s\n", path, line_number, key);
+            return 0;
+        }
+    }
+    fclose(fp);
+    return 1;
 }
 
 static int parse_epochs_arg(int argc, char** argv, int default_epochs) {
@@ -686,7 +800,8 @@ static int load_runtime_from_replay_file(
     const char* replay_path,
     GruModel* model,
     EnvRuntime* runtime,
-    EnvRewardMode reward_mode
+    EnvRewardMode reward_mode,
+    const EnvDenseRewardConfig* dense_reward_config
 ) {
     FILE* f;
     char line[16384];
@@ -703,7 +818,7 @@ static int load_runtime_from_replay_file(
         fprintf(stderr, "Failed to open replay file '%s': %s\n", replay_path, strerror(errno));
         return 0;
     }
-    if (!env_runtime_init(runtime, model, NULL, 1, reward_mode)) {
+    if (!env_runtime_init(runtime, model, NULL, 1, reward_mode, dense_reward_config)) {
         fclose(f);
         return 0;
     }
@@ -1271,7 +1386,7 @@ static int export_battle_snapshots(const char* replay_path, const char* battle_i
         fprintf(stderr, "Failed to create model for battle export\n");
         return 1;
     }
-    if (!env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_TERMINAL)) {
+    if (!env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_TERMINAL, NULL)) {
         fprintf(stderr, "Failed to initialize runtime for battle export\n");
         gru_model_destroy(model);
         return 1;
@@ -1371,7 +1486,11 @@ static int export_battle_snapshots(const char* replay_path, const char* battle_i
     return 0;
 }
 
-static int evaluate_checkpoint_on_replay_file(const char* replay_path, const char* checkpoint_path) {
+static int evaluate_checkpoint_on_replay_file(
+    const char* replay_path,
+    const char* checkpoint_path,
+    const RewardConfig* reward_config
+) {
     char* resolved_checkpoint_path = NULL;
     GruModel* model = NULL;
     GruTrainer trainer;
@@ -1416,7 +1535,12 @@ static int evaluate_checkpoint_on_replay_file(const char* replay_path, const cha
         checkpoint_state.seed);
     trainer.step = checkpoint_state.step;
 
-    if (!load_runtime_from_replay_file(replay_path, model, &runtime, ENV_REWARD_TERMINAL)) {
+    if (!load_runtime_from_replay_file(
+            replay_path,
+            model,
+            &runtime,
+            ENV_REWARD_TERMINAL,
+            reward_config ? &reward_config->dense_additive : NULL)) {
         gru_model_destroy(model);
         free(resolved_checkpoint_path);
         return 1;
@@ -1574,7 +1698,7 @@ static int run_runtime_mode(const char* checkpoint_path) {
     if (replay_path && *replay_path) {
         replay_file = fopen(replay_path, "a");
     }
-    if (!env_runtime_init(&runtime, model, replay_file, 0, ENV_REWARD_TERMINAL)) {
+    if (!env_runtime_init(&runtime, model, replay_file, 0, ENV_REWARD_TERMINAL, NULL)) {
         fprintf(stderr, "Failed to initialize runtime\n");
         fclose(replay_file);
         gru_model_destroy(model);
@@ -1620,7 +1744,8 @@ static int train_from_replay_file(
     float rl_gamma,
     float rl_entropy_coef,
     int rl_advantage_norm,
-    const char* rl_reward_mode
+    const char* rl_reward_mode,
+    const RewardConfig* reward_config
 ) {
     char* resolved_checkpoint_path = NULL;
     GruModel* model = NULL;
@@ -1685,7 +1810,12 @@ static int train_from_replay_file(
         trainer.advantage_norm = rl_advantage_norm ? 1 : 0;
     }
 
-    if (!load_runtime_from_replay_file(replay_path, model, &runtime, reward_mode)) {
+    if (!load_runtime_from_replay_file(
+            replay_path,
+            model,
+            &runtime,
+            reward_mode,
+            reward_config ? &reward_config->dense_additive : NULL)) {
         gru_model_destroy(model);
         free(resolved_checkpoint_path);
         return 1;
@@ -1985,7 +2115,11 @@ static int showdown_client_main(int argc, char** argv) {
     float rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef", 0.001f);
     int rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", 1);
     const char* rl_reward_mode = parse_string_flag(argc, argv, "--reward-mode", "terminal");
+    RewardConfig reward_config;
     srand((unsigned int)time(NULL));
+    if (!load_reward_config_file(SHOWDOWN_CLIENT_REWARD_CONFIG_PATH, &reward_config)) {
+        return 1;
+    }
     if (!id_tables_init()) {
         fprintf(stderr, "Failed to initialize ID tables\n");
         return 1;
@@ -1997,13 +2131,31 @@ static int showdown_client_main(int argc, char** argv) {
         return run_runtime_mode(argc >= 3 ? argv[2] : NULL);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-supervised") == 0) {
-        return train_from_replay_file(argv[2], argv[3], 0, epochs, rl_gamma, rl_entropy_coef, rl_advantage_norm, rl_reward_mode);
+        return train_from_replay_file(
+            argv[2],
+            argv[3],
+            0,
+            epochs,
+            rl_gamma,
+            rl_entropy_coef,
+            rl_advantage_norm,
+            rl_reward_mode,
+            &reward_config);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-rl") == 0) {
-        return train_from_replay_file(argv[2], argv[3], 1, epochs, rl_gamma, rl_entropy_coef, rl_advantage_norm, rl_reward_mode);
+        return train_from_replay_file(
+            argv[2],
+            argv[3],
+            1,
+            epochs,
+            rl_gamma,
+            rl_entropy_coef,
+            rl_advantage_norm,
+            rl_reward_mode,
+            &reward_config);
     }
     if (argc >= 4 && strcmp(argv[1], "--eval-supervised") == 0) {
-        return evaluate_checkpoint_on_replay_file(argv[2], argv[3]);
+        return evaluate_checkpoint_on_replay_file(argv[2], argv[3], &reward_config);
     }
     if (argc >= 4 && strcmp(argv[1], "--clean-replay") == 0) {
         return clean_replay_file(argv[2], argv[3]);

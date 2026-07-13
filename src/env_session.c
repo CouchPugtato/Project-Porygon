@@ -7,9 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ENV_DENSE_HP_SWING_WEIGHT 0.30f
-#define ENV_DENSE_FAINT_SWING_WEIGHT 0.40f
-#define ENV_DENSE_REWARD_CLIP 0.75f
+#define ENV_DENSE_HP_SWING_WEIGHT_DEFAULT 0.10f
+#define ENV_DENSE_FAINT_SWING_WEIGHT_DEFAULT 0.25f
+#define ENV_DENSE_REWARD_CLIP_DEFAULT 0.40f
 
 typedef struct {
     float self_hp_frac_sum;
@@ -87,12 +87,12 @@ static int queue_prestart_message(EnvSession* session, const RuntimeMessage* msg
     return 1;
 }
 
-static float clamp_dense_reward(float reward) {
-    if (reward > ENV_DENSE_REWARD_CLIP) {
-        return ENV_DENSE_REWARD_CLIP;
+static float clamp_dense_reward(float reward, float reward_clip) {
+    if (reward > reward_clip) {
+        return reward_clip;
     }
-    if (reward < -ENV_DENSE_REWARD_CLIP) {
-        return -ENV_DENSE_REWARD_CLIP;
+    if (reward < -reward_clip) {
+        return -reward_clip;
     }
     return reward;
 }
@@ -119,7 +119,11 @@ static void compute_reward_snapshot(const RawBattleState* state, EnvRewardSnapsh
     }
 }
 
-static float compute_dense_reward_delta(const EnvRewardSnapshot* previous, const EnvRewardSnapshot* current) {
+static float compute_dense_reward_delta(
+    const EnvRewardSnapshot* previous,
+    const EnvRewardSnapshot* current,
+    const EnvDenseRewardConfig* dense_reward_config
+) {
     float opp_hp_loss;
     float self_hp_loss;
     int opp_faints_gained;
@@ -134,9 +138,9 @@ static float compute_dense_reward_delta(const EnvRewardSnapshot* previous, const
     opp_faints_gained = current->opp_fainted_count - previous->opp_fainted_count;
     self_faints_gained = current->self_fainted_count - previous->self_fainted_count;
     reward =
-        ENV_DENSE_HP_SWING_WEIGHT * (opp_hp_loss - self_hp_loss) +
-        ENV_DENSE_FAINT_SWING_WEIGHT * (float)(opp_faints_gained - self_faints_gained);
-    return clamp_dense_reward(reward);
+        dense_reward_config->hp_swing_weight * (opp_hp_loss - self_hp_loss) +
+        dense_reward_config->faint_swing_weight * (float)(opp_faints_gained - self_faints_gained);
+    return clamp_dense_reward(reward, dense_reward_config->reward_clip);
 }
 
 static float compute_request_reward(const EnvRuntime* runtime, const EnvSession* session) {
@@ -154,7 +158,7 @@ static float compute_request_reward(const EnvRuntime* runtime, const EnvSession*
     previous.opp_hp_frac_sum = session->prev_opp_hp_frac_sum;
     previous.self_fainted_count = session->prev_self_fainted_count;
     previous.opp_fainted_count = session->prev_opp_fainted_count;
-    return compute_dense_reward_delta(&previous, &current);
+    return compute_dense_reward_delta(&previous, &current, &runtime->dense_reward_config);
 }
 
 static void update_request_reward_snapshot(EnvSession* session) {
@@ -181,7 +185,14 @@ static void clear_request_reward_snapshot(EnvSession* session) {
     session->prev_opp_fainted_count = 0;
 }
 
-int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, int replay_only, EnvRewardMode reward_mode) {
+int env_runtime_init(
+    EnvRuntime* runtime,
+    GruModel* model,
+    FILE* replay_file,
+    int replay_only,
+    EnvRewardMode reward_mode,
+    const EnvDenseRewardConfig* dense_reward_config
+) {
     if (!runtime || !model) {
         return 0;
     }
@@ -191,6 +202,9 @@ int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, in
     runtime->replay_file = replay_file;
     runtime->replay_only = replay_only;
     runtime->reward_mode = reward_mode;
+    runtime->dense_reward_config.hp_swing_weight = dense_reward_config ? dense_reward_config->hp_swing_weight : ENV_DENSE_HP_SWING_WEIGHT_DEFAULT;
+    runtime->dense_reward_config.faint_swing_weight = dense_reward_config ? dense_reward_config->faint_swing_weight : ENV_DENSE_FAINT_SWING_WEIGHT_DEFAULT;
+    runtime->dense_reward_config.reward_clip = dense_reward_config ? dense_reward_config->reward_clip : ENV_DENSE_REWARD_CLIP_DEFAULT;
     return 1;
 }
 

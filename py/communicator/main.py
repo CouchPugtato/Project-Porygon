@@ -36,6 +36,7 @@ THINK_DELAY_MAX_SECONDS = 5.0
 FALLBACK_DELAY_MIN_SECONDS = 0.4
 FALLBACK_DELAY_MAX_SECONDS = 1.2
 DEFAULT_ARGS_PATH = Path("config/communicator.toml")
+DEFAULT_REWARD_WEIGHTS_PATH = Path("config/reward_weights.toml")
 DEFAULT_RECONNECT_SECONDS = 5.0
 DEFAULT_LEARNER_COMMAND = r".\build-fresh\showdown_client.exe"
 DEFAULT_GUEST_REFRESH_SECONDS = 0.0
@@ -84,6 +85,39 @@ def load_default_args(path: Path) -> list[str]:
             value = value_text
         args.extend([flag, value])
     return args
+
+
+def load_flat_toml_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise SystemExit(f"invalid config {path}:{line_number}: expected key = value")
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip()
+        value_text = raw_value.strip()
+        if not key:
+            raise SystemExit(f"invalid config {path}:{line_number}: empty key")
+        if len(value_text) >= 2 and value_text[0] == '"' and value_text[-1] == '"':
+            value = bytes(value_text[1:-1], "utf-8").decode("unicode_escape")
+        else:
+            value = value_text
+        values[key] = value
+    return values
+
+
+def reward_float(config: dict[str, str], key: str, default: float) -> float:
+    raw_value = config.get(key)
+    if raw_value is None or raw_value == "":
+        return default
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise SystemExit(f"invalid reward config {key}={raw_value!r}") from exc
 
 
 def resolve_replay_save_path(run_name: str) -> Path:
@@ -983,6 +1017,11 @@ async def random_mode(
     guest_refresh_seconds: float = DEFAULT_GUEST_REFRESH_SECONDS,
 ) -> None:
     gateway: ShowdownGateway | None = None
+    reward_config = load_flat_toml_values(DEFAULT_REWARD_WEIGHTS_PATH)
+    reward_win = reward_float(reward_config, "terminal_win", 1.0)
+    reward_loss = reward_float(reward_config, "terminal_loss", -1.0)
+    reward_draw = reward_float(reward_config, "terminal_draw", 0.0)
+    reward_disconnect_or_forfeit = reward_float(reward_config, "terminal_disconnect_or_forfeit", 0.0)
     writer = BufferedReplayWriter(replay_path)
     stats = MatchStats(replay_path)
     seq = 0
@@ -1182,16 +1221,16 @@ async def random_mode(
             bot_rating = ratings.get(bot_side)
             if event.line.startswith("|tie|"):
                 final_result = "draw"
-                reward = 0.0
+                reward = reward_draw
             elif bot_side is not None and players.get(bot_side) == winner_name:
                 final_result = "win"
-                reward = 1.0
+                reward = reward_win
             else:
                 final_result = "loss"
-                reward = -1.0
+                reward = reward_loss
             disconnected_or_forfeited = disconnect_or_forfeit_end.get(event.room_id, False)
             if disconnected_or_forfeited:
-                reward = 0.0
+                reward = reward_disconnect_or_forfeit
             writer.append(event.room_id, terminal_message(event.room_id, final_result, reward).to_json())
             writer.append(event.room_id, battle_end(event.room_id).to_json())
             writer.commit_battle(event.room_id)
@@ -1305,6 +1344,11 @@ async def live_mode(
 ) -> None:
     gateway: ShowdownGateway | None = None
     learner: LearnerProcess | None = None
+    reward_config = load_flat_toml_values(DEFAULT_REWARD_WEIGHTS_PATH)
+    reward_win = reward_float(reward_config, "terminal_win", 1.0)
+    reward_loss = reward_float(reward_config, "terminal_loss", -1.0)
+    reward_draw = reward_float(reward_config, "terminal_draw", 0.0)
+    reward_disconnect_or_forfeit = reward_float(reward_config, "terminal_disconnect_or_forfeit", 0.0)
     writer = BufferedReplayWriter(replay_path) if replay_path is not None else None
     stats = MatchStats(replay_path or Path("matches/runtime_capture.jsonl"))
     seq = 0
@@ -1600,16 +1644,16 @@ async def live_mode(
             bot_rating = ratings.get(bot_side)
             if event.line.startswith("|tie|"):
                 final_result = "draw"
-                reward = 0.0
+                reward = reward_draw
             elif bot_side is not None and players.get(bot_side) == winner_name:
                 final_result = "win"
-                reward = 1.0
+                reward = reward_win
             else:
                 final_result = "loss"
-                reward = -1.0
+                reward = reward_loss
             disconnected_or_forfeited = disconnect_or_forfeit_end.get(event.room_id, False)
             if disconnected_or_forfeited:
-                reward = 0.0
+                reward = reward_disconnect_or_forfeit
             if writer is not None:
                 writer.append(event.room_id, terminal_message(event.room_id, final_result, reward).to_json())
                 writer.append(event.room_id, battle_end(event.room_id).to_json())

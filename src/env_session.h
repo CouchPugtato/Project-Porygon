@@ -19,6 +19,12 @@ typedef enum {
 } EnvRewardMode;
 
 typedef struct {
+    float hp_swing_weight;
+    float faint_swing_weight;
+    float reward_clip;
+} EnvDenseRewardConfig;
+
+typedef struct {
     char battle_id[RUNTIME_BATTLE_ID_LEN];
     RawBattleState raw_state;
     Observation observation;
@@ -52,12 +58,20 @@ typedef struct {
     FILE* replay_file;
     int replay_only;
     EnvRewardMode reward_mode;
+    EnvDenseRewardConfig dense_reward_config;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;
 } EnvRuntime;
 
-int env_runtime_init(EnvRuntime* runtime, GruModel* model, FILE* replay_file, int replay_only, EnvRewardMode reward_mode);
+int env_runtime_init(
+    EnvRuntime* runtime,
+    GruModel* model,
+    FILE* replay_file,
+    int replay_only,
+    EnvRewardMode reward_mode,
+    const EnvDenseRewardConfig* dense_reward_config
+);
 void env_runtime_free(EnvRuntime* runtime);
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);
 

@@ -18,8 +18,7 @@ Files:
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
   - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
 - `reward_weights.toml`
-  - human-readable source-of-truth for current reward weights and examples
-  - not auto-loaded by the trainer today
+  - runtime-loaded by both `showdown_client` and `py/communicator/main.py`
 
 Example:
 
@@ -70,14 +69,30 @@ matches/runs/run_0013_random_pool/worker_000_a_raw.jsonl
 
 ### Reward weights
 
-`config/reward_weights.toml` documents the current reward stack:
+`config/reward_weights.toml` is a runtime-loaded declarative config for:
 
 - terminal rewards
 - dense additive shaping weights
 - per-request reward clip
-- a few example event-to-reward mappings
 
-It is intended to make the current training incentives explicit without reading C/Python source.
+Current keys:
+
+```toml
+terminal_win = 1.0
+terminal_loss = -1.0
+terminal_draw = 0.0
+terminal_disconnect_or_forfeit = 0.0
+
+dense_additive_hp_swing_weight = 0.10
+dense_additive_faint_swing_weight = 0.25
+dense_additive_reward_clip = 0.40
+```
+
+Notes:
+
+- `py/communicator/main.py` reads the terminal reward keys when writing replay terminal records
+- `showdown_client` reads the dense additive keys when reconstructing RL rewards from replay
+- keep this file flat and declarative; do not put inferred ratios, examples, or derived commentary into the config itself
 
 `--reconnect-seconds <n>` controls how long the communicator waits before reconnecting after an unexpected websocket/network drop.
 
