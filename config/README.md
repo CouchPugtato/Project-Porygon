@@ -145,6 +145,20 @@ python py/tools/replay_diagnose.py --glob "matches/runs/run_0050_g1_best_loss_re
 python py/tools/replay_diagnose.py --run run_0050_g1_best_loss_review --side a --include-outcomes loss --sample-losses 15
 ```
 
+For reduced-board / post-faint curriculum extraction:
+
+- `py/tools/replay_extract_postfaint.py` copies full battles into a new run folder when the selected side encounters:
+  - a `forceSwitch` request, or
+  - a request with fewer than two active mons
+- it keeps the whole battle so the existing trainer can still reconstruct state from the start of the replay
+
+Examples:
+
+```powershell
+python py/tools/replay_extract_postfaint.py --run run_0050_g1_best_loss_review --output-run run_0050_g1_best_postfaint --side a
+python py/tools/train_batch_selfplay.py --run run_0050_g1_best_postfaint --mode supervised --pattern "worker_*_a_raw.jsonl" --checkpoint g1_best_postfaint_sup.chk --epochs 1
+```
+
 ### League registry workflow
 
 `py/tools/league_manage.py` manages a filesystem-backed checkpoint league and emits pool JSON files for `selfplay_server.py`.

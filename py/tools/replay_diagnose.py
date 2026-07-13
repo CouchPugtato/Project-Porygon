@@ -46,6 +46,7 @@ class BattleRecord:
     actions_taken: list[ActionRecord] = field(default_factory=list)
     actions_rejected: list[ActionRecord] = field(default_factory=list)
     events: list[EventRecord] = field(default_factory=list)
+    timeline: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -250,6 +251,28 @@ def battle_bucket(length: int) -> str:
     return "long"
 
 
+def request_has_force_switch(payload: dict[str, Any]) -> bool:
+    raw = payload.get("forceSwitch")
+    if isinstance(raw, list):
+        return any(bool(value) for value in raw)
+    return bool(raw)
+
+
+def request_active_len(payload: dict[str, Any]) -> int:
+    active = payload.get("active")
+    if isinstance(active, list):
+        return len(active)
+    return 0
+
+
+def self_faint_event(line: str, side: str) -> bool:
+    text = str(line or "")
+    if not text.startswith("|faint|"):
+        return False
+    self_prefix = "p1" if side == "a" else "p2"
+    return f"|faint|{self_prefix}" in text
+
+
 def load_battles(files: list[Path]) -> tuple[dict[str, BattleRecord], dict[str, Any]]:
     battles: dict[str, BattleRecord] = {}
     warnings: dict[str, Any] = {
@@ -279,12 +302,14 @@ def load_battles(files: list[Path]) -> tuple[dict[str, BattleRecord], dict[str, 
                 battle.source_files.add(path.name)
                 record_type = str(payload.get("type") or payload.get("message_type") or "").strip().lower()
                 if record_type == "request":
+                    request_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
                     battle.requests.append(
                         RequestRecord(
                             request_id=payload.get("request_id"),
-                            payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
+                            payload=request_payload,
                         )
                     )
+                    battle.timeline.append({"type": "request", "request_id": payload.get("request_id"), "payload": request_payload})
                 elif record_type == "action_taken":
                     command = str(payload.get("command") or "")
                     if not command.strip():
@@ -298,6 +323,7 @@ def load_battles(files: list[Path]) -> tuple[dict[str, BattleRecord], dict[str, 
                             accepted=True,
                         )
                     )
+                    battle.timeline.append({"type": "action_taken", "request_id": payload.get("request_id"), "command": command})
                 elif record_type == "action_rejected":
                     command = str(payload.get("command") or "")
                     if not command.strip():
@@ -312,9 +338,12 @@ def load_battles(files: list[Path]) -> tuple[dict[str, BattleRecord], dict[str, 
                         )
                     )
                 elif record_type == "event":
-                    battle.events.append(EventRecord(seq=payload.get("seq"), line=str(payload.get("line") or "")))
+                    line_text = str(payload.get("line") or "")
+                    battle.events.append(EventRecord(seq=payload.get("seq"), line=line_text))
+                    battle.timeline.append({"type": "event", "line": line_text})
                 elif record_type == "terminal":
                     result = str(payload.get("result") or "").strip().lower()
+                    battle.timeline.append({"type": "terminal", "result": result})
                     if battle.terminal_result is None:
                         battle.terminal_result = result
                         reward = payload.get("reward")
@@ -324,8 +353,9 @@ def load_battles(files: list[Path]) -> tuple[dict[str, BattleRecord], dict[str, 
     return battles, warnings
 
 
-def collect_battle_features(battle: BattleRecord) -> dict[str, Any]:
+def collect_battle_features(battle: BattleRecord, side: str) -> dict[str, Any]:
     parsed_actions = [parse_choose_command(record.command) for record in battle.actions_taken]
+    request_by_id = {request.request_id: request for request in battle.requests if request.request_id is not None}
     request_count = len(battle.requests)
     accepted_action_count = len(battle.actions_taken)
     rejected_action_count = len(battle.actions_rejected)
@@ -348,6 +378,12 @@ def collect_battle_features(battle: BattleRecord) -> dict[str, Any]:
     tera_action_index: int | None = None
     repeated_command_transitions = 0
     forced_switch_turns = 0
+    force_switch_request_count = 0
+    reduced_active_request_count = 0
+    first_force_switch_action_index: int | None = None
+    fallback_within_one_turn_of_force_switch = False
+    fallback_within_one_turn_of_reduced_active = False
+    fallback_within_one_turn_of_self_faint = False
 
     late_idx = late_start_index(accepted_action_count)
     late_single_action_fallback = 0
@@ -355,9 +391,21 @@ def collect_battle_features(battle: BattleRecord) -> dict[str, Any]:
     late_actions = 0
     earlier_double_action_seen = False
     prior_command = None
+    previous_has_force_switch = False
+    previous_reduced_active = False
 
-    for index, parsed in enumerate(parsed_actions, start=1):
+    for index, (record, parsed) in enumerate(zip(battle.actions_taken, parsed_actions), start=1):
         parts = parsed.parts
+        request = request_by_id.get(record.request_id)
+        request_payload = request.payload if request is not None else {}
+        has_force_switch = request_has_force_switch(request_payload)
+        active_len = request_active_len(request_payload)
+        if has_force_switch:
+            force_switch_request_count += 1
+            if first_force_switch_action_index is None:
+                first_force_switch_action_index = index
+        if active_len > 0 and active_len < 2:
+            reduced_active_request_count += 1
         if prior_command is not None and parsed.raw.strip() == prior_command:
             repeated_command_transitions += 1
         prior_command = parsed.raw.strip()
@@ -420,9 +468,15 @@ def collect_battle_features(battle: BattleRecord) -> dict[str, Any]:
             late_actions += 1
             if earlier_double_action_seen and len(move_parts) == 1 and not switch_parts:
                 late_single_action_fallback += 1
+                if has_force_switch or previous_has_force_switch:
+                    fallback_within_one_turn_of_force_switch = True
+                if (active_len > 0 and active_len < 2) or previous_reduced_active:
+                    fallback_within_one_turn_of_reduced_active = True
             for part in switch_parts:
                 if part.switch_slot == 6:
                     late_slot6_switch_count += 1
+        previous_has_force_switch = has_force_switch
+        previous_reduced_active = active_len > 0 and active_len < 2
 
     tera_timing = "none"
     if tera_action_index is not None:
@@ -455,6 +509,47 @@ def collect_battle_features(battle: BattleRecord) -> dict[str, Any]:
         flags.append("long_collapse")
     if late_single_action_rate > 0.25:
         flags.append("late_single_action_fallback")
+    if fallback_within_one_turn_of_force_switch:
+        flags.append("fallback_after_force_switch")
+
+    action_index = 0
+    seen_double = False
+    force_switch_window = 0
+    reduced_active_window = 0
+    self_faint_window = 0
+    for entry in battle.timeline:
+        entry_type = entry.get("type")
+        if entry_type == "request":
+            payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+            if request_has_force_switch(payload):
+                force_switch_window = max(force_switch_window, 2)
+            active_len = request_active_len(payload)
+            if active_len > 0 and active_len < 2:
+                reduced_active_window = max(reduced_active_window, 2)
+        elif entry_type == "event":
+            if self_faint_event(str(entry.get("line") or ""), side):
+                self_faint_window = max(self_faint_window, 2)
+        elif entry_type == "action_taken":
+            action_index += 1
+            parsed = parse_choose_command(str(entry.get("command") or ""))
+            parts = parsed.parts
+            move_parts = [part for part in parts if part.kind == "move"]
+            switch_parts = [part for part in parts if part.kind == "switch"]
+            if len([part for part in parts if part.kind in {"move", "switch", "pass"}]) >= 2:
+                seen_double = True
+            is_late_fallback = action_index > late_idx and seen_double and len(move_parts) == 1 and not switch_parts
+            if is_late_fallback:
+                if force_switch_window > 0:
+                    fallback_within_one_turn_of_force_switch = True
+                if reduced_active_window > 0:
+                    fallback_within_one_turn_of_reduced_active = True
+                if self_faint_window > 0:
+                    fallback_within_one_turn_of_self_faint = True
+            force_switch_window = max(0, force_switch_window - 1)
+            reduced_active_window = max(0, reduced_active_window - 1)
+            self_faint_window = max(0, self_faint_window - 1)
+    if fallback_within_one_turn_of_self_faint:
+        flags.append("fallback_after_self_faint")
 
     return {
         "battle_id": battle.battle_id,
@@ -491,12 +586,18 @@ def collect_battle_features(battle: BattleRecord) -> dict[str, Any]:
         "late_slot6_switch_count": late_slot6_switch_count,
         "late_slot6_switch_rate": late_slot6_switch_rate,
         "forced_switch_turns": forced_switch_turns,
+        "force_switch_request_count": force_switch_request_count,
+        "reduced_active_request_count": reduced_active_request_count,
+        "first_force_switch_action_index": first_force_switch_action_index,
         "slot6_switch_rate": slot6_switch_rate,
         "target_foe1_rate": target_foe1_rate,
         "target_foe2_rate": target_foe2_rate,
         "ally_target_rate": ally_target_rate,
         "no_target_rate": no_target_rate,
         "battle_length_bucket": battle_bucket(accepted_action_count),
+        "fallback_within_one_turn_of_force_switch": fallback_within_one_turn_of_force_switch,
+        "fallback_within_one_turn_of_reduced_active": fallback_within_one_turn_of_reduced_active,
+        "fallback_within_one_turn_of_self_faint": fallback_within_one_turn_of_self_faint,
         "reason_flags": flags,
     }
 
@@ -525,12 +626,17 @@ def aggregate_outcome(features: list[dict[str, Any]]) -> dict[str, Any]:
     total_self_target_moves = 0
     total_no_target_moves = 0
     total_forced_switch_turns = 0
+    total_force_switch_requests = 0
+    total_reduced_active_requests = 0
 
     tera_used_battles = 0
     tera_action_indices: list[int] = []
     repeated_command_rates: list[float] = []
     late_single_action_rates: list[float] = []
     target_foe1_rates: list[float] = []
+    fallback_after_force_switch_count = 0
+    fallback_after_reduced_active_count = 0
+    fallback_after_self_faint_count = 0
     flagged_counts = Counter()
 
     for feature in features:
@@ -552,6 +658,8 @@ def aggregate_outcome(features: list[dict[str, Any]]) -> dict[str, Any]:
         total_self_target_moves += int(feature["self_target_move_count"])
         total_no_target_moves += int(feature["no_target_move_count"])
         total_forced_switch_turns += int(feature["forced_switch_turns"])
+        total_force_switch_requests += int(feature["force_switch_request_count"])
+        total_reduced_active_requests += int(feature["reduced_active_request_count"])
         if feature["tera_used"]:
             tera_used_battles += 1
         if feature["tera_action_index"] is not None:
@@ -559,6 +667,12 @@ def aggregate_outcome(features: list[dict[str, Any]]) -> dict[str, Any]:
         repeated_command_rates.append(float(feature["repeated_command_rate"]))
         late_single_action_rates.append(float(feature["late_single_action_rate"]))
         target_foe1_rates.append(float(feature["target_foe1_rate"]))
+        if feature["fallback_within_one_turn_of_force_switch"]:
+            fallback_after_force_switch_count += 1
+        if feature["fallback_within_one_turn_of_reduced_active"]:
+            fallback_after_reduced_active_count += 1
+        if feature["fallback_within_one_turn_of_self_faint"]:
+            fallback_after_self_faint_count += 1
         flagged_counts.update(feature["reason_flags"])
 
     move_slot_rates = {slot: safe_rate(count, total_moves) for slot, count in sorted(move_slot_counts.items())}
@@ -574,11 +688,16 @@ def aggregate_outcome(features: list[dict[str, Any]]) -> dict[str, Any]:
     }
     forced_switch = {
         "forced_switch_turns": total_forced_switch_turns,
+        "force_switch_request_count": total_force_switch_requests,
+        "reduced_active_request_count": total_reduced_active_requests,
         "pure_switch_rate": safe_rate(total_pure_switch_turns, total_forced_switch_turns),
         "pass_switch_rate": safe_rate(total_pass_switch_turns, total_forced_switch_turns),
         "move_switch_rate": safe_rate(total_move_switch_turns, total_forced_switch_turns),
         "slot6_rate": safe_rate(switch_slot_counts.get("slot_6", 0), total_switches),
         "switch_concentration": max(switch_slot_rates.values(), default=0.0),
+        "fallback_within_one_turn_of_force_switch_rate": safe_rate(fallback_after_force_switch_count, battle_count),
+        "fallback_within_one_turn_of_reduced_active_rate": safe_rate(fallback_after_reduced_active_count, battle_count),
+        "fallback_within_one_turn_of_self_faint_rate": safe_rate(fallback_after_self_faint_count, battle_count),
     }
     tera = {
         "tera_rate": safe_rate(tera_used_battles, battle_count),
@@ -601,6 +720,9 @@ def aggregate_outcome(features: list[dict[str, Any]]) -> dict[str, Any]:
         "repeated_foe1_bias": sum(target_foe1_rates) / battle_count if battle_count else 0.0,
         "early_tera_rate": tera["early_tera_rate"],
         "pass_switch_rate": forced_switch["pass_switch_rate"],
+        "fallback_within_one_turn_of_force_switch_rate": forced_switch["fallback_within_one_turn_of_force_switch_rate"],
+        "fallback_within_one_turn_of_reduced_active_rate": forced_switch["fallback_within_one_turn_of_reduced_active_rate"],
+        "fallback_within_one_turn_of_self_faint_rate": forced_switch["fallback_within_one_turn_of_self_faint_rate"],
     }
     return {
         "battle_count": battle_count,
@@ -638,6 +760,9 @@ def build_comparisons(by_outcome: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "early_tera_rate": losses["tera"]["early_tera_rate"] - wins["tera"]["early_tera_rate"],
             "same_target_double_rate": losses["target_patterns"]["same_target_double_rate"] - wins["target_patterns"]["same_target_double_rate"],
             "late_single_action_fallback_rate": losses["loss_heuristics"]["late_single_action_fallback_rate"] - wins["loss_heuristics"]["late_single_action_fallback_rate"],
+            "fallback_within_one_turn_of_force_switch_rate": losses["loss_heuristics"]["fallback_within_one_turn_of_force_switch_rate"] - wins["loss_heuristics"]["fallback_within_one_turn_of_force_switch_rate"],
+            "fallback_within_one_turn_of_reduced_active_rate": losses["loss_heuristics"]["fallback_within_one_turn_of_reduced_active_rate"] - wins["loss_heuristics"]["fallback_within_one_turn_of_reduced_active_rate"],
+            "fallback_within_one_turn_of_self_faint_rate": losses["loss_heuristics"]["fallback_within_one_turn_of_self_faint_rate"] - wins["loss_heuristics"]["fallback_within_one_turn_of_self_faint_rate"],
         }
     }
 
@@ -707,7 +832,8 @@ def print_text_summary(summary: dict[str, Any], by_outcome: dict[str, dict[str, 
         print(
             "[replay_diagnose] forced_switch loss "
             f"slot6_rate={forced_switch.get('slot6_rate', 0.0):.2f} "
-            f"pass_switch_rate={forced_switch.get('pass_switch_rate', 0.0):.2f}",
+            f"pass_switch_rate={forced_switch.get('pass_switch_rate', 0.0):.2f} "
+            f"fallback_after_self_faint={forced_switch.get('fallback_within_one_turn_of_self_faint_rate', 0.0):.2f}",
             flush=True,
         )
     if representative_losses:
@@ -720,7 +846,7 @@ def print_text_summary(summary: dict[str, Any], by_outcome: dict[str, dict[str, 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    repo_root = Path.cwd()
+    repo_root = Path(__file__).resolve().parents[2]
     outcome_filter = parse_outcome_filter(args.include_outcomes)
     mode, files, output_path = resolve_input_files(args, repo_root)
     battles, warnings = load_battles(files)
@@ -739,7 +865,7 @@ def main() -> None:
             continue
         if battle.terminal_result not in outcome_filter:
             continue
-        usable_features.append(collect_battle_features(battle))
+        usable_features.append(collect_battle_features(battle, args.side))
 
     if len(usable_features) < args.min_battles:
         raise SystemExit(f"usable battles {len(usable_features)} is below --min-battles {args.min_battles}")
