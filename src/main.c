@@ -145,6 +145,13 @@ static double elapsed_seconds_since(clock_t start_clock) {
     return (double)(clock() - start_clock) / (double)CLOCKS_PER_SEC;
 }
 
+static double ema_update(double previous, double sample, double alpha) {
+    if (previous <= 0.0) {
+        return sample;
+    }
+    return (alpha * sample) + ((1.0 - alpha) * previous);
+}
+
 static char* trim_whitespace(char* text) {
     char* end;
     if (!text) {
@@ -1629,6 +1636,10 @@ static int train_from_replay_file(
     float best_val_action_loss = 0.0f;
     int has_best_val = 0;
     int epoch;
+    double train_eta_rate_ema = 0.0;
+    const double train_eta_alpha = 0.2;
+    const double train_eta_min_elapsed = 10.0;
+    const size_t train_eta_min_episodes = 5;
 
     if (!replay_path || !checkpoint_path || epochs <= 0) {
         return 1;
@@ -1751,7 +1762,14 @@ static int train_from_replay_file(
             {
                 double elapsed = elapsed_seconds_since(train_loop_start_clock);
                 double episodes_per_sec = elapsed > 0.0 ? (double)trained_in_epoch / elapsed : 0.0;
-                double eta = episodes_per_sec > 0.0 ? (double)(train_sessions - trained_in_epoch) / episodes_per_sec : 0.0;
+                double eta = 0.0;
+                int eta_ready = (elapsed >= train_eta_min_elapsed || trained_in_epoch >= train_eta_min_episodes);
+                if (episodes_per_sec > 0.0) {
+                    train_eta_rate_ema = ema_update(train_eta_rate_ema, episodes_per_sec, train_eta_alpha);
+                }
+                if (eta_ready && train_eta_rate_ema > 0.0) {
+                    eta = (double)(train_sessions - trained_in_epoch) / train_eta_rate_ema;
+                }
                 if (rl_mode) {
                     printf("[train-rl] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f mean_advantage=%.4f entropy=%.4f labels=%zu\n",
                         epoch,
@@ -1774,11 +1792,18 @@ static int train_from_replay_file(
                         trainer.last_value_loss,
                         trainer.last_accuracy);
                 }
-                printf("[train] epoch=%d elapsed=%.1fs episodes_per_sec=%.2f eta=%.1fs\n",
-                    epoch,
-                    elapsed,
-                    episodes_per_sec,
-                    eta);
+                if (eta_ready && train_eta_rate_ema > 0.0) {
+                    printf("[train] epoch=%d elapsed=%.1fs episodes_per_sec=%.2f eta=%.1fs\n",
+                        epoch,
+                        elapsed,
+                        train_eta_rate_ema,
+                        eta);
+                } else {
+                    printf("[train] epoch=%d elapsed=%.1fs episodes_per_sec=%.2f eta=estimating\n",
+                        epoch,
+                        elapsed,
+                        episodes_per_sec);
+                }
             }
             if (!rl_mode && ((trained_in_epoch % 500u) == 0u || trained_in_epoch == train_sessions)) {
                 TrainerCheckpointState periodic_state = gru_trainer_checkpoint_state(&trainer);

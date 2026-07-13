@@ -13,6 +13,12 @@ DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
 DEFAULT_ARGS_PATH = Path("config/train_batch_selfplay.toml")
 
 
+def ema_update(previous: float, sample: float, alpha: float) -> float:
+    if previous <= 0.0:
+        return sample
+    return (alpha * sample) + ((1.0 - alpha) * previous)
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -145,6 +151,10 @@ def main() -> None:
     )
 
     completed_files = 0
+    shard_rate_ema = 0.0
+    eta_alpha = 0.2
+    eta_min_elapsed = 30.0
+    eta_min_completed = 3
     planned_total_shards = (
         args.epochs * min(total_shards, args.sample_files)
         if args.sample_files > 0
@@ -180,15 +190,27 @@ def main() -> None:
             completed_files += 1
             shard_elapsed = time.monotonic() - shard_started_at
             total_elapsed = time.monotonic() - started_at
-            shards_per_minute = (completed_files * 60.0) / total_elapsed if total_elapsed > 0.0 else 0.0
+            shard_rate_sample = (completed_files / total_elapsed) if total_elapsed > 0.0 else 0.0
+            if shard_rate_sample > 0.0:
+                shard_rate_ema = ema_update(shard_rate_ema, shard_rate_sample, eta_alpha)
+            shards_per_minute = shard_rate_ema * 60.0 if shard_rate_ema > 0.0 else 0.0
             remaining_shards = planned_total_shards - completed_files
-            eta_seconds = remaining_shards / (completed_files / total_elapsed) if completed_files > 0 and total_elapsed > 0.0 else 0.0
-            print(
-                f"[train_batch_selfplay] shard complete elapsed={shard_elapsed:.1f}s "
-                f"overall={completed_files}/{planned_total_shards} "
-                f"shards_per_minute={shards_per_minute:.2f} eta_minutes={eta_seconds / 60.0:.1f}",
-                flush=True,
-            )
+            eta_ready = completed_files >= eta_min_completed or total_elapsed >= eta_min_elapsed
+            if eta_ready and shard_rate_ema > 0.0:
+                eta_seconds = remaining_shards / shard_rate_ema
+                print(
+                    f"[train_batch_selfplay] shard complete elapsed={shard_elapsed:.1f}s "
+                    f"overall={completed_files}/{planned_total_shards} "
+                    f"shards_per_minute={shards_per_minute:.2f} eta_minutes={eta_seconds / 60.0:.1f}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[train_batch_selfplay] shard complete elapsed={shard_elapsed:.1f}s "
+                    f"overall={completed_files}/{planned_total_shards} "
+                    f"shards_per_minute={shards_per_minute:.2f} eta_minutes=estimating",
+                    flush=True,
+                )
 
         epoch_elapsed = time.monotonic() - epoch_started_at
         print(
