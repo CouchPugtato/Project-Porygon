@@ -159,6 +159,19 @@ python py/tools/replay_extract_postfaint.py --run run_0050_g1_best_loss_review -
 python py/tools/train_batch_selfplay.py --run run_0050_g1_best_postfaint --mode supervised --pattern "worker_*_a_raw.jsonl" --checkpoint g1_best_postfaint_sup.chk --epochs 1
 ```
 
+For wins-only full-battle extraction:
+
+- `py/tools/replay_extract_wins.py` copies only full battles that ended in an earned `win` for the selected side
+- it excludes disconnect/forfeit wins by requiring terminal `reward > 0.0`
+- use this when you want a cleaner teacher-only supervised dataset without truncating battle context
+
+Example:
+
+```powershell
+python py/tools/replay_extract_wins.py --run run_0044_teacher_sup_pool_collect --output-run run_0044_teacher_sup_pool_collect_wins --side a
+python py/tools/train_batch_selfplay.py --run run_0044_teacher_sup_pool_collect_wins --mode supervised --pattern "worker_*_a_raw.jsonl" --checkpoint g1_teacher_sup_pool_wins_sup.chk --epochs 1
+```
+
 ### League registry workflow
 
 `py/tools/league_manage.py` manages a filesystem-backed checkpoint league and emits pool JSON files for `selfplay_server.py`.
