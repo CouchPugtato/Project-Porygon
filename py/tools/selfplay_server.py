@@ -704,7 +704,6 @@ class PoolOrchestrator:
         self._drain_started_at: float | None = None
         self._last_drain_progress_at: float | None = None
         self._shutdown_requested = False
-        self._wait_for_current_matches = False
         self._failed = False
         self._failure_reason = ""
         self._group_member_stats: dict[str, dict[str, dict[str, int]]] = {"a": {}, "b": {}}
@@ -920,7 +919,6 @@ class PoolOrchestrator:
         self._draining = True
         self._drain_started_at = time.monotonic()
         self._last_drain_progress_at = self._drain_started_at
-        self._wait_for_current_matches = reason == "ctrl+c"
         self.log(f"draining worker pool: {reason}")
         for worker in list(self.worker_processes.values()):
             await worker.request_stop()
@@ -1167,7 +1165,7 @@ class PoolOrchestrator:
                     if active_battles == 0:
                         for worker in self.worker_processes.values():
                             await worker.request_stop()
-                    if not self._wait_for_current_matches and drain_elapsed >= self.args.shutdown_grace_seconds:
+                    if drain_elapsed >= self.args.shutdown_grace_seconds:
                         self.log("shutdown grace expired; terminating remaining workers")
                         break
             await self._terminate_workers()
