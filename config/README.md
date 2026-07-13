@@ -117,6 +117,34 @@ python py/tools/selfplay_server.py --run-name run_pool_test --games 100 --concur
 python py/tools/selfplay_server.py --run-name run_pool_vs_pool --games 100 --concurrent-games 8 --model-a-pool config/pools/a_pool.json --model-b-pool config/pools/b_pool.json --pool-seed 123
 ```
 
+### Replay diagnostics
+
+`py/tools/replay_diagnose.py` analyzes replay JSONLs and produces:
+
+- a compact terminal summary
+- an optional JSON report for later review/tooling
+
+Supported inputs:
+
+- `--run <run_name>`
+- `--path <jsonl_file_or_dir>`
+- `--glob <glob_pattern>`
+
+Notes:
+
+- the analyzer is CLI-first and does not modify replay files
+- it compares outcome buckets for a selected side, defaulting to side `a`
+- it currently uses replay metadata and command-string parsing only; it does not require snapshot export
+
+Examples:
+
+```powershell
+python py/tools/replay_diagnose.py --run run_0050_g1_best_loss_review --side a
+python py/tools/replay_diagnose.py --run run_0050_g1_best_loss_review --side a --output matches/runs/run_0050_g1_best_loss_review/run_0050_g1_best_loss_review_diagnostics.json
+python py/tools/replay_diagnose.py --glob "matches/runs/run_0050_g1_best_loss_review/worker_*_a_raw.jsonl" --side a
+python py/tools/replay_diagnose.py --run run_0050_g1_best_loss_review --side a --include-outcomes loss --sample-losses 15
+```
+
 ### League registry workflow
 
 `py/tools/league_manage.py` manages a filesystem-backed checkpoint league and emits pool JSON files for `selfplay_server.py`.
