@@ -6,3 +6,4 @@ epochs = 1
 epochs_per_file = 1
 shuffle = true
 sample_files = 200
+env_porygon_omp_threads = 8

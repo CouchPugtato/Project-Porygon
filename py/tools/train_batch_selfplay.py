@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import subprocess
 import sys
@@ -32,10 +33,10 @@ def parse_bool01(value: str) -> bool:
     return value == "1"
 
 
-def load_default_args(path: Path) -> list[str]:
+def parse_config_entries(path: Path) -> list[tuple[str, str]]:
     if not path.exists():
         return []
-    args: list[str] = []
+    entries: list[tuple[str, str]] = []
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         line = raw_line.split("#", 1)[0].strip()
         if not line:
@@ -47,17 +48,39 @@ def load_default_args(path: Path) -> list[str]:
         value_text = raw_value.strip()
         if not key:
             raise SystemExit(f"invalid config {path}:{line_number}: empty key")
-        flag = "--" + key.replace("_", "-")
         lowered = value_text.lower()
         if lowered in {"true", "false"}:
-            args.extend([flag, "1" if lowered == "true" else "0"])
-            continue
-        if len(value_text) >= 2 and value_text[0] == '"' and value_text[-1] == '"':
+            value = "1" if lowered == "true" else "0"
+        elif len(value_text) >= 2 and value_text[0] == '"' and value_text[-1] == '"':
             value = bytes(value_text[1:-1], "utf-8").decode("unicode_escape")
         else:
             value = value_text
+        entries.append((key, value))
+    return entries
+
+
+def load_default_args(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    args: list[str] = []
+    for key, value in parse_config_entries(path):
+        if key.startswith("env_"):
+            continue
+        flag = "--" + key.replace("_", "-")
         args.extend([flag, value])
     return args
+
+
+def load_default_env(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key, value in parse_config_entries(path):
+        if not key.startswith("env_"):
+            continue
+        env_name = key[4:].strip()
+        if not env_name:
+            raise SystemExit(f"invalid config {path}: env_ key must include a variable name")
+        env[env_name.upper()] = value
+    return env
 
 
 def has_path_separator(path: str) -> bool:
@@ -120,6 +143,7 @@ def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> lis
 def main() -> None:
     parser = build_parser()
     argv = load_default_args(DEFAULT_ARGS_PATH) + sys.argv[1:]
+    configured_env = load_default_env(DEFAULT_ARGS_PATH)
     args = parser.parse_args(argv)
     repo_root = Path.cwd()
     run_dir = repo_root / DEFAULT_RUNS_ROOT / args.run
@@ -131,6 +155,8 @@ def main() -> None:
     if not trainer_exe.exists():
         raise SystemExit(f"trainer executable not found: {trainer_exe}")
     args.resolved_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    subprocess_env = os.environ.copy()
+    subprocess_env.update(configured_env)
 
     all_files = sorted(run_dir.glob(args.pattern))
     if args.start_index > 0:
@@ -146,7 +172,8 @@ def main() -> None:
         f"[train_batch_selfplay] run={args.run} mode={args.mode} epochs={args.epochs} "
         f"epochs_per_file={args.epochs_per_file} shards={total_shards} "
         f"sample_files={args.sample_files if args.sample_files > 0 else 'all'} "
-        f"checkpoint={args.resolved_checkpoint}",
+        f"checkpoint={args.resolved_checkpoint} "
+        f"config_env={configured_env if configured_env else '{}'}",
         flush=True,
     )
 
@@ -181,7 +208,7 @@ def main() -> None:
                 f"path={replay_path.name}",
                 flush=True,
             )
-            completed = subprocess.run(command, cwd=str(repo_root))
+            completed = subprocess.run(command, cwd=str(repo_root), env=subprocess_env)
             if completed.returncode != 0:
                 raise SystemExit(
                     f"[train_batch_selfplay] shard failed epoch={epoch} shard={shard_index} "

@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 typedef struct {
     size_t rows;
     size_t cols;
@@ -372,17 +376,53 @@ int gru_model_apply_accumulated_supervised_updates(GruModel* model, float learni
         return 1;
     }
     scale = learning_rate / (float)accum->count;
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->wzx.rows * model->wzx.cols >= 512)
+#endif
     for (i = 0; i < model->wzx.rows * model->wzx.cols; ++i) model->wzx.data[i] -= scale * accum->wzx[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->wzh.rows * model->wzh.cols >= 512)
+#endif
     for (i = 0; i < model->wzh.rows * model->wzh.cols; ++i) model->wzh.data[i] -= scale * accum->wzh[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->hidden_dim >= 64)
+#endif
     for (i = 0; i < model->hidden_dim; ++i) model->bz[i] -= scale * accum->bz[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->wrx.rows * model->wrx.cols >= 512)
+#endif
     for (i = 0; i < model->wrx.rows * model->wrx.cols; ++i) model->wrx.data[i] -= scale * accum->wrx[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->wrh.rows * model->wrh.cols >= 512)
+#endif
     for (i = 0; i < model->wrh.rows * model->wrh.cols; ++i) model->wrh.data[i] -= scale * accum->wrh[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->hidden_dim >= 64)
+#endif
     for (i = 0; i < model->hidden_dim; ++i) model->br[i] -= scale * accum->br[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->wnx.rows * model->wnx.cols >= 512)
+#endif
     for (i = 0; i < model->wnx.rows * model->wnx.cols; ++i) model->wnx.data[i] -= scale * accum->wnx[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->wnh.rows * model->wnh.cols >= 512)
+#endif
     for (i = 0; i < model->wnh.rows * model->wnh.cols; ++i) model->wnh.data[i] -= scale * accum->wnh[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->hidden_dim >= 64)
+#endif
     for (i = 0; i < model->hidden_dim; ++i) model->bn[i] -= scale * accum->bn[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->policy_head.rows * model->policy_head.cols >= 512)
+#endif
     for (i = 0; i < model->policy_head.rows * model->policy_head.cols; ++i) model->policy_head.data[i] -= scale * accum->policy_head[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->num_actions >= 16)
+#endif
     for (i = 0; i < model->num_actions; ++i) model->policy_bias[i] -= scale * accum->policy_bias[i];
+#ifdef _OPENMP
+    #pragma omp parallel for if(model->hidden_dim >= 64)
+#endif
     for (i = 0; i < model->hidden_dim; ++i) model->value_head[i] -= scale * accum->value_head[i];
     model->value_bias -= scale * accum->value_bias;
     gru_model_clear_accumulated_supervised_updates(model);
@@ -391,8 +431,11 @@ int gru_model_apply_accumulated_supervised_updates(GruModel* model, float learni
 
 static void matrix_vec_mul_accum(const Matrix* matrix, const float* vec, float* out) {
     size_t r;
-    size_t c;
+#ifdef _OPENMP
+    #pragma omp parallel for private(r) if(matrix->rows >= 32)
+#endif
     for (r = 0; r < matrix->rows; ++r) {
+        size_t c;
         const float* row = matrix->data + (r * matrix->cols);
         float sum = 0.0f;
         for (c = 0; c < matrix->cols; ++c) {
@@ -405,6 +448,37 @@ static void matrix_vec_mul_accum(const Matrix* matrix, const float* vec, float* 
 static void matrix_transpose_vec_mul_accum(const Matrix* matrix, const float* vec, float* out) {
     size_t r;
     size_t c;
+#ifdef _OPENMP
+    int thread_count;
+    float* partials;
+    if (matrix->rows >= 32 && matrix->cols >= 32) {
+        thread_count = omp_get_max_threads();
+        partials = (float*)calloc((size_t)thread_count * matrix->cols, sizeof(float));
+        if (partials) {
+            #pragma omp parallel
+            {
+                int tid = omp_get_thread_num();
+                float* local = partials + ((size_t)tid * matrix->cols);
+                #pragma omp for
+                for (r = 0; r < matrix->rows; ++r) {
+                    const float* row = matrix->data + (r * matrix->cols);
+                    float vr = vec[r];
+                    for (c = 0; c < matrix->cols; ++c) {
+                        local[c] += row[c] * vr;
+                    }
+                }
+            }
+            for (r = 0; r < (size_t)thread_count; ++r) {
+                float* local = partials + (r * matrix->cols);
+                for (c = 0; c < matrix->cols; ++c) {
+                    out[c] += local[c];
+                }
+            }
+            free(partials);
+            return;
+        }
+    }
+#endif
     for (r = 0; r < matrix->rows; ++r) {
         const float* row = matrix->data + (r * matrix->cols);
         for (c = 0; c < matrix->cols; ++c) {
@@ -415,10 +489,15 @@ static void matrix_transpose_vec_mul_accum(const Matrix* matrix, const float* ve
 
 static void outer_product_accum(float* dst, size_t rows, size_t cols, const float* lhs, const float* rhs) {
     size_t r;
-    size_t c;
+#ifdef _OPENMP
+    #pragma omp parallel for private(r) if(rows >= 32)
+#endif
     for (r = 0; r < rows; ++r) {
+        size_t c;
+        float* dst_row = dst + (r * cols);
+        float lhs_r = lhs[r];
         for (c = 0; c < cols; ++c) {
-            dst[r * cols + c] += lhs[r] * rhs[c];
+            dst_row[c] += lhs_r * rhs[c];
         }
     }
 }
@@ -1063,32 +1142,104 @@ static int recurrent_update_sequence(
     }
 
     if (accumulate_only) {
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wzx.rows * model->wzx.cols >= 512)
+#endif
         for (h = 0; h < model->wzx.rows * model->wzx.cols; ++h) accum->wzx[h] += grad_wzx[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wzh.rows * model->wzh.cols >= 512)
+#endif
         for (h = 0; h < model->wzh.rows * model->wzh.cols; ++h) accum->wzh[h] += grad_wzh[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(hdim >= 64)
+#endif
         for (h = 0; h < hdim; ++h) accum->bz[h] += grad_bz[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wrx.rows * model->wrx.cols >= 512)
+#endif
         for (h = 0; h < model->wrx.rows * model->wrx.cols; ++h) accum->wrx[h] += grad_wrx[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wrh.rows * model->wrh.cols >= 512)
+#endif
         for (h = 0; h < model->wrh.rows * model->wrh.cols; ++h) accum->wrh[h] += grad_wrh[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(hdim >= 64)
+#endif
         for (h = 0; h < hdim; ++h) accum->br[h] += grad_br[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wnx.rows * model->wnx.cols >= 512)
+#endif
         for (h = 0; h < model->wnx.rows * model->wnx.cols; ++h) accum->wnx[h] += grad_wnx[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wnh.rows * model->wnh.cols >= 512)
+#endif
         for (h = 0; h < model->wnh.rows * model->wnh.cols; ++h) accum->wnh[h] += grad_wnh[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(hdim >= 64)
+#endif
         for (h = 0; h < hdim; ++h) accum->bn[h] += grad_bn[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->policy_head.rows * model->policy_head.cols >= 512)
+#endif
         for (a = 0; a < model->policy_head.rows * model->policy_head.cols; ++a) accum->policy_head[a] += grad_policy_head[a];
+#ifdef _OPENMP
+        #pragma omp parallel for if(adim >= 16)
+#endif
         for (a = 0; a < adim; ++a) accum->policy_bias[a] += grad_policy_bias[a];
+#ifdef _OPENMP
+        #pragma omp parallel for if(hdim >= 64)
+#endif
         for (h = 0; h < hdim; ++h) accum->value_head[h] += grad_value_head[h];
         accum->value_bias += grad_value_bias;
         accum->count += 1;
     } else {
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wzx.rows * model->wzx.cols >= 512)
+#endif
         for (h = 0; h < model->wzx.rows * model->wzx.cols; ++h) model->wzx.data[h] -= learning_rate * grad_wzx[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wzh.rows * model->wzh.cols >= 512)
+#endif
         for (h = 0; h < model->wzh.rows * model->wzh.cols; ++h) model->wzh.data[h] -= learning_rate * grad_wzh[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(hdim >= 64)
+#endif
         for (h = 0; h < hdim; ++h) model->bz[h] -= learning_rate * grad_bz[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wrx.rows * model->wrx.cols >= 512)
+#endif
         for (h = 0; h < model->wrx.rows * model->wrx.cols; ++h) model->wrx.data[h] -= learning_rate * grad_wrx[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wrh.rows * model->wrh.cols >= 512)
+#endif
         for (h = 0; h < model->wrh.rows * model->wrh.cols; ++h) model->wrh.data[h] -= learning_rate * grad_wrh[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(hdim >= 64)
+#endif
         for (h = 0; h < hdim; ++h) model->br[h] -= learning_rate * grad_br[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wnx.rows * model->wnx.cols >= 512)
+#endif
         for (h = 0; h < model->wnx.rows * model->wnx.cols; ++h) model->wnx.data[h] -= learning_rate * grad_wnx[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->wnh.rows * model->wnh.cols >= 512)
+#endif
         for (h = 0; h < model->wnh.rows * model->wnh.cols; ++h) model->wnh.data[h] -= learning_rate * grad_wnh[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(hdim >= 64)
+#endif
         for (h = 0; h < hdim; ++h) model->bn[h] -= learning_rate * grad_bn[h];
+#ifdef _OPENMP
+        #pragma omp parallel for if(model->policy_head.rows * model->policy_head.cols >= 512)
+#endif
         for (a = 0; a < model->policy_head.rows * model->policy_head.cols; ++a) model->policy_head.data[a] -= learning_rate * grad_policy_head[a];
+#ifdef _OPENMP
+        #pragma omp parallel for if(adim >= 16)
+#endif
         for (a = 0; a < adim; ++a) model->policy_bias[a] -= learning_rate * grad_policy_bias[a];
+#ifdef _OPENMP
+        #pragma omp parallel for if(hdim >= 64)
+#endif
         for (h = 0; h < hdim; ++h) model->value_head[h] -= learning_rate * grad_value_head[h];
         model->value_bias -= learning_rate * grad_value_bias;
     }

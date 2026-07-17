@@ -5,10 +5,22 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(BUILD_LEGACY_NATIVE_SHOWDOWN "Build the old native C Showdown websocket client" OFF)
+option(ENABLE_OPENMP "Enable OpenMP CPU parallelization" ON)
 
 if(BUILD_LEGACY_NATIVE_SHOWDOWN)
     find_package(LibWebSockets REQUIRED)
     find_package(CURL REQUIRED)
+endif()
+
+if(ENABLE_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_C_FOUND)
+        message(STATUS "OpenMP enabled for CPU training kernels")
+    else()
+        message(STATUS "OpenMP requested but unavailable; building single-threaded")
+    endif()
+else()
+    message(STATUS "OpenMP disabled")
 endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -70,6 +82,12 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 )
 
 add_executable(showdown_reconstruction_tests ${SHOWDOWN_RECONSTRUCTION_TEST_SOURCES})
+
+if(ENABLE_OPENMP AND OpenMP_C_FOUND)
+    target_link_libraries(showdown_client PRIVATE OpenMP::OpenMP_C)
+    target_link_libraries(showdown_legality_tests PRIVATE OpenMP::OpenMP_C)
+    target_link_libraries(showdown_reconstruction_tests PRIVATE OpenMP::OpenMP_C)
+endif()
 
 if(BUILD_LEGACY_NATIVE_SHOWDOWN)
     target_compile_definitions(showdown_client PRIVATE HAVE_NATIVE_SHOWDOWN_CLIENT=1)

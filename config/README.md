@@ -17,6 +17,7 @@ Files:
   - consumed by `py/tools/train_batch_selfplay.py` before CLI args are applied
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
   - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
+  - supports `env_<NAME> = <value>` entries to set subprocess environment variables for `showdown_client`
 - `reward_weights.toml`
   - runtime-loaded by both `showdown_client` and `py/communicator/main.py`
 
@@ -27,6 +28,7 @@ run = "run_0018_recorded_action_sp1000"
 checkpoint = "run18_200shards.chk"
 mode = "rl"
 epochs = 1
+env_porygon_omp_threads = 8
 ```
 
 Notes:
@@ -35,6 +37,7 @@ Notes:
 - numbers can be written as numbers
 - ordinary boolean options become `1`/`0` on the generated CLI
 - bare passthrough flags like `battle_agent = true` emit `--battle-agent`
+- `env_<NAME> = <value>` entries are exported to trainer subprocesses instead of becoming CLI flags
 
 Examples:
 

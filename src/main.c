@@ -13,6 +13,10 @@
 #include <time.h>
 #include <ctype.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #ifdef HAVE_NATIVE_SHOWDOWN_CLIENT
 #include "showdown_client.h"
 #endif
@@ -2123,6 +2127,7 @@ static int showdown_client_main(int argc, char** argv) {
     int rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", 1);
     const char* rl_reward_mode = parse_string_flag(argc, argv, "--reward-mode", "terminal");
     RewardConfig reward_config;
+    int training_or_eval_mode = 0;
     srand((unsigned int)time(NULL));
     if (!load_reward_config_file(SHOWDOWN_CLIENT_REWARD_CONFIG_PATH, &reward_config)) {
         return 1;
@@ -2134,6 +2139,31 @@ static int showdown_client_main(int argc, char** argv) {
     if (getenv("PORYGON_DEMO_GRU")) {
         return run_demo_gru();
     }
+    if (argc >= 2 &&
+            (strcmp(argv[1], "--train-supervised") == 0 ||
+             strcmp(argv[1], "--train-rl") == 0 ||
+             strcmp(argv[1], "--eval-supervised") == 0)) {
+        training_or_eval_mode = 1;
+    }
+#ifdef _OPENMP
+    {
+        const char* omp_threads_text = getenv("PORYGON_OMP_THREADS");
+        if (omp_threads_text && *omp_threads_text) {
+            char* endptr = NULL;
+            long threads = strtol(omp_threads_text, &endptr, 10);
+            if (endptr && *endptr == '\0' && threads > 0) {
+                omp_set_num_threads((int)threads);
+            }
+        }
+        if (training_or_eval_mode) {
+            printf("[train] OpenMP threads=%d\n", omp_get_max_threads());
+        }
+    }
+#else
+    if (training_or_eval_mode) {
+        printf("[train] OpenMP unavailable; running single-threaded\n");
+    }
+#endif
     if (argc >= 2 && (strcmp(argv[1], "--battle-agent") == 0 || strcmp(argv[1], "--runtime") == 0)) {
         return run_runtime_mode(argc >= 3 ? argv[2] : NULL);
     }
