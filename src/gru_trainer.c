@@ -12,27 +12,6 @@ static void build_step_slot_legal_mask(const Episode* episode, size_t step_index
     build_slot_legal_mask(episode->legal_masks + (step_index * OBS_NUM_ACTIONS), slot, out);
 }
 
-static int train_prefix(
-    GruTrainer* trainer,
-    GruModel* model,
-    const float* observations,
-    size_t obs_dim,
-    size_t steps,
-    const unsigned char* legal_mask,
-    int target_action,
-    float target_value,
-    float* action_loss,
-    float* value_loss,
-    float* accuracy
-) {
-    if (!gru_model_supervised_update_sequence(model, observations, steps, legal_mask, target_action, target_value,
-        trainer->learning_rate, action_loss, value_loss, accuracy)) {
-        return 0;
-    }
-    (void)obs_dim;
-    return 1;
-}
-
 void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_window, float gradient_clip, unsigned int seed) {
     if (!trainer) {
         return;
@@ -62,75 +41,148 @@ TrainerCheckpointState gru_trainer_checkpoint_state(const GruTrainer* trainer) {
 
 int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const Episode* episode) {
     size_t t;
+    size_t hidden_dim;
+    size_t action_dim;
     float action_loss_sum = 0.0f;
     float value_loss_sum = 0.0f;
     float accuracy_sum = 0.0f;
     size_t trained = 0;
-    uint8_t slot_mask[OBS_NUM_ACTIONS];
+    float* hidden = NULL;
+    float* next_hidden = NULL;
+    float* hidden_after = NULL;
+    float* policy = NULL;
+    float value = 0.0f;
+    uint8_t slot_mask_a[OBS_NUM_ACTIONS];
+    uint8_t slot_mask_b[OBS_NUM_ACTIONS];
     if (!trainer || !model || !episode) {
         return 0;
     }
+
+    hidden_dim = gru_model_hidden_dim(model);
+    action_dim = gru_model_num_actions(model);
+    hidden = (float*)calloc(hidden_dim, sizeof(float));
+    next_hidden = (float*)malloc(hidden_dim * sizeof(float));
+    hidden_after = (float*)calloc(episode->count * hidden_dim, sizeof(float));
+    policy = (float*)malloc(action_dim * sizeof(float));
+    if (!hidden || !next_hidden || !hidden_after || !policy) {
+        free(hidden);
+        free(next_hidden);
+        free(hidden_after);
+        free(policy);
+        return 0;
+    }
+
+    gru_model_zero_state(model, hidden);
+    for (t = 0; t < episode->count; ++t) {
+        gru_model_forward_step(
+            model,
+            episode->observations + (t * episode->obs_dim),
+            hidden,
+            next_hidden,
+            policy,
+            &value);
+        memcpy(hidden_after + (t * hidden_dim), next_hidden, hidden_dim * sizeof(float));
+        memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
+    }
+
     for (t = 0; t < episode->count; ++t) {
         size_t start = (t + 1 > trainer->bptt_window) ? (t + 1 - trainer->bptt_window) : 0;
         size_t steps = (t - start) + 1;
+        const float* initial_hidden = start > 0 ? (hidden_after + ((start - 1) * hidden_dim)) : NULL;
         float action_loss = 0.0f;
         float value_loss = 0.0f;
         float accuracy = 0.0f;
-        int slot;
+        size_t label_count = 0;
+
         if (episode->actions[t] < 0 && episode->actions2[t] < 0) {
             continue;
         }
         if (episode->actions[t] >= 0) {
-            slot = obs_action_slot((enum ObsAction)episode->actions[t]);
-            build_step_slot_legal_mask(episode, t, slot, slot_mask);
-            if (!train_prefix(trainer, model,
-                    episode->observations + (start * episode->obs_dim),
-                    episode->obs_dim,
-                    steps,
-                    slot_mask,
-                    episode->actions[t],
-                    episode->rewards[t],
-                    &action_loss,
-                    &value_loss,
-                    &accuracy)) {
-                return 0;
-            }
-            action_loss_sum += action_loss;
-            value_loss_sum += value_loss;
-            accuracy_sum += accuracy;
-            ++trained;
-            ++trainer->step;
+            build_step_slot_legal_mask(episode, t, obs_action_slot((enum ObsAction)episode->actions[t]), slot_mask_a);
+            ++label_count;
         }
         if (episode->actions2[t] >= 0) {
-            action_loss = 0.0f;
-            value_loss = 0.0f;
-            accuracy = 0.0f;
-            slot = obs_action_slot((enum ObsAction)episode->actions2[t]);
-            build_step_slot_legal_mask(episode, t, slot, slot_mask);
-            if (!train_prefix(trainer, model,
+            build_step_slot_legal_mask(episode, t, obs_action_slot((enum ObsAction)episode->actions2[t]), slot_mask_b);
+            ++label_count;
+        }
+
+        if (episode->actions[t] >= 0 && episode->actions2[t] >= 0) {
+            if (!gru_model_supervised_update_sequence_window_dual(
+                    model,
                     episode->observations + (start * episode->obs_dim),
-                    episode->obs_dim,
                     steps,
-                    slot_mask,
+                    initial_hidden,
+                    slot_mask_a,
+                    episode->actions[t],
+                    slot_mask_b,
                     episode->actions2[t],
                     episode->rewards[t],
+                    trainer->learning_rate,
                     &action_loss,
                     &value_loss,
                     &accuracy)) {
+                free(hidden);
+                free(next_hidden);
+                free(hidden_after);
+                free(policy);
                 return 0;
             }
-            action_loss_sum += action_loss;
-            value_loss_sum += value_loss;
-            accuracy_sum += accuracy;
-            ++trained;
-            ++trainer->step;
+        } else if (episode->actions[t] >= 0) {
+            if (!gru_model_supervised_update_sequence_window(
+                    model,
+                    episode->observations + (start * episode->obs_dim),
+                    steps,
+                    initial_hidden,
+                    slot_mask_a,
+                    episode->actions[t],
+                    episode->rewards[t],
+                    trainer->learning_rate,
+                    &action_loss,
+                    &value_loss,
+                    &accuracy)) {
+                free(hidden);
+                free(next_hidden);
+                free(hidden_after);
+                free(policy);
+                return 0;
+            }
+        } else {
+            if (!gru_model_supervised_update_sequence_window(
+                    model,
+                    episode->observations + (start * episode->obs_dim),
+                    steps,
+                    initial_hidden,
+                    slot_mask_b,
+                    episode->actions2[t],
+                    episode->rewards[t],
+                    trainer->learning_rate,
+                    &action_loss,
+                    &value_loss,
+                    &accuracy)) {
+                free(hidden);
+                free(next_hidden);
+                free(hidden_after);
+                free(policy);
+                return 0;
+            }
         }
+
+        action_loss_sum += action_loss * (float)label_count;
+        value_loss_sum += value_loss * (float)label_count;
+        accuracy_sum += accuracy * (float)label_count;
+        trained += label_count;
+        trainer->step += label_count;
     }
+
     if (trained > 0) {
         trainer->last_action_loss = action_loss_sum / (float)trained;
         trainer->last_value_loss = value_loss_sum / (float)trained;
         trainer->last_accuracy = accuracy_sum / (float)trained;
     }
+    free(hidden);
+    free(next_hidden);
+    free(hidden_after);
+    free(policy);
     return 1;
 }
 

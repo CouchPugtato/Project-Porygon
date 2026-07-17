@@ -551,6 +551,9 @@ static int recurrent_update_sequence(
     GruModel* model,
     const float* sequence,
     size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_secondary,
+    int target_action_secondary,
     const unsigned char* legal_mask,
     int target_action,
     float policy_scale,
@@ -590,6 +593,10 @@ static int recurrent_update_sequence(
     float grad_value_bias = 0.0f;
     float value = 0.0f;
     float dv;
+    size_t target_count = 1;
+    float accuracy_sum = 0.0f;
+    float action_loss_sum = 0.0f;
+    const float* start_hidden;
 
     if (!model || !sequence || steps == 0 || target_action < 0 || (size_t)target_action >= model->num_actions) {
         return 0;
@@ -637,9 +644,14 @@ static int recurrent_update_sequence(
         return 0;
     }
 
+    start_hidden = initial_hidden_state ? initial_hidden_state : zero_hidden;
+    if (target_action_secondary >= 0) {
+        target_count = 2;
+    }
+
     for (t = 0; t < steps; ++t) {
         const float* input = sequence + (t * xdim);
-        const float* prev_h = (t > 0) ? (h_states + ((t - 1) * hdim)) : zero_hidden;
+        const float* prev_h = (t > 0) ? (h_states + ((t - 1) * hdim)) : start_hidden;
         float* z_t = z_cache + (t * hdim);
         float* r_t = r_cache + (t * hdim);
         float* n_t = n_cache + (t * hdim);
@@ -666,17 +678,8 @@ static int recurrent_update_sequence(
     }
 
     evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), legal_mask, logits, policy, &value);
-    if (action_loss_out) {
-        *action_loss_out = -logf(policy[target_action] > 1.0e-8f ? policy[target_action] : 1.0e-8f);
-    }
-    if (value_loss_out) {
-        float err = value - target_value;
-        *value_loss_out = 0.5f * err * err;
-    }
-    if (accuracy_out) {
-        *accuracy_out = (gru_model_select_action(policy, NULL, adim) == target_action) ? 1.0f : 0.0f;
-    }
-
+    action_loss_sum += -logf(policy[target_action] > 1.0e-8f ? policy[target_action] : 1.0e-8f);
+    accuracy_sum += (gru_model_select_action(policy, legal_mask, adim) == target_action) ? 1.0f : 0.0f;
     for (a = 0; a < adim; ++a) {
         grad_logits[a] = (policy[a] - ((int)a == target_action ? 1.0f : 0.0f)) * policy_scale;
         if (entropy_coef != 0.0f) {
@@ -689,11 +692,37 @@ static int recurrent_update_sequence(
     }
     matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
 
+    if (target_action_secondary >= 0) {
+        evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), legal_mask_secondary, logits, policy, &value);
+        action_loss_sum += -logf(policy[target_action_secondary] > 1.0e-8f ? policy[target_action_secondary] : 1.0e-8f);
+        accuracy_sum += (gru_model_select_action(policy, legal_mask_secondary, adim) == target_action_secondary) ? 1.0f : 0.0f;
+        for (a = 0; a < adim; ++a) {
+            grad_logits[a] = (policy[a] - ((int)a == target_action_secondary ? 1.0f : 0.0f)) * policy_scale;
+            if (entropy_coef != 0.0f) {
+                grad_logits[a] += entropy_coef * policy[a] * logf(policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f);
+            }
+            grad_policy_bias[a] += grad_logits[a];
+            for (h = 0; h < hdim; ++h) {
+                grad_policy_head[a * hdim + h] += grad_logits[a] * h_states[(steps - 1) * hdim + h];
+            }
+        }
+        matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
+    }
+
     dv = value - target_value;
-    grad_value_bias += dv;
+    grad_value_bias += dv * (float)target_count;
     for (h = 0; h < hdim; ++h) {
-        grad_value_head[h] += dv * h_states[(steps - 1) * hdim + h];
-        grad_h[h] += model->value_head[h] * dv;
+        grad_value_head[h] += dv * (float)target_count * h_states[(steps - 1) * hdim + h];
+        grad_h[h] += model->value_head[h] * dv * (float)target_count;
+    }
+    if (action_loss_out) {
+        *action_loss_out = action_loss_sum / (float)target_count;
+    }
+    if (value_loss_out) {
+        *value_loss_out = 0.5f * dv * dv;
+    }
+    if (accuracy_out) {
+        *accuracy_out = accuracy_sum / (float)target_count;
     }
 
     for (t = steps; t-- > 0;) {
@@ -770,8 +799,45 @@ int gru_model_supervised_update_sequence(
     float* value_loss_out,
     float* accuracy_out
 ) {
-    return recurrent_update_sequence(model, sequence, steps, legal_mask, target_action, 1.0f, target_value, 0.0f,
+    return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, target_action, 1.0f, target_value, 0.0f,
         learning_rate, action_loss_out, value_loss_out, accuracy_out);
+}
+
+int gru_model_supervised_update_sequence_window(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask,
+    int target_action,
+    float target_value,
+    float learning_rate,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out
+) {
+    return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, NULL, -1, legal_mask, target_action,
+        1.0f, target_value, 0.0f, learning_rate, action_loss_out, value_loss_out, accuracy_out);
+}
+
+int gru_model_supervised_update_sequence_window_dual(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    int target_action_a,
+    const unsigned char* legal_mask_b,
+    int target_action_b,
+    float target_value,
+    float learning_rate,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out
+) {
+    return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, legal_mask_b, target_action_b,
+        legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, learning_rate,
+        action_loss_out, value_loss_out, accuracy_out);
 }
 
 int gru_model_supervised_update_heads(
@@ -902,7 +968,7 @@ int gru_model_policy_gradient_update_sequence(
     float entropy_coef,
     float learning_rate
 ) {
-    return recurrent_update_sequence(model, sequence, steps, legal_mask, action, advantage, target_value, entropy_coef,
+    return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, action, advantage, target_value, entropy_coef,
         learning_rate, NULL, NULL, NULL);
 }
 

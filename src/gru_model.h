@@ -86,6 +86,34 @@ int gru_model_supervised_update_sequence(
     float* value_loss_out,
     float* accuracy_out
 );
+int gru_model_supervised_update_sequence_window(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask,
+    int target_action,
+    float target_value,
+    float learning_rate,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out
+);
+int gru_model_supervised_update_sequence_window_dual(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    int target_action_a,
+    const unsigned char* legal_mask_b,
+    int target_action_b,
+    float target_value,
+    float learning_rate,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out
+);
 int gru_model_policy_gradient_update_heads(
     GruModel* model,
     const float* hidden_state,
