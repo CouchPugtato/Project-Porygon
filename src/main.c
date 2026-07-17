@@ -1921,6 +1921,12 @@ static int train_from_replay_file(
                         trainer.last_action_loss,
                         trainer.last_value_loss,
                         trainer.last_accuracy);
+                    printf("[train] epoch=%d supervised_profile cache=%.3fs update=%.3fs labels=%zu windows=%zu\n",
+                        epoch,
+                        trainer.last_supervised_cache_seconds,
+                        trainer.last_supervised_update_seconds,
+                        trainer.last_supervised_label_count,
+                        trainer.last_supervised_window_count);
                 }
                 if (eta_ready && train_eta_rate_ema > 0.0) {
                     printf("[train] epoch=%d elapsed=%.1fs episodes_per_sec=%.2f eta=%.1fs\n",

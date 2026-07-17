@@ -22,6 +22,10 @@ typedef struct {
     float last_mean_advantage;
     float last_entropy;
     size_t last_rl_labels;
+    double last_supervised_cache_seconds;
+    double last_supervised_update_seconds;
+    size_t last_supervised_label_count;
+    size_t last_supervised_window_count;
 } GruTrainer;
 
 void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_window, float gradient_clip, unsigned int seed);

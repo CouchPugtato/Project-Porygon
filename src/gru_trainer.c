@@ -2,6 +2,7 @@
 #include "action_mapper.h"
 
 #include <math.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -43,6 +44,8 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
     size_t t;
     size_t hidden_dim;
     size_t action_dim;
+    clock_t cache_start_clock;
+    clock_t update_start_clock;
     float action_loss_sum = 0.0f;
     float value_loss_sum = 0.0f;
     float accuracy_sum = 0.0f;
@@ -72,6 +75,12 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         return 0;
     }
 
+    trainer->last_supervised_cache_seconds = 0.0;
+    trainer->last_supervised_update_seconds = 0.0;
+    trainer->last_supervised_label_count = 0;
+    trainer->last_supervised_window_count = 0;
+
+    cache_start_clock = clock();
     gru_model_zero_state(model, hidden);
     for (t = 0; t < episode->count; ++t) {
         gru_model_forward_step(
@@ -84,7 +93,10 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         memcpy(hidden_after + (t * hidden_dim), next_hidden, hidden_dim * sizeof(float));
         memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
     }
+    trainer->last_supervised_cache_seconds =
+        (double)(clock() - cache_start_clock) / (double)CLOCKS_PER_SEC;
 
+    update_start_clock = clock();
     for (t = 0; t < episode->count; ++t) {
         size_t start = (t + 1 > trainer->bptt_window) ? (t + 1 - trainer->bptt_window) : 0;
         size_t steps = (t - start) + 1;
@@ -172,7 +184,11 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         accuracy_sum += accuracy * (float)label_count;
         trained += label_count;
         trainer->step += label_count;
+        trainer->last_supervised_window_count += 1;
     }
+    trainer->last_supervised_update_seconds =
+        (double)(clock() - update_start_clock) / (double)CLOCKS_PER_SEC;
+    trainer->last_supervised_label_count = trained;
 
     if (trained > 0) {
         trainer->last_action_loss = action_loss_sum / (float)trained;
