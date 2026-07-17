@@ -18,6 +18,7 @@ Files:
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
   - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
   - supports `env_<NAME> = <value>` entries to set subprocess environment variables for `showdown_client`
+  - writes one batch-training stats JSON per shard under `models/runs/<run>/<checkpoint_stem>/<checkpoint_stem>_batch_training_stats/`
 - `reward_weights.toml`
   - runtime-loaded by both `showdown_client` and `py/communicator/main.py`
 

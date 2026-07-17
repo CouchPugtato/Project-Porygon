@@ -154,6 +154,7 @@ static char* make_best_checkpoint_path(const char* base_path) {
     return out;
 }
 
+
 static double elapsed_seconds_since(clock_t start_clock) {
     return (double)(clock() - start_clock) / (double)CLOCKS_PER_SEC;
 }

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -12,6 +14,7 @@ from pathlib import Path
 DEFAULT_RUNS_ROOT = Path("matches") / "runs"
 DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
 DEFAULT_ARGS_PATH = Path("config/train_batch_selfplay.toml")
+KEY_VALUE_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 
 
 def ema_update(previous: float, sample: float, alpha: float) -> float:
@@ -93,6 +96,121 @@ def resolve_batch_checkpoint(run_name: str, checkpoint_arg: str) -> Path:
         return checkpoint_path
     stem = checkpoint_path.stem or checkpoint_path.name
     return Path("models") / "runs" / run_name / stem / checkpoint_path.name
+
+
+def coerce_value(value: str) -> int | float | str:
+    lowered = value.lower()
+    if lowered in {"estimating"}:
+        return value
+    try:
+        if any(ch in value for ch in (".", "e", "E")):
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
+
+
+def parse_key_values(line: str) -> dict[str, int | float | str]:
+    return {match.group(1): coerce_value(match.group(2)) for match in KEY_VALUE_RE.finditer(line)}
+
+
+def batch_stats_dir(checkpoint_path: Path) -> Path:
+    return checkpoint_path.parent / f"{checkpoint_path.stem}_batch_training_stats"
+
+
+def batch_stats_path(
+    checkpoint_path: Path,
+    epoch: int,
+    shard_index: int,
+    replay_path: Path,
+) -> Path:
+    safe_replay = replay_path.stem.replace(" ", "_")
+    return batch_stats_dir(checkpoint_path) / (
+        f"epoch{epoch:03d}_shard{shard_index:04d}_{safe_replay}_training_stats.json"
+    )
+
+
+def collect_training_stats(lines: list[str]) -> dict[str, object]:
+    stats: dict[str, object] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line.startswith("[train] OpenMP threads="):
+            stats["openmp"] = parse_key_values(line)
+        elif line.startswith("[train] ingest complete "):
+            stats["ingest"] = parse_key_values(line)
+        elif line.startswith("[train] accepted_labels "):
+            accepted = stats.setdefault("accepted_labels", [])
+            if isinstance(accepted, list):
+                accepted.append(parse_key_values(line))
+        elif line.startswith("[train] split "):
+            stats["split"] = parse_key_values(line)
+        elif line.startswith("[train] epoch=") and "supervised_profile" in line:
+            profiles = stats.setdefault("supervised_profile", [])
+            if isinstance(profiles, list):
+                profiles.append(parse_key_values(line))
+        elif line.startswith("[train] epoch=") and " validation action_loss=" in line:
+            stats["validation_summary"] = parse_key_values(line)
+        elif line.startswith("[train] epoch=") and " validation top3_accuracy=" in line:
+            stats["validation_breakdown"] = parse_key_values(line)
+        elif line.startswith("[train] epoch=") and " validation elapsed=" in line:
+            stats["validation_timing"] = parse_key_values(line)
+        elif line.startswith("trained mode="):
+            stats["final_train"] = parse_key_values(line)
+        elif line.startswith("[train] saved checkpoint "):
+            stats["saved_checkpoint"] = line.removeprefix("[train] saved checkpoint ").strip()
+    return stats
+
+
+def run_trainer_and_capture(command: list[str], cwd: Path, env: dict[str, str]) -> tuple[int, list[str]]:
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    captured_lines: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="")
+        captured_lines.append(line.rstrip("\r\n"))
+    return_code = process.wait()
+    return return_code, captured_lines
+
+
+def write_batch_training_stats(
+    path: Path,
+    *,
+    args: argparse.Namespace,
+    epoch: int,
+    shard_index: int,
+    shard_count: int,
+    replay_path: Path,
+    command: list[str],
+    elapsed_seconds: float,
+    return_code: int,
+    parsed_stats: dict[str, object],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run": args.run,
+        "mode": args.mode,
+        "epoch": epoch,
+        "epochs": args.epochs,
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "replay_path": str(replay_path),
+        "checkpoint": str(args.resolved_checkpoint),
+        "command": command,
+        "elapsed_seconds": elapsed_seconds,
+        "return_code": return_code,
+        "stats": parsed_stats,
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -208,14 +326,29 @@ def main() -> None:
                 f"path={replay_path.name}",
                 flush=True,
             )
-            completed = subprocess.run(command, cwd=str(repo_root), env=subprocess_env)
-            if completed.returncode != 0:
+            return_code, captured_lines = run_trainer_and_capture(command, repo_root, subprocess_env)
+            shard_elapsed = time.monotonic() - shard_started_at
+            parsed_stats = collect_training_stats(captured_lines)
+            stats_path = batch_stats_path(args.resolved_checkpoint, epoch, shard_index, replay_path)
+            write_batch_training_stats(
+                stats_path,
+                args=args,
+                epoch=epoch,
+                shard_index=shard_index,
+                shard_count=len(epoch_files),
+                replay_path=replay_path,
+                command=command,
+                elapsed_seconds=shard_elapsed,
+                return_code=return_code,
+                parsed_stats=parsed_stats,
+            )
+            print(f"[train_batch_selfplay] wrote stats {stats_path}", flush=True)
+            if return_code != 0:
                 raise SystemExit(
                     f"[train_batch_selfplay] shard failed epoch={epoch} shard={shard_index} "
-                    f"path={replay_path} exit_code={completed.returncode}"
+                    f"path={replay_path} exit_code={return_code}"
                 )
             completed_files += 1
-            shard_elapsed = time.monotonic() - shard_started_at
             total_elapsed = time.monotonic() - started_at
             shard_rate_sample = (completed_files / total_elapsed) if total_elapsed > 0.0 else 0.0
             if shard_rate_sample > 0.0:
