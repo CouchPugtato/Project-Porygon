@@ -10,6 +10,51 @@ typedef struct {
     float* data;
 } Matrix;
 
+typedef struct {
+    size_t hidden_capacity;
+    size_t action_capacity;
+    float* z;
+    float* r;
+    float* n;
+    float* gated_hidden;
+    float* logits;
+    float* next_hidden;
+} GruForwardScratch;
+
+typedef struct {
+    size_t step_capacity;
+    size_t hidden_capacity;
+    size_t input_capacity;
+    size_t action_capacity;
+    float* h_states;
+    float* z_cache;
+    float* r_cache;
+    float* n_cache;
+    float* gated_cache;
+    float* zero_hidden;
+    float* logits;
+    float* policy;
+    float* grad_h;
+    float* next_grad_h;
+    float* grad_logits;
+    float* d_gated;
+    float* d_pre_z;
+    float* d_pre_r;
+    float* d_pre_n;
+    float* grad_wzx;
+    float* grad_wzh;
+    float* grad_bz;
+    float* grad_wrx;
+    float* grad_wrh;
+    float* grad_br;
+    float* grad_wnx;
+    float* grad_wnh;
+    float* grad_bn;
+    float* grad_policy_head;
+    float* grad_policy_bias;
+    float* grad_value_head;
+} GruRecurrentScratch;
+
 struct GruModel {
     size_t input_dim;
     size_t hidden_dim;
@@ -32,6 +77,8 @@ struct GruModel {
 
     float* value_head;
     float value_bias;
+    GruForwardScratch forward_scratch;
+    GruRecurrentScratch recurrent_scratch;
 };
 
 static float rand_uniform(void) {
@@ -83,6 +130,142 @@ static void matrix_free(Matrix* matrix) {
 
 static float* vector_make(size_t len) {
     return (float*)calloc(len, sizeof(float));
+}
+
+static void gru_forward_scratch_free(GruForwardScratch* scratch) {
+    if (!scratch) {
+        return;
+    }
+    free(scratch->z);
+    free(scratch->r);
+    free(scratch->n);
+    free(scratch->gated_hidden);
+    free(scratch->logits);
+    free(scratch->next_hidden);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+static int gru_forward_scratch_ensure(GruModel* model) {
+    GruForwardScratch* scratch;
+    if (!model) {
+        return 0;
+    }
+    scratch = &model->forward_scratch;
+    if (scratch->hidden_capacity == model->hidden_dim && scratch->action_capacity == model->num_actions &&
+            scratch->z && scratch->r && scratch->n && scratch->gated_hidden && scratch->logits && scratch->next_hidden) {
+        return 1;
+    }
+    gru_forward_scratch_free(scratch);
+    scratch->z = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->r = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->n = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->gated_hidden = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->logits = (float*)calloc(model->num_actions, sizeof(float));
+    scratch->next_hidden = (float*)calloc(model->hidden_dim, sizeof(float));
+    if (!scratch->z || !scratch->r || !scratch->n || !scratch->gated_hidden || !scratch->logits || !scratch->next_hidden) {
+        gru_forward_scratch_free(scratch);
+        return 0;
+    }
+    scratch->hidden_capacity = model->hidden_dim;
+    scratch->action_capacity = model->num_actions;
+    return 1;
+}
+
+static void gru_recurrent_scratch_free(GruRecurrentScratch* scratch) {
+    if (!scratch) {
+        return;
+    }
+    free(scratch->h_states);
+    free(scratch->z_cache);
+    free(scratch->r_cache);
+    free(scratch->n_cache);
+    free(scratch->gated_cache);
+    free(scratch->zero_hidden);
+    free(scratch->logits);
+    free(scratch->policy);
+    free(scratch->grad_h);
+    free(scratch->next_grad_h);
+    free(scratch->grad_logits);
+    free(scratch->d_gated);
+    free(scratch->d_pre_z);
+    free(scratch->d_pre_r);
+    free(scratch->d_pre_n);
+    free(scratch->grad_wzx);
+    free(scratch->grad_wzh);
+    free(scratch->grad_bz);
+    free(scratch->grad_wrx);
+    free(scratch->grad_wrh);
+    free(scratch->grad_br);
+    free(scratch->grad_wnx);
+    free(scratch->grad_wnh);
+    free(scratch->grad_bn);
+    free(scratch->grad_policy_head);
+    free(scratch->grad_policy_bias);
+    free(scratch->grad_value_head);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+static int gru_recurrent_scratch_ensure(GruModel* model, size_t steps) {
+    GruRecurrentScratch* scratch;
+    if (!model || steps == 0) {
+        return 0;
+    }
+    scratch = &model->recurrent_scratch;
+    if (scratch->step_capacity >= steps &&
+            scratch->hidden_capacity == model->hidden_dim &&
+            scratch->input_capacity == model->input_dim &&
+            scratch->action_capacity == model->num_actions &&
+            scratch->h_states && scratch->z_cache && scratch->r_cache && scratch->n_cache && scratch->gated_cache &&
+            scratch->zero_hidden && scratch->logits && scratch->policy && scratch->grad_h && scratch->next_grad_h &&
+            scratch->grad_logits && scratch->d_gated && scratch->d_pre_z && scratch->d_pre_r && scratch->d_pre_n &&
+            scratch->grad_wzx && scratch->grad_wzh && scratch->grad_bz && scratch->grad_wrx && scratch->grad_wrh &&
+            scratch->grad_br && scratch->grad_wnx && scratch->grad_wnh && scratch->grad_bn &&
+            scratch->grad_policy_head && scratch->grad_policy_bias && scratch->grad_value_head) {
+        return 1;
+    }
+    gru_recurrent_scratch_free(scratch);
+    scratch->h_states = (float*)calloc(steps * model->hidden_dim, sizeof(float));
+    scratch->z_cache = (float*)calloc(steps * model->hidden_dim, sizeof(float));
+    scratch->r_cache = (float*)calloc(steps * model->hidden_dim, sizeof(float));
+    scratch->n_cache = (float*)calloc(steps * model->hidden_dim, sizeof(float));
+    scratch->gated_cache = (float*)calloc(steps * model->hidden_dim, sizeof(float));
+    scratch->zero_hidden = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->logits = (float*)calloc(model->num_actions, sizeof(float));
+    scratch->policy = (float*)calloc(model->num_actions, sizeof(float));
+    scratch->grad_h = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->next_grad_h = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->grad_logits = (float*)calloc(model->num_actions, sizeof(float));
+    scratch->d_gated = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->d_pre_z = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->d_pre_r = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->d_pre_n = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->grad_wzx = (float*)calloc(model->wzx.rows * model->wzx.cols, sizeof(float));
+    scratch->grad_wzh = (float*)calloc(model->wzh.rows * model->wzh.cols, sizeof(float));
+    scratch->grad_bz = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->grad_wrx = (float*)calloc(model->wrx.rows * model->wrx.cols, sizeof(float));
+    scratch->grad_wrh = (float*)calloc(model->wrh.rows * model->wrh.cols, sizeof(float));
+    scratch->grad_br = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->grad_wnx = (float*)calloc(model->wnx.rows * model->wnx.cols, sizeof(float));
+    scratch->grad_wnh = (float*)calloc(model->wnh.rows * model->wnh.cols, sizeof(float));
+    scratch->grad_bn = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->grad_policy_head = (float*)calloc(model->policy_head.rows * model->policy_head.cols, sizeof(float));
+    scratch->grad_policy_bias = (float*)calloc(model->num_actions, sizeof(float));
+    scratch->grad_value_head = (float*)calloc(model->hidden_dim, sizeof(float));
+    if (!scratch->h_states || !scratch->z_cache || !scratch->r_cache || !scratch->n_cache || !scratch->gated_cache ||
+            !scratch->zero_hidden || !scratch->logits || !scratch->policy || !scratch->grad_h ||
+            !scratch->next_grad_h || !scratch->grad_logits || !scratch->d_gated || !scratch->d_pre_z ||
+            !scratch->d_pre_r || !scratch->d_pre_n || !scratch->grad_wzx || !scratch->grad_wzh ||
+            !scratch->grad_bz || !scratch->grad_wrx || !scratch->grad_wrh || !scratch->grad_br ||
+            !scratch->grad_wnx || !scratch->grad_wnh || !scratch->grad_bn || !scratch->grad_policy_head ||
+            !scratch->grad_policy_bias || !scratch->grad_value_head) {
+        gru_recurrent_scratch_free(scratch);
+        return 0;
+    }
+    scratch->step_capacity = steps;
+    scratch->hidden_capacity = model->hidden_dim;
+    scratch->input_capacity = model->input_dim;
+    scratch->action_capacity = model->num_actions;
+    return 1;
 }
 
 static void matrix_vec_mul_accum(const Matrix* matrix, const float* vec, float* out) {
@@ -236,6 +419,8 @@ void gru_model_destroy(GruModel* model) {
     matrix_free(&model->policy_head);
     free(model->policy_bias);
     free(model->value_head);
+    gru_forward_scratch_free(&model->forward_scratch);
+    gru_recurrent_scratch_free(&model->recurrent_scratch);
     free(model);
 }
 
@@ -311,36 +496,17 @@ void gru_model_forward_step(
     float* policy_out,
     float* value_out
 ) {
-    float* scratch;
-    float* z;
-    float* r;
-    float* n;
-    float* gated_hidden;
-    float* logits;
-    size_t hidden_bytes;
-    size_t action_bytes;
+    GruForwardScratch* scratch;
 
     if (!model || !input || !hidden_state_in || !hidden_state_out || !policy_out || !value_out) {
         return;
     }
-
-    hidden_bytes = model->hidden_dim * sizeof(float);
-    action_bytes = model->num_actions * sizeof(float);
-    scratch = (float*)calloc((model->hidden_dim * 4u) + model->num_actions, sizeof(float));
-    if (!scratch) {
+    if (!gru_forward_scratch_ensure((GruModel*)model)) {
         return;
     }
-    z = scratch;
-    r = z + model->hidden_dim;
-    n = r + model->hidden_dim;
-    gated_hidden = n + model->hidden_dim;
-    logits = gated_hidden + model->hidden_dim;
-
-    (void)hidden_bytes;
-    (void)action_bytes;
+    scratch = &((GruModel*)model)->forward_scratch;
     gru_model_forward_step_with_buffers(model, input, hidden_state_in, hidden_state_out, policy_out, value_out,
-        z, r, n, gated_hidden, logits);
-    free(scratch);
+        scratch->z, scratch->r, scratch->n, scratch->gated_hidden, scratch->logits);
 }
 
 void gru_model_forward_sequence(
@@ -352,43 +518,24 @@ void gru_model_forward_sequence(
     float* value_out
 ) {
     size_t t;
-    float* next_hidden;
-    float* scratch;
-    float* z;
-    float* r;
-    float* n;
-    float* gated_hidden;
-    float* logits;
+    GruForwardScratch* scratch;
 
     if (!model || !sequence || !hidden_state_io || !policy_out || !value_out) {
         return;
     }
-
-    next_hidden = (float*)malloc(model->hidden_dim * sizeof(float));
-    scratch = (float*)calloc((model->hidden_dim * 4u) + model->num_actions, sizeof(float));
-    if (!next_hidden || !scratch) {
-        free(next_hidden);
-        free(scratch);
+    if (!gru_forward_scratch_ensure((GruModel*)model)) {
         return;
     }
-    z = scratch;
-    r = z + model->hidden_dim;
-    n = r + model->hidden_dim;
-    gated_hidden = n + model->hidden_dim;
-    logits = gated_hidden + model->hidden_dim;
+    scratch = &((GruModel*)model)->forward_scratch;
 
     for (t = 0; t < steps; ++t) {
         const float* input = sequence + (t * model->input_dim);
-        if (!gru_model_forward_step_with_buffers(model, input, hidden_state_io, next_hidden, policy_out, value_out,
-                z, r, n, gated_hidden, logits)) {
-            free(next_hidden);
-            free(scratch);
+        if (!gru_model_forward_step_with_buffers(model, input, hidden_state_io, scratch->next_hidden, policy_out, value_out,
+                scratch->z, scratch->r, scratch->n, scratch->gated_hidden, scratch->logits)) {
             return;
         }
-        memcpy(hidden_state_io, next_hidden, model->hidden_dim * sizeof(float));
+        memcpy(hidden_state_io, scratch->next_hidden, model->hidden_dim * sizeof(float));
     }
-    free(next_hidden);
-    free(scratch);
 }
 
 int gru_model_evaluate_sequence_step(
@@ -570,6 +717,7 @@ static int recurrent_update_sequence(
     size_t t;
     size_t h;
     size_t a;
+    GruRecurrentScratch* scratch = NULL;
     float* h_states = NULL;
     float* z_cache = NULL;
     float* r_cache = NULL;
@@ -605,44 +753,64 @@ static int recurrent_update_sequence(
     xdim = model->input_dim;
     adim = model->num_actions;
 
-    h_states = (float*)calloc(steps * hdim, sizeof(float));
-    z_cache = (float*)calloc(steps * hdim, sizeof(float));
-    r_cache = (float*)calloc(steps * hdim, sizeof(float));
-    n_cache = (float*)calloc(steps * hdim, sizeof(float));
-    gated_cache = (float*)calloc(steps * hdim, sizeof(float));
-    zero_hidden = (float*)calloc(hdim, sizeof(float));
-    logits = (float*)malloc(adim * sizeof(float));
-    policy = (float*)malloc(adim * sizeof(float));
-    grad_h = (float*)calloc(hdim, sizeof(float));
-    next_grad_h = (float*)calloc(hdim, sizeof(float));
-    grad_logits = (float*)calloc(adim, sizeof(float));
-    d_gated = (float*)calloc(hdim, sizeof(float));
-    d_pre_z = (float*)calloc(hdim, sizeof(float));
-    d_pre_r = (float*)calloc(hdim, sizeof(float));
-    d_pre_n = (float*)calloc(hdim, sizeof(float));
-    grad_wzx = (float*)calloc(model->wzx.rows * model->wzx.cols, sizeof(float));
-    grad_wzh = (float*)calloc(model->wzh.rows * model->wzh.cols, sizeof(float));
-    grad_bz = (float*)calloc(hdim, sizeof(float));
-    grad_wrx = (float*)calloc(model->wrx.rows * model->wrx.cols, sizeof(float));
-    grad_wrh = (float*)calloc(model->wrh.rows * model->wrh.cols, sizeof(float));
-    grad_br = (float*)calloc(hdim, sizeof(float));
-    grad_wnx = (float*)calloc(model->wnx.rows * model->wnx.cols, sizeof(float));
-    grad_wnh = (float*)calloc(model->wnh.rows * model->wnh.cols, sizeof(float));
-    grad_bn = (float*)calloc(hdim, sizeof(float));
-    grad_policy_head = (float*)calloc(model->policy_head.rows * model->policy_head.cols, sizeof(float));
-    grad_policy_bias = (float*)calloc(adim, sizeof(float));
-    grad_value_head = (float*)calloc(hdim, sizeof(float));
-    if (!h_states || !z_cache || !r_cache || !n_cache || !gated_cache || !zero_hidden || !logits || !policy ||
-        !grad_h || !next_grad_h || !grad_logits || !d_gated || !d_pre_z || !d_pre_r || !d_pre_n ||
-        !grad_wzx || !grad_wzh || !grad_bz || !grad_wrx || !grad_wrh || !grad_br ||
-        !grad_wnx || !grad_wnh || !grad_bn || !grad_policy_head || !grad_policy_bias || !grad_value_head) {
-        free(h_states); free(z_cache); free(r_cache); free(n_cache); free(gated_cache); free(zero_hidden);
-        free(logits); free(policy); free(grad_h); free(next_grad_h); free(grad_logits); free(d_gated);
-        free(d_pre_z); free(d_pre_r); free(d_pre_n);
-        free(grad_wzx); free(grad_wzh); free(grad_bz); free(grad_wrx); free(grad_wrh); free(grad_br);
-        free(grad_wnx); free(grad_wnh); free(grad_bn); free(grad_policy_head); free(grad_policy_bias); free(grad_value_head);
+    if (!gru_recurrent_scratch_ensure(model, steps)) {
         return 0;
     }
+    scratch = &model->recurrent_scratch;
+    h_states = scratch->h_states;
+    z_cache = scratch->z_cache;
+    r_cache = scratch->r_cache;
+    n_cache = scratch->n_cache;
+    gated_cache = scratch->gated_cache;
+    zero_hidden = scratch->zero_hidden;
+    logits = scratch->logits;
+    policy = scratch->policy;
+    grad_h = scratch->grad_h;
+    next_grad_h = scratch->next_grad_h;
+    grad_logits = scratch->grad_logits;
+    d_gated = scratch->d_gated;
+    d_pre_z = scratch->d_pre_z;
+    d_pre_r = scratch->d_pre_r;
+    d_pre_n = scratch->d_pre_n;
+    grad_wzx = scratch->grad_wzx;
+    grad_wzh = scratch->grad_wzh;
+    grad_bz = scratch->grad_bz;
+    grad_wrx = scratch->grad_wrx;
+    grad_wrh = scratch->grad_wrh;
+    grad_br = scratch->grad_br;
+    grad_wnx = scratch->grad_wnx;
+    grad_wnh = scratch->grad_wnh;
+    grad_bn = scratch->grad_bn;
+    grad_policy_head = scratch->grad_policy_head;
+    grad_policy_bias = scratch->grad_policy_bias;
+    grad_value_head = scratch->grad_value_head;
+    memset(h_states, 0, steps * hdim * sizeof(float));
+    memset(z_cache, 0, steps * hdim * sizeof(float));
+    memset(r_cache, 0, steps * hdim * sizeof(float));
+    memset(n_cache, 0, steps * hdim * sizeof(float));
+    memset(gated_cache, 0, steps * hdim * sizeof(float));
+    memset(zero_hidden, 0, hdim * sizeof(float));
+    memset(logits, 0, adim * sizeof(float));
+    memset(policy, 0, adim * sizeof(float));
+    memset(grad_h, 0, hdim * sizeof(float));
+    memset(next_grad_h, 0, hdim * sizeof(float));
+    memset(grad_logits, 0, adim * sizeof(float));
+    memset(d_gated, 0, hdim * sizeof(float));
+    memset(d_pre_z, 0, hdim * sizeof(float));
+    memset(d_pre_r, 0, hdim * sizeof(float));
+    memset(d_pre_n, 0, hdim * sizeof(float));
+    memset(grad_wzx, 0, model->wzx.rows * model->wzx.cols * sizeof(float));
+    memset(grad_wzh, 0, model->wzh.rows * model->wzh.cols * sizeof(float));
+    memset(grad_bz, 0, hdim * sizeof(float));
+    memset(grad_wrx, 0, model->wrx.rows * model->wrx.cols * sizeof(float));
+    memset(grad_wrh, 0, model->wrh.rows * model->wrh.cols * sizeof(float));
+    memset(grad_br, 0, hdim * sizeof(float));
+    memset(grad_wnx, 0, model->wnx.rows * model->wnx.cols * sizeof(float));
+    memset(grad_wnh, 0, model->wnh.rows * model->wnh.cols * sizeof(float));
+    memset(grad_bn, 0, hdim * sizeof(float));
+    memset(grad_policy_head, 0, model->policy_head.rows * model->policy_head.cols * sizeof(float));
+    memset(grad_policy_bias, 0, adim * sizeof(float));
+    memset(grad_value_head, 0, hdim * sizeof(float));
 
     start_hidden = initial_hidden_state ? initial_hidden_state : zero_hidden;
     if (target_action_secondary >= 0) {
@@ -727,7 +895,7 @@ static int recurrent_update_sequence(
 
     for (t = steps; t-- > 0;) {
         const float* input = sequence + (t * xdim);
-        const float* prev_h = (t > 0) ? (h_states + ((t - 1) * hdim)) : zero_hidden;
+        const float* prev_h = (t > 0) ? (h_states + ((t - 1) * hdim)) : start_hidden;
         const float* z_t = z_cache + (t * hdim);
         const float* r_t = r_cache + (t * hdim);
         const float* n_t = n_cache + (t * hdim);
@@ -779,11 +947,6 @@ static int recurrent_update_sequence(
     for (h = 0; h < hdim; ++h) model->value_head[h] -= learning_rate * grad_value_head[h];
     model->value_bias -= learning_rate * grad_value_bias;
 
-    free(h_states); free(z_cache); free(r_cache); free(n_cache); free(gated_cache); free(zero_hidden);
-    free(logits); free(policy); free(grad_h); free(next_grad_h); free(grad_logits); free(d_gated);
-    free(d_pre_z); free(d_pre_r); free(d_pre_n);
-    free(grad_wzx); free(grad_wzh); free(grad_bz); free(grad_wrx); free(grad_wrh); free(grad_br);
-    free(grad_wnx); free(grad_wnh); free(grad_bn); free(grad_policy_head); free(grad_policy_bias); free(grad_value_head);
     return 1;
 }
 
