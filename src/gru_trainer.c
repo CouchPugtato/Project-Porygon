@@ -25,6 +25,7 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
     trainer->gamma = 1.0f;
     trainer->entropy_coef = 0.001f;
     trainer->advantage_norm = 1;
+    trainer->supervised_minibatch_size = 8;
 }
 
 TrainerCheckpointState gru_trainer_checkpoint_state(const GruTrainer* trainer) {
@@ -79,6 +80,8 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
     trainer->last_supervised_update_seconds = 0.0;
     trainer->last_supervised_label_count = 0;
     trainer->last_supervised_window_count = 0;
+    trainer->last_supervised_batch_flushes = 0;
+    gru_model_clear_accumulated_supervised_updates(model);
 
     cache_start_clock = clock();
     gru_model_zero_state(model, hidden);
@@ -105,6 +108,7 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         float value_loss = 0.0f;
         float accuracy = 0.0f;
         size_t label_count = 0;
+        int accumulated = 0;
 
         if (episode->actions[t] < 0 && episode->actions2[t] < 0) {
             continue;
@@ -119,7 +123,7 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         }
 
         if (episode->actions[t] >= 0 && episode->actions2[t] >= 0) {
-            if (!gru_model_supervised_update_sequence_window_dual(
+            if (!gru_model_supervised_accumulate_sequence_window_dual(
                     model,
                     episode->observations + (start * episode->obs_dim),
                     steps,
@@ -129,7 +133,6 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
                     slot_mask_b,
                     episode->actions2[t],
                     episode->rewards[t],
-                    trainer->learning_rate,
                     &action_loss,
                     &value_loss,
                     &accuracy)) {
@@ -139,8 +142,9 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
                 free(policy);
                 return 0;
             }
+            accumulated = 1;
         } else if (episode->actions[t] >= 0) {
-            if (!gru_model_supervised_update_sequence_window(
+            if (!gru_model_supervised_accumulate_sequence_window(
                     model,
                     episode->observations + (start * episode->obs_dim),
                     steps,
@@ -148,7 +152,6 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
                     slot_mask_a,
                     episode->actions[t],
                     episode->rewards[t],
-                    trainer->learning_rate,
                     &action_loss,
                     &value_loss,
                     &accuracy)) {
@@ -158,8 +161,9 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
                 free(policy);
                 return 0;
             }
+            accumulated = 1;
         } else {
-            if (!gru_model_supervised_update_sequence_window(
+            if (!gru_model_supervised_accumulate_sequence_window(
                     model,
                     episode->observations + (start * episode->obs_dim),
                     steps,
@@ -167,7 +171,6 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
                     slot_mask_b,
                     episode->actions2[t],
                     episode->rewards[t],
-                    trainer->learning_rate,
                     &action_loss,
                     &value_loss,
                     &accuracy)) {
@@ -177,6 +180,7 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
                 free(policy);
                 return 0;
             }
+            accumulated = 1;
         }
 
         action_loss_sum += action_loss * (float)label_count;
@@ -185,6 +189,29 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         trained += label_count;
         trainer->step += label_count;
         trainer->last_supervised_window_count += 1;
+        if (accumulated && trainer->supervised_minibatch_size > 0 &&
+                (trainer->last_supervised_window_count % trainer->supervised_minibatch_size) == 0) {
+            if (!gru_model_apply_accumulated_supervised_updates(model, trainer->learning_rate)) {
+                free(hidden);
+                free(next_hidden);
+                free(hidden_after);
+                free(policy);
+                return 0;
+            }
+            trainer->last_supervised_batch_flushes += 1;
+        }
+    }
+    if (!gru_model_apply_accumulated_supervised_updates(model, trainer->learning_rate)) {
+        free(hidden);
+        free(next_hidden);
+        free(hidden_after);
+        free(policy);
+        return 0;
+    }
+    if (trainer->supervised_minibatch_size > 0 &&
+            trainer->last_supervised_window_count > 0 &&
+            (trainer->last_supervised_window_count % trainer->supervised_minibatch_size) != 0) {
+        trainer->last_supervised_batch_flushes += 1;
     }
     trainer->last_supervised_update_seconds =
         (double)(clock() - update_start_clock) / (double)CLOCKS_PER_SEC;

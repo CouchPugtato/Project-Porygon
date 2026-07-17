@@ -55,6 +55,23 @@ typedef struct {
     float* grad_value_head;
 } GruRecurrentScratch;
 
+typedef struct {
+    float* wzx;
+    float* wzh;
+    float* bz;
+    float* wrx;
+    float* wrh;
+    float* br;
+    float* wnx;
+    float* wnh;
+    float* bn;
+    float* policy_head;
+    float* policy_bias;
+    float* value_head;
+    float value_bias;
+    size_t count;
+} GruGradientAccum;
+
 struct GruModel {
     size_t input_dim;
     size_t hidden_dim;
@@ -79,6 +96,7 @@ struct GruModel {
     float value_bias;
     GruForwardScratch forward_scratch;
     GruRecurrentScratch recurrent_scratch;
+    GruGradientAccum grad_accum;
 };
 
 static float rand_uniform(void) {
@@ -265,6 +283,109 @@ static int gru_recurrent_scratch_ensure(GruModel* model, size_t steps) {
     scratch->hidden_capacity = model->hidden_dim;
     scratch->input_capacity = model->input_dim;
     scratch->action_capacity = model->num_actions;
+    return 1;
+}
+
+static void gru_gradient_accum_free(GruGradientAccum* accum) {
+    if (!accum) {
+        return;
+    }
+    free(accum->wzx);
+    free(accum->wzh);
+    free(accum->bz);
+    free(accum->wrx);
+    free(accum->wrh);
+    free(accum->br);
+    free(accum->wnx);
+    free(accum->wnh);
+    free(accum->bn);
+    free(accum->policy_head);
+    free(accum->policy_bias);
+    free(accum->value_head);
+    memset(accum, 0, sizeof(*accum));
+}
+
+static int gru_gradient_accum_ensure(GruModel* model) {
+    GruGradientAccum* accum;
+    if (!model) {
+        return 0;
+    }
+    accum = &model->grad_accum;
+    if (accum->wzx && accum->wzh && accum->bz && accum->wrx && accum->wrh && accum->br &&
+            accum->wnx && accum->wnh && accum->bn && accum->policy_head && accum->policy_bias &&
+            accum->value_head) {
+        return 1;
+    }
+    gru_gradient_accum_free(accum);
+    accum->wzx = (float*)calloc(model->wzx.rows * model->wzx.cols, sizeof(float));
+    accum->wzh = (float*)calloc(model->wzh.rows * model->wzh.cols, sizeof(float));
+    accum->bz = (float*)calloc(model->hidden_dim, sizeof(float));
+    accum->wrx = (float*)calloc(model->wrx.rows * model->wrx.cols, sizeof(float));
+    accum->wrh = (float*)calloc(model->wrh.rows * model->wrh.cols, sizeof(float));
+    accum->br = (float*)calloc(model->hidden_dim, sizeof(float));
+    accum->wnx = (float*)calloc(model->wnx.rows * model->wnx.cols, sizeof(float));
+    accum->wnh = (float*)calloc(model->wnh.rows * model->wnh.cols, sizeof(float));
+    accum->bn = (float*)calloc(model->hidden_dim, sizeof(float));
+    accum->policy_head = (float*)calloc(model->policy_head.rows * model->policy_head.cols, sizeof(float));
+    accum->policy_bias = (float*)calloc(model->num_actions, sizeof(float));
+    accum->value_head = (float*)calloc(model->hidden_dim, sizeof(float));
+    if (!accum->wzx || !accum->wzh || !accum->bz || !accum->wrx || !accum->wrh || !accum->br ||
+            !accum->wnx || !accum->wnh || !accum->bn || !accum->policy_head || !accum->policy_bias ||
+            !accum->value_head) {
+        gru_gradient_accum_free(accum);
+        return 0;
+    }
+    return 1;
+}
+
+void gru_model_clear_accumulated_supervised_updates(GruModel* model) {
+    GruGradientAccum* accum;
+    if (!model || !gru_gradient_accum_ensure(model)) {
+        return;
+    }
+    accum = &model->grad_accum;
+    memset(accum->wzx, 0, model->wzx.rows * model->wzx.cols * sizeof(float));
+    memset(accum->wzh, 0, model->wzh.rows * model->wzh.cols * sizeof(float));
+    memset(accum->bz, 0, model->hidden_dim * sizeof(float));
+    memset(accum->wrx, 0, model->wrx.rows * model->wrx.cols * sizeof(float));
+    memset(accum->wrh, 0, model->wrh.rows * model->wrh.cols * sizeof(float));
+    memset(accum->br, 0, model->hidden_dim * sizeof(float));
+    memset(accum->wnx, 0, model->wnx.rows * model->wnx.cols * sizeof(float));
+    memset(accum->wnh, 0, model->wnh.rows * model->wnh.cols * sizeof(float));
+    memset(accum->bn, 0, model->hidden_dim * sizeof(float));
+    memset(accum->policy_head, 0, model->policy_head.rows * model->policy_head.cols * sizeof(float));
+    memset(accum->policy_bias, 0, model->num_actions * sizeof(float));
+    memset(accum->value_head, 0, model->hidden_dim * sizeof(float));
+    accum->value_bias = 0.0f;
+    accum->count = 0;
+}
+
+int gru_model_apply_accumulated_supervised_updates(GruModel* model, float learning_rate) {
+    size_t i;
+    float scale;
+    GruGradientAccum* accum;
+    if (!model || !gru_gradient_accum_ensure(model)) {
+        return 0;
+    }
+    accum = &model->grad_accum;
+    if (accum->count == 0) {
+        return 1;
+    }
+    scale = learning_rate / (float)accum->count;
+    for (i = 0; i < model->wzx.rows * model->wzx.cols; ++i) model->wzx.data[i] -= scale * accum->wzx[i];
+    for (i = 0; i < model->wzh.rows * model->wzh.cols; ++i) model->wzh.data[i] -= scale * accum->wzh[i];
+    for (i = 0; i < model->hidden_dim; ++i) model->bz[i] -= scale * accum->bz[i];
+    for (i = 0; i < model->wrx.rows * model->wrx.cols; ++i) model->wrx.data[i] -= scale * accum->wrx[i];
+    for (i = 0; i < model->wrh.rows * model->wrh.cols; ++i) model->wrh.data[i] -= scale * accum->wrh[i];
+    for (i = 0; i < model->hidden_dim; ++i) model->br[i] -= scale * accum->br[i];
+    for (i = 0; i < model->wnx.rows * model->wnx.cols; ++i) model->wnx.data[i] -= scale * accum->wnx[i];
+    for (i = 0; i < model->wnh.rows * model->wnh.cols; ++i) model->wnh.data[i] -= scale * accum->wnh[i];
+    for (i = 0; i < model->hidden_dim; ++i) model->bn[i] -= scale * accum->bn[i];
+    for (i = 0; i < model->policy_head.rows * model->policy_head.cols; ++i) model->policy_head.data[i] -= scale * accum->policy_head[i];
+    for (i = 0; i < model->num_actions; ++i) model->policy_bias[i] -= scale * accum->policy_bias[i];
+    for (i = 0; i < model->hidden_dim; ++i) model->value_head[i] -= scale * accum->value_head[i];
+    model->value_bias -= scale * accum->value_bias;
+    gru_model_clear_accumulated_supervised_updates(model);
     return 1;
 }
 
@@ -707,6 +828,7 @@ static int recurrent_update_sequence(
     float target_value,
     float entropy_coef,
     float learning_rate,
+    int accumulate_only,
     float* action_loss_out,
     float* value_loss_out,
     float* accuracy_out
@@ -745,6 +867,7 @@ static int recurrent_update_sequence(
     float accuracy_sum = 0.0f;
     float action_loss_sum = 0.0f;
     const float* start_hidden;
+    GruGradientAccum* accum = NULL;
 
     if (!model || !sequence || steps == 0 || target_action < 0 || (size_t)target_action >= model->num_actions) {
         return 0;
@@ -752,6 +875,12 @@ static int recurrent_update_sequence(
     hdim = model->hidden_dim;
     xdim = model->input_dim;
     adim = model->num_actions;
+    if (accumulate_only) {
+        if (!gru_gradient_accum_ensure(model)) {
+            return 0;
+        }
+        accum = &model->grad_accum;
+    }
 
     if (!gru_recurrent_scratch_ensure(model, steps)) {
         return 0;
@@ -933,19 +1062,36 @@ static int recurrent_update_sequence(
         memcpy(grad_h, next_grad_h, hdim * sizeof(float));
     }
 
-    for (h = 0; h < model->wzx.rows * model->wzx.cols; ++h) model->wzx.data[h] -= learning_rate * grad_wzx[h];
-    for (h = 0; h < model->wzh.rows * model->wzh.cols; ++h) model->wzh.data[h] -= learning_rate * grad_wzh[h];
-    for (h = 0; h < hdim; ++h) model->bz[h] -= learning_rate * grad_bz[h];
-    for (h = 0; h < model->wrx.rows * model->wrx.cols; ++h) model->wrx.data[h] -= learning_rate * grad_wrx[h];
-    for (h = 0; h < model->wrh.rows * model->wrh.cols; ++h) model->wrh.data[h] -= learning_rate * grad_wrh[h];
-    for (h = 0; h < hdim; ++h) model->br[h] -= learning_rate * grad_br[h];
-    for (h = 0; h < model->wnx.rows * model->wnx.cols; ++h) model->wnx.data[h] -= learning_rate * grad_wnx[h];
-    for (h = 0; h < model->wnh.rows * model->wnh.cols; ++h) model->wnh.data[h] -= learning_rate * grad_wnh[h];
-    for (h = 0; h < hdim; ++h) model->bn[h] -= learning_rate * grad_bn[h];
-    for (a = 0; a < model->policy_head.rows * model->policy_head.cols; ++a) model->policy_head.data[a] -= learning_rate * grad_policy_head[a];
-    for (a = 0; a < adim; ++a) model->policy_bias[a] -= learning_rate * grad_policy_bias[a];
-    for (h = 0; h < hdim; ++h) model->value_head[h] -= learning_rate * grad_value_head[h];
-    model->value_bias -= learning_rate * grad_value_bias;
+    if (accumulate_only) {
+        for (h = 0; h < model->wzx.rows * model->wzx.cols; ++h) accum->wzx[h] += grad_wzx[h];
+        for (h = 0; h < model->wzh.rows * model->wzh.cols; ++h) accum->wzh[h] += grad_wzh[h];
+        for (h = 0; h < hdim; ++h) accum->bz[h] += grad_bz[h];
+        for (h = 0; h < model->wrx.rows * model->wrx.cols; ++h) accum->wrx[h] += grad_wrx[h];
+        for (h = 0; h < model->wrh.rows * model->wrh.cols; ++h) accum->wrh[h] += grad_wrh[h];
+        for (h = 0; h < hdim; ++h) accum->br[h] += grad_br[h];
+        for (h = 0; h < model->wnx.rows * model->wnx.cols; ++h) accum->wnx[h] += grad_wnx[h];
+        for (h = 0; h < model->wnh.rows * model->wnh.cols; ++h) accum->wnh[h] += grad_wnh[h];
+        for (h = 0; h < hdim; ++h) accum->bn[h] += grad_bn[h];
+        for (a = 0; a < model->policy_head.rows * model->policy_head.cols; ++a) accum->policy_head[a] += grad_policy_head[a];
+        for (a = 0; a < adim; ++a) accum->policy_bias[a] += grad_policy_bias[a];
+        for (h = 0; h < hdim; ++h) accum->value_head[h] += grad_value_head[h];
+        accum->value_bias += grad_value_bias;
+        accum->count += 1;
+    } else {
+        for (h = 0; h < model->wzx.rows * model->wzx.cols; ++h) model->wzx.data[h] -= learning_rate * grad_wzx[h];
+        for (h = 0; h < model->wzh.rows * model->wzh.cols; ++h) model->wzh.data[h] -= learning_rate * grad_wzh[h];
+        for (h = 0; h < hdim; ++h) model->bz[h] -= learning_rate * grad_bz[h];
+        for (h = 0; h < model->wrx.rows * model->wrx.cols; ++h) model->wrx.data[h] -= learning_rate * grad_wrx[h];
+        for (h = 0; h < model->wrh.rows * model->wrh.cols; ++h) model->wrh.data[h] -= learning_rate * grad_wrh[h];
+        for (h = 0; h < hdim; ++h) model->br[h] -= learning_rate * grad_br[h];
+        for (h = 0; h < model->wnx.rows * model->wnx.cols; ++h) model->wnx.data[h] -= learning_rate * grad_wnx[h];
+        for (h = 0; h < model->wnh.rows * model->wnh.cols; ++h) model->wnh.data[h] -= learning_rate * grad_wnh[h];
+        for (h = 0; h < hdim; ++h) model->bn[h] -= learning_rate * grad_bn[h];
+        for (a = 0; a < model->policy_head.rows * model->policy_head.cols; ++a) model->policy_head.data[a] -= learning_rate * grad_policy_head[a];
+        for (a = 0; a < adim; ++a) model->policy_bias[a] -= learning_rate * grad_policy_bias[a];
+        for (h = 0; h < hdim; ++h) model->value_head[h] -= learning_rate * grad_value_head[h];
+        model->value_bias -= learning_rate * grad_value_bias;
+    }
 
     return 1;
 }
@@ -963,7 +1109,7 @@ int gru_model_supervised_update_sequence(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, target_action, 1.0f, target_value, 0.0f,
-        learning_rate, action_loss_out, value_loss_out, accuracy_out);
+        learning_rate, 0, action_loss_out, value_loss_out, accuracy_out);
 }
 
 int gru_model_supervised_update_sequence_window(
@@ -980,7 +1126,7 @@ int gru_model_supervised_update_sequence_window(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, NULL, -1, legal_mask, target_action,
-        1.0f, target_value, 0.0f, learning_rate, action_loss_out, value_loss_out, accuracy_out);
+        1.0f, target_value, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out);
 }
 
 int gru_model_supervised_update_sequence_window_dual(
@@ -999,7 +1145,42 @@ int gru_model_supervised_update_sequence_window_dual(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, legal_mask_b, target_action_b,
-        legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, learning_rate,
+        legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, learning_rate, 0,
+        action_loss_out, value_loss_out, accuracy_out);
+}
+
+int gru_model_supervised_accumulate_sequence_window(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask,
+    int target_action,
+    float target_value,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out
+) {
+    return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, NULL, -1, legal_mask, target_action,
+        1.0f, target_value, 0.0f, 0.0f, 1, action_loss_out, value_loss_out, accuracy_out);
+}
+
+int gru_model_supervised_accumulate_sequence_window_dual(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    int target_action_a,
+    const unsigned char* legal_mask_b,
+    int target_action_b,
+    float target_value,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out
+) {
+    return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, legal_mask_b, target_action_b,
+        legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, 0.0f, 1,
         action_loss_out, value_loss_out, accuracy_out);
 }
 
@@ -1132,7 +1313,7 @@ int gru_model_policy_gradient_update_sequence(
     float learning_rate
 ) {
     return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, action, advantage, target_value, entropy_coef,
-        learning_rate, NULL, NULL, NULL);
+        learning_rate, 0, NULL, NULL, NULL);
 }
 
 size_t gru_model_parameter_count(const GruModel* model) {
