@@ -18,6 +18,9 @@ Files:
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
   - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
   - supports `supervised_profile = true|false` to enable or fully disable per-episode supervised profiling work in `showdown_client`
+  - supports a `Rich` live dashboard when `dashboard = true`
+  - automatically falls back to plain-text output if `Rich` is unavailable or the terminal is not interactive
+  - writes one raw trainer log per shard when `dashboard_write_raw_logs = true`
   - supports `env_<NAME> = <value>` entries to set subprocess environment variables for `showdown_client`
   - writes one batch-training stats JSON per shard under `models/runs/<run>/<checkpoint_stem>/<checkpoint_stem>_batch_training_stats/`
 - `reward_weights.toml`
@@ -31,6 +34,9 @@ checkpoint = "run18_200shards.chk"
 mode = "rl"
 epochs = 1
 supervised_profile = true
+dashboard = true
+dashboard_visible_shards = 5
+dashboard_write_raw_logs = true
 env_porygon_omp_threads = 8
 ```
 
@@ -41,6 +47,18 @@ Notes:
 - ordinary boolean options become `1`/`0` on the generated CLI
 - bare passthrough flags like `battle_agent = true` emit `--battle-agent`
 - `env_<NAME> = <value>` entries are exported to trainer subprocesses instead of becoming CLI flags
+- `dashboard_visible_shards` accepts any positive integer; if even, the live window biases one extra row toward upcoming shards
+
+Training dashboard notes:
+
+- install Python tooling dependencies from [requirements.txt](/abs/f:/Coding/Repositories/Project-Porygon/py/requirements.txt), including `rich`
+- when `dashboard = true`, `py/tools/train_batch_selfplay.py` renders:
+  - a top summary with ETA/checkpoint/throughput/context
+  - an epoch progress bar
+  - a rolling shard window centered around the current shard
+- raw trainer stdout is written to:
+  - `models/runs/<run>/<checkpoint_stem>/<checkpoint_stem>_batch_training_logs/`
+- if `Rich` is missing or the output is not a TTY, the wrapper falls back to the current plain-text logging style
 
 Examples:
 

@@ -1754,6 +1754,7 @@ static int train_from_replay_file(
     float rl_gamma,
     float rl_entropy_coef,
     int rl_advantage_norm,
+    int supervised_profile,
     const char* rl_reward_mode,
     const RewardConfig* reward_config
 ) {
@@ -1955,6 +1956,7 @@ static int train_from_replay_file(
                         elapsed,
                         episodes_per_sec);
                 }
+                fflush(stdout);
             }
             if (!rl_mode && ((trained_in_epoch % 500u) == 0u || trained_in_epoch == train_sessions)) {
                 TrainerCheckpointState periodic_state = gru_trainer_checkpoint_state(&trainer);
@@ -2187,6 +2189,7 @@ static int showdown_client_main(int argc, char** argv) {
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            supervised_profile,
             rl_reward_mode,
             &reward_config);
     }
@@ -2199,6 +2202,7 @@ static int showdown_client_main(int argc, char** argv) {
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            supervised_profile,
             rl_reward_mode,
             &reward_config);
     }
@@ -2248,6 +2252,9 @@ int main(int argc, char** argv) {
     int effective_argc = argc;
     char** effective_argv = argv;
     int rc;
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
 
     if (argc == 1) {
         config_args = load_default_args_file(SHOWDOWN_CLIENT_DEFAULT_ARGS_PATH, &config_argc);
