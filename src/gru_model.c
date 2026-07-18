@@ -447,7 +447,6 @@ static void matrix_vec_mul_accum(const Matrix* matrix, const float* vec, float* 
 
 static void matrix_transpose_vec_mul_accum(const Matrix* matrix, const float* vec, float* out) {
     size_t r;
-    size_t c;
 #ifdef _OPENMP
     int thread_count;
     float* partials;
@@ -461,6 +460,7 @@ static void matrix_transpose_vec_mul_accum(const Matrix* matrix, const float* ve
                 float* local = partials + ((size_t)tid * matrix->cols);
                 #pragma omp for
                 for (r = 0; r < matrix->rows; ++r) {
+                    size_t c;
                     const float* row = matrix->data + (r * matrix->cols);
                     float vr = vec[r];
                     for (c = 0; c < matrix->cols; ++c) {
@@ -469,6 +469,7 @@ static void matrix_transpose_vec_mul_accum(const Matrix* matrix, const float* ve
                 }
             }
             for (r = 0; r < (size_t)thread_count; ++r) {
+                size_t c;
                 float* local = partials + (r * matrix->cols);
                 for (c = 0; c < matrix->cols; ++c) {
                     out[c] += local[c];
@@ -480,6 +481,7 @@ static void matrix_transpose_vec_mul_accum(const Matrix* matrix, const float* ve
     }
 #endif
     for (r = 0; r < matrix->rows; ++r) {
+        size_t c;
         const float* row = matrix->data + (r * matrix->cols);
         for (c = 0; c < matrix->cols; ++c) {
             out[c] += row[c] * vec[r];
