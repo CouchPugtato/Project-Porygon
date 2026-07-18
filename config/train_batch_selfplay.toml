@@ -5,5 +5,6 @@ reward_mode = "dense_additive" # terminal | dense_additive
 epochs = 1
 epochs_per_file = 1
 shuffle = true
+supervised_profile = false
 sample_files = 200
-env_porygon_omp_threads = 16
+env_porygon_omp_threads = 24

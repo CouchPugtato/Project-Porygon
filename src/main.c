@@ -475,6 +475,11 @@ static int parse_int_flag(int argc, char** argv, const char* name, int default_v
     return default_value;
 }
 
+static int parse_bool01_flag(int argc, char** argv, const char* name, int default_value) {
+    int parsed = parse_int_flag(argc, argv, name, default_value);
+    return parsed ? 1 : 0;
+}
+
 static int parse_reward_mode(const char* reward_mode_name, EnvRewardMode* reward_mode_out) {
     if (!reward_mode_name || !reward_mode_out) {
         return 0;
@@ -1813,6 +1818,8 @@ static int train_from_replay_file(
         trainer.gamma = rl_gamma;
         trainer.entropy_coef = rl_entropy_coef;
         trainer.advantage_norm = rl_advantage_norm ? 1 : 0;
+    } else {
+        trainer.supervised_profile_enabled = supervised_profile;
     }
 
     if (!load_runtime_from_replay_file(
@@ -1926,13 +1933,15 @@ static int train_from_replay_file(
                         trainer.last_action_loss,
                         trainer.last_value_loss,
                         trainer.last_accuracy);
-                    printf("[train] epoch=%d supervised_profile cache=%.3fs update=%.3fs labels=%zu windows=%zu flushes=%zu\n",
-                        epoch,
-                        trainer.last_supervised_cache_seconds,
-                        trainer.last_supervised_update_seconds,
-                        trainer.last_supervised_label_count,
-                        trainer.last_supervised_window_count,
-                        trainer.last_supervised_batch_flushes);
+                    if (trainer.supervised_profile_enabled) {
+                        printf("[train] epoch=%d supervised_profile cache=%.3fs update=%.3fs labels=%zu windows=%zu flushes=%zu\n",
+                            epoch,
+                            trainer.last_supervised_cache_seconds,
+                            trainer.last_supervised_update_seconds,
+                            trainer.last_supervised_label_count,
+                            trainer.last_supervised_window_count,
+                            trainer.last_supervised_batch_flushes);
+                    }
                 }
                 if (eta_ready && train_eta_rate_ema > 0.0) {
                     printf("[train] epoch=%d elapsed=%.1fs episodes_per_sec=%.2f eta=%.1fs\n",
@@ -2126,6 +2135,7 @@ static int showdown_client_main(int argc, char** argv) {
     float rl_gamma = parse_float_flag(argc, argv, "--gamma", 1.0f);
     float rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef", 0.001f);
     int rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", 1);
+    int supervised_profile = parse_bool01_flag(argc, argv, "--supervised-profile", 1);
     const char* rl_reward_mode = parse_string_flag(argc, argv, "--reward-mode", "terminal");
     RewardConfig reward_config;
     int training_or_eval_mode = 0;
@@ -2220,7 +2230,7 @@ static int showdown_client_main(int argc, char** argv) {
         fprintf(stderr,
         "Usage:\n"
         "  showdown_client --battle-agent [checkpoint]\n"
-        "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N]\n"
+        "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--supervised-profile 0|1]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"

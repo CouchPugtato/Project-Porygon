@@ -17,6 +17,7 @@ Files:
   - consumed by `py/tools/train_batch_selfplay.py` before CLI args are applied
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
   - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
+  - supports `supervised_profile = true|false` to enable or fully disable per-episode supervised profiling work in `showdown_client`
   - supports `env_<NAME> = <value>` entries to set subprocess environment variables for `showdown_client`
   - writes one batch-training stats JSON per shard under `models/runs/<run>/<checkpoint_stem>/<checkpoint_stem>_batch_training_stats/`
 - `reward_weights.toml`
@@ -29,6 +30,7 @@ run = "run_0018_recorded_action_sp1000"
 checkpoint = "run18_200shards.chk"
 mode = "rl"
 epochs = 1
+supervised_profile = true
 env_porygon_omp_threads = 8
 ```
 

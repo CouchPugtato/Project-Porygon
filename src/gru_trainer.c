@@ -26,6 +26,7 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
     trainer->entropy_coef = 0.001f;
     trainer->advantage_norm = 1;
     trainer->supervised_minibatch_size = 8;
+    trainer->supervised_profile_enabled = 1;
 }
 
 TrainerCheckpointState gru_trainer_checkpoint_state(const GruTrainer* trainer) {
@@ -45,12 +46,15 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
     size_t t;
     size_t hidden_dim;
     size_t action_dim;
-    clock_t cache_start_clock;
-    clock_t update_start_clock;
+    clock_t cache_start_clock = 0;
+    clock_t update_start_clock = 0;
     float action_loss_sum = 0.0f;
     float value_loss_sum = 0.0f;
     float accuracy_sum = 0.0f;
     size_t trained = 0;
+    size_t window_count = 0;
+    size_t batch_flushes = 0;
+    int profile_enabled;
     float* hidden = NULL;
     float* next_hidden = NULL;
     float* hidden_after = NULL;
@@ -61,6 +65,7 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
     if (!trainer || !model || !episode) {
         return 0;
     }
+    profile_enabled = trainer->supervised_profile_enabled ? 1 : 0;
 
     hidden_dim = gru_model_hidden_dim(model);
     action_dim = gru_model_num_actions(model);
@@ -83,7 +88,9 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
     trainer->last_supervised_batch_flushes = 0;
     gru_model_clear_accumulated_supervised_updates(model);
 
-    cache_start_clock = clock();
+    if (profile_enabled) {
+        cache_start_clock = clock();
+    }
     gru_model_zero_state(model, hidden);
     for (t = 0; t < episode->count; ++t) {
         gru_model_forward_step(
@@ -96,10 +103,14 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         memcpy(hidden_after + (t * hidden_dim), next_hidden, hidden_dim * sizeof(float));
         memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
     }
-    trainer->last_supervised_cache_seconds =
-        (double)(clock() - cache_start_clock) / (double)CLOCKS_PER_SEC;
+    if (profile_enabled) {
+        trainer->last_supervised_cache_seconds =
+            (double)(clock() - cache_start_clock) / (double)CLOCKS_PER_SEC;
+    }
 
-    update_start_clock = clock();
+    if (profile_enabled) {
+        update_start_clock = clock();
+    }
     for (t = 0; t < episode->count; ++t) {
         size_t start = (t + 1 > trainer->bptt_window) ? (t + 1 - trainer->bptt_window) : 0;
         size_t steps = (t - start) + 1;
@@ -188,9 +199,9 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         accuracy_sum += accuracy * (float)label_count;
         trained += label_count;
         trainer->step += label_count;
-        trainer->last_supervised_window_count += 1;
+        window_count += 1;
         if (accumulated && trainer->supervised_minibatch_size > 0 &&
-                (trainer->last_supervised_window_count % trainer->supervised_minibatch_size) == 0) {
+                (window_count % trainer->supervised_minibatch_size) == 0) {
             if (!gru_model_apply_accumulated_supervised_updates(model, trainer->learning_rate)) {
                 free(hidden);
                 free(next_hidden);
@@ -198,7 +209,7 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
                 free(policy);
                 return 0;
             }
-            trainer->last_supervised_batch_flushes += 1;
+            batch_flushes += 1;
         }
     }
     if (!gru_model_apply_accumulated_supervised_updates(model, trainer->learning_rate)) {
@@ -209,13 +220,17 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         return 0;
     }
     if (trainer->supervised_minibatch_size > 0 &&
-            trainer->last_supervised_window_count > 0 &&
-            (trainer->last_supervised_window_count % trainer->supervised_minibatch_size) != 0) {
-        trainer->last_supervised_batch_flushes += 1;
+            window_count > 0 &&
+            (window_count % trainer->supervised_minibatch_size) != 0) {
+        batch_flushes += 1;
     }
-    trainer->last_supervised_update_seconds =
-        (double)(clock() - update_start_clock) / (double)CLOCKS_PER_SEC;
-    trainer->last_supervised_label_count = trained;
+    if (profile_enabled) {
+        trainer->last_supervised_update_seconds =
+            (double)(clock() - update_start_clock) / (double)CLOCKS_PER_SEC;
+        trainer->last_supervised_label_count = trained;
+        trainer->last_supervised_window_count = window_count;
+        trainer->last_supervised_batch_flushes = batch_flushes;
+    }
 
     if (trained > 0) {
         trainer->last_action_loss = action_loss_sum / (float)trained;

@@ -222,6 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pattern", default="worker_*_raw.jsonl", help="Glob for training shards")
     parser.add_argument("--trainer-exe", default=str(DEFAULT_TRAINER_EXE))
     parser.add_argument("--shuffle", type=parse_bool01, default=True, help="Shuffle shard order each epoch")
+    parser.add_argument("--supervised-profile", type=parse_bool01, default=True, help="Enable per-episode supervised profiling output")
     parser.add_argument("--start-index", type=int, default=0, help="Skip the first N matched files")
     parser.add_argument("--limit-files", type=positive_int, default=0, help="Optional cap on matched files")
     parser.add_argument("--sample-files", type=positive_int, default=0, help="Train on a random subset of up to N shards per epoch")
@@ -242,6 +243,13 @@ def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> lis
         "--epochs",
         str(args.epochs_per_file),
     ]
+    if args.mode == "supervised":
+        command.extend(
+            [
+                "--supervised-profile",
+                "1" if args.supervised_profile else "0",
+            ]
+        )
     if args.mode == "rl":
         command.extend(
             [

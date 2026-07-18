@@ -23,6 +23,7 @@ typedef struct {
     float last_entropy;
     size_t last_rl_labels;
     size_t supervised_minibatch_size;
+    int supervised_profile_enabled;
     double last_supervised_cache_seconds;
     double last_supervised_update_seconds;
     size_t last_supervised_label_count;
