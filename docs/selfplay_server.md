@@ -11,6 +11,14 @@ Defaults:
 - same-model matches are allowed
 - worker pool size: `2 * --concurrent-games`
 
+Queued shard mode:
+
+- by default, worker count still follows `2 * --concurrent-games`
+- if you set `--worker-pairs`, the runner creates that many `A/B` worker pairs instead
+- in queued shard mode, only `--concurrent-games` pairs are active at once
+- each side-`A` worker file is a training shard, so `--worker-pairs 200` yields about `200` side-`A` shard files
+- if `--worker-games` is unset, the runner auto-budgets per-pair games as `ceil(--games / --worker-pairs)`
+
 What it manages:
 
 - starts the local Showdown server
@@ -71,6 +79,12 @@ Important flags:
   - if a model spec is exactly `random`, that worker group always uses random mode
 - `--model-a-weight` / `--model-b-weight`
   - population split across the fixed worker pool
+- `--worker-pairs`
+  - explicit shard-producing pair count
+  - enables queued shard mode
+- `--worker-games`
+  - per-worker max game budget in queued shard mode
+  - defaults to `ceil(--games / --worker-pairs)` when omitted
 
 Notes:
 
@@ -81,3 +95,4 @@ Notes:
 - if the client build step fails, the runner can still try serving `testclient-old.html` from the cloned client repo
 - if the Showdown server exits unexpectedly, the run fails and workers are terminated
 - worker disconnects are handled first by communicator reconnect logic; if a worker exits, the orchestrator respawns it before shutdown begins
+- in queued shard mode, a worker that exits after logging `reached max games (...)` is treated as complete, not crashed

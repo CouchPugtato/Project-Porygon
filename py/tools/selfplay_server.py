@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import math
 import json
 import os
 import random
@@ -190,6 +191,7 @@ async def terminate_process(process: asyncio.subprocess.Process | None, timeout_
 @dataclass(frozen=True)
 class WorkerSpec:
     worker_id: int
+    pair_index: int
     model_group: str
     checkpoint_path: str
     mode: str
@@ -198,6 +200,7 @@ class WorkerSpec:
     replay_path: Path
     stdout_log_path: Path
     shutdown_path: Path
+    max_games: int = 0
     challenge_target: str = ""
     accept_challenges: bool = False
     accept_challenge_from: str = ""
@@ -494,6 +497,7 @@ class WorkerProcess:
         self.graceful_stop_requested = False
         self.active_battles: set[str] = set()
         self.reconnect_pending = False
+        self.max_games_reached = False
 
     def command(self) -> list[str]:
         command = [
@@ -503,7 +507,7 @@ class WorkerProcess:
             "--mode",
             self.launch_identity.mode,
             "--games",
-            "0",
+            str(self.spec.max_games),
             "--server-uri",
             self.server_uri,
             "--username",
@@ -547,6 +551,7 @@ class WorkerProcess:
         self.graceful_stop_requested = False
         self.active_battles.clear()
         self.reconnect_pending = False
+        self.max_games_reached = False
         self._stdout_task = asyncio.create_task(self._pipe_output())
 
     async def _pipe_output(self) -> None:
@@ -570,6 +575,8 @@ class WorkerProcess:
         ended = BATTLE_ENDED_RE.search(line)
         if ended:
             self.active_battles.discard(ended.group(1))
+        if "reached max games (" in line:
+            self.max_games_reached = True
         self.on_log_line(self, line)
 
     def is_running(self) -> bool:
@@ -590,6 +597,7 @@ class WorkerProcess:
         await terminate_process(self.process)
         self.active_battles.clear()
         self.reconnect_pending = False
+        self.max_games_reached = False
         if self._stdout_task is not None:
             with contextlib.suppress(Exception):
                 await self._stdout_task
@@ -683,16 +691,31 @@ class PoolOrchestrator:
             args.server_host,
             args.server_port,
         )
-        self.total_workers = max(2, args.concurrent_games * 2)
-        self.model_a_workers, self.model_b_workers = split_weighted_workers(
-            self.total_workers,
-            args.model_a_weight,
-            args.model_b_weight,
-        )
-        self.model_b_workers = self.total_workers - self.model_a_workers
+        self.explicit_worker_pairs = args.worker_pairs > 0 or args.worker_games > 0
+        if self.explicit_worker_pairs:
+            self.total_pairs = max(1, args.worker_pairs or args.concurrent_games)
+            self.total_workers = self.total_pairs * 2
+            self.model_a_workers = self.total_pairs
+            self.model_b_workers = self.total_pairs
+        else:
+            self.total_pairs = 0
+            self.total_workers = max(2, args.concurrent_games * 2)
+            self.model_a_workers, self.model_b_workers = split_weighted_workers(
+                self.total_workers,
+                args.model_a_weight,
+                args.model_b_weight,
+            )
+            self.model_b_workers = self.total_workers - self.model_a_workers
+        self.worker_games = self._resolve_worker_games()
         self.pool_rng = random.Random(args.pool_seed) if args.pool_seed is not None else random.Random()
         self.side_configs = self._resolve_side_configs()
         self.worker_specs = self._build_worker_specs()
+        self.worker_specs_by_pair: dict[int, list[WorkerSpec]] = {}
+        for spec in self.worker_specs:
+            self.worker_specs_by_pair.setdefault(spec.pair_index, []).append(spec)
+        self.pending_pair_indices: list[int] = list(range(self.total_pairs))
+        self.active_pair_indices: set[int] = set()
+        self.completed_pair_indices: set[int] = set()
         self.worker_processes: dict[str, WorkerProcess] = {}
         self.group_modes_seen: dict[str, set[str]] = {"a": set(), "b": set()}
         self.replay_monitor = ReplayTailMonitor()
@@ -724,26 +747,68 @@ class PoolOrchestrator:
             configs["b"] = SingleSideSpec(model_spec=self.args.model_b)
         return configs
 
+    def _resolve_worker_games(self) -> int:
+        if not self.explicit_worker_pairs:
+            return 0
+        if self.args.worker_games > 0:
+            return self.args.worker_games
+        if self.args.games <= 0:
+            return 0
+        return max(1, math.ceil(self.args.games / self.total_pairs))
+
     def _build_worker_specs(self) -> list[WorkerSpec]:
         specs: list[WorkerSpec] = []
+        if not self.explicit_worker_pairs:
+            worker_id = 0
+            group_usernames: dict[str, list[str]] = {
+                "a": [f"{self.args.username_prefix}A{index:03d}" for index in range(self.model_a_workers)],
+                "b": [f"{self.args.username_prefix}B{index:03d}" for index in range(self.model_b_workers)],
+            }
+            group_counts = [("a", self.model_a_workers), ("b", self.model_b_workers)]
+            for group_name, count in group_counts:
+                side_config = self.side_configs[group_name]
+                default_model_spec = side_config.model_spec if isinstance(side_config, SingleSideSpec) else "random"
+                opponent_group = "b" if group_name == "a" else "a"
+                opponent_usernames = group_usernames[opponent_group]
+                for group_index in range(count):
+                    worker_token = f"worker_{worker_id:03d}_{group_name}"
+                    username = group_usernames[group_name][group_index]
+                    paired_username = opponent_usernames[group_index % len(opponent_usernames)] if opponent_usernames else ""
+                    specs.append(
+                        WorkerSpec(
+                            worker_id=worker_id,
+                            pair_index=group_index,
+                            model_group=group_name,
+                            checkpoint_path=checkpoint_for_model_spec(default_model_spec),
+                            mode=worker_mode_for_model_spec(self.args.worker_think_mode, default_model_spec),
+                            username=username,
+                            replay_save_token=worker_replay_save_token(self.args.run_name, worker_token),
+                            replay_path=worker_replay_path(self.args.run_name, worker_token),
+                            stdout_log_path=self.run_dir / f"{worker_token}.stdout.log",
+                            shutdown_path=self.run_dir / f"{worker_token}.shutdown",
+                            max_games=0,
+                            challenge_target=paired_username if group_name == "a" else "",
+                            accept_challenges=(group_name == "b"),
+                            accept_challenge_from=paired_username if group_name == "b" else "",
+                        )
+                    )
+                    worker_id += 1
+            return specs
         worker_id = 0
-        group_usernames: dict[str, list[str]] = {
-            "a": [f"{self.args.username_prefix}A{index:03d}" for index in range(self.model_a_workers)],
-            "b": [f"{self.args.username_prefix}B{index:03d}" for index in range(self.model_b_workers)],
-        }
-        group_counts = [("a", self.model_a_workers), ("b", self.model_b_workers)]
-        for group_name, count in group_counts:
-            side_config = self.side_configs[group_name]
-            default_model_spec = side_config.model_spec if isinstance(side_config, SingleSideSpec) else "random"
-            opponent_group = "b" if group_name == "a" else "a"
-            opponent_usernames = group_usernames[opponent_group]
-            for group_index in range(count):
+        for pair_index in range(self.total_pairs):
+            a_username = f"{self.args.username_prefix}A{pair_index:03d}"
+            b_username = f"{self.args.username_prefix}B{pair_index:03d}"
+            for group_name, username, paired_username in (
+                ("b", b_username, a_username),
+                ("a", a_username, b_username),
+            ):
+                side_config = self.side_configs[group_name]
+                default_model_spec = side_config.model_spec if isinstance(side_config, SingleSideSpec) else "random"
                 worker_token = f"worker_{worker_id:03d}_{group_name}"
-                username = group_usernames[group_name][group_index]
-                paired_username = opponent_usernames[group_index % len(opponent_usernames)] if opponent_usernames else ""
                 specs.append(
                     WorkerSpec(
                         worker_id=worker_id,
+                        pair_index=pair_index,
                         model_group=group_name,
                         checkpoint_path=checkpoint_for_model_spec(default_model_spec),
                         mode=worker_mode_for_model_spec(self.args.worker_think_mode, default_model_spec),
@@ -752,6 +817,7 @@ class PoolOrchestrator:
                         replay_path=worker_replay_path(self.args.run_name, worker_token),
                         stdout_log_path=self.run_dir / f"{worker_token}.stdout.log",
                         shutdown_path=self.run_dir / f"{worker_token}.shutdown",
+                        max_games=self.worker_games,
                         challenge_target=paired_username if group_name == "a" else "",
                         accept_challenges=(group_name == "b"),
                         accept_challenge_from=paired_username if group_name == "b" else "",
@@ -889,29 +955,83 @@ class PoolOrchestrator:
         else:
             self.log(f"started {spec.worker_token} user={spec.username} mode={launch_identity.mode} agent={launch_identity.agent_label}")
 
-    async def _start_workers(self) -> None:
-        ordered_specs = sorted(self.worker_specs, key=lambda spec: 0 if spec.model_group == "b" else 1)
-        for index, spec in enumerate(ordered_specs):
+    async def _start_pair(self, pair_index: int) -> None:
+        specs = sorted(self.worker_specs_by_pair.get(pair_index, []), key=lambda spec: 0 if spec.model_group == "b" else 1)
+        for spec in specs:
             await self._start_worker(spec)
-            if index == len(ordered_specs) - 1:
-                print()
+
+    async def _start_next_pairs_if_capacity(self) -> None:
+        while len(self.active_pair_indices) < self.args.concurrent_games and self.pending_pair_indices:
+            pair_index = self.pending_pair_indices.pop(0)
+            await self._start_pair(pair_index)
+            self.active_pair_indices.add(pair_index)
+
+    async def _start_workers(self) -> None:
+        if not self.explicit_worker_pairs:
+            ordered_specs = sorted(self.worker_specs, key=lambda spec: 0 if spec.model_group == "b" else 1)
+            for spec in ordered_specs:
+                await self._start_worker(spec)
+            print()
+            return
+        await self._start_next_pairs_if_capacity()
+        print()
+
+    def _pair_processes(self, pair_index: int) -> list[WorkerProcess]:
+        processes: list[WorkerProcess] = []
+        for spec in self.worker_specs_by_pair.get(pair_index, []):
+            worker = self.worker_processes.get(spec.worker_token)
+            if worker is not None:
+                processes.append(worker)
+        return processes
+
+    def _pair_is_complete(self, pair_index: int) -> bool:
+        processes = self._pair_processes(pair_index)
+        if not processes:
+            return False
+        if any(worker.is_running() for worker in processes):
+            return False
+        return all(worker.max_games_reached for worker in processes)
 
     async def _respawn_if_needed(self) -> None:
         if self._draining:
             return
-        for spec in self.worker_specs:
-            worker = self.worker_processes.get(spec.worker_token)
-            if worker is None:
+        if not self.explicit_worker_pairs:
+            for spec in self.worker_specs:
+                worker = self.worker_processes.get(spec.worker_token)
+                if worker is None:
+                    continue
+                if worker.is_running():
+                    continue
+                return_code = worker.process.returncode if worker.process is not None else None
+                if worker.reconnect_pending:
+                    worker.reconnect_pending = False
+                    self.log(f"{spec.worker_token} failed to reconnect before exit")
+                await worker.terminate()
+                self.log(f"{spec.worker_token} exited unexpectedly with code {return_code}; respawning")
+                await self._start_worker(spec)
+            return
+        completed_pairs: list[int] = []
+        for pair_index in sorted(self.active_pair_indices):
+            if self._pair_is_complete(pair_index):
+                completed_pairs.append(pair_index)
                 continue
-            if worker.is_running():
-                continue
-            return_code = worker.process.returncode if worker.process is not None else None
-            if worker.reconnect_pending:
-                worker.reconnect_pending = False
-                self.log(f"{spec.worker_token} failed to reconnect before exit")
-            await worker.terminate()
-            self.log(f"{spec.worker_token} exited unexpectedly with code {return_code}; respawning")
-            await self._start_worker(spec)
+            for spec in self.worker_specs_by_pair.get(pair_index, []):
+                worker = self.worker_processes.get(spec.worker_token)
+                if worker is None or worker.is_running() or worker.max_games_reached:
+                    continue
+                return_code = worker.process.returncode if worker.process is not None else None
+                if worker.reconnect_pending:
+                    worker.reconnect_pending = False
+                    self.log(f"{spec.worker_token} failed to reconnect before exit")
+                await worker.terminate()
+                self.log(f"{spec.worker_token} exited unexpectedly with code {return_code}; respawning")
+                await self._start_worker(spec)
+        for pair_index in completed_pairs:
+            self.active_pair_indices.discard(pair_index)
+            self.completed_pair_indices.add(pair_index)
+            self.log(f"pair {pair_index:03d} completed shard budget")
+        if completed_pairs:
+            await self._start_next_pairs_if_capacity()
 
     async def _request_drain(self, reason: str) -> None:
         if self._draining:
@@ -1094,6 +1214,8 @@ class PoolOrchestrator:
             "completed_games": self.replay_monitor.completed_games,
             "completed_worker_perspectives": self.replay_monitor.completed_worker_perspectives,
             "concurrent_games": self.args.concurrent_games,
+            "worker_pairs": self.total_pairs,
+            "worker_games": self.worker_games,
             "worker_count": self.total_workers,
             "model_a_workers": self.model_a_workers,
             "model_b_workers": self.model_b_workers,
@@ -1131,6 +1253,7 @@ class PoolOrchestrator:
             await self._start_workers()
             self.log(
                 f"pool ready: target_games={self.target_games_label} concurrent_games={self.args.concurrent_games} "
+                f"worker_pairs={self.total_pairs} worker_games={self.worker_games} "
                 f"workers={self.total_workers} model_a_workers={self.model_a_workers} model_b_workers={self.model_b_workers}"
             )
             while True:
@@ -1193,6 +1316,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--games", required=True, type=nonnegative_int)
     parser.add_argument("--concurrent-games", required=True, type=positive_int)
+    parser.add_argument("--worker-pairs", type=positive_int, default=0)
+    parser.add_argument("--worker-games", type=nonnegative_int, default=0)
     parser.add_argument("--model-a", default="")
     parser.add_argument("--model-b", default="")
     parser.add_argument("--model-a-pool", default="")

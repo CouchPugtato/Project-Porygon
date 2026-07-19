@@ -1,6 +1,11 @@
-run_name = "run_0018_recorded_action_sp1000"
-games = 0
-concurrent_games = 1
-model_a = "random" # random | <checkpoint path>
-model_b = "random" # random | <checkpoint path>
+run_name = "run_0056_g4_teacher_sup_pool_collect_200shards"
+games = 1000
+concurrent_games = 24
+worker_pairs = 200
+model_a_pool = "models/league/pools/g3_teacher_sup_pool_wins_best_plus_random.json"
+model_b = "random"
+pool_seed = 56
 format = "gen9randomdoublesbattle"
+worker_think_mode = "live"
+serve_client = false
+worker_log_stdout = false
