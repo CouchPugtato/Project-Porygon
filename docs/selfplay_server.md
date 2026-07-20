@@ -16,8 +16,10 @@ Queued shard mode:
 - by default, worker count still follows `2 * --concurrent-games`
 - if you set `--worker-pairs`, the runner creates that many `A/B` worker pairs instead
 - in queued shard mode, only `--concurrent-games` pairs are active at once
-- each side-`A` worker file is a training shard, so `--worker-pairs 200` yields about `200` side-`A` shard files
-- if `--worker-games` is unset, the runner auto-budgets per-pair games as `ceil(--games / --worker-pairs)`
+- each side-`A` worker file is a training shard, so `--worker-pairs 200` targets about `200` side-`A` shard files
+- if `--worker-games` is unset and `--ensure-shard-count true`, the runner auto-budgets per-pair games as `ceil(--games / --worker-pairs)`
+- `--ensure-shard-count false` disables queued replacement after the initial launch and leaves workers uncapped unless `--worker-games` is set explicitly
+- if all requested pairs finish but the global game target is still short, `--ensure-shard-count true` now launches extra pairs and slightly overcollects instead of stalling forever
 
 What it manages:
 
@@ -84,7 +86,12 @@ Important flags:
   - enables queued shard mode
 - `--worker-games`
   - per-worker max game budget in queued shard mode
-  - defaults to `ceil(--games / --worker-pairs)` when omitted
+  - defaults to `ceil(--games / --worker-pairs)` when omitted and `--ensure-shard-count=true`
+  - defaults to unlimited when omitted and `--ensure-shard-count=false`
+- `--ensure-shard-count`
+  - `true` by default
+  - when set to `false`, only the initially launched pairs run, completed pairs are not replaced, and implicit worker caps are disabled
+  - when set to `true`, `--worker-pairs` is treated as a minimum shard target rather than a hard cap
 
 Notes:
 

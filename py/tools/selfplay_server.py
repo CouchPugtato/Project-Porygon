@@ -101,6 +101,15 @@ def parse_bool01(value: str) -> bool:
     return value == "1"
 
 
+def parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true"}:
+        return True
+    if lowered in {"0", "false"}:
+        return False
+    raise argparse.ArgumentTypeError("value must be true or false")
+
+
 def load_default_args(path: Path) -> list[str]:
     if not path.exists():
         return []
@@ -693,11 +702,13 @@ class PoolOrchestrator:
         )
         self.explicit_worker_pairs = args.worker_pairs > 0 or args.worker_games > 0
         if self.explicit_worker_pairs:
-            self.total_pairs = max(1, args.worker_pairs or args.concurrent_games)
+            self.requested_pairs = max(1, args.worker_pairs or args.concurrent_games)
+            self.total_pairs = self.requested_pairs
             self.total_workers = self.total_pairs * 2
             self.model_a_workers = self.total_pairs
             self.model_b_workers = self.total_pairs
         else:
+            self.requested_pairs = 0
             self.total_pairs = 0
             self.total_workers = max(2, args.concurrent_games * 2)
             self.model_a_workers, self.model_b_workers = split_weighted_workers(
@@ -713,9 +724,11 @@ class PoolOrchestrator:
         self.worker_specs_by_pair: dict[int, list[WorkerSpec]] = {}
         for spec in self.worker_specs:
             self.worker_specs_by_pair.setdefault(spec.pair_index, []).append(spec)
+        self.next_worker_id = len(self.worker_specs)
         self.pending_pair_indices: list[int] = list(range(self.total_pairs))
         self.active_pair_indices: set[int] = set()
         self.completed_pair_indices: set[int] = set()
+        self.initial_pair_launch_complete = False
         self.worker_processes: dict[str, WorkerProcess] = {}
         self.group_modes_seen: dict[str, set[str]] = {"a": set(), "b": set()}
         self.replay_monitor = ReplayTailMonitor()
@@ -752,9 +765,57 @@ class PoolOrchestrator:
             return 0
         if self.args.worker_games > 0:
             return self.args.worker_games
+        if not self.args.ensure_shard_count:
+            return 0
         if self.args.games <= 0:
             return 0
         return max(1, math.ceil(self.args.games / self.total_pairs))
+
+    def _build_explicit_pair_specs(self, pair_index: int, worker_id: int) -> list[WorkerSpec]:
+        specs: list[WorkerSpec] = []
+        a_username = f"{self.args.username_prefix}A{pair_index:03d}"
+        b_username = f"{self.args.username_prefix}B{pair_index:03d}"
+        for group_name, username, paired_username in (
+            ("b", b_username, a_username),
+            ("a", a_username, b_username),
+        ):
+            side_config = self.side_configs[group_name]
+            default_model_spec = side_config.model_spec if isinstance(side_config, SingleSideSpec) else "random"
+            worker_token = f"worker_{worker_id:03d}_{group_name}"
+            specs.append(
+                WorkerSpec(
+                    worker_id=worker_id,
+                    pair_index=pair_index,
+                    model_group=group_name,
+                    checkpoint_path=checkpoint_for_model_spec(default_model_spec),
+                    mode=worker_mode_for_model_spec(self.args.worker_think_mode, default_model_spec),
+                    username=username,
+                    replay_save_token=worker_replay_save_token(self.args.run_name, worker_token),
+                    replay_path=worker_replay_path(self.args.run_name, worker_token),
+                    stdout_log_path=self.run_dir / f"{worker_token}.stdout.log",
+                    shutdown_path=self.run_dir / f"{worker_token}.shutdown",
+                    max_games=self.worker_games,
+                    challenge_target=paired_username if group_name == "a" else "",
+                    accept_challenges=(group_name == "b"),
+                    accept_challenge_from=paired_username if group_name == "b" else "",
+                )
+            )
+            worker_id += 1
+        return specs
+
+    def _append_extra_pair(self) -> int:
+        pair_index = self.total_pairs
+        specs = self._build_explicit_pair_specs(pair_index, self.next_worker_id)
+        self.next_worker_id += len(specs)
+        self.total_pairs += 1
+        self.total_workers += len(specs)
+        self.model_a_workers += 1
+        self.model_b_workers += 1
+        self.worker_specs.extend(specs)
+        self.worker_specs_by_pair[pair_index] = specs
+        self.pending_pair_indices.append(pair_index)
+        self.log(f"extended queued pair budget with pair {pair_index:03d}")
+        return pair_index
 
     def _build_worker_specs(self) -> list[WorkerSpec]:
         specs: list[WorkerSpec] = []
@@ -796,34 +857,9 @@ class PoolOrchestrator:
             return specs
         worker_id = 0
         for pair_index in range(self.total_pairs):
-            a_username = f"{self.args.username_prefix}A{pair_index:03d}"
-            b_username = f"{self.args.username_prefix}B{pair_index:03d}"
-            for group_name, username, paired_username in (
-                ("b", b_username, a_username),
-                ("a", a_username, b_username),
-            ):
-                side_config = self.side_configs[group_name]
-                default_model_spec = side_config.model_spec if isinstance(side_config, SingleSideSpec) else "random"
-                worker_token = f"worker_{worker_id:03d}_{group_name}"
-                specs.append(
-                    WorkerSpec(
-                        worker_id=worker_id,
-                        pair_index=pair_index,
-                        model_group=group_name,
-                        checkpoint_path=checkpoint_for_model_spec(default_model_spec),
-                        mode=worker_mode_for_model_spec(self.args.worker_think_mode, default_model_spec),
-                        username=username,
-                        replay_save_token=worker_replay_save_token(self.args.run_name, worker_token),
-                        replay_path=worker_replay_path(self.args.run_name, worker_token),
-                        stdout_log_path=self.run_dir / f"{worker_token}.stdout.log",
-                        shutdown_path=self.run_dir / f"{worker_token}.shutdown",
-                        max_games=self.worker_games,
-                        challenge_target=paired_username if group_name == "a" else "",
-                        accept_challenges=(group_name == "b"),
-                        accept_challenge_from=paired_username if group_name == "b" else "",
-                    )
-                )
-                worker_id += 1
+            pair_specs = self._build_explicit_pair_specs(pair_index, worker_id)
+            specs.extend(pair_specs)
+            worker_id += len(pair_specs)
         return specs
 
     def log(self, message: str) -> None:
@@ -961,8 +997,21 @@ class PoolOrchestrator:
             await self._start_worker(spec)
 
     async def _start_next_pairs_if_capacity(self) -> None:
+        if self.initial_pair_launch_complete and not self.args.ensure_shard_count:
+            return
         while len(self.active_pair_indices) < self.args.concurrent_games and self.pending_pair_indices:
             pair_index = self.pending_pair_indices.pop(0)
+            await self._start_pair(pair_index)
+            self.active_pair_indices.add(pair_index)
+        while (
+            self.args.ensure_shard_count
+            and self.args.games > 0
+            and self.replay_monitor.completed_games < self.args.games
+            and len(self.active_pair_indices) < self.args.concurrent_games
+            and not self.pending_pair_indices
+        ):
+            pair_index = self._append_extra_pair()
+            self.pending_pair_indices.pop()
             await self._start_pair(pair_index)
             self.active_pair_indices.add(pair_index)
 
@@ -974,6 +1023,7 @@ class PoolOrchestrator:
             print()
             return
         await self._start_next_pairs_if_capacity()
+        self.initial_pair_launch_complete = True
         print()
 
     def _pair_processes(self, pair_index: int) -> list[WorkerProcess]:
@@ -1214,6 +1264,7 @@ class PoolOrchestrator:
             "completed_games": self.replay_monitor.completed_games,
             "completed_worker_perspectives": self.replay_monitor.completed_worker_perspectives,
             "concurrent_games": self.args.concurrent_games,
+            "requested_worker_pairs": self.requested_pairs,
             "worker_pairs": self.total_pairs,
             "worker_games": self.worker_games,
             "worker_count": self.total_workers,
@@ -1318,6 +1369,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--concurrent-games", required=True, type=positive_int)
     parser.add_argument("--worker-pairs", type=positive_int, default=0)
     parser.add_argument("--worker-games", type=nonnegative_int, default=0)
+    parser.add_argument("--ensure-shard-count", type=parse_bool, default=True)
     parser.add_argument("--model-a", default="")
     parser.add_argument("--model-b", default="")
     parser.add_argument("--model-a-pool", default="")

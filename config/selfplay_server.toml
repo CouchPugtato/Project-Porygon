@@ -1,11 +1,12 @@
 run_name = "run_0056_g4_teacher_sup_pool_collect_200shards"
-games = 1000
-concurrent_games = 24
+games = 10000
+concurrent_games = 150
 worker_pairs = 200
+ensure_shard_count = true
 model_a_pool = "models/league/pools/g3_teacher_sup_pool_wins_best_plus_random.json"
 model_b = "random"
 pool_seed = 56
 format = "gen9randomdoublesbattle"
 worker_think_mode = "live"
-serve_client = false
+serve_client = true
 worker_log_stdout = false
