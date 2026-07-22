@@ -163,6 +163,16 @@ async def randomized_send_delay(min_seconds: float, max_seconds: float) -> None:
     await asyncio.sleep(delay)
 
 
+async def enable_battle_timer(gateway: ShowdownGateway | None, room_id: str, prefix: str) -> None:
+    if gateway is None:
+        return
+    try:
+        await gateway.send_room_command(room_id, "/timer on")
+        print(f"[{prefix}] timer enabled for {room_id}")
+    except (RuntimeError, ConnectionClosed, OSError) as exc:
+        print(f"[{prefix}] timer enable skipped for {room_id}: {exc}")
+
+
 def event_summary(event: ShowdownEvent) -> str | None:
     line = event.line
     parts = line.split("|")
@@ -922,8 +932,7 @@ async def capture_mode(
                 )
                 print(f"[capture] started {event.room_id}")
                 assert gateway is not None
-                await gateway.send_room_command(event.room_id, "/timer on")
-                print(f"[capture] timer enabled for {event.room_id}")
+                await enable_battle_timer(gateway, event.room_id, "capture")
 
         summary = event_summary(event)
         if summary:
@@ -1125,8 +1134,7 @@ async def random_mode(
                 )
                 print(f"[random] battle started {event.room_id}")
                 assert gateway is not None
-                await gateway.send_room_command(event.room_id, "/timer on")
-                print(f"[random] timer enabled for {event.room_id}")
+                await enable_battle_timer(gateway, event.room_id, "random")
         summary = event_summary(event)
         if summary:
             print(summary)
@@ -1440,8 +1448,7 @@ async def live_mode(
                 )
                 print(f"[live] battle started {event.room_id}")
                 assert gateway is not None
-                await gateway.send_room_command(event.room_id, "/timer on")
-                print(f"[live] timer enabled for {event.room_id}")
+                await enable_battle_timer(gateway, event.room_id, "live")
         summary = event_summary(event)
         if summary:
             print(summary)
