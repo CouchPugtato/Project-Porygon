@@ -13,5 +13,5 @@ dashboard_visible_shards = 10
 dashboard_show_top_stats = true
 dashboard_show_epoch_bar = true
 dashboard_show_shard_window = true
-dashboard_write_raw_logs = true
+dashboard_write_raw_logs = false
 env_porygon_omp_threads = 4

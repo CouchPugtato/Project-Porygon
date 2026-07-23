@@ -204,11 +204,13 @@ For reduced-board / post-faint curriculum extraction:
   - a `forceSwitch` request, or
   - a request with fewer than two active mons
 - it keeps the whole battle so the existing trainer can still reconstruct state from the start of the replay
+- `--wins-only` further restricts the extracted set to earned wins for the selected side
 
 Examples:
 
 ```powershell
 python py/tools/replay_extract_postfaint.py --run run_0050_g1_best_loss_review --output-run run_0050_g1_best_postfaint --side a
+python py/tools/replay_extract_postfaint.py --run run_0050_g1_best_loss_review --output-run run_0050_g1_best_postfaint_wins --side a --wins-only
 python py/tools/train_batch_selfplay.py --run run_0050_g1_best_postfaint --mode supervised --pattern "worker_*_a_raw.jsonl" --checkpoint g1_best_postfaint_sup.chk --epochs 1
 ```
 

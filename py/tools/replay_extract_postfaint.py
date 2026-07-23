@@ -21,6 +21,9 @@ class BattleBuffer:
     has_post_trigger_activity: bool = False
     action_taken_after_trigger: bool = False
     request_after_trigger: bool = False
+    terminal_result: str | None = None
+    reward: float | None = None
+    terminal_conflict: bool = False
 
 
 def positive_int(value: str) -> int:
@@ -50,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-run", required=True, help="Destination filtered run name under matches/runs/")
     parser.add_argument("--side", choices=["a", "b"], default="a")
     parser.add_argument("--min-lines", type=positive_int, default=1, help="Minimum number of lines to write per output shard")
+    parser.add_argument(
+        "--wins-only",
+        action="store_true",
+        help="Keep only post-faint battles where the selected side won with positive reward",
+    )
     return parser
 
 
@@ -94,6 +102,13 @@ def load_battle_buffers(files: list[Path]) -> dict[str, BattleBuffer]:
                         battle.has_post_trigger_activity = True
                         battle.action_taken_after_trigger = True
                 elif record_type == "terminal":
+                    result = str(payload.get("result") or "").strip().lower()
+                    reward = payload.get("reward")
+                    if battle.terminal_result is None:
+                        battle.terminal_result = result
+                        battle.reward = float(reward) if reward is not None else None
+                    elif battle.terminal_result != result:
+                        battle.terminal_conflict = True
                     if battle.has_force_switch or battle.has_reduced_active:
                         battle.has_post_trigger_activity = True
     return battles
@@ -113,11 +128,15 @@ def main() -> None:
         raise SystemExit(f"no replay files found for side {args.side} in {run_dir}")
 
     battles = load_battle_buffers(all_files)
-    selected_battles = {
-        battle_id: battle
-        for battle_id, battle in battles.items()
-        if (battle.has_force_switch or battle.has_reduced_active) and battle.has_post_trigger_activity
-    }
+    selected_battles = {}
+    for battle_id, battle in battles.items():
+        if not ((battle.has_force_switch or battle.has_reduced_active) and battle.has_post_trigger_activity):
+            continue
+        if args.wins_only and (
+            battle.terminal_conflict or battle.terminal_result != "win" or (battle.reward or 0.0) <= 0.0
+        ):
+            continue
+        selected_battles[battle_id] = battle
     if not selected_battles:
         raise SystemExit("no battles matched the post-faint/reduced-board filter")
 
@@ -151,6 +170,7 @@ def main() -> None:
         "source_run": args.run,
         "output_run": args.output_run,
         "side": args.side,
+        "wins_only": bool(args.wins_only),
         "selected_battles": len(selected_battles),
         "written_files": written_files,
         "written_lines": written_lines,
@@ -159,7 +179,8 @@ def main() -> None:
     (output_dir / f"{args.output_run}_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(
         f"[replay_extract_postfaint] source_run={args.run} output_run={args.output_run} "
-        f"side={args.side} selected_battles={len(selected_battles)} written_files={written_files} written_lines={written_lines}",
+        f"side={args.side} wins_only={int(bool(args.wins_only))} "
+        f"selected_battles={len(selected_battles)} written_files={written_files} written_lines={written_lines}",
         flush=True,
     )
 
