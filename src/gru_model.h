@@ -163,6 +163,32 @@ int gru_model_policy_gradient_update_sequence(
     float entropy_coef,
     float learning_rate
 );
+int gru_model_policy_gradient_update_sequence_window(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask,
+    int action,
+    float advantage,
+    float target_value,
+    float entropy_coef,
+    float learning_rate
+);
+int gru_model_policy_gradient_update_sequence_window_dual(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    int action_a,
+    const unsigned char* legal_mask_b,
+    int action_b,
+    float advantage,
+    float target_value,
+    float entropy_coef,
+    float learning_rate
+);
 size_t gru_model_parameter_count(const GruModel* model);
 int gru_model_export_parameters(const GruModel* model, float* out, size_t count);
 int gru_model_import_parameters(GruModel* model, const float* in, size_t count);

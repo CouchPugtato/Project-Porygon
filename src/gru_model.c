@@ -1469,6 +1469,70 @@ int gru_model_policy_gradient_update_sequence(
         learning_rate, 0, NULL, NULL, NULL);
 }
 
+int gru_model_policy_gradient_update_sequence_window(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask,
+    int action,
+    float advantage,
+    float target_value,
+    float entropy_coef,
+    float learning_rate
+) {
+    return recurrent_update_sequence(
+        model,
+        sequence,
+        steps,
+        initial_hidden_state,
+        NULL,
+        -1,
+        legal_mask,
+        action,
+        advantage,
+        target_value,
+        entropy_coef,
+        learning_rate,
+        0,
+        NULL,
+        NULL,
+        NULL);
+}
+
+int gru_model_policy_gradient_update_sequence_window_dual(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    int action_a,
+    const unsigned char* legal_mask_b,
+    int action_b,
+    float advantage,
+    float target_value,
+    float entropy_coef,
+    float learning_rate
+) {
+    return recurrent_update_sequence(
+        model,
+        sequence,
+        steps,
+        initial_hidden_state,
+        legal_mask_b,
+        action_b,
+        legal_mask_a,
+        action_a,
+        advantage,
+        target_value,
+        entropy_coef,
+        learning_rate,
+        0,
+        NULL,
+        NULL,
+        NULL);
+}
+
 size_t gru_model_parameter_count(const GruModel* model) {
     if (!model) {
         return 0;
