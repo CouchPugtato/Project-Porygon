@@ -10,6 +10,8 @@ from pathlib import Path
 
 DEFAULT_REGISTRY_PATH = Path("models") / "league" / "league_registry.json"
 DEFAULT_MAX_ACTIVE_MEMBERS = 5
+VALID_MEMBER_STATUSES = {"candidate", "active", "inactive", "rejected"}
+PROMOTABLE_STATUSES = {"candidate", "active"}
 
 
 def parse_bool01(value: str) -> bool:
@@ -65,6 +67,8 @@ def resolve_checkpoint_path(path_str: str) -> str:
 class LeagueEval:
     vs_random_win_rate: float | None = None
     vs_champion_win_rate: float | None = None
+    summary_path: str = ""
+    collapse_flags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -76,6 +80,9 @@ class LeagueMember:
     collection_weight: float
     notes: str = ""
     parent_id: str = ""
+    regime: str = ""
+    source_run: str = ""
+    experiment_id: str = ""
     eval: LeagueEval = field(default_factory=LeagueEval)
     promoted_at: str = ""
     created_at: str = field(default_factory=utc_now_iso)
@@ -98,9 +105,14 @@ def member_to_json_dict(member: LeagueMember) -> dict[str, object]:
         "collection_weight": member.collection_weight,
         "notes": member.notes,
         "parent_id": member.parent_id,
+        "regime": member.regime,
+        "source_run": member.source_run,
+        "experiment_id": member.experiment_id,
         "eval": {
             "vs_random_win_rate": member.eval.vs_random_win_rate,
             "vs_champion_win_rate": member.eval.vs_champion_win_rate,
+            "summary_path": member.eval.summary_path,
+            "collapse_flags": member.eval.collapse_flags,
         },
         "promoted_at": member.promoted_at,
         "created_at": member.created_at,
@@ -121,6 +133,8 @@ def league_eval_from_json(raw: object) -> LeagueEval:
     return LeagueEval(
         vs_random_win_rate=payload.get("vs_random_win_rate"),
         vs_champion_win_rate=payload.get("vs_champion_win_rate"),
+        summary_path=str(payload.get("summary_path", "")),
+        collapse_flags=[str(value) for value in payload.get("collapse_flags", []) if str(value).strip()],
     )
 
 
@@ -133,6 +147,9 @@ def league_member_from_json(raw: dict[str, object]) -> LeagueMember:
         collection_weight=float(raw.get("collection_weight", 0.0)),
         notes=str(raw.get("notes", "")),
         parent_id=str(raw.get("parent_id", "")).strip(),
+        regime=str(raw.get("regime", "")).strip(),
+        source_run=str(raw.get("source_run", "")).strip(),
+        experiment_id=str(raw.get("experiment_id", "")).strip(),
         eval=league_eval_from_json(raw.get("eval")),
         promoted_at=str(raw.get("promoted_at", "")),
         created_at=str(raw.get("created_at", "")),
@@ -189,6 +206,12 @@ def find_member(registry: LeagueRegistry, member_id: str) -> LeagueMember:
     raise SystemExit(f"member not found: {member_id}")
 
 
+def member_public_status(registry: LeagueRegistry, member: LeagueMember) -> str:
+    if registry.champion_id == member.id:
+        return "champion"
+    return member.status
+
+
 def validate_registry(registry: LeagueRegistry) -> None:
     if registry.current_generation < 0:
         raise SystemExit("invalid registry: current_generation must be >= 0")
@@ -208,7 +231,7 @@ def validate_registry(registry: LeagueRegistry) -> None:
             raise SystemExit(f"invalid registry member '{member.id}': checkpoint path not found: {member.path}")
         if member.generation < 0:
             raise SystemExit(f"invalid registry member '{member.id}': generation must be >= 0")
-        if member.status not in {"active", "inactive"}:
+        if member.status not in VALID_MEMBER_STATUSES:
             raise SystemExit(f"invalid registry member '{member.id}': bad status '{member.status}'")
         if member.collection_weight <= 0.0:
             raise SystemExit(f"invalid registry member '{member.id}': collection_weight must be > 0")
@@ -218,6 +241,8 @@ def validate_registry(registry: LeagueRegistry) -> None:
             raise SystemExit(f"invalid registry member '{member.id}': vs_random_win_rate must be between 0 and 1")
         if member.eval.vs_champion_win_rate is not None and not (0.0 <= member.eval.vs_champion_win_rate <= 1.0):
             raise SystemExit(f"invalid registry member '{member.id}': vs_champion_win_rate must be between 0 and 1")
+        if member.regime and member.regime not in {"supervised", "rl"}:
+            raise SystemExit(f"invalid registry member '{member.id}': regime must be supervised or rl")
         if member.status == "active":
             active_ids.add(member.id)
     for member in registry.members:
@@ -235,12 +260,38 @@ def validate_registry(registry: LeagueRegistry) -> None:
 def build_pool_payload(
     registry: LeagueRegistry,
     *,
+    preset: str,
     status_filter: str,
     include_random: bool,
     random_weight: float,
     selected_member_ids: list[str],
     normalize_member_weights: bool,
+    top_k: int,
 ) -> dict[str, object]:
+    if preset != "none":
+        champion = find_member(registry, registry.champion_id) if registry.champion_id else None
+        if preset == "champion-plus-random":
+            selected = [champion] if champion is not None else []
+            selected_member_ids = [member.id for member in selected]
+            status_filter = "all"
+            include_random = True
+        elif preset == "active-mixed":
+            status_filter = "active"
+            include_random = True
+        elif preset == "top-k":
+            if top_k <= 0:
+                raise SystemExit("--top-k must be > 0 when using --preset top-k")
+            ranked = sorted(
+                [member for member in registry.members if member.status == "active"],
+                key=lambda member: (member.generation, member.promoted_at or member.created_at, member.id),
+                reverse=True,
+            )
+            selected_member_ids = [member.id for member in ranked[:top_k]]
+            status_filter = "all"
+            include_random = True
+        else:
+            raise SystemExit(f"unknown preset: {preset}")
+
     selected: list[LeagueMember] = []
     allowlist = set(selected_member_ids)
     for member in registry.members:
@@ -287,10 +338,10 @@ def print_registry_summary(registry: LeagueRegistry) -> None:
         print("  (none)")
         return
     for member in sorted(registry.members, key=lambda item: (item.generation, item.id)):
-        champion_marker = " *champion" if registry.champion_id == member.id else ""
         print(
-            f"  - id={member.id} generation={member.generation} status={member.status} "
-            f"weight={member.collection_weight:g} path={member.path}{champion_marker}"
+            f"  - id={member.id} generation={member.generation} status={member_public_status(registry, member)} "
+            f"weight={member.collection_weight:g} path={member.path} regime={member.regime or '(unset)'}"
+            f" source_run={member.source_run or '(unset)'}"
         )
 
 
@@ -319,14 +370,20 @@ def command_add_checkpoint(args: argparse.Namespace) -> None:
     if parent_id:
         find_member(registry, parent_id)
     generation = registry.current_generation if args.generation is None else args.generation
+    status = args.status
+    if status == "champion":
+        status = "active"
     member = LeagueMember(
         id=member_id,
         path=resolve_checkpoint_path(args.path),
         generation=generation,
-        status=args.status,
+        status=status,
         collection_weight=args.collection_weight,
         notes=args.notes,
         parent_id=parent_id,
+        regime=args.regime,
+        source_run=args.source_run,
+        experiment_id=args.experiment_id,
         created_at=utc_now_iso(),
     )
     registry.members.append(member)
@@ -343,7 +400,7 @@ def command_update_member(args: argparse.Namespace) -> None:
     if args.collection_weight is not None:
         member.collection_weight = args.collection_weight
     if args.status is not None:
-        member.status = args.status
+        member.status = "active" if args.status == "champion" else args.status
     if args.notes is not None:
         member.notes = args.notes
     if args.parent_id is not None:
@@ -351,10 +408,20 @@ def command_update_member(args: argparse.Namespace) -> None:
         if parent_id:
             find_member(registry, parent_id)
         member.parent_id = parent_id
+    if args.regime is not None:
+        member.regime = args.regime
+    if args.source_run is not None:
+        member.source_run = args.source_run
+    if args.experiment_id is not None:
+        member.experiment_id = args.experiment_id
     if args.vs_random_win_rate is not None:
         member.eval.vs_random_win_rate = args.vs_random_win_rate
     if args.vs_champion_win_rate is not None:
         member.eval.vs_champion_win_rate = args.vs_champion_win_rate
+    if args.eval_summary_path is not None:
+        member.eval.summary_path = args.eval_summary_path
+    if args.collapse_flag:
+        member.eval.collapse_flags = list(args.collapse_flag)
     save_registry(registry_path, registry)
     print(f"[league_manage] updated member id={member.id}")
 
@@ -365,6 +432,8 @@ def command_promote(args: argparse.Namespace) -> None:
     member = find_member(registry, args.id)
     if args.generation is not None:
         member.generation = args.generation
+    if member.status not in PROMOTABLE_STATUSES:
+        raise SystemExit(f"cannot promote member with status '{member.status}': {member.id}")
     member.status = "active"
     member.promoted_at = utc_now_iso()
     registry.champion_id = member.id
@@ -394,11 +463,13 @@ def command_build_pool(args: argparse.Namespace) -> None:
     registry = load_registry(Path(args.registry))
     payload = build_pool_payload(
         registry,
+        preset=args.preset,
         status_filter=args.status,
         include_random=args.include_random,
         random_weight=args.random_weight,
         selected_member_ids=args.member,
         normalize_member_weights=args.normalize_member_weights,
+        top_k=args.top_k,
     )
     output_path = Path(args.output).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -426,8 +497,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--path", required=True)
     add_parser.add_argument("--generation", type=nonnegative_int, default=None)
     add_parser.add_argument("--collection-weight", type=positive_float, default=1.0)
-    add_parser.add_argument("--status", choices=["active", "inactive"], default="active")
+    add_parser.add_argument("--status", choices=["candidate", "active", "inactive", "rejected", "champion"], default="candidate")
     add_parser.add_argument("--parent-id", default="")
+    add_parser.add_argument("--regime", choices=["supervised", "rl"], default="")
+    add_parser.add_argument("--source-run", default="")
+    add_parser.add_argument("--experiment-id", default="")
     add_parser.add_argument("--notes", default="")
     add_parser.set_defaults(func=command_add_checkpoint)
 
@@ -435,11 +509,16 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--registry", default=str(default_registry_path()))
     update_parser.add_argument("--id", required=True)
     update_parser.add_argument("--collection-weight", type=positive_float, default=None)
-    update_parser.add_argument("--status", choices=["active", "inactive"], default=None)
+    update_parser.add_argument("--status", choices=["candidate", "active", "inactive", "rejected", "champion"], default=None)
     update_parser.add_argument("--notes", default=None)
     update_parser.add_argument("--parent-id", default=None)
+    update_parser.add_argument("--regime", choices=["supervised", "rl"], default=None)
+    update_parser.add_argument("--source-run", default=None)
+    update_parser.add_argument("--experiment-id", default=None)
     update_parser.add_argument("--vs-random-win-rate", type=win_rate_float, default=None)
     update_parser.add_argument("--vs-champion-win-rate", type=win_rate_float, default=None)
+    update_parser.add_argument("--eval-summary-path", default=None)
+    update_parser.add_argument("--collapse-flag", action="append", default=[])
     update_parser.set_defaults(func=command_update_member)
 
     promote_parser = subparsers.add_parser("promote")
@@ -457,11 +536,13 @@ def build_parser() -> argparse.ArgumentParser:
     pool_parser = subparsers.add_parser("build-pool")
     pool_parser.add_argument("--registry", default=str(default_registry_path()))
     pool_parser.add_argument("--output", required=True)
-    pool_parser.add_argument("--status", choices=["active", "inactive", "all"], default="active")
+    pool_parser.add_argument("--preset", choices=["none", "champion-plus-random", "active-mixed", "top-k"], default="none")
+    pool_parser.add_argument("--status", choices=["candidate", "active", "inactive", "rejected", "all"], default="active")
     pool_parser.add_argument("--include-random", type=parse_bool01, default=True)
     pool_parser.add_argument("--random-weight", type=positive_float, default=1.0)
     pool_parser.add_argument("--member", action="append", default=[])
     pool_parser.add_argument("--normalize-member-weights", type=parse_bool01, default=False)
+    pool_parser.add_argument("--top-k", type=positive_int, default=3)
     pool_parser.set_defaults(func=command_build_pool)
 
     return parser

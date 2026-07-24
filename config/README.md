@@ -15,6 +15,8 @@ Files:
   - consumed by `py/tools/selfplay_server.py` when launched with no CLI args
 - `train_batch_selfplay.toml`
   - consumed by `py/tools/train_batch_selfplay.py` before CLI args are applied
+  - supports `--init-checkpoint <path>` for warm-start RL/supervised runs without manual checkpoint copying
+  - supports `--experiment-id <token>` and `--manifest-path <path>` for experiment lineage/provenance
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
   - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
   - supports `supervised_profile = true|false` to enable or fully disable per-episode supervised profiling work in `showdown_client`
@@ -23,8 +25,12 @@ Files:
   - writes one raw trainer log per shard when `dashboard_write_raw_logs = true`
   - supports `env_<NAME> = <value>` entries to set subprocess environment variables for `showdown_client`
   - writes one batch-training stats JSON per shard under `models/runs/<run>/<checkpoint_stem>/<checkpoint_stem>_batch_training_stats/`
+  - writes one training manifest JSON beside the checkpoint by default
 - `reward_weights.toml`
   - runtime-loaded by both `showdown_client` and `py/communicator/main.py`
+- `experimental/*.toml`
+  - example templates for common collection/training regimes
+  - intended as copy/rename starting points rather than auto-loaded defaults
 
 Example:
 
@@ -45,9 +51,15 @@ Notes:
 - strings should be quoted
 - numbers can be written as numbers
 - ordinary boolean options become `1`/`0` on the generated CLI
-- bare passthrough flags like `battle_agent = true` emit `--battle-agent`
 - `env_<NAME> = <value>` entries are exported to trainer subprocesses instead of becoming CLI flags
 - `dashboard_visible_shards` accepts any positive integer; if even, the live window biases one extra row toward upcoming shards
+
+Warm-start notes:
+
+- `checkpoint` is still the output checkpoint path
+- `init_checkpoint` is only used when the output checkpoint does not already exist
+- if both are provided and the output checkpoint already exists, the wrapper keeps the existing output checkpoint and logs that `init_checkpoint` was ignored
+- this is the intended entrypoint for warm-start RL from a trusted baseline such as `g4`
 
 Training dashboard notes:
 
@@ -127,6 +139,7 @@ Notes:
 - `--model-a-pool <path>`
 - `--model-b-pool <path>`
 - `--pool-seed <int>`
+- `--ensure-shard-count true|false`
 
 Pool files are JSON with this schema:
 
@@ -162,6 +175,11 @@ Sampling behavior:
 - pool sampling happens per worker start, not per battle
 - if a worker respawns, it samples again from that side's pool
 - existing `--model-a` / `--model-b` behavior is unchanged when pool args are omitted
+- every run now writes both:
+  - `<run_name>_summary.json`
+  - `<run_name>_manifest.json`
+- the manifest records pool provenance, sampled member counts, worker settings, and candidate/parent checkpoint info when available
+- eval/collection summaries now include automatic collapse flags for each side using the current RL guardrail thresholds
 
 Examples:
 
@@ -169,6 +187,13 @@ Examples:
 python py/tools/selfplay_server.py --run-name run_pool_test --games 100 --concurrent-games 8 --model-a-pool config/pools/a_pool.json --model-b random
 python py/tools/selfplay_server.py --run-name run_pool_vs_pool --games 100 --concurrent-games 8 --model-a-pool config/pools/a_pool.json --model-b-pool config/pools/b_pool.json --pool-seed 123
 ```
+
+Experiment templates currently included:
+
+- `config/experimental/supervised_baseline.toml`
+- `config/experimental/warmstart_rl_safe.toml`
+- `config/experimental/warmstart_rl_entropy_high.toml`
+- `config/experimental/large_collection_active_pool.toml`
 
 ### Replay diagnostics
 
@@ -196,6 +221,35 @@ python py/tools/replay_diagnose.py --run run_0050_g1_best_loss_review --side a
 python py/tools/replay_diagnose.py --run run_0050_g1_best_loss_review --side a --output matches/runs/run_0050_g1_best_loss_review/run_0050_g1_best_loss_review_diagnostics.json
 python py/tools/replay_diagnose.py --glob "matches/runs/run_0050_g1_best_loss_review/worker_*_a_raw.jsonl" --side a
 python py/tools/replay_diagnose.py --run run_0050_g1_best_loss_review --side a --include-outcomes loss --sample-losses 15
+```
+
+`py/tools/replay_switch_diagnose.py` focuses specifically on switch-slot behavior and splits it by:
+
+- outcome (`win`, `loss`, `draw`)
+- `forced_switch`
+- `reduced_active`
+- `voluntary_switch`
+
+Example:
+
+```powershell
+python py/tools/replay_switch_diagnose.py --run run_0060_g8_teacher_sup_pool_collect_200shards_postfaint_wins --side a
+```
+
+`py/tools/eval_collapse_check.py` reads a selfplay summary and emits a compact collapse report for RL guardrails.
+
+Current default checks:
+
+- warning when one move slot exceeds `55%`
+- hard collapse when one move slot exceeds `70%`
+- warning when `switch_slot_6` exceeds `60%`
+- warning when candidate tera rate falls below `50%` of baseline side
+- fail-fast warning when earned win rate is below `40%` after at least `150` games
+
+Example:
+
+```powershell
+python py/tools/eval_collapse_check.py --summary matches/runs/run_0060_g9_teacher_rl_from_g4_vs_champion/run_0060_g9_teacher_rl_from_g4_vs_champion_summary.json --candidate-side a
 ```
 
 For reduced-board / post-faint curriculum extraction:
@@ -253,12 +307,32 @@ Supported commands:
 - `deactivate`
 - `build-pool`
 
+Registry additions:
+
+- members now support optional lineage/eval metadata:
+  - `parent_id`
+  - `regime`
+  - `source_run`
+  - `experiment_id`
+  - `eval.summary_path`
+  - `eval.collapse_flags`
+- public statuses now support:
+  - `candidate`
+  - `active`
+  - `inactive`
+  - `rejected`
+  - `champion` is derived from `champion_id`
+- `build-pool` also supports presets:
+  - `champion-plus-random`
+  - `active-mixed`
+  - `top-k`
+
 Examples:
 
 ```powershell
 python py/tools/league_manage.py init
-python py/tools/league_manage.py add-checkpoint --id g1_seed --path models/runs/run_x/seed/seed.chk
+python py/tools/league_manage.py add-checkpoint --id g1_seed --path models/runs/run_x/seed/seed.chk --status candidate --regime supervised
 python py/tools/league_manage.py promote --id g1_seed
-python py/tools/league_manage.py build-pool --output models/league/pools/active_pool.json --include-random 1 --random-weight 1.0
+python py/tools/league_manage.py build-pool --output models/league/pools/active_pool.json --preset active-mixed
 python py/tools/selfplay_server.py --run-name run_league_smoke --games 100 --concurrent-games 8 --model-a-pool models/league/pools/active_pool.json --model-b random
 ```

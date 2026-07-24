@@ -61,6 +61,12 @@ def worker_replay_path(run_name: str, worker_token: str) -> Path:
     return run_dir_for_name(run_name) / f"{worker_token}_raw.jsonl"
 
 
+def safe_rate(numerator: int | float, denominator: int | float) -> float:
+    if not denominator:
+        return 0.0
+    return float(numerator) / float(denominator)
+
+
 def parse_stats_file(path: Path) -> dict[str, str]:
     stats: dict[str, str] = {}
     if not path.exists():
@@ -687,6 +693,7 @@ class PoolOrchestrator:
         self.repo_root = Path.cwd()
         self.run_dir = run_dir_for_name(args.run_name)
         self.summary_path = self.run_dir / f"{args.run_name}_summary.json"
+        self.manifest_path = self.run_dir / f"{args.run_name}_manifest.json"
         self.log_path = self.run_dir / "orchestrator.log"
         self.server_log_path = self.run_dir / "showdown_server.log"
         self.client_log_path = self.run_dir / "showdown_client_static.log"
@@ -913,6 +920,98 @@ class PoolOrchestrator:
                 "draws": 0,
             }
         return side_stats[member_name]
+
+    def _build_group_member_stats_summary(self) -> dict[str, dict[str, dict[str, object]]]:
+        summary: dict[str, dict[str, dict[str, object]]] = {}
+        for side, members in self._group_member_stats.items():
+            if not members:
+                continue
+            side_summary: dict[str, dict[str, object]] = {}
+            for member_name, stats in sorted(members.items()):
+                completed_games = int(stats.get("completed_games", 0))
+                wins = int(stats.get("wins", 0))
+                losses = int(stats.get("losses", 0))
+                draws = int(stats.get("draws", 0))
+                side_summary[member_name] = {
+                    **stats,
+                    "win_rate": safe_rate(wins, completed_games),
+                    "loss_rate": safe_rate(losses, completed_games),
+                    "draw_rate": safe_rate(draws, completed_games),
+                }
+            summary[side] = side_summary
+        return summary
+
+    def _collapse_flags_for_group(self, group: dict[str, object], baseline_group: dict[str, object] | None) -> list[str]:
+        flags: list[str] = []
+        move_rates = group.get("move_slot_rates", {})
+        if isinstance(move_rates, dict) and move_rates:
+            dominant_slot, dominant_rate = max(
+                ((str(slot), float(rate)) for slot, rate in move_rates.items()),
+                key=lambda item: item[1],
+            )
+            if dominant_rate >= 0.70:
+                flags.append(f"hard_move_slot_collapse:{dominant_slot}:{dominant_rate:.3f}")
+            elif dominant_rate >= 0.55:
+                flags.append(f"warn_move_slot_concentration:{dominant_slot}:{dominant_rate:.3f}")
+        switch_rates = group.get("switch_slot_rates", {})
+        if isinstance(switch_rates, dict):
+            slot6_rate = float(switch_rates.get("slot_6", 0.0))
+            if slot6_rate >= 0.60:
+                flags.append(f"warn_switch_slot_6_concentration:{slot6_rate:.3f}")
+        tera_rate = float(group.get("tera_rate", 0.0))
+        baseline_tera_rate = 0.0
+        if baseline_group is not None:
+            baseline_tera_rate = float(baseline_group.get("tera_rate", 0.0))
+        if baseline_tera_rate > 0.0 and tera_rate < (baseline_tera_rate * 0.5):
+            flags.append(f"warn_tera_rate_low_vs_baseline:{tera_rate:.3f}:{baseline_tera_rate:.3f}")
+        earned_win_rate = float(group.get("earned_win_rate", 0.0))
+        matches_played = int(group.get("matches_played", 0))
+        if matches_played >= 150 and earned_win_rate < 0.40:
+            flags.append(f"fail_fast_low_earned_win_rate:{earned_win_rate:.3f}")
+        return flags
+
+    def _resolve_model_specs(self) -> dict[str, dict[str, object]]:
+        payload: dict[str, dict[str, object]] = {}
+        for side, side_config in self.side_configs.items():
+            if isinstance(side_config, PoolSideSpec):
+                payload[side] = {
+                    "kind": "pool",
+                    "pool_path": side_config.pool.source_path,
+                }
+            else:
+                model_spec = side_config.model_spec.strip()
+                if model_spec.lower() == "random":
+                    payload[side] = {"kind": "random"}
+                else:
+                    payload[side] = {
+                        "kind": "checkpoint",
+                        "path": str(Path(model_spec).resolve()) if model_spec else "",
+                    }
+        return payload
+
+    def _build_run_manifest(self, summary: dict[str, object]) -> dict[str, object]:
+        return {
+            "run_name": self.args.run_name,
+            "status": summary["status"],
+            "failure_reason": summary["failure_reason"],
+            "games": self.args.games,
+            "completed_games": self.replay_monitor.completed_games,
+            "concurrent_games": self.args.concurrent_games,
+            "requested_worker_pairs": self.requested_pairs,
+            "worker_pairs": self.total_pairs,
+            "worker_games": self.worker_games,
+            "ensure_shard_count": bool(self.args.ensure_shard_count),
+            "format": self.args.format,
+            "server_uri": self.server_uri,
+            "collection_pool_source": {
+                "model_a_pool_path": str(Path(self.args.model_a_pool).resolve()) if self.args.model_a_pool else "",
+                "model_b_pool_path": str(Path(self.args.model_b_pool).resolve()) if self.args.model_b_pool else "",
+            },
+            "model_specs": self._resolve_model_specs(),
+            "sampled_member_counts": self._build_group_member_stats_summary(),
+            "summary_path": str(self.summary_path.resolve()),
+            "created_at_run_seconds": max(time.monotonic() - self._start_time, 0.0),
+        }
 
     def _record_terminal_records(self) -> None:
         for record in self.replay_monitor.last_terminal_records:
@@ -1256,6 +1355,12 @@ class PoolOrchestrator:
         }
         pool_members = self._build_group_pool_members_summary()
         pool_mode = bool(pool_members)
+        group_stats = self._build_group_stats_summary()
+        model_specs = self._resolve_model_specs()
+        group_collapse_flags = {
+            "a": self._collapse_flags_for_group(group_stats["a"], group_stats.get("b")),
+            "b": self._collapse_flags_for_group(group_stats["b"], group_stats.get("a")),
+        }
         summary = {
             "status": "failed" if self._failed else "completed",
             "failure_reason": self._failure_reason,
@@ -1272,20 +1377,34 @@ class PoolOrchestrator:
             "model_b_workers": self.model_b_workers,
             "server_uri": self.server_uri,
             "format": self.args.format,
+            "model_specs": model_specs,
             "model_group_modes": group_modes,
-            "group_stats": self._build_group_stats_summary(),
+            "group_stats": group_stats,
+            "group_collapse_flags": group_collapse_flags,
+            "collapse_thresholds": {
+                "warn_move_slot_concentration": 0.55,
+                "hard_move_slot_collapse": 0.70,
+                "warn_switch_slot_6_concentration": 0.60,
+                "warn_tera_rate_low_vs_baseline_ratio": 0.50,
+                "fail_fast_low_earned_win_rate_after_150_games": 0.40,
+            },
             "pool_mode": pool_mode,
             "run_duration_seconds": max(time.monotonic() - self._start_time, 0.0),
             "per_worker_completed_perspectives": dict(sorted(self.replay_monitor.completed_perspectives_by_worker.items())),
         }
+        if model_specs.get("a", {}).get("kind") == "checkpoint":
+            summary["candidate_checkpoint"] = model_specs["a"].get("path", "")
+        if model_specs.get("b", {}).get("kind") == "checkpoint":
+            summary["parent_checkpoint"] = model_specs["b"].get("path", "")
         if pool_mode:
             summary["group_pool_members"] = pool_members
-            summary["group_member_stats"] = self._group_member_stats
+            summary["group_member_stats"] = self._build_group_member_stats_summary()
             if self.args.model_a_pool:
                 summary["model_a_pool_path"] = str(Path(self.args.model_a_pool).resolve())
             if self.args.model_b_pool:
                 summary["model_b_pool_path"] = str(Path(self.args.model_b_pool).resolve())
         self.summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        self.manifest_path.write_text(json.dumps(self._build_run_manifest(summary), indent=2) + "\n", encoding="utf-8")
 
     async def run(self) -> int:
         self.run_dir.mkdir(parents=True, exist_ok=True)

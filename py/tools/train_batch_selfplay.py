@@ -9,6 +9,7 @@ from pathlib import Path
 import queue
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -117,6 +118,12 @@ def resolve_batch_checkpoint(run_name: str, checkpoint_arg: str) -> Path:
     return Path("models") / "runs" / run_name / stem / checkpoint_path.name
 
 
+def resolve_optional_path(value: str | None) -> Path | None:
+    if not value:
+        return None
+    return Path(value)
+
+
 def coerce_value(value: str) -> int | float | str:
     lowered = value.lower()
     if lowered in {"estimating"}:
@@ -180,6 +187,34 @@ def collect_training_stats(lines: list[str]) -> dict[str, object]:
         elif line.startswith("[train] saved checkpoint "):
             stats["saved_checkpoint"] = line.removeprefix("[train] saved checkpoint ").strip()
     return stats
+
+
+def load_json_if_exists(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def replay_run_summary_path(run_name: str) -> Path:
+    return DEFAULT_RUNS_ROOT / run_name / f"{run_name}_summary.json"
+
+
+def infer_collection_pool_source(run_name: str) -> dict[str, str]:
+    summary = load_json_if_exists(replay_run_summary_path(run_name))
+    if not summary:
+        return {}
+    pool_source: dict[str, str] = {}
+    model_a_pool = summary.get("model_a_pool_path")
+    model_b_pool = summary.get("model_b_pool_path")
+    if isinstance(model_a_pool, str) and model_a_pool.strip():
+        pool_source["model_a_pool_path"] = model_a_pool
+    if isinstance(model_b_pool, str) and model_b_pool.strip():
+        pool_source["model_b_pool_path"] = model_b_pool
+    return pool_source
 
 
 def format_duration(seconds: float | None) -> str:
@@ -675,10 +710,22 @@ def write_batch_training_stats(
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def default_training_manifest_path(checkpoint_path: Path) -> Path:
+    return checkpoint_path.parent / f"{checkpoint_path.stem}_training_manifest.json"
+
+
+def write_training_manifest(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True, help="Run name under matches/runs/")
     parser.add_argument("--checkpoint", required=True, help="Checkpoint path/name to train into")
+    parser.add_argument("--init-checkpoint", default="", help="Optional checkpoint path/name to use for warm-start initialization")
+    parser.add_argument("--experiment-id", default="", help="Optional experiment grouping token for manifests")
+    parser.add_argument("--manifest-path", default="", help="Optional explicit training manifest path")
     parser.add_argument("--mode", choices=["supervised", "rl"], default="supervised")
     parser.add_argument("--epochs", type=positive_int, default=1, help="Passes over all worker files")
     parser.add_argument("--pattern", default="worker_*_raw.jsonl", help="Glob for training shards")
@@ -729,6 +776,28 @@ def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> lis
     return command
 
 
+def ensure_initialized_checkpoint(args: argparse.Namespace) -> tuple[bool, str | None]:
+    resolved_init = args.resolved_init_checkpoint
+    if args.resolved_checkpoint.exists():
+        if resolved_init is not None:
+            print(
+                f"[train_batch_selfplay] output checkpoint already exists; ignoring --init-checkpoint {resolved_init}",
+                flush=True,
+            )
+        return False, None
+    if resolved_init is None:
+        return False, None
+    if not resolved_init.exists():
+        raise SystemExit(f"init checkpoint not found: {resolved_init}")
+    args.resolved_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(resolved_init, args.resolved_checkpoint)
+    print(
+        f"[train_batch_selfplay] initialized checkpoint {args.resolved_checkpoint} from {resolved_init}",
+        flush=True,
+    )
+    return True, str(resolved_init)
+
+
 def main() -> None:
     parser = build_parser()
     argv = load_default_args(DEFAULT_ARGS_PATH) + sys.argv[1:]
@@ -738,12 +807,23 @@ def main() -> None:
     run_dir = repo_root / DEFAULT_RUNS_ROOT / args.run
     trainer_exe = repo_root / Path(args.trainer_exe)
     args.resolved_checkpoint = resolve_batch_checkpoint(args.run, args.checkpoint)
+    args.resolved_init_checkpoint = (
+        resolve_batch_checkpoint(args.run, args.init_checkpoint) if args.init_checkpoint else None
+    )
+    if args.resolved_init_checkpoint is not None and not args.resolved_init_checkpoint.is_absolute():
+        args.resolved_init_checkpoint = (repo_root / args.resolved_init_checkpoint).resolve()
+    args.resolved_manifest_path = (
+        resolve_optional_path(args.manifest_path) if args.manifest_path else default_training_manifest_path(args.resolved_checkpoint)
+    )
+    if args.resolved_manifest_path is not None and not args.resolved_manifest_path.is_absolute():
+        args.resolved_manifest_path = (repo_root / args.resolved_manifest_path).resolve()
 
     if not run_dir.exists():
         raise SystemExit(f"run dir not found: {run_dir}")
     if not trainer_exe.exists():
         raise SystemExit(f"trainer executable not found: {trainer_exe}")
     args.resolved_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    initialized_from_init, initialized_checkpoint_path = ensure_initialized_checkpoint(args)
     subprocess_env = os.environ.copy()
     subprocess_env.update(configured_env)
 
@@ -756,6 +836,35 @@ def main() -> None:
         raise SystemExit(f"no input files matched {args.pattern!r} in {run_dir}")
 
     planned_total_shards = args.epochs * (min(len(all_files), args.sample_files) if args.sample_files > 0 else len(all_files))
+    source_replay_summary = replay_run_summary_path(args.run).resolve()
+    collection_pool_source = infer_collection_pool_source(args.run)
+    training_manifest: dict[str, object] = {
+        "run": args.run,
+        "mode": args.mode,
+        "experiment_id": args.experiment_id,
+        "init_checkpoint": str(args.resolved_init_checkpoint) if args.resolved_init_checkpoint is not None else "",
+        "output_checkpoint": str(args.resolved_checkpoint.resolve()),
+        "checkpoint_initialized_from": initialized_checkpoint_path or "",
+        "checkpoint_preexisting": args.resolved_checkpoint.exists() and not initialized_from_init,
+        "source_replay_run": args.run,
+        "source_replay_summary_path": str(source_replay_summary) if source_replay_summary.exists() else "",
+        "collection_pool_source": collection_pool_source,
+        "pattern": args.pattern,
+        "reward_mode": args.reward_mode,
+        "gamma": args.gamma,
+        "entropy_coef": args.entropy_coef,
+        "advantage_norm": args.advantage_norm,
+        "sample_files": args.sample_files,
+        "epochs": args.epochs,
+        "epochs_per_file": args.epochs_per_file,
+        "shuffle": bool(args.shuffle),
+        "trainer_exe": str(trainer_exe.resolve()),
+        "configured_env": configured_env,
+        "status": "running",
+        "completed_files": 0,
+        "planned_total_shards": planned_total_shards,
+    }
+    write_training_manifest(args.resolved_manifest_path, training_manifest)
     state = RunDisplayState(
         run=args.run,
         mode=args.mode,
@@ -773,6 +882,7 @@ def main() -> None:
     eta_alpha = 0.2
     eta_min_elapsed = 30.0
     eta_min_completed = 3
+    failure_message = ""
 
     try:
         for epoch in range(1, args.epochs + 1):
@@ -868,6 +978,10 @@ def main() -> None:
                 eta_ready = completed_files >= eta_min_completed or total_elapsed >= eta_min_elapsed
                 state.eta_seconds = (remaining_shards / shard_rate_ema) if eta_ready and shard_rate_ema > 0.0 else None
                 reporter.shard_finished()
+                training_manifest["completed_files"] = completed_files
+                training_manifest["current_epoch"] = epoch
+                training_manifest["last_completed_shard"] = shard_index
+                write_training_manifest(args.resolved_manifest_path, training_manifest)
 
             epoch_elapsed = time.monotonic() - epoch_started_at
             state.last_notice = f"epoch {epoch}/{args.epochs} complete elapsed={epoch_elapsed:.1f}s"
@@ -877,7 +991,15 @@ def main() -> None:
 
         state.last_notice = "training complete"
         reporter.run_finished()
+        training_manifest["status"] = "completed"
     finally:
+        if training_manifest.get("status") != "completed":
+            training_manifest["status"] = "failed"
+            training_manifest["failure_reason"] = state.last_notice or failure_message
+        training_manifest["completed_files"] = completed_files
+        training_manifest["checkpoint_exists"] = args.resolved_checkpoint.exists()
+        training_manifest["manifest_written_at_epoch_count"] = args.epochs
+        write_training_manifest(args.resolved_manifest_path, training_manifest)
         reporter.close()
 
 

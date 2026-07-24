@@ -17,3 +17,119 @@ Current implementation notes:
 - The repository now includes the protocol/session/raw-state/trainer/checkpoint path.
 - Supervised and policy-gradient updates currently operate on the GRU output heads using sequence hidden states.
 - Replay logs preserve raw battle messages so the environment can be rebuilt offline.
+
+## Current operating model
+
+As of July 24, 2026, the intended long-term path is:
+
+1. keep a trusted supervised baseline checkpoint
+2. warm-start RL from that checkpoint instead of retraining from scratch
+3. capture provenance for collection, training, and eval runs
+4. reject obviously collapsed RL candidates before promotion discussion
+
+The current trusted baseline is `g4_teacher_sup_pool_wins_sup`.
+
+## Warm-start training
+
+`py/tools/train_batch_selfplay.py` now separates:
+
+- `--checkpoint`
+  - output checkpoint path
+- `--init-checkpoint`
+  - optional warm-start source
+
+Behavior:
+
+- if `checkpoint` does not exist and `init-checkpoint` is provided, the wrapper copies the init checkpoint into the output location before launching `showdown_client`
+- if `checkpoint` already exists, the wrapper keeps it and ignores `init-checkpoint`
+- this avoids manual checkpoint copying for RL experiments
+
+The wrapper also writes a training manifest beside the checkpoint by default. The manifest records:
+
+- replay source run
+- init checkpoint
+- output checkpoint
+- RL hyperparameters such as `reward_mode`, `gamma`, and `entropy_coef`
+- sample file count
+- configured environment variables
+- shard completion progress
+
+## Eval and collapse guardrails
+
+`py/tools/selfplay_server.py` summaries now include:
+
+- `candidate_checkpoint`
+- `parent_checkpoint`
+- `group_stats`
+- `group_collapse_flags`
+- `collapse_thresholds`
+
+Current default collapse checks:
+
+- warning when one move slot exceeds `55%`
+- hard collapse when one move slot exceeds `70%`
+- warning when `switch_slot_6` exceeds `60%`
+- warning when candidate tera rate falls below `50%` of the baseline side
+- fail-fast warning when earned win rate is below `40%` after at least `150` games
+
+Use `py/tools/eval_collapse_check.py` to re-run those checks from an existing summary JSON.
+
+## Collection provenance
+
+`py/tools/selfplay_server.py` now writes a manifest per run in addition to the existing summary.
+
+The manifest records:
+
+- pool source paths
+- resolved model specs for both sides
+- sampled member counts from pool-based runs
+- worker settings such as `worker_pairs`, `worker_games`, and `ensure_shard_count`
+- summary path linkage
+
+This is the basis for reproducible collection -> train -> eval lineage.
+
+## League metadata
+
+`py/tools/league_manage.py` now supports optional lineage/eval metadata on members:
+
+- `parent_id`
+- `regime`
+- `source_run`
+- `experiment_id`
+- `eval.summary_path`
+- `eval.collapse_flags`
+
+It also supports workflow statuses beyond the original active/inactive pair:
+
+- `candidate`
+- `active`
+- `inactive`
+- `rejected`
+- `champion` remains derived from `champion_id`
+
+Pool presets are available through `build-pool`:
+
+- `champion-plus-random`
+- `active-mixed`
+- `top-k`
+
+## Recommended first RL ladder
+
+The current recommended first RL sweep is:
+
+1. start from the trusted baseline checkpoint
+2. use `wins-only postfaint` or another high-signal champion-centered replay source
+3. keep:
+   - `mode = rl`
+   - `reward_mode = terminal`
+   - `epochs = 1`
+   - `epochs_per_file = 1`
+   - `sample_files = 200`
+   - `gamma = 1.0`
+   - `advantage_norm = 1`
+4. vary only `entropy_coef` first:
+   - `0.0003`
+   - `0.001`
+   - `0.003`
+
+Do not scale model size or broaden collection policy until this ladder stops collapsing.
