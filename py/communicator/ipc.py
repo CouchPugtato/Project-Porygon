@@ -83,8 +83,21 @@ class LearnerProcess:
         if self._process is None:
             return
         self._closed = True
-        if self._process.stdin is not None:
-            self._process.stdin.close()
-        if self._process.returncode is None:
-            self._process.terminate()
-        await self._process.wait()
+        process = self._process
+        self._process = None
+        self._stdout_buffer.clear()
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.returncode is None:
+            process.terminate()
+        await process.wait()
+
+        # On Windows ProactorEventLoop, leaving subprocess transport cleanup to
+        # GC can emit noisy "Event loop is closed" errors during interpreter
+        # shutdown. Close the transport explicitly once the child has exited.
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            try:
+                transport.close()
+            except RuntimeError:
+                pass
