@@ -862,6 +862,81 @@ static int load_runtime_from_replay_file(
     return 1;
 }
 
+static int load_runtime_from_episode_batch_file(
+    const char* input_path,
+    GruModel* model,
+    EnvRuntime* runtime,
+    EnvRewardMode reward_mode,
+    const EnvDenseRewardConfig* dense_reward_config
+) {
+    FILE* f;
+    char line[1 << 20];
+    size_t lines_read = 0;
+    size_t parsed_episodes = 0;
+    size_t invalid_lines = 0;
+    clock_t ingest_start_clock;
+
+    if (!input_path || !model || !runtime) {
+        return 0;
+    }
+    f = fopen(input_path, "r");
+    if (!f) {
+        fprintf(stderr, "Failed to open episode batch file '%s': %s\n", input_path, strerror(errno));
+        return 0;
+    }
+    if (!env_runtime_init(runtime, model, NULL, 1, reward_mode, dense_reward_config)) {
+        fclose(f);
+        return 0;
+    }
+
+    ingest_start_clock = clock();
+    while (fgets(line, sizeof(line), f)) {
+        Episode episode;
+        EnvSession* new_sessions;
+        char battle_id[RUNTIME_BATTLE_ID_LEN];
+        char policy_tag[256];
+        ++lines_read;
+        memset(&episode, 0, sizeof(episode));
+        battle_id[0] = '\0';
+        policy_tag[0] = '\0';
+        if (!episode_parse_json_record(line, &episode, battle_id, sizeof(battle_id), policy_tag, sizeof(policy_tag))) {
+            ++invalid_lines;
+            continue;
+        }
+        if (runtime->count == runtime->capacity) {
+            size_t new_capacity = runtime->capacity ? (runtime->capacity * 2u) : 16u;
+            new_sessions = (EnvSession*)realloc(runtime->sessions, new_capacity * sizeof(EnvSession));
+            if (!new_sessions) {
+                episode_free(&episode);
+                fclose(f);
+                env_runtime_free(runtime);
+                return 0;
+            }
+            runtime->sessions = new_sessions;
+            runtime->capacity = new_capacity;
+        }
+        memset(&runtime->sessions[runtime->count], 0, sizeof(EnvSession));
+        runtime->sessions[runtime->count].episode = episode;
+        strncpy(runtime->sessions[runtime->count].battle_id, battle_id, sizeof(runtime->sessions[runtime->count].battle_id) - 1);
+        runtime->sessions[runtime->count].battle_id[sizeof(runtime->sessions[runtime->count].battle_id) - 1] = '\0';
+        runtime->sessions[runtime->count].format_known = 1;
+        runtime->sessions[runtime->count].terminal = 1;
+        runtime->count += 1;
+        ++parsed_episodes;
+        if ((lines_read % 1000u) == 0u) {
+            double elapsed = elapsed_seconds_since(ingest_start_clock);
+            double lines_per_sec = elapsed > 0.0 ? (double)lines_read / elapsed : 0.0;
+            printf("[train-live-rl] ingest lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
+                lines_read, parsed_episodes, invalid_lines, runtime->count);
+            printf("[train-live-rl] ingest elapsed=%.1fs lines_per_sec=%.1f\n", elapsed, lines_per_sec);
+        }
+    }
+    fclose(f);
+    printf("[train-live-rl] ingest complete lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
+        lines_read, parsed_episodes, invalid_lines, runtime->count);
+    return 1;
+}
+
 static EnvSession* find_runtime_session_by_id(EnvRuntime* runtime, const char* battle_id) {
     size_t i;
     if (!runtime || !battle_id) {
@@ -1746,9 +1821,10 @@ static int run_runtime_mode(const char* checkpoint_path) {
     return 0;
 }
 
-static int train_from_replay_file(
-    const char* replay_path,
+static int train_from_input_file(
+    const char* input_path,
     const char* checkpoint_path,
+    int input_is_episode_batch,
     int rl_mode,
     int epochs,
     float rl_gamma,
@@ -1777,7 +1853,7 @@ static int train_from_replay_file(
     const double train_eta_min_elapsed = 10.0;
     const size_t train_eta_min_episodes = 5;
 
-    if (!replay_path || !checkpoint_path || epochs <= 0) {
+    if (!input_path || !checkpoint_path || epochs <= 0) {
         return 1;
     }
     if (rl_mode) {
@@ -1786,7 +1862,7 @@ static int train_from_replay_file(
                 rl_reward_mode ? rl_reward_mode : "");
             return 1;
         }
-        if (strstr(replay_path, "legacy") != NULL) {
+        if (!input_is_episode_batch && strstr(input_path, "legacy") != NULL) {
             printf("[train-rl] warning: replay path contains 'legacy'; RL is intended for fresh post-fix runs only\n");
         }
     } else {
@@ -1823,12 +1899,19 @@ static int train_from_replay_file(
         trainer.supervised_profile_enabled = supervised_profile;
     }
 
-    if (!load_runtime_from_replay_file(
-            replay_path,
-            model,
-            &runtime,
-            reward_mode,
-            reward_config ? &reward_config->dense_additive : NULL)) {
+    if (!(input_is_episode_batch
+            ? load_runtime_from_episode_batch_file(
+                input_path,
+                model,
+                &runtime,
+                reward_mode,
+                reward_config ? &reward_config->dense_additive : NULL)
+            : load_runtime_from_replay_file(
+                input_path,
+                model,
+                &runtime,
+                reward_mode,
+                reward_config ? &reward_config->dense_additive : NULL))) {
         gru_model_destroy(model);
         free(resolved_checkpoint_path);
         return 1;
@@ -2155,6 +2238,7 @@ static int showdown_client_main(int argc, char** argv) {
     if (argc >= 2 &&
             (strcmp(argv[1], "--train-supervised") == 0 ||
              strcmp(argv[1], "--train-rl") == 0 ||
+             strcmp(argv[1], "--train-live-rl") == 0 ||
              strcmp(argv[1], "--eval-supervised") == 0)) {
         training_or_eval_mode = 1;
     }
@@ -2181,9 +2265,10 @@ static int showdown_client_main(int argc, char** argv) {
         return run_runtime_mode(argc >= 3 ? argv[2] : NULL);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-supervised") == 0) {
-        return train_from_replay_file(
+        return train_from_input_file(
             argv[2],
             argv[3],
+            0,
             0,
             epochs,
             rl_gamma,
@@ -2194,9 +2279,24 @@ static int showdown_client_main(int argc, char** argv) {
             &reward_config);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-rl") == 0) {
-        return train_from_replay_file(
+        return train_from_input_file(
             argv[2],
             argv[3],
+            0,
+            1,
+            epochs,
+            rl_gamma,
+            rl_entropy_coef,
+            rl_advantage_norm,
+            supervised_profile,
+            rl_reward_mode,
+            &reward_config);
+    }
+    if (argc >= 4 && strcmp(argv[1], "--train-live-rl") == 0) {
+        return train_from_input_file(
+            argv[2],
+            argv[3],
+            1,
             1,
             epochs,
             rl_gamma,
@@ -2236,6 +2336,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --battle-agent [checkpoint]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--supervised-profile 0|1]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
         "  showdown_client --export-battle <replay.jsonl> <battle_id> <output.json>\n"

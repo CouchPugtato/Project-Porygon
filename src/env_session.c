@@ -457,6 +457,10 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
             }
             clear_request_reward_snapshot(session);
             session->terminal = 1;
+            if (out && !runtime->replay_only && session->episode.count > 0) {
+                episode_write_json_record(out, &session->episode, session->battle_id, "");
+                fflush(out);
+            }
             return 1;
         case RUNTIME_MSG_DECISION:
             session = ensure_session(runtime, msg->battle_id, msg->is_doubles);

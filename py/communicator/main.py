@@ -1759,6 +1759,11 @@ async def live_mode(
                 return
             if msg.get("type") == "ready":
                 print(f"[live] learner ready: {msg}")
+            elif msg.get("type") == "episode_complete":
+                battle_id = str(msg.get("battle_id") or "")
+                if writer is not None and battle_id:
+                    writer.append(battle_id, json.dumps(msg, separators=(",", ":")))
+                print(f"[live] episode complete for {battle_id} steps={msg.get('count', 0)}")
             elif msg.get("type") == "action":
                 battle_id = msg["battle_id"]
                 if not request_open.get(battle_id, False):

@@ -2,6 +2,7 @@
 #define EPISODE_H
 
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 
 typedef struct {
@@ -27,5 +28,14 @@ int episode_append(
     uint8_t done
 );
 const float* episode_observation_at(const Episode* episode, size_t index);
+int episode_write_json_record(FILE* out, const Episode* episode, const char* battle_id, const char* policy_tag);
+int episode_parse_json_record(
+    const char* json,
+    Episode* episode,
+    char* battle_id,
+    size_t battle_id_len,
+    char* policy_tag,
+    size_t policy_tag_len
+);
 
 #endif
