@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import string
@@ -184,6 +185,10 @@ class ShowdownGateway:
 
         if line.startswith("|popup|"):
             print(f"[communicator] popup: {line}")
+            if self.challenge_target and "was not found" in line:
+                self._challenge_sent = False
+                await asyncio.sleep(1.0)
+                await self.challenge_battle()
             return
 
     async def run(self, on_event: Callable[[ShowdownEvent], Awaitable[None]]) -> None:

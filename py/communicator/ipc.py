@@ -15,6 +15,7 @@ class LearnerProcess:
         self._replay_path = replay_path
         self._process: Optional[asyncio.subprocess.Process] = None
         self._closed = False
+        self._stdout_buffer = bytearray()
 
     async def start(self) -> None:
         env = os.environ.copy()
@@ -48,9 +49,20 @@ class LearnerProcess:
         if not self._process or not self._process.stdout:
             return None
         while True:
-            line = await self._process.stdout.readline()
-            if not line:
-                return None
+            newline_index = self._stdout_buffer.find(b"\n")
+            if newline_index < 0:
+                chunk = await self._process.stdout.read(65536)
+                if not chunk:
+                    if not self._stdout_buffer:
+                        return None
+                    line = bytes(self._stdout_buffer)
+                    self._stdout_buffer.clear()
+                else:
+                    self._stdout_buffer.extend(chunk)
+                    continue
+            else:
+                line = bytes(self._stdout_buffer[:newline_index])
+                del self._stdout_buffer[: newline_index + 1]
             text = line.decode("utf-8", errors="replace").strip()
             if not text:
                 continue
