@@ -8,15 +8,16 @@ The trainable path is staged:
 4. Each decision point is appended to an `Episode`.
 5. Live inference uses the GRU model to choose an action and emits `/choose ...`.
 6. Replay logs preserve raw protocol messages and agent `decision` records.
-7. Offline supervised training replays those logs, rebuilds episodes, and updates the GRU heads.
+7. Offline supervised training replays those logs, rebuilds episodes, and updates the GRU over sequence windows.
 8. Checkpoints serialize model weights and trainer state.
-9. Online RL reuses the same episodes and applies policy-gradient head updates on terminal rewards.
+9. RL can either reuse reconstructed episodes offline or consume live-exported `episode_complete` batches directly.
 
 Current implementation notes:
 
 - The repository now includes the protocol/session/raw-state/trainer/checkpoint path.
-- Supervised and policy-gradient updates currently operate on the GRU output heads using sequence hidden states.
+- Supervised and policy-gradient updates now operate over sequence windows rather than only updating output heads.
 - Replay logs preserve raw battle messages so the environment can be rebuilt offline.
+- Live runtime sessions can also export completed episodes directly for `--train-live-rl` without replay reconstruction.
 
 ## Current operating model
 
@@ -53,6 +54,30 @@ The wrapper also writes a training manifest beside the checkpoint by default. Th
 - sample file count
 - configured environment variables
 - shard completion progress
+
+## Live self-play RL
+
+The repository now has a first round-based actor -> learner path for live RL:
+
+1. live workers sample actions from the current checkpoint in battle
+2. terminal battles emit `episode_complete` JSON records directly from the runtime
+3. `py/tools/live_rl_orchestrator.py` collects those records from worker JSONLs
+4. the orchestrator copies the parent checkpoint into a child checkpoint path
+5. `showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint>` applies RL updates from that batch
+6. the child checkpoint becomes the actor policy for the next round
+
+This is intentionally round-based and restart-based. Actors are relaunched between rounds so each rollout batch is tied to one frozen policy version.
+
+Artifacts:
+
+- workflow manifest:
+  - `models/runs/<run_name>/<run_name>_live_rl_manifest.json`
+- per-round manifest:
+  - `models/runs/<run_name>/roundXX/<run_name>_roundXX_manifest.json`
+- extracted live episode batch:
+  - `matches/runs/<collect_run>/episode_batch_<side>.jsonl`
+
+This path is the preferred long-term direction over replay RL because it removes the off-policy mismatch from training on older logged actions.
 
 ## Eval and collapse guardrails
 

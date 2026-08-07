@@ -862,6 +862,42 @@ static int load_runtime_from_replay_file(
     return 1;
 }
 
+static int read_line_dynamic(FILE* f, char** buffer, size_t* capacity) {
+    size_t length = 0;
+    int ch;
+    char* resized;
+    if (!f || !buffer || !capacity) {
+        return -1;
+    }
+    if (!*buffer || *capacity == 0) {
+        *capacity = 4096;
+        *buffer = (char*)malloc(*capacity);
+        if (!*buffer) {
+            *capacity = 0;
+            return -1;
+        }
+    }
+    while ((ch = fgetc(f)) != EOF) {
+        if (length + 2 >= *capacity) {
+            *capacity *= 2u;
+            resized = (char*)realloc(*buffer, *capacity);
+            if (!resized) {
+                return -1;
+            }
+            *buffer = resized;
+        }
+        (*buffer)[length++] = (char)ch;
+        if (ch == '\n') {
+            break;
+        }
+    }
+    if (length == 0 && ch == EOF) {
+        return 0;
+    }
+    (*buffer)[length] = '\0';
+    return 1;
+}
+
 static int load_runtime_from_episode_batch_file(
     const char* input_path,
     GruModel* model,
@@ -870,7 +906,8 @@ static int load_runtime_from_episode_batch_file(
     const EnvDenseRewardConfig* dense_reward_config
 ) {
     FILE* f;
-    char line[1 << 20];
+    char* line = NULL;
+    size_t line_capacity = 0;
     size_t lines_read = 0;
     size_t parsed_episodes = 0;
     size_t invalid_lines = 0;
@@ -890,11 +927,21 @@ static int load_runtime_from_episode_batch_file(
     }
 
     ingest_start_clock = clock();
-    while (fgets(line, sizeof(line), f)) {
+    while (1) {
         Episode episode;
         EnvSession* new_sessions;
         char battle_id[RUNTIME_BATTLE_ID_LEN];
         char policy_tag[256];
+        int read_rc = read_line_dynamic(f, &line, &line_capacity);
+        if (read_rc < 0) {
+            free(line);
+            fclose(f);
+            env_runtime_free(runtime);
+            return 0;
+        }
+        if (read_rc == 0) {
+            break;
+        }
         ++lines_read;
         memset(&episode, 0, sizeof(episode));
         battle_id[0] = '\0';
@@ -931,6 +978,7 @@ static int load_runtime_from_episode_batch_file(
             printf("[train-live-rl] ingest elapsed=%.1fs lines_per_sec=%.1f\n", elapsed, lines_per_sec);
         }
     }
+    free(line);
     fclose(f);
     printf("[train-live-rl] ingest complete lines=%zu parsed=%zu invalid=%zu sessions=%zu\n",
         lines_read, parsed_episodes, invalid_lines, runtime->count);

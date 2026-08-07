@@ -26,6 +26,12 @@ Files:
   - supports `env_<NAME> = <value>` entries to set subprocess environment variables for `showdown_client`
   - writes one batch-training stats JSON per shard under `models/runs/<run>/<checkpoint_stem>/<checkpoint_stem>_batch_training_stats/`
   - writes one training manifest JSON beside the checkpoint by default
+- `live_rl_orchestrator.toml`
+  - consumed by `py/tools/live_rl_orchestrator.py` before CLI args are applied
+  - runs round-based live self-play RL using the current checkpoint on side `a`
+  - collects `episode_complete` records directly from worker JSONLs and trains with `showdown_client --train-live-rl`
+  - copies the parent checkpoint into each round output path before the RL update so actor rollouts stay versioned by round
+  - writes one workflow manifest under `models/runs/<run_name>/` plus one per-round manifest
 - `reward_weights.toml`
   - runtime-loaded by both `showdown_client` and `py/communicator/main.py`
 - `experimental/*.toml`
@@ -79,6 +85,7 @@ Examples:
 python -m py.communicator.main
 python py/tools/selfplay_server.py
 python py/tools/train_batch_selfplay.py
+python py/tools/live_rl_orchestrator.py
 ```
 
 Those commands will use the tokens from these files automatically.
@@ -250,6 +257,34 @@ Example:
 
 ```powershell
 python py/tools/eval_collapse_check.py --summary matches/runs/run_0060_g9_teacher_rl_from_g4_vs_champion/run_0060_g9_teacher_rl_from_g4_vs_champion_summary.json --candidate-side a
+```
+
+### Live Self-Play RL
+
+`py/tools/live_rl_orchestrator.py` is the first round-based actor -> learner loop for on-policy-style self-play.
+
+Per round it does this:
+
+1. launches `py/tools/selfplay_server.py` with the current checkpoint on side `a`
+2. waits for the collection run to finish
+3. extracts `episode_complete` JSON records from `worker_*_<side>_raw.jsonl`
+4. copies the parent checkpoint to a new child checkpoint path
+5. runs `showdown_client --train-live-rl <episode_batch.jsonl> <child_checkpoint>`
+6. uses that child checkpoint as the next round's actor policy
+
+Artifacts:
+
+- workflow manifest:
+  - `models/runs/<run_name>/<run_name>_live_rl_manifest.json`
+- per-round manifests:
+  - `models/runs/<run_name>/roundXX/<run_name>_roundXX_manifest.json`
+- extracted episode batches:
+  - `matches/runs/<collect_run>/episode_batch_<side>.jsonl`
+
+Example:
+
+```powershell
+python py/tools/live_rl_orchestrator.py --run-name run_live_rl_g4_test --init-checkpoint "models/runs/run_0056_g4_teacher_sup_pool_collect_200shards_wins/g4_teacher_sup_pool_wins_sup/g4_teacher_sup_pool_wins_sup.chk" --rounds 2 --games 1000 --concurrent-games 70 --worker-pairs 200 --ensure-shard-count true --model-b random --pool-seed 71 --entropy-coef 0.003 --reward-mode terminal
 ```
 
 For reduced-board / post-faint curriculum extraction:

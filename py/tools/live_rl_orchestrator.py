@@ -1,0 +1,333 @@
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+DEFAULT_ARGS_PATH = Path("config/live_rl_orchestrator.toml")
+DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
+DEFAULT_RUNS_ROOT = Path("matches") / "runs"
+DEFAULT_MODELS_ROOT = Path("models") / "runs"
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
+def parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true"}:
+        return True
+    if lowered in {"0", "false"}:
+        return False
+    raise argparse.ArgumentTypeError("value must be true or false")
+
+
+def load_default_args(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    args: list[str] = []
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise SystemExit(f"invalid config {path}:{line_number}: expected key = value")
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip()
+        value_text = raw_value.strip()
+        if not key:
+            raise SystemExit(f"invalid config {path}:{line_number}: empty key")
+        flag = "--" + key.replace("_", "-")
+        lowered = value_text.lower()
+        if lowered in {"true", "false"}:
+            args.extend([flag, "1" if lowered == "true" else "0"])
+            continue
+        if len(value_text) >= 2 and value_text[0] == '"' and value_text[-1] == '"':
+            value = bytes(value_text[1:-1], "utf-8").decode("unicode_escape")
+        else:
+            value = value_text
+        args.extend([flag, value])
+    return args
+
+
+def resolve_repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve_path(repo_root: Path, value: str | Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (repo_root / path).resolve()
+
+
+def run_dir_for_name(repo_root: Path, run_name: str) -> Path:
+    return (repo_root / DEFAULT_RUNS_ROOT / run_name).resolve()
+
+
+def worker_glob_for_side(side: str) -> str:
+    return f"worker_*_{side}_raw.jsonl"
+
+
+def log(message: str) -> None:
+    print(f"[live-rl] {message}", flush=True)
+
+
+def run_command(command: list[str], cwd: Path) -> None:
+    log("exec: " + " ".join(f'"{part}"' if " " in part else part for part in command))
+    completed = subprocess.run(command, cwd=str(cwd))
+    if completed.returncode != 0:
+        raise SystemExit(completed.returncode)
+
+
+def extract_episode_batch(run_dir: Path, side: str, output_path: Path) -> dict[str, int]:
+    worker_paths = sorted(run_dir.glob(worker_glob_for_side(side)))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    scanned = 0
+    source_files = 0
+    with output_path.open("w", encoding="utf-8", newline="\n") as out_handle:
+        for worker_path in worker_paths:
+            source_files += 1
+            with worker_path.open("r", encoding="utf-8") as in_handle:
+                for raw_line in in_handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    scanned += 1
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(payload, dict) or payload.get("type") != "episode_complete":
+                        continue
+                    out_handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                    written += 1
+    return {
+        "source_files": source_files,
+        "scanned_lines": scanned,
+        "written_episodes": written,
+    }
+
+
+def copy_checkpoint(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def build_selfplay_command(args: argparse.Namespace, repo_root: Path, run_name: str, checkpoint_path: Path) -> list[str]:
+    command = [
+        sys.executable,
+        str((repo_root / "py" / "tools" / "selfplay_server.py").resolve()),
+        "--run-name",
+        run_name,
+        "--games",
+        str(args.games),
+        "--concurrent-games",
+        str(args.concurrent_games),
+        "--worker-pairs",
+        str(args.worker_pairs),
+        "--worker-games",
+        str(args.worker_games),
+        "--ensure-shard-count",
+        "true" if args.ensure_shard_count else "false",
+        "--model-a-pool",
+        "",
+        "--model-a",
+        str(checkpoint_path),
+        "--pool-seed",
+        str(args.pool_seed),
+        "--format",
+        args.format,
+        "--worker-think-mode",
+        args.worker_think_mode,
+        "--serve-client",
+        "1" if args.serve_client else "0",
+        "--worker-log-stdout",
+        "1" if args.worker_log_stdout else "0",
+    ]
+    if args.model_b_pool:
+        command.extend(["--model-b", "", "--model-b-pool", args.model_b_pool])
+    else:
+        command.extend(["--model-b-pool", "", "--model-b", args.model_b])
+    return command
+
+
+def build_train_command(args: argparse.Namespace, trainer_exe: Path, episode_batch_path: Path, output_checkpoint: Path) -> list[str]:
+    return [
+        str(trainer_exe),
+        "--train-live-rl",
+        str(episode_batch_path),
+        str(output_checkpoint),
+        "--epochs",
+        str(args.epochs),
+        "--gamma",
+        str(args.gamma),
+        "--entropy-coef",
+        str(args.entropy_coef),
+        "--advantage-norm",
+        "1" if args.advantage_norm else "0",
+        "--reward-mode",
+        args.reward_mode,
+    ]
+
+
+def write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-name", required=True)
+    parser.add_argument("--init-checkpoint", required=True)
+    parser.add_argument("--rounds", type=positive_int, default=1)
+    parser.add_argument("--games", type=nonnegative_int, required=True)
+    parser.add_argument("--concurrent-games", type=positive_int, required=True)
+    parser.add_argument("--worker-pairs", type=positive_int, default=200)
+    parser.add_argument("--worker-games", type=nonnegative_int, default=0)
+    parser.add_argument("--ensure-shard-count", type=parse_bool, default=True)
+    parser.add_argument("--model-b", default="random")
+    parser.add_argument("--model-b-pool", default="")
+    parser.add_argument("--pool-seed", type=int, default=1)
+    parser.add_argument("--format", default="gen9randomdoublesbattle")
+    parser.add_argument("--worker-think-mode", choices=["live", "random"], default="live")
+    parser.add_argument("--serve-client", type=parse_bool, default=True)
+    parser.add_argument("--worker-log-stdout", type=parse_bool, default=False)
+    parser.add_argument("--trainer-exe", default=str(DEFAULT_TRAINER_EXE))
+    parser.add_argument("--checkpoint-prefix", default="live_rl")
+    parser.add_argument("--episode-side", choices=["a", "b"], default="a")
+    parser.add_argument("--epochs", type=positive_int, default=1)
+    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--entropy-coef", type=float, default=0.001)
+    parser.add_argument("--advantage-norm", type=parse_bool, default=True)
+    parser.add_argument("--reward-mode", choices=["terminal", "dense_additive"], default="terminal")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    argv = load_default_args(DEFAULT_ARGS_PATH) + sys.argv[1:]
+    args = parser.parse_args(argv)
+    repo_root = resolve_repo_root()
+    trainer_exe = resolve_path(repo_root, args.trainer_exe)
+    if not trainer_exe.exists():
+        raise SystemExit(f"trainer exe not found: {trainer_exe}")
+    if not args.model_b and not args.model_b_pool:
+        raise SystemExit("provide either --model-b or --model-b-pool")
+    if args.model_b and args.model_b_pool:
+        raise SystemExit("--model-b and --model-b-pool are mutually exclusive")
+
+    init_checkpoint = resolve_path(repo_root, args.init_checkpoint)
+    if not init_checkpoint.exists():
+        raise SystemExit(f"init checkpoint not found: {init_checkpoint}")
+
+    workflow_dir = (repo_root / DEFAULT_MODELS_ROOT / args.run_name).resolve()
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    workflow_manifest_path = workflow_dir / f"{args.run_name}_live_rl_manifest.json"
+
+    workflow_manifest: dict[str, object] = {
+        "run_name": args.run_name,
+        "status": "running",
+        "started_at_unix": time.time(),
+        "init_checkpoint": str(init_checkpoint),
+        "trainer_exe": str(trainer_exe),
+        "rounds": args.rounds,
+        "games": args.games,
+        "concurrent_games": args.concurrent_games,
+        "worker_pairs": args.worker_pairs,
+        "worker_games": args.worker_games,
+        "ensure_shard_count": args.ensure_shard_count,
+        "reward_mode": args.reward_mode,
+        "gamma": args.gamma,
+        "entropy_coef": args.entropy_coef,
+        "advantage_norm": args.advantage_norm,
+        "episode_side": args.episode_side,
+        "opponent": {
+            "model_b": args.model_b,
+            "model_b_pool": args.model_b_pool,
+        },
+        "round_manifests": [],
+    }
+    write_json(workflow_manifest_path, workflow_manifest)
+
+    current_checkpoint = init_checkpoint
+    try:
+        for round_index in range(1, args.rounds + 1):
+            round_token = f"round{round_index:02d}"
+            collect_run_name = f"{args.run_name}_{round_token}_collect"
+            round_dir = workflow_dir / round_token
+            round_dir.mkdir(parents=True, exist_ok=True)
+            output_checkpoint = round_dir / f"{args.checkpoint_prefix}_{round_token}.chk"
+            episode_batch_path = run_dir_for_name(repo_root, collect_run_name) / f"episode_batch_{args.episode_side}.jsonl"
+            round_manifest_path = round_dir / f"{args.run_name}_{round_token}_manifest.json"
+
+            round_manifest: dict[str, object] = {
+                "round": round_index,
+                "status": "running",
+                "started_at_unix": time.time(),
+                "input_checkpoint": str(current_checkpoint),
+                "output_checkpoint": str(output_checkpoint),
+                "collection_run": collect_run_name,
+                "episode_batch_path": str(episode_batch_path),
+                "trainer_exe": str(trainer_exe),
+            }
+            write_json(round_manifest_path, round_manifest)
+
+            selfplay_command = build_selfplay_command(args, repo_root, collect_run_name, current_checkpoint)
+            round_manifest["selfplay_command"] = selfplay_command
+            write_json(round_manifest_path, round_manifest)
+            run_command(selfplay_command, repo_root)
+
+            extract_stats = extract_episode_batch(run_dir_for_name(repo_root, collect_run_name), args.episode_side, episode_batch_path)
+            round_manifest["episode_extract"] = extract_stats
+            if not extract_stats["written_episodes"]:
+                raise SystemExit(f"no episode_complete records found for {collect_run_name} side {args.episode_side}")
+
+            copy_checkpoint(current_checkpoint, output_checkpoint)
+            round_manifest["checkpoint_initialized_from"] = str(current_checkpoint)
+            round_manifest["checkpoint_initialized_to"] = str(output_checkpoint)
+
+            train_command = build_train_command(args, trainer_exe, episode_batch_path, output_checkpoint)
+            round_manifest["train_command"] = train_command
+            write_json(round_manifest_path, round_manifest)
+            run_command(train_command, repo_root)
+
+            current_checkpoint = output_checkpoint
+            round_manifest["status"] = "completed"
+            round_manifest["completed_at_unix"] = time.time()
+            write_json(round_manifest_path, round_manifest)
+            workflow_manifest["round_manifests"].append(str(round_manifest_path))
+            workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
+            write_json(workflow_manifest_path, workflow_manifest)
+
+        workflow_manifest["status"] = "completed"
+        workflow_manifest["completed_at_unix"] = time.time()
+        workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
+        write_json(workflow_manifest_path, workflow_manifest)
+    except Exception as exc:
+        workflow_manifest["status"] = "failed"
+        workflow_manifest["failure_reason"] = str(exc)
+        workflow_manifest["completed_at_unix"] = time.time()
+        write_json(workflow_manifest_path, workflow_manifest)
+        raise
+
+
+if __name__ == "__main__":
+    main()
