@@ -1763,6 +1763,8 @@ async def live_mode(
                 battle_id = str(msg.get("battle_id") or "")
                 if writer is not None and battle_id:
                     writer.append(battle_id, json.dumps(msg, separators=(",", ":")))
+                    if battle_id not in active_battles:
+                        writer.commit_battle(battle_id)
                 print(f"[live] episode complete for {battle_id} steps={msg.get('count', 0)}")
             elif msg.get("type") == "action":
                 battle_id = msg["battle_id"]
