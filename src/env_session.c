@@ -191,7 +191,8 @@ int env_runtime_init(
     FILE* replay_file,
     int replay_only,
     EnvRewardMode reward_mode,
-    const EnvDenseRewardConfig* dense_reward_config
+    const EnvDenseRewardConfig* dense_reward_config,
+    const char* policy_tag
 ) {
     if (!runtime || !model) {
         return 0;
@@ -202,6 +203,10 @@ int env_runtime_init(
     runtime->replay_file = replay_file;
     runtime->replay_only = replay_only;
     runtime->reward_mode = reward_mode;
+    runtime->policy_tag[0] = '\0';
+    if (policy_tag && *policy_tag) {
+        snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "%s", policy_tag);
+    }
     runtime->dense_reward_config.hp_swing_weight = dense_reward_config ? dense_reward_config->hp_swing_weight : ENV_DENSE_HP_SWING_WEIGHT_DEFAULT;
     runtime->dense_reward_config.faint_swing_weight = dense_reward_config ? dense_reward_config->faint_swing_weight : ENV_DENSE_FAINT_SWING_WEIGHT_DEFAULT;
     runtime->dense_reward_config.reward_clip = dense_reward_config ? dense_reward_config->reward_clip : ENV_DENSE_REWARD_CLIP_DEFAULT;
@@ -458,7 +463,7 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
             clear_request_reward_snapshot(session);
             session->terminal = 1;
             if (out && !runtime->replay_only && session->episode.count > 0) {
-                episode_write_json_record(out, &session->episode, session->battle_id, "");
+                episode_write_json_record(out, &session->episode, session->battle_id, runtime->policy_tag);
                 fflush(out);
             }
             return 1;

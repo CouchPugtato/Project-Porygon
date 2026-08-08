@@ -1058,14 +1058,26 @@ static int recurrent_update_sequence(
     evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), legal_mask, logits, policy, &value);
     action_loss_sum += -logf(policy[target_action] > 1.0e-8f ? policy[target_action] : 1.0e-8f);
     accuracy_sum += (gru_model_select_action(policy, legal_mask, adim) == target_action) ? 1.0f : 0.0f;
-    for (a = 0; a < adim; ++a) {
-        grad_logits[a] = (policy[a] - ((int)a == target_action ? 1.0f : 0.0f)) * policy_scale;
-        if (entropy_coef != 0.0f) {
-            grad_logits[a] += entropy_coef * policy[a] * logf(policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f);
+    {
+        float neg_entropy = 0.0f;
+        for (a = 0; a < adim; ++a) {
+            float p;
+            if (legal_mask && !legal_mask[a]) {
+                continue;
+            }
+            p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
+            neg_entropy += p * logf(p);
         }
-        grad_policy_bias[a] += grad_logits[a];
-        for (h = 0; h < hdim; ++h) {
-            grad_policy_head[a * hdim + h] += grad_logits[a] * h_states[(steps - 1) * hdim + h];
+        for (a = 0; a < adim; ++a) {
+            grad_logits[a] = (policy[a] - ((int)a == target_action ? 1.0f : 0.0f)) * policy_scale;
+            if (entropy_coef != 0.0f && (!legal_mask || legal_mask[a])) {
+                float p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
+                grad_logits[a] += entropy_coef * p * (logf(p) - neg_entropy);
+            }
+            grad_policy_bias[a] += grad_logits[a];
+            for (h = 0; h < hdim; ++h) {
+                grad_policy_head[a * hdim + h] += grad_logits[a] * h_states[(steps - 1) * hdim + h];
+            }
         }
     }
     matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
@@ -1074,14 +1086,26 @@ static int recurrent_update_sequence(
         evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), legal_mask_secondary, logits, policy, &value);
         action_loss_sum += -logf(policy[target_action_secondary] > 1.0e-8f ? policy[target_action_secondary] : 1.0e-8f);
         accuracy_sum += (gru_model_select_action(policy, legal_mask_secondary, adim) == target_action_secondary) ? 1.0f : 0.0f;
-        for (a = 0; a < adim; ++a) {
-            grad_logits[a] = (policy[a] - ((int)a == target_action_secondary ? 1.0f : 0.0f)) * policy_scale;
-            if (entropy_coef != 0.0f) {
-                grad_logits[a] += entropy_coef * policy[a] * logf(policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f);
+        {
+            float neg_entropy = 0.0f;
+            for (a = 0; a < adim; ++a) {
+                float p;
+                if (legal_mask_secondary && !legal_mask_secondary[a]) {
+                    continue;
+                }
+                p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
+                neg_entropy += p * logf(p);
             }
-            grad_policy_bias[a] += grad_logits[a];
-            for (h = 0; h < hdim; ++h) {
-                grad_policy_head[a * hdim + h] += grad_logits[a] * h_states[(steps - 1) * hdim + h];
+            for (a = 0; a < adim; ++a) {
+                grad_logits[a] = (policy[a] - ((int)a == target_action_secondary ? 1.0f : 0.0f)) * policy_scale;
+                if (entropy_coef != 0.0f && (!legal_mask_secondary || legal_mask_secondary[a])) {
+                    float p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
+                    grad_logits[a] += entropy_coef * p * (logf(p) - neg_entropy);
+                }
+                grad_policy_bias[a] += grad_logits[a];
+                for (h = 0; h < hdim; ++h) {
+                    grad_policy_head[a * hdim + h] += grad_logits[a] * h_states[(steps - 1) * hdim + h];
+                }
             }
         }
         matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
@@ -1430,19 +1454,31 @@ int gru_model_policy_gradient_update_heads(
     }
 
     evaluate_hidden_internal(model, hidden_state, legal_mask, logits, policy, &value);
-    for (a = 0; a < model->num_actions; ++a) {
-        float grad;
-        if (legal_mask && !legal_mask[a]) {
-            continue;
+    {
+        float neg_entropy = 0.0f;
+        for (a = 0; a < model->num_actions; ++a) {
+            float p;
+            if (legal_mask && !legal_mask[a]) {
+                continue;
+            }
+            p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
+            neg_entropy += p * logf(p);
         }
-        grad = (policy[a] - ((int)a == action ? 1.0f : 0.0f)) * advantage;
-        if (entropy_coef != 0.0f) {
-            grad += entropy_coef * policy[a] * logf(policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f);
+        for (a = 0; a < model->num_actions; ++a) {
+            float grad;
+            if (legal_mask && !legal_mask[a]) {
+                continue;
+            }
+            grad = (policy[a] - ((int)a == action ? 1.0f : 0.0f)) * advantage;
+            if (entropy_coef != 0.0f) {
+                float p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
+                grad += entropy_coef * p * (logf(p) - neg_entropy);
+            }
+            for (h = 0; h < model->hidden_dim; ++h) {
+                model->policy_head.data[a * model->hidden_dim + h] -= learning_rate * grad * hidden_state[h];
+            }
+            model->policy_bias[a] -= learning_rate * grad;
         }
-        for (h = 0; h < model->hidden_dim; ++h) {
-            model->policy_head.data[a * model->hidden_dim + h] -= learning_rate * grad * hidden_state[h];
-        }
-        model->policy_bias[a] -= learning_rate * grad;
     }
     dv = value - target_value;
     for (h = 0; h < model->hidden_dim; ++h) {

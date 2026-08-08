@@ -12,6 +12,7 @@
 #include <stdio.h>
 
 #define ENV_PRESTART_QUEUE_MAX 32
+#define ENV_POLICY_TAG_LEN 512
 
 typedef enum {
     ENV_REWARD_TERMINAL = 0,
@@ -59,6 +60,7 @@ typedef struct {
     int replay_only;
     EnvRewardMode reward_mode;
     EnvDenseRewardConfig dense_reward_config;
+    char policy_tag[ENV_POLICY_TAG_LEN];
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;
@@ -70,7 +72,8 @@ int env_runtime_init(
     FILE* replay_file,
     int replay_only,
     EnvRewardMode reward_mode,
-    const EnvDenseRewardConfig* dense_reward_config
+    const EnvDenseRewardConfig* dense_reward_config,
+    const char* policy_tag
 );
 void env_runtime_free(EnvRuntime* runtime);
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);

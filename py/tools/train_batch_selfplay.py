@@ -742,6 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit-files", type=positive_int, default=0, help="Optional cap on matched files")
     parser.add_argument("--sample-files", type=positive_int, default=0, help="Train on a random subset of up to N shards per epoch")
     parser.add_argument("--epochs-per-file", type=positive_int, default=1, help="Epochs to pass to showdown_client for each shard")
+    parser.add_argument("--learning-rate", type=float, default=-1.0)
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--entropy-coef", type=float, default=0.001)
     parser.add_argument("--advantage-norm", choices=["0", "1"], default="1")
@@ -765,6 +766,8 @@ def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> lis
             [
                 "--gamma",
                 str(args.gamma),
+                "--learning-rate",
+                str(args.learning_rate),
                 "--entropy-coef",
                 str(args.entropy_coef),
                 "--advantage-norm",
@@ -852,6 +855,7 @@ def main() -> None:
         "pattern": args.pattern,
         "reward_mode": args.reward_mode,
         "gamma": args.gamma,
+        "learning_rate": args.learning_rate,
         "entropy_coef": args.entropy_coef,
         "advantage_norm": args.advantage_norm,
         "sample_files": args.sample_files,

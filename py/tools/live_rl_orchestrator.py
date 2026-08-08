@@ -175,8 +175,12 @@ def build_train_command(args: argparse.Namespace, trainer_exe: Path, episode_bat
         "--train-live-rl",
         str(episode_batch_path),
         str(output_checkpoint),
+        "--policy-tag-expected",
+        str(args.current_policy_tag),
         "--epochs",
         str(args.epochs),
+        "--learning-rate",
+        str(args.learning_rate),
         "--gamma",
         str(args.gamma),
         "--entropy-coef",
@@ -214,6 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-prefix", default="live_rl")
     parser.add_argument("--episode-side", choices=["a", "b"], default="a")
     parser.add_argument("--epochs", type=positive_int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--entropy-coef", type=float, default=0.001)
     parser.add_argument("--advantage-norm", type=parse_bool, default=True)
@@ -304,6 +309,7 @@ def main() -> None:
             round_manifest["checkpoint_initialized_from"] = str(current_checkpoint)
             round_manifest["checkpoint_initialized_to"] = str(output_checkpoint)
 
+            args.current_policy_tag = str(current_checkpoint)
             train_command = build_train_command(args, trainer_exe, episode_batch_path, output_checkpoint)
             round_manifest["train_command"] = train_command
             write_json(round_manifest_path, round_manifest)

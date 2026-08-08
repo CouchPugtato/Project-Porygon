@@ -558,7 +558,7 @@ static int test_runtime_request_session_not_forced_doubles(void) {
 
     model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
     if (!assert_true(model != NULL, "create minimal gru model")) return 0;
-    if (!assert_true(env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_TERMINAL), "init runtime")) {
+    if (!assert_true(env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_TERMINAL, NULL, NULL), "init runtime")) {
         gru_model_destroy(model);
         return 0;
     }
@@ -633,7 +633,7 @@ static int test_runtime_dense_additive_rewards(void) {
 
     model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
     if (!assert_true(model != NULL, "create minimal gru model for dense rewards")) return 0;
-    if (!assert_true(env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_DENSE_ADDITIVE), "init dense runtime")) {
+    if (!assert_true(env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_DENSE_ADDITIVE, NULL, NULL), "init dense runtime")) {
         gru_model_destroy(model);
         return 0;
     }
