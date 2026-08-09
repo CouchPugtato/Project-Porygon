@@ -161,6 +161,14 @@ def build_selfplay_command(args: argparse.Namespace, repo_root: Path, run_name: 
         "1" if args.serve_client else "0",
         "--worker-log-stdout",
         "1" if args.worker_log_stdout else "0",
+        "--launch-stagger-seconds",
+        str(args.launch_stagger_seconds),
+        "--resource-check-seconds",
+        str(args.resource_check_seconds),
+        "--min-available-memory-gb",
+        str(args.min_available_memory_gb),
+        "--min-available-pagefile-gb",
+        str(args.min_available_pagefile_gb),
     ]
     if args.model_b_pool:
         command.extend(["--model-b", "", "--model-b-pool", args.model_b_pool])
@@ -214,6 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-think-mode", choices=["live", "random"], default="live")
     parser.add_argument("--serve-client", type=parse_bool, default=True)
     parser.add_argument("--worker-log-stdout", type=parse_bool, default=False)
+    parser.add_argument("--launch-stagger-seconds", type=float, default=0.25)
+    parser.add_argument("--resource-check-seconds", type=float, default=2.0)
+    parser.add_argument("--min-available-memory-gb", type=float, default=2.0)
+    parser.add_argument("--min-available-pagefile-gb", type=float, default=4.0)
     parser.add_argument("--trainer-exe", default=str(DEFAULT_TRAINER_EXE))
     parser.add_argument("--checkpoint-prefix", default="live_rl")
     parser.add_argument("--episode-side", choices=["a", "b"], default="a")
@@ -258,6 +270,10 @@ def main() -> None:
         "concurrent_games": args.concurrent_games,
         "worker_pairs": args.worker_pairs,
         "worker_games": args.worker_games,
+        "launch_stagger_seconds": args.launch_stagger_seconds,
+        "resource_check_seconds": args.resource_check_seconds,
+        "min_available_memory_gb": args.min_available_memory_gb,
+        "min_available_pagefile_gb": args.min_available_pagefile_gb,
         "ensure_shard_count": args.ensure_shard_count,
         "reward_mode": args.reward_mode,
         "gamma": args.gamma,

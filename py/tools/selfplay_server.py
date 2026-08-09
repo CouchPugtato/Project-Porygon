@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import ctypes
 import math
 import json
 import os
@@ -32,9 +33,43 @@ DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_SHUTDOWN_GRACE_SECONDS = 20.0
 DEFAULT_USERNAME_PREFIX = "PoryPool"
 DEFAULT_ARGS_PATH = Path("config/selfplay_server.toml")
+DEFAULT_LAUNCH_STAGGER_SECONDS = 0.25
+DEFAULT_RESOURCE_CHECK_SECONDS = 2.0
+DEFAULT_MIN_AVAILABLE_MEMORY_GB = 2.0
+DEFAULT_MIN_AVAILABLE_PAGEFILE_GB = 4.0
 
 JOINED_BATTLE_RE = re.compile(r"\[communicator\] joined battle room (battle-[^\s]+)")
 BATTLE_ENDED_RE = re.compile(r"\[(?:live|random)\] battle ended (battle-[^\s]+) result=")
+
+
+class MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def current_resource_headroom() -> dict[str, float] | None:
+    if os.name != "nt":
+        return None
+    status = MEMORYSTATUSEX()
+    status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    kernel32 = ctypes.windll.kernel32
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    gib = float(1024 ** 3)
+    return {
+        "memory_load_percent": float(status.dwMemoryLoad),
+        "available_memory_gb": float(status.ullAvailPhys) / gib,
+        "available_pagefile_gb": float(status.ullAvailPageFile) / gib,
+    }
 
 
 def default_server_uri(host: str, port: int) -> str:
@@ -742,6 +777,7 @@ class PoolOrchestrator:
         self.server: ServerProcess | None = None
         self.client: ClientProcess | None = None
         self._log_handle: TextIO | None = None
+        self._last_resource_wait_log_at = 0.0
         self._start_time = 0.0
         self._draining = False
         self._drain_started_at: float | None = None
@@ -766,6 +802,33 @@ class PoolOrchestrator:
         else:
             configs["b"] = SingleSideSpec(model_spec=self.args.model_b)
         return configs
+
+    async def _wait_for_launch_headroom(self) -> None:
+        if os.name != "nt":
+            return
+        if (
+            self.args.min_available_memory_gb <= 0.0
+            and self.args.min_available_pagefile_gb <= 0.0
+        ):
+            return
+        while True:
+            stats = current_resource_headroom()
+            if stats is None:
+                return
+            has_memory = stats["available_memory_gb"] >= self.args.min_available_memory_gb
+            has_pagefile = stats["available_pagefile_gb"] >= self.args.min_available_pagefile_gb
+            if has_memory and has_pagefile:
+                return
+            now = time.monotonic()
+            if now - self._last_resource_wait_log_at >= 5.0:
+                self.log(
+                    "launch throttle waiting for headroom: "
+                    f"avail_mem={stats['available_memory_gb']:.2f}GB "
+                    f"avail_pagefile={stats['available_pagefile_gb']:.2f}GB "
+                    f"load={stats['memory_load_percent']:.1f}%"
+                )
+                self._last_resource_wait_log_at = now
+            await asyncio.sleep(self.args.resource_check_seconds)
 
     def _resolve_worker_games(self) -> int:
         if not self.explicit_worker_pairs:
@@ -1064,6 +1127,7 @@ class PoolOrchestrator:
     async def _start_worker(self, spec: WorkerSpec) -> None:
         if spec.shutdown_path.exists():
             spec.shutdown_path.unlink()
+        await self._wait_for_launch_headroom()
         launch_identity = self._sample_launch_identity(spec)
         worker = WorkerProcess(
             spec=spec,
@@ -1078,6 +1142,8 @@ class PoolOrchestrator:
         )
         self.replay_monitor.register_worker(spec.worker_token, spec.replay_path)
         await worker.start()
+        if self.args.launch_stagger_seconds > 0.0:
+            await asyncio.sleep(self.args.launch_stagger_seconds)
         self.worker_processes[spec.worker_token] = worker
         self.group_modes_seen[spec.model_group].add(launch_identity.mode)
         if launch_identity.sampled_from_pool and launch_identity.sampled_member_name:
@@ -1511,6 +1577,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconnect-seconds", type=nonnegative_float, default=DEFAULT_RECONNECT_SECONDS)
     parser.add_argument("--startup-timeout-seconds", type=nonnegative_float, default=DEFAULT_STARTUP_TIMEOUT_SECONDS)
     parser.add_argument("--shutdown-grace-seconds", type=nonnegative_float, default=DEFAULT_SHUTDOWN_GRACE_SECONDS)
+    parser.add_argument("--launch-stagger-seconds", type=nonnegative_float, default=DEFAULT_LAUNCH_STAGGER_SECONDS)
+    parser.add_argument("--resource-check-seconds", type=nonnegative_float, default=DEFAULT_RESOURCE_CHECK_SECONDS)
+    parser.add_argument("--min-available-memory-gb", type=nonnegative_float, default=DEFAULT_MIN_AVAILABLE_MEMORY_GB)
+    parser.add_argument("--min-available-pagefile-gb", type=nonnegative_float, default=DEFAULT_MIN_AVAILABLE_PAGEFILE_GB)
     parser.add_argument("--username-prefix", default=DEFAULT_USERNAME_PREFIX)
     parser.add_argument("--python-exe", default=sys.executable)
     parser.add_argument("--worker-log-stdout", type=parse_bool01, default=False)
