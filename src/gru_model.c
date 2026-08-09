@@ -908,6 +908,8 @@ static int recurrent_update_sequence(
     float policy_scale,
     float target_value,
     float entropy_coef,
+    const float* anchor_policy,
+    float anchor_kl_coef,
     float learning_rate,
     int accumulate_only,
     float* action_loss_out,
@@ -1069,16 +1071,19 @@ static int recurrent_update_sequence(
             neg_entropy += p * logf(p);
         }
         for (a = 0; a < adim; ++a) {
-            grad_logits[a] = (policy[a] - ((int)a == target_action ? 1.0f : 0.0f)) * policy_scale;
-            if (entropy_coef != 0.0f && (!legal_mask || legal_mask[a])) {
-                float p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
-                grad_logits[a] += entropy_coef * p * (logf(p) - neg_entropy);
+                grad_logits[a] = (policy[a] - ((int)a == target_action ? 1.0f : 0.0f)) * policy_scale;
+                if (entropy_coef != 0.0f && (!legal_mask || legal_mask[a])) {
+                    float p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
+                    grad_logits[a] += entropy_coef * p * (logf(p) - neg_entropy);
+                }
+                if (anchor_policy && anchor_kl_coef > 0.0f && (!legal_mask || legal_mask[a])) {
+                    grad_logits[a] += anchor_kl_coef * (policy[a] - anchor_policy[a]);
+                }
+                grad_policy_bias[a] += grad_logits[a];
+                for (h = 0; h < hdim; ++h) {
+                    grad_policy_head[a * hdim + h] += grad_logits[a] * h_states[(steps - 1) * hdim + h];
+                }
             }
-            grad_policy_bias[a] += grad_logits[a];
-            for (h = 0; h < hdim; ++h) {
-                grad_policy_head[a * hdim + h] += grad_logits[a] * h_states[(steps - 1) * hdim + h];
-            }
-        }
     }
     matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
 
@@ -1101,6 +1106,9 @@ static int recurrent_update_sequence(
                 if (entropy_coef != 0.0f && (!legal_mask_secondary || legal_mask_secondary[a])) {
                     float p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
                     grad_logits[a] += entropy_coef * p * (logf(p) - neg_entropy);
+                }
+                if (anchor_policy && anchor_kl_coef > 0.0f && (!legal_mask_secondary || legal_mask_secondary[a])) {
+                    grad_logits[a] += anchor_kl_coef * (policy[a] - anchor_policy[a]);
                 }
                 grad_policy_bias[a] += grad_logits[a];
                 for (h = 0; h < hdim; ++h) {
@@ -1286,7 +1294,7 @@ int gru_model_supervised_update_sequence(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, target_action, 1.0f, target_value, 0.0f,
-        learning_rate, 0, action_loss_out, value_loss_out, accuracy_out);
+        NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out);
 }
 
 int gru_model_supervised_update_sequence_window(
@@ -1303,7 +1311,7 @@ int gru_model_supervised_update_sequence_window(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, NULL, -1, legal_mask, target_action,
-        1.0f, target_value, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out);
+        1.0f, target_value, 0.0f, NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out);
 }
 
 int gru_model_supervised_update_sequence_window_dual(
@@ -1322,7 +1330,7 @@ int gru_model_supervised_update_sequence_window_dual(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, legal_mask_b, target_action_b,
-        legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, learning_rate, 0,
+        legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, NULL, 0.0f, learning_rate, 0,
         action_loss_out, value_loss_out, accuracy_out);
 }
 
@@ -1339,7 +1347,7 @@ int gru_model_supervised_accumulate_sequence_window(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, NULL, -1, legal_mask, target_action,
-        1.0f, target_value, 0.0f, 0.0f, 1, action_loss_out, value_loss_out, accuracy_out);
+        1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1, action_loss_out, value_loss_out, accuracy_out);
 }
 
 int gru_model_supervised_accumulate_sequence_window_dual(
@@ -1357,7 +1365,7 @@ int gru_model_supervised_accumulate_sequence_window_dual(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, legal_mask_b, target_action_b,
-        legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, 0.0f, 1,
+        legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1,
         action_loss_out, value_loss_out, accuracy_out);
 }
 
@@ -1502,7 +1510,7 @@ int gru_model_policy_gradient_update_sequence(
     float learning_rate
 ) {
     return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, action, advantage, target_value, entropy_coef,
-        learning_rate, 0, NULL, NULL, NULL);
+        NULL, 0.0f, learning_rate, 0, NULL, NULL, NULL);
 }
 
 int gru_model_policy_gradient_update_sequence_window(
@@ -1529,6 +1537,43 @@ int gru_model_policy_gradient_update_sequence_window(
         advantage,
         target_value,
         entropy_coef,
+        NULL,
+        0.0f,
+        learning_rate,
+        0,
+        NULL,
+        NULL,
+        NULL);
+}
+
+int gru_model_policy_gradient_update_sequence_window_anchored(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask,
+    int action,
+    float advantage,
+    float target_value,
+    float entropy_coef,
+    float learning_rate,
+    const float* anchor_policy,
+    float anchor_kl_coef
+) {
+    return recurrent_update_sequence(
+        model,
+        sequence,
+        steps,
+        initial_hidden_state,
+        NULL,
+        -1,
+        legal_mask,
+        action,
+        advantage,
+        target_value,
+        entropy_coef,
+        anchor_policy,
+        anchor_kl_coef,
         learning_rate,
         0,
         NULL,
@@ -1562,11 +1607,60 @@ int gru_model_policy_gradient_update_sequence_window_dual(
         advantage,
         target_value,
         entropy_coef,
+        NULL,
+        0.0f,
         learning_rate,
         0,
         NULL,
         NULL,
         NULL);
+}
+
+int gru_model_policy_gradient_update_sequence_window_dual_anchored(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    int action_a,
+    const unsigned char* legal_mask_b,
+    int action_b,
+    float advantage,
+    float target_value,
+    float entropy_coef,
+    float learning_rate,
+    const float* anchor_policy_a,
+    const float* anchor_policy_b,
+    float anchor_kl_coef
+) {
+    if (!gru_model_policy_gradient_update_sequence_window_anchored(
+            model,
+            sequence,
+            steps,
+            initial_hidden_state,
+            legal_mask_a,
+            action_a,
+            advantage,
+            target_value,
+            entropy_coef,
+            learning_rate,
+            anchor_policy_a,
+            anchor_kl_coef)) {
+        return 0;
+    }
+    return gru_model_policy_gradient_update_sequence_window_anchored(
+        model,
+        sequence,
+        steps,
+        initial_hidden_state,
+        legal_mask_b,
+        action_b,
+        advantage,
+        target_value,
+        entropy_coef,
+        learning_rate,
+        anchor_policy_b,
+        anchor_kl_coef);
 }
 
 size_t gru_model_parameter_count(const GruModel* model) {

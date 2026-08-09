@@ -25,6 +25,7 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
     trainer->gamma = 1.0f;
     trainer->entropy_coef = 0.001f;
     trainer->advantage_norm = 1;
+    trainer->anchor_kl_coef = 0.0f;
     trainer->supervised_minibatch_size = 8;
     trainer->supervised_profile_enabled = 1;
 }
@@ -256,12 +257,21 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     float* hidden_after = NULL;
     float* policy_step = NULL;
     float* masked_policy = NULL;
+    float* anchor_hidden = NULL;
+    float* anchor_next_hidden = NULL;
+    float* anchor_hidden_after = NULL;
+    float* anchor_policy = NULL;
     size_t* labeled_indices = NULL;
     float return_sum = 0.0f;
     float advantage_sum = 0.0f;
+    float abs_advantage_sum = 0.0f;
+    float mean_value_sum = 0.0f;
     float policy_loss_sum = 0.0f;
     float value_loss_sum = 0.0f;
     float entropy_sum = 0.0f;
+    float anchor_kl_sum = 0.0f;
+    float anchor_loss_sum = 0.0f;
+    float anchor_kl_max = 0.0f;
     float advantage_mean = 0.0f;
     float advantage_std = 0.0f;
     size_t action_dim;
@@ -292,7 +302,14 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     policy_step = (float*)malloc(action_dim * sizeof(float));
     masked_policy = (float*)malloc(action_dim * sizeof(float));
     labeled_indices = (size_t*)calloc(episode->count, sizeof(size_t));
-    if (!returns || !advantages || !values || !hidden || !next_hidden || !hidden_after || !policy_step || !masked_policy || !labeled_indices) {
+    if (trainer->anchor_model && trainer->anchor_kl_coef > 0.0f) {
+        anchor_hidden = (float*)calloc(hidden_dim, sizeof(float));
+        anchor_next_hidden = (float*)malloc(hidden_dim * sizeof(float));
+        anchor_hidden_after = (float*)calloc(episode->count * hidden_dim, sizeof(float));
+        anchor_policy = (float*)malloc(action_dim * sizeof(float));
+    }
+    if (!returns || !advantages || !values || !hidden || !next_hidden || !hidden_after || !policy_step || !masked_policy || !labeled_indices ||
+            ((trainer->anchor_model && trainer->anchor_kl_coef > 0.0f) && (!anchor_hidden || !anchor_next_hidden || !anchor_hidden_after || !anchor_policy))) {
         free(returns);
         free(advantages);
         free(values);
@@ -301,6 +318,10 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
         free(hidden_after);
         free(policy_step);
         free(masked_policy);
+        free(anchor_hidden);
+        free(anchor_next_hidden);
+        free(anchor_hidden_after);
+        free(anchor_policy);
         free(labeled_indices);
         return 0;
     }
@@ -314,9 +335,11 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     }
 
     gru_model_zero_state(model, hidden);
+    if (trainer->anchor_model && trainer->anchor_kl_coef > 0.0f) {
+        gru_model_zero_state(trainer->anchor_model, anchor_hidden);
+    }
     for (t = 0; t < episode->count; ++t) {
         float value = 0.0f;
-        float* stored_hidden;
         gru_model_forward_step(
             model,
             episode->observations + (t * episode->obs_dim),
@@ -325,16 +348,28 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
             policy_step,
             &value);
         memcpy(hidden_after + (t * hidden_dim), next_hidden, hidden_dim * sizeof(float));
+        if (trainer->anchor_model && trainer->anchor_kl_coef > 0.0f) {
+            float anchor_value = 0.0f;
+            gru_model_forward_step(
+                trainer->anchor_model,
+                episode->observations + (t * episode->obs_dim),
+                anchor_hidden,
+                anchor_next_hidden,
+                anchor_policy,
+                &anchor_value);
+            memcpy(anchor_hidden_after + (t * hidden_dim), anchor_next_hidden, hidden_dim * sizeof(float));
+            memcpy(anchor_hidden, anchor_next_hidden, hidden_dim * sizeof(float));
+        }
         if (episode->actions[t] < 0 && episode->actions2[t] < 0) {
             memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
             continue;
         }
-        stored_hidden = hidden_after + (t * hidden_dim);
         values[labeled_steps] = value;
         labeled_indices[labeled_steps] = t;
         advantages[labeled_steps] = returns[t] - values[labeled_steps];
         advantage_sum += advantages[labeled_steps];
         return_sum += returns[t];
+        mean_value_sum += values[labeled_steps];
         ++labeled_steps;
         memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
     }
@@ -344,7 +379,12 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
         trainer->last_value_loss = 0.0f;
         trainer->last_mean_return = 0.0f;
         trainer->last_mean_advantage = 0.0f;
+        trainer->last_mean_abs_advantage = 0.0f;
+        trainer->last_mean_value = 0.0f;
         trainer->last_entropy = 0.0f;
+        trainer->last_anchor_kl_mean = 0.0f;
+        trainer->last_anchor_kl_max = 0.0f;
+        trainer->last_anchor_loss = 0.0f;
         trainer->last_rl_labels = 0;
         free(returns);
         free(advantages);
@@ -354,6 +394,10 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
         free(hidden_after);
         free(policy_step);
         free(masked_policy);
+        free(anchor_hidden);
+        free(anchor_next_hidden);
+        free(anchor_hidden_after);
+        free(anchor_policy);
         free(labeled_indices);
         return 1;
     }
@@ -385,11 +429,15 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
         size_t steps = (episode_t - start) + 1;
         const float* initial_hidden = start > 0 ? (hidden_after + ((start - 1) * hidden_dim)) : NULL;
         const float* stored_hidden = hidden_after + (episode_t * hidden_dim);
+        const float* stored_anchor_hidden = (trainer->anchor_model && trainer->anchor_kl_coef > 0.0f)
+            ? (anchor_hidden_after + (episode_t * hidden_dim))
+            : NULL;
         float prob_action = 0.0f;
         float prob_action2 = 0.0f;
         size_t a;
         if (episode->actions[episode_t] >= 0 && episode->actions2[episode_t] >= 0) {
             uint8_t slot_mask_secondary[OBS_NUM_ACTIONS];
+            float* anchor_policy_secondary = NULL;
             build_step_slot_legal_mask(episode, episode_t, 0, slot_mask);
             build_step_slot_legal_mask(episode, episode_t, 1, slot_mask_secondary);
             gru_model_evaluate_hidden(model, stored_hidden, slot_mask, masked_policy, &values[t]);
@@ -407,6 +455,29 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                 }
                 entropy_sum += slot_entropy;
             }
+            if (stored_anchor_hidden && anchor_policy) {
+                size_t k;
+                float anchor_value = 0.0f;
+                float slot_kl = 0.0f;
+                gru_model_evaluate_hidden(trainer->anchor_model, stored_anchor_hidden, slot_mask, anchor_policy, &anchor_value);
+                for (k = 0; k < action_dim; ++k) {
+                    float q;
+                    float p;
+                    if (!slot_mask[k]) {
+                        continue;
+                    }
+                    q = anchor_policy[k] > 1.0e-8f ? anchor_policy[k] : 1.0e-8f;
+                    p = masked_policy[k] > 1.0e-8f ? masked_policy[k] : 1.0e-8f;
+                    slot_kl += q * (logf(q) - logf(p));
+                }
+                anchor_kl_sum += slot_kl;
+                anchor_loss_sum += trainer->anchor_kl_coef * slot_kl;
+                if (slot_kl > anchor_kl_max) {
+                    anchor_kl_max = slot_kl;
+                }
+                anchor_policy_secondary = policy_step;
+                gru_model_evaluate_hidden(trainer->anchor_model, stored_anchor_hidden, slot_mask_secondary, anchor_policy_secondary, &anchor_value);
+            }
             gru_model_evaluate_hidden(model, stored_hidden, slot_mask_secondary, masked_policy, &values[t]);
             prob_action2 = masked_policy[episode->actions2[episode_t]] > 1.0e-8f ? masked_policy[episode->actions2[episode_t]] : 1.0e-8f;
             policy_loss_sum += -logf(prob_action2) * advantages[t];
@@ -423,9 +494,46 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                 }
                 entropy_sum += slot_entropy;
             }
+            if (anchor_policy_secondary) {
+                size_t k;
+                float slot_kl = 0.0f;
+                for (k = 0; k < action_dim; ++k) {
+                    float q;
+                    float p;
+                    if (!slot_mask_secondary[k]) {
+                        continue;
+                    }
+                    q = anchor_policy_secondary[k] > 1.0e-8f ? anchor_policy_secondary[k] : 1.0e-8f;
+                    p = masked_policy[k] > 1.0e-8f ? masked_policy[k] : 1.0e-8f;
+                    slot_kl += q * (logf(q) - logf(p));
+                }
+                anchor_kl_sum += slot_kl;
+                anchor_loss_sum += trainer->anchor_kl_coef * slot_kl;
+                if (slot_kl > anchor_kl_max) {
+                    anchor_kl_max = slot_kl;
+                }
+            }
             advantage_sum += advantages[t] * 2.0f;
+            abs_advantage_sum += fabsf(advantages[t]) * 2.0f;
             trained_labels += 2;
-            if (!gru_model_policy_gradient_update_sequence_window_dual(
+            if (!((stored_anchor_hidden && anchor_policy && anchor_policy_secondary && trainer->anchor_kl_coef > 0.0f)
+                    ? gru_model_policy_gradient_update_sequence_window_dual_anchored(
+                        model,
+                        episode->observations + (start * episode->obs_dim),
+                        steps,
+                        initial_hidden,
+                        slot_mask,
+                        episode->actions[episode_t],
+                        slot_mask_secondary,
+                        episode->actions2[episode_t],
+                        advantages[t],
+                        returns[episode_t],
+                        trainer->entropy_coef,
+                        trainer->learning_rate,
+                        anchor_policy,
+                        anchor_policy_secondary,
+                        trainer->anchor_kl_coef)
+                    : gru_model_policy_gradient_update_sequence_window_dual(
                     model,
                     episode->observations + (start * episode->obs_dim),
                     steps,
@@ -437,7 +545,7 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                     advantages[t],
                     returns[episode_t],
                     trainer->entropy_coef,
-                    trainer->learning_rate)) {
+                    trainer->learning_rate))) {
                 free(returns);
                 free(advantages);
                 free(values);
@@ -446,6 +554,10 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                 free(hidden_after);
                 free(policy_step);
                 free(masked_policy);
+                free(anchor_hidden);
+                free(anchor_next_hidden);
+                free(anchor_hidden_after);
+                free(anchor_policy);
                 free(labeled_indices);
                 return 0;
             }
@@ -470,9 +582,45 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                 }
                 entropy_sum += slot_entropy;
             }
+            if (stored_anchor_hidden && anchor_policy) {
+                size_t k;
+                float anchor_value = 0.0f;
+                float slot_kl = 0.0f;
+                gru_model_evaluate_hidden(trainer->anchor_model, stored_anchor_hidden, slot_mask, anchor_policy, &anchor_value);
+                for (k = 0; k < action_dim; ++k) {
+                    float q;
+                    float p;
+                    if (!slot_mask[k]) {
+                        continue;
+                    }
+                    q = anchor_policy[k] > 1.0e-8f ? anchor_policy[k] : 1.0e-8f;
+                    p = masked_policy[k] > 1.0e-8f ? masked_policy[k] : 1.0e-8f;
+                    slot_kl += q * (logf(q) - logf(p));
+                }
+                anchor_kl_sum += slot_kl;
+                anchor_loss_sum += trainer->anchor_kl_coef * slot_kl;
+                if (slot_kl > anchor_kl_max) {
+                    anchor_kl_max = slot_kl;
+                }
+            }
             advantage_sum += advantages[t];
+            abs_advantage_sum += fabsf(advantages[t]);
             ++trained_labels;
-            if (!gru_model_policy_gradient_update_sequence_window(
+            if (!((stored_anchor_hidden && anchor_policy && trainer->anchor_kl_coef > 0.0f)
+                    ? gru_model_policy_gradient_update_sequence_window_anchored(
+                        model,
+                        episode->observations + (start * episode->obs_dim),
+                        steps,
+                        initial_hidden,
+                        slot_mask,
+                        episode->actions[episode_t],
+                        advantages[t],
+                        returns[episode_t],
+                        trainer->entropy_coef,
+                        trainer->learning_rate,
+                        anchor_policy,
+                        trainer->anchor_kl_coef)
+                    : gru_model_policy_gradient_update_sequence_window(
                     model,
                     episode->observations + (start * episode->obs_dim),
                     steps,
@@ -482,7 +630,7 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                     advantages[t],
                     returns[episode_t],
                     trainer->entropy_coef,
-                    trainer->learning_rate)) {
+                    trainer->learning_rate))) {
                 free(returns);
                 free(advantages);
                 free(values);
@@ -491,6 +639,10 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                 free(hidden_after);
                 free(policy_step);
                 free(masked_policy);
+                free(anchor_hidden);
+                free(anchor_next_hidden);
+                free(anchor_hidden_after);
+                free(anchor_policy);
                 free(labeled_indices);
                 return 0;
             }
@@ -514,9 +666,45 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                 }
                 entropy_sum += slot_entropy;
             }
+            if (stored_anchor_hidden && anchor_policy) {
+                size_t k;
+                float anchor_value = 0.0f;
+                float slot_kl = 0.0f;
+                gru_model_evaluate_hidden(trainer->anchor_model, stored_anchor_hidden, slot_mask, anchor_policy, &anchor_value);
+                for (k = 0; k < action_dim; ++k) {
+                    float q;
+                    float p;
+                    if (!slot_mask[k]) {
+                        continue;
+                    }
+                    q = anchor_policy[k] > 1.0e-8f ? anchor_policy[k] : 1.0e-8f;
+                    p = masked_policy[k] > 1.0e-8f ? masked_policy[k] : 1.0e-8f;
+                    slot_kl += q * (logf(q) - logf(p));
+                }
+                anchor_kl_sum += slot_kl;
+                anchor_loss_sum += trainer->anchor_kl_coef * slot_kl;
+                if (slot_kl > anchor_kl_max) {
+                    anchor_kl_max = slot_kl;
+                }
+            }
             advantage_sum += advantages[t];
+            abs_advantage_sum += fabsf(advantages[t]);
             ++trained_labels;
-            if (!gru_model_policy_gradient_update_sequence_window(
+            if (!((stored_anchor_hidden && anchor_policy && trainer->anchor_kl_coef > 0.0f)
+                    ? gru_model_policy_gradient_update_sequence_window_anchored(
+                        model,
+                        episode->observations + (start * episode->obs_dim),
+                        steps,
+                        initial_hidden,
+                        slot_mask,
+                        episode->actions2[episode_t],
+                        advantages[t],
+                        returns[episode_t],
+                        trainer->entropy_coef,
+                        trainer->learning_rate,
+                        anchor_policy,
+                        trainer->anchor_kl_coef)
+                    : gru_model_policy_gradient_update_sequence_window(
                     model,
                     episode->observations + (start * episode->obs_dim),
                     steps,
@@ -526,7 +714,7 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                     advantages[t],
                     returns[episode_t],
                     trainer->entropy_coef,
-                    trainer->learning_rate)) {
+                    trainer->learning_rate))) {
                 free(returns);
                 free(advantages);
                 free(values);
@@ -535,6 +723,10 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
                 free(hidden_after);
                 free(policy_step);
                 free(masked_policy);
+                free(anchor_hidden);
+                free(anchor_next_hidden);
+                free(anchor_hidden_after);
+                free(anchor_policy);
                 free(labeled_indices);
                 return 0;
             }
@@ -545,7 +737,12 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     trainer->last_value_loss = trained_labels > 0 ? (value_loss_sum / (float)trained_labels) : 0.0f;
     trainer->last_mean_return = labeled_steps > 0 ? (return_sum / (float)labeled_steps) : 0.0f;
     trainer->last_mean_advantage = trained_labels > 0 ? (advantage_sum / (float)trained_labels) : 0.0f;
+    trainer->last_mean_abs_advantage = trained_labels > 0 ? (abs_advantage_sum / (float)trained_labels) : 0.0f;
+    trainer->last_mean_value = labeled_steps > 0 ? (mean_value_sum / (float)labeled_steps) : 0.0f;
     trainer->last_entropy = trained_labels > 0 ? (entropy_sum / (float)trained_labels) : 0.0f;
+    trainer->last_anchor_kl_mean = trained_labels > 0 ? (anchor_kl_sum / (float)trained_labels) : 0.0f;
+    trainer->last_anchor_kl_max = anchor_kl_max;
+    trainer->last_anchor_loss = trained_labels > 0 ? (anchor_loss_sum / (float)trained_labels) : 0.0f;
     trainer->last_rl_labels = trained_labels;
     trainer->last_action_loss = trainer->last_policy_loss;
     trainer->last_accuracy = 0.0f;
@@ -557,6 +754,10 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     free(hidden_after);
     free(policy_step);
     free(masked_policy);
+    free(anchor_hidden);
+    free(anchor_next_hidden);
+    free(anchor_hidden_after);
+    free(anchor_policy);
     free(labeled_indices);
     return 1;
 }

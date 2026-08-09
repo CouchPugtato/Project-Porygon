@@ -20,7 +20,12 @@ typedef struct {
     float last_policy_loss;
     float last_mean_return;
     float last_mean_advantage;
+    float last_mean_abs_advantage;
+    float last_mean_value;
     float last_entropy;
+    float last_anchor_kl_mean;
+    float last_anchor_kl_max;
+    float last_anchor_loss;
     size_t last_rl_labels;
     size_t supervised_minibatch_size;
     int supervised_profile_enabled;
@@ -29,6 +34,8 @@ typedef struct {
     size_t last_supervised_label_count;
     size_t last_supervised_window_count;
     size_t last_supervised_batch_flushes;
+    const GruModel* anchor_model;
+    float anchor_kl_coef;
 } GruTrainer;
 
 void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_window, float gradient_clip, unsigned int seed);

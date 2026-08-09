@@ -201,6 +201,7 @@ Experiment templates currently included:
 - `config/experimental/warmstart_rl_safe.toml`
 - `config/experimental/warmstart_rl_entropy_high.toml`
 - `config/experimental/large_collection_active_pool.toml`
+- `config/experimental/live_rl_dense_anchor_safe.toml`
 
 ### Replay diagnostics
 

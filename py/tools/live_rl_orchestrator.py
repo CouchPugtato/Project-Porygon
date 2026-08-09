@@ -197,7 +197,44 @@ def build_train_command(args: argparse.Namespace, trainer_exe: Path, episode_bat
         "1" if args.advantage_norm else "0",
         "--reward-mode",
         args.reward_mode,
+        "--training-summary-path",
+        str(args.training_summary_path),
+        "--anchor-checkpoint",
+        args.anchor_checkpoint,
+        "--anchor-kl-coef",
+        str(args.anchor_kl_coef),
+        "--dense-additive-hp-swing-weight",
+        str(args.dense_additive_hp_swing_weight),
+        "--dense-additive-faint-swing-weight",
+        str(args.dense_additive_faint_swing_weight),
+        "--dense-additive-reward-clip",
+        str(args.dense_additive_reward_clip),
     ]
+
+
+def load_json(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def collapse_flags_from_training_summary(summary: dict[str, object], baseline_tera_rate: float, min_episodes_warn: int, anchor_kl_warn_threshold: float) -> list[str]:
+    flags: list[str] = []
+    episode_count = int(summary.get("episode_count", 0) or 0)
+    tera_rate = float(summary.get("tera_rate", 0.0) or 0.0)
+    move_slot_rates = summary.get("move_slot_rates", {}) or {}
+    anchor_kl_mean = float(summary.get("anchor_kl_mean", 0.0) or 0.0)
+    if episode_count < min_episodes_warn:
+        flags.append(f"warn_low_episode_count:{episode_count}")
+    if baseline_tera_rate > 0.0 and tera_rate < (0.5 * baseline_tera_rate):
+        flags.append(f"warn_tera_rate_low:{tera_rate:.3f}:{baseline_tera_rate:.3f}")
+    for key, value in move_slot_rates.items():
+        rate = float(value or 0.0)
+        if rate > 0.70:
+            flags.append(f"hard_move_slot_collapse:{key}:{rate:.3f}")
+        elif rate > 0.55:
+            flags.append(f"warn_move_slot_concentration:{key}:{rate:.3f}")
+    if anchor_kl_warn_threshold > 0.0 and anchor_kl_mean > anchor_kl_warn_threshold:
+        flags.append(f"warn_anchor_kl_high:{anchor_kl_mean:.3f}")
+    return flags
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
@@ -235,6 +272,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--entropy-coef", type=float, default=0.001)
     parser.add_argument("--advantage-norm", type=parse_bool, default=True)
     parser.add_argument("--reward-mode", choices=["terminal", "dense_additive"], default="terminal")
+    parser.add_argument("--dense-additive-hp-swing-weight", type=float, default=0.10)
+    parser.add_argument("--dense-additive-faint-swing-weight", type=float, default=0.25)
+    parser.add_argument("--dense-additive-reward-clip", type=float, default=0.40)
+    parser.add_argument("--anchor-checkpoint", default="")
+    parser.add_argument("--anchor-kl-coef", type=float, default=0.01)
+    parser.add_argument("--baseline-tera-rate", type=float, default=0.8562992125984252)
+    parser.add_argument("--anchor-kl-warn-threshold", type=float, default=0.10)
+    parser.add_argument("--min-episodes-warn", type=int, default=100)
+    parser.add_argument("--stop-on-collapse", type=parse_bool, default=True)
     return parser
 
 
@@ -276,6 +322,11 @@ def main() -> None:
         "min_available_pagefile_gb": args.min_available_pagefile_gb,
         "ensure_shard_count": args.ensure_shard_count,
         "reward_mode": args.reward_mode,
+        "dense_additive_hp_swing_weight": args.dense_additive_hp_swing_weight,
+        "dense_additive_faint_swing_weight": args.dense_additive_faint_swing_weight,
+        "dense_additive_reward_clip": args.dense_additive_reward_clip,
+        "anchor_checkpoint": args.anchor_checkpoint,
+        "anchor_kl_coef": args.anchor_kl_coef,
         "gamma": args.gamma,
         "entropy_coef": args.entropy_coef,
         "advantage_norm": args.advantage_norm,
@@ -296,6 +347,7 @@ def main() -> None:
             round_dir = workflow_dir / round_token
             round_dir.mkdir(parents=True, exist_ok=True)
             output_checkpoint = round_dir / f"{args.checkpoint_prefix}_{round_token}.chk"
+            training_summary_path = round_dir / f"{args.run_name}_{round_token}_training_summary.json"
             episode_batch_path = run_dir_for_name(repo_root, collect_run_name) / f"episode_batch_{args.episode_side}.jsonl"
             round_manifest_path = round_dir / f"{args.run_name}_{round_token}_manifest.json"
 
@@ -307,6 +359,7 @@ def main() -> None:
                 "output_checkpoint": str(output_checkpoint),
                 "collection_run": collect_run_name,
                 "episode_batch_path": str(episode_batch_path),
+                "training_round_stats_path": str(training_summary_path),
                 "trainer_exe": str(trainer_exe),
             }
             write_json(round_manifest_path, round_manifest)
@@ -326,10 +379,28 @@ def main() -> None:
             round_manifest["checkpoint_initialized_to"] = str(output_checkpoint)
 
             args.current_policy_tag = str(current_checkpoint)
+            args.training_summary_path = training_summary_path
             train_command = build_train_command(args, trainer_exe, episode_batch_path, output_checkpoint)
             round_manifest["train_command"] = train_command
             write_json(round_manifest_path, round_manifest)
             run_command(train_command, repo_root)
+
+            training_summary = load_json(training_summary_path)
+            collapse_flags = collapse_flags_from_training_summary(
+                training_summary,
+                args.baseline_tera_rate,
+                args.min_episodes_warn,
+                args.anchor_kl_warn_threshold,
+            )
+            round_manifest["training_round_summary"] = str(training_summary_path)
+            round_manifest["training_round_collapse_flags"] = collapse_flags
+            round_manifest["parent_checkpoint"] = str(current_checkpoint)
+            round_manifest["anchor_checkpoint"] = args.anchor_checkpoint
+            round_manifest["anchor_kl_coef"] = args.anchor_kl_coef
+            round_manifest["reward_mode"] = args.reward_mode
+            round_manifest["dense_additive_hp_swing_weight"] = args.dense_additive_hp_swing_weight
+            round_manifest["dense_additive_faint_swing_weight"] = args.dense_additive_faint_swing_weight
+            round_manifest["dense_additive_reward_clip"] = args.dense_additive_reward_clip
 
             current_checkpoint = output_checkpoint
             round_manifest["status"] = "completed"
@@ -338,6 +409,13 @@ def main() -> None:
             workflow_manifest["round_manifests"].append(str(round_manifest_path))
             workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
             write_json(workflow_manifest_path, workflow_manifest)
+            if args.stop_on_collapse and any(flag.startswith("hard_move_slot_collapse") for flag in collapse_flags):
+                workflow_manifest["status"] = "stopped_on_collapse"
+                workflow_manifest["completed_at_unix"] = time.time()
+                workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
+                workflow_manifest["stop_reason"] = collapse_flags
+                write_json(workflow_manifest_path, workflow_manifest)
+                return
 
         workflow_manifest["status"] = "completed"
         workflow_manifest["completed_at_unix"] = time.time()

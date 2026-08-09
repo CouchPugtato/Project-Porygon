@@ -32,8 +32,137 @@ typedef struct {
     EnvDenseRewardConfig dense_additive;
 } RewardConfig;
 
+typedef struct {
+    size_t move_slot_counts[4];
+    size_t switch_slot_counts[6];
+    size_t move_count;
+    size_t switch_count;
+    size_t tera_count;
+    size_t episode_count;
+    size_t total_steps;
+    size_t outcome_wins;
+    size_t outcome_losses;
+    size_t outcome_draws;
+    double return_sum;
+    float return_min;
+    float return_max;
+    double policy_loss_sum;
+    double value_loss_sum;
+    double entropy_sum;
+    double anchor_loss_sum;
+    double anchor_kl_mean_sum;
+    float anchor_kl_max;
+    double value_mean_sum;
+    double advantage_mean_sum;
+    double abs_advantage_mean_sum;
+    size_t label_weight_sum;
+} RlTrainingSummary;
+
 static GruModel* create_default_model(void) {
     return gru_model_create(observation_flat_size(), 128, OBS_NUM_ACTIONS);
+}
+
+static void rl_training_summary_init(RlTrainingSummary* summary) {
+    if (!summary) {
+        return;
+    }
+    memset(summary, 0, sizeof(*summary));
+    summary->return_min = 0.0f;
+    summary->return_max = 0.0f;
+}
+
+static void rl_training_summary_record_action(RlTrainingSummary* summary, int action) {
+    int move_slot = -1;
+    int switch_slot = -1;
+    int tera = 0;
+    if (!summary) {
+        return;
+    }
+    if (action >= OBS_A1_MOVE1 && action <= OBS_A1_MOVE4) {
+        move_slot = action - OBS_A1_MOVE1;
+    } else if (action >= OBS_A2_MOVE1 && action <= OBS_A2_MOVE4) {
+        move_slot = action - OBS_A2_MOVE1;
+    } else if (action >= OBS_A1_MOVE1_TERA && action <= OBS_A1_MOVE4_TERA) {
+        move_slot = action - OBS_A1_MOVE1_TERA;
+        tera = 1;
+    } else if (action >= OBS_A2_MOVE1_TERA && action <= OBS_A2_MOVE4_TERA) {
+        move_slot = action - OBS_A2_MOVE1_TERA;
+        tera = 1;
+    } else if (action >= OBS_A1_SWITCH1 && action <= OBS_A1_SWITCH6) {
+        switch_slot = action - OBS_A1_SWITCH1;
+    } else if (action >= OBS_A2_SWITCH1 && action <= OBS_A2_SWITCH6) {
+        switch_slot = action - OBS_A2_SWITCH1;
+    }
+    if (move_slot >= 0 && move_slot < 4) {
+        summary->move_slot_counts[move_slot] += 1u;
+        summary->move_count += 1u;
+        if (tera) {
+            summary->tera_count += 1u;
+        }
+    }
+    if (switch_slot >= 0 && switch_slot < 6) {
+        summary->switch_slot_counts[switch_slot] += 1u;
+        summary->switch_count += 1u;
+    }
+}
+
+static void rl_training_summary_record_episode(RlTrainingSummary* summary, const Episode* episode) {
+    size_t i;
+    float episode_return = 0.0f;
+    if (!summary || !episode) {
+        return;
+    }
+    summary->episode_count += 1u;
+    summary->total_steps += episode->count;
+    for (i = 0; i < episode->count; ++i) {
+        episode_return += episode->rewards[i];
+        if (episode->actions[i] >= 0) {
+            rl_training_summary_record_action(summary, episode->actions[i]);
+        }
+        if (episode->actions2[i] >= 0) {
+            rl_training_summary_record_action(summary, episode->actions2[i]);
+        }
+    }
+    if (summary->episode_count == 1u) {
+        summary->return_min = episode_return;
+        summary->return_max = episode_return;
+    } else {
+        if (episode_return < summary->return_min) {
+            summary->return_min = episode_return;
+        }
+        if (episode_return > summary->return_max) {
+            summary->return_max = episode_return;
+        }
+    }
+    summary->return_sum += episode_return;
+    if (episode->count > 0) {
+        float terminal_reward = episode->rewards[episode->count - 1];
+        if (terminal_reward > 0.0f) {
+            summary->outcome_wins += 1u;
+        } else if (terminal_reward < 0.0f) {
+            summary->outcome_losses += 1u;
+        } else {
+            summary->outcome_draws += 1u;
+        }
+    }
+}
+
+static void rl_training_summary_record_trainer(RlTrainingSummary* summary, const GruTrainer* trainer) {
+    if (!summary || !trainer || trainer->last_rl_labels == 0) {
+        return;
+    }
+    summary->policy_loss_sum += (double)trainer->last_policy_loss * (double)trainer->last_rl_labels;
+    summary->value_loss_sum += (double)trainer->last_value_loss * (double)trainer->last_rl_labels;
+    summary->entropy_sum += (double)trainer->last_entropy * (double)trainer->last_rl_labels;
+    summary->anchor_loss_sum += (double)trainer->last_anchor_loss * (double)trainer->last_rl_labels;
+    summary->anchor_kl_mean_sum += (double)trainer->last_anchor_kl_mean * (double)trainer->last_rl_labels;
+    summary->value_mean_sum += (double)trainer->last_mean_value * (double)trainer->last_rl_labels;
+    summary->advantage_mean_sum += (double)trainer->last_mean_advantage * (double)trainer->last_rl_labels;
+    summary->abs_advantage_mean_sum += (double)trainer->last_mean_abs_advantage * (double)trainer->last_rl_labels;
+    summary->label_weight_sum += trainer->last_rl_labels;
+    if (trainer->last_anchor_kl_max > summary->anchor_kl_max) {
+        summary->anchor_kl_max = trainer->last_anchor_kl_max;
+    }
 }
 
 static int has_path_separator(const char* path) {
@@ -1142,6 +1271,69 @@ static void json_write_escaped(FILE* out, const char* text) {
     fputc('"', out);
 }
 
+static int write_rl_training_summary_json(
+    const char* path,
+    const RlTrainingSummary* summary,
+    const GruTrainer* trainer,
+    const char* parent_checkpoint,
+    const char* anchor_checkpoint,
+    float anchor_kl_coef,
+    const char* reward_mode,
+    const RewardConfig* reward_config
+) {
+    FILE* out;
+    size_t i;
+    if (!path || !*path || !summary || !trainer || !reward_mode || !reward_config) {
+        return 0;
+    }
+    out = fopen(path, "w");
+    if (!out) {
+        return 0;
+    }
+    fputs("{\n", out);
+    fputs("  \"parent_checkpoint\": ", out); json_write_escaped(out, parent_checkpoint ? parent_checkpoint : ""); fputs(",\n", out);
+    fputs("  \"anchor_checkpoint\": ", out); json_write_escaped(out, anchor_checkpoint ? anchor_checkpoint : ""); fputs(",\n", out);
+    fprintf(out, "  \"anchor_kl_coef\": %.6f,\n", anchor_kl_coef);
+    fputs("  \"reward_mode\": ", out); json_write_escaped(out, reward_mode); fputs(",\n", out);
+    fprintf(out, "  \"dense_additive_hp_swing_weight\": %.6f,\n", reward_config->dense_additive.hp_swing_weight);
+    fprintf(out, "  \"dense_additive_faint_swing_weight\": %.6f,\n", reward_config->dense_additive.faint_swing_weight);
+    fprintf(out, "  \"dense_additive_reward_clip\": %.6f,\n", reward_config->dense_additive.reward_clip);
+    fprintf(out, "  \"episode_count\": %zu,\n", summary->episode_count);
+    fprintf(out, "  \"avg_episode_length\": %.6f,\n", summary->episode_count > 0 ? (double)summary->total_steps / (double)summary->episode_count : 0.0);
+    fprintf(out, "  \"reward_mean\": %.6f,\n", summary->episode_count > 0 ? summary->return_sum / (double)summary->episode_count : 0.0);
+    fprintf(out, "  \"reward_min\": %.6f,\n", summary->return_min);
+    fprintf(out, "  \"reward_max\": %.6f,\n", summary->return_max);
+    fprintf(out, "  \"outcome_wins\": %zu,\n", summary->outcome_wins);
+    fprintf(out, "  \"outcome_losses\": %zu,\n", summary->outcome_losses);
+    fprintf(out, "  \"outcome_draws\": %zu,\n", summary->outcome_draws);
+    fprintf(out, "  \"tera_rate\": %.6f,\n", summary->move_count > 0 ? (double)summary->tera_count / (double)summary->move_count : 0.0);
+    fputs("  \"move_slot_rates\": {", out);
+    for (i = 0; i < 4; ++i) {
+        if (i) fputs(", ", out);
+        fprintf(out, "\"slot_%zu\": %.6f", i + 1u, summary->move_count > 0 ? (double)summary->move_slot_counts[i] / (double)summary->move_count : 0.0);
+    }
+    fputs("},\n", out);
+    fputs("  \"switch_slot_rates\": {", out);
+    for (i = 0; i < 6; ++i) {
+        if (i) fputs(", ", out);
+        fprintf(out, "\"slot_%zu\": %.6f", i + 1u, summary->switch_count > 0 ? (double)summary->switch_slot_counts[i] / (double)summary->switch_count : 0.0);
+    }
+    fputs("},\n", out);
+    fprintf(out, "  \"mean_value_prediction\": %.6f,\n", summary->label_weight_sum > 0 ? summary->value_mean_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"mean_advantage\": %.6f,\n", summary->label_weight_sum > 0 ? summary->advantage_mean_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"mean_absolute_advantage\": %.6f,\n", summary->label_weight_sum > 0 ? summary->abs_advantage_mean_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"policy_loss\": %.6f,\n", summary->label_weight_sum > 0 ? summary->policy_loss_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"value_loss\": %.6f,\n", summary->label_weight_sum > 0 ? summary->value_loss_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"entropy\": %.6f,\n", summary->label_weight_sum > 0 ? summary->entropy_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"anchor_loss\": %.6f,\n", summary->label_weight_sum > 0 ? summary->anchor_loss_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"anchor_kl_mean\": %.6f,\n", summary->label_weight_sum > 0 ? summary->anchor_kl_mean_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"anchor_kl_max\": %.6f,\n", summary->anchor_kl_max);
+    fprintf(out, "  \"labels\": %zu\n", summary->label_weight_sum);
+    fputs("}\n", out);
+    fclose(out);
+    return 1;
+}
+
 static void json_write_tracked_int(FILE* out, const TrackedInt* tracked, const char* (*name_fn)(int)) {
     const char* resolved_name = NULL;
     if (!tracked) {
@@ -1946,14 +2138,21 @@ static int train_from_input_file(
     int supervised_profile,
     const char* rl_reward_mode,
     const RewardConfig* reward_config,
-    const char* expected_policy_tag
+    const char* expected_policy_tag,
+    const char* training_summary_path,
+    const char* anchor_checkpoint_path,
+    float anchor_kl_coef
 ) {
     char* resolved_checkpoint_path = NULL;
+    char* resolved_anchor_checkpoint_path = NULL;
     GruModel* model = NULL;
+    GruModel* anchor_model = NULL;
     GruTrainer trainer;
     EnvRuntime runtime;
     EnvRewardMode reward_mode;
     TrainerCheckpointState checkpoint_state;
+    TrainerCheckpointState anchor_checkpoint_state;
+    RlTrainingSummary rl_summary;
     size_t* train_indices = NULL;
     size_t* val_indices = NULL;
     clock_t train_loop_start_clock;
@@ -1970,6 +2169,7 @@ static int train_from_input_file(
     if (!input_path || !checkpoint_path || epochs <= 0) {
         return 1;
     }
+    rl_training_summary_init(&rl_summary);
     if (rl_mode) {
         if (!parse_reward_mode(rl_reward_mode, &reward_mode)) {
             fprintf(stderr, "Unsupported --reward-mode '%s'. Supported modes: terminal, dense_additive.\n",
@@ -1988,6 +2188,7 @@ static int train_from_input_file(
         return 1;
     }
     memset(&checkpoint_state, 0, sizeof(checkpoint_state));
+    memset(&anchor_checkpoint_state, 0, sizeof(anchor_checkpoint_state));
     model = checkpoint_load(resolved_checkpoint_path, &checkpoint_state);
     if (!model) {
         model = create_default_model();
@@ -1998,6 +2199,33 @@ static int train_from_input_file(
     if (!model) {
         free(resolved_checkpoint_path);
         return 1;
+    }
+    if (rl_mode && anchor_checkpoint_path && *anchor_checkpoint_path && anchor_kl_coef > 0.0f) {
+        resolved_anchor_checkpoint_path = resolve_checkpoint_path(anchor_checkpoint_path);
+        if (!resolved_anchor_checkpoint_path) {
+            fprintf(stderr, "Failed to resolve anchor checkpoint path\n");
+            gru_model_destroy(model);
+            free(resolved_checkpoint_path);
+            return 1;
+        }
+        anchor_model = checkpoint_load(resolved_anchor_checkpoint_path, &anchor_checkpoint_state);
+        if (!anchor_model) {
+            fprintf(stderr, "Failed to load anchor checkpoint '%s'\n", resolved_anchor_checkpoint_path);
+            gru_model_destroy(model);
+            free(resolved_anchor_checkpoint_path);
+            free(resolved_checkpoint_path);
+            return 1;
+        }
+        if (gru_model_input_dim(anchor_model) != gru_model_input_dim(model) ||
+                gru_model_hidden_dim(anchor_model) != gru_model_hidden_dim(model) ||
+                gru_model_num_actions(anchor_model) != gru_model_num_actions(model)) {
+            fprintf(stderr, "anchor checkpoint incompatible current=%s anchor=%s\n", resolved_checkpoint_path, resolved_anchor_checkpoint_path);
+            gru_model_destroy(anchor_model);
+            gru_model_destroy(model);
+            free(resolved_anchor_checkpoint_path);
+            free(resolved_checkpoint_path);
+            return 1;
+        }
     }
     gru_trainer_init(&trainer,
         learning_rate_override > 0.0f
@@ -2011,6 +2239,8 @@ static int train_from_input_file(
         trainer.gamma = rl_gamma;
         trainer.entropy_coef = rl_entropy_coef;
         trainer.advantage_norm = rl_advantage_norm ? 1 : 0;
+        trainer.anchor_model = anchor_model;
+        trainer.anchor_kl_coef = anchor_kl_coef;
     } else {
         trainer.supervised_profile_enabled = supervised_profile;
     }
@@ -2095,6 +2325,8 @@ static int train_from_input_file(
                     free(resolved_checkpoint_path);
                     return 1;
                 }
+                rl_training_summary_record_episode(&rl_summary, &runtime.sessions[session_index].episode);
+                rl_training_summary_record_trainer(&rl_summary, &trainer);
             } else {
                 if (!gru_trainer_supervised_episode(&trainer, model, &runtime.sessions[session_index].episode)) {
                     fprintf(stderr, "Failed supervised training episode\n");
@@ -2273,6 +2505,19 @@ static int train_from_input_file(
             trainer.last_entropy,
             trainer.last_rl_labels,
             runtime.count);
+        if (training_summary_path && *training_summary_path) {
+            if (!write_rl_training_summary_json(
+                    training_summary_path,
+                    &rl_summary,
+                    &trainer,
+                    resolved_checkpoint_path,
+                    resolved_anchor_checkpoint_path ? resolved_anchor_checkpoint_path : "",
+                    anchor_kl_coef,
+                    rl_reward_mode,
+                    reward_config)) {
+                fprintf(stderr, "Failed to write RL training summary '%s'\n", training_summary_path);
+            }
+        }
     } else {
         printf("trained mode=supervised step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f sessions=%zu\n",
             trainer.step,
@@ -2285,7 +2530,9 @@ static int train_from_input_file(
     free(train_indices);
     free(val_indices);
     env_runtime_free(&runtime);
+    gru_model_destroy(anchor_model);
     gru_model_destroy(model);
+    free(resolved_anchor_checkpoint_path);
     free(resolved_checkpoint_path);
     return 0;
 }
@@ -2341,6 +2588,9 @@ static int showdown_client_main(int argc, char** argv) {
     int epochs = parse_epochs_arg(argc, argv, 1);
     float learning_rate_override = parse_float_flag(argc, argv, "--learning-rate", -1.0f);
     const char* expected_policy_tag = parse_string_flag(argc, argv, "--policy-tag-expected", "");
+    const char* training_summary_path = parse_string_flag(argc, argv, "--training-summary-path", "");
+    const char* anchor_checkpoint_path = parse_string_flag(argc, argv, "--anchor-checkpoint", "");
+    float anchor_kl_coef = parse_float_flag(argc, argv, "--anchor-kl-coef", 0.0f);
     float rl_gamma = parse_float_flag(argc, argv, "--gamma", 1.0f);
     float rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef", 0.001f);
     int rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", 1);
@@ -2351,6 +2601,21 @@ static int showdown_client_main(int argc, char** argv) {
     srand((unsigned int)time(NULL));
     if (!load_reward_config_file(SHOWDOWN_CLIENT_REWARD_CONFIG_PATH, &reward_config)) {
         return 1;
+    }
+    {
+        float override_value;
+        override_value = parse_float_flag(argc, argv, "--dense-additive-hp-swing-weight", NAN);
+        if (!isnan(override_value)) {
+            reward_config.dense_additive.hp_swing_weight = override_value;
+        }
+        override_value = parse_float_flag(argc, argv, "--dense-additive-faint-swing-weight", NAN);
+        if (!isnan(override_value)) {
+            reward_config.dense_additive.faint_swing_weight = override_value;
+        }
+        override_value = parse_float_flag(argc, argv, "--dense-additive-reward-clip", NAN);
+        if (!isnan(override_value)) {
+            reward_config.dense_additive.reward_clip = override_value;
+        }
     }
     if (!id_tables_init()) {
         fprintf(stderr, "Failed to initialize ID tables\n");
@@ -2402,7 +2667,10 @@ static int showdown_client_main(int argc, char** argv) {
             supervised_profile,
             rl_reward_mode,
             &reward_config,
-            expected_policy_tag);
+            expected_policy_tag,
+            training_summary_path,
+            anchor_checkpoint_path,
+            anchor_kl_coef);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-rl") == 0) {
         return train_from_input_file(
@@ -2418,7 +2686,10 @@ static int showdown_client_main(int argc, char** argv) {
             supervised_profile,
             rl_reward_mode,
             &reward_config,
-            expected_policy_tag);
+            expected_policy_tag,
+            training_summary_path,
+            anchor_checkpoint_path,
+            anchor_kl_coef);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-live-rl") == 0) {
         return train_from_input_file(
@@ -2434,7 +2705,10 @@ static int showdown_client_main(int argc, char** argv) {
             supervised_profile,
             rl_reward_mode,
             &reward_config,
-            expected_policy_tag);
+            expected_policy_tag,
+            training_summary_path,
+            anchor_checkpoint_path,
+            anchor_kl_coef);
     }
     if (argc >= 4 && strcmp(argv[1], "--eval-supervised") == 0) {
         return evaluate_checkpoint_on_replay_file(argv[2], argv[3], &reward_config);
