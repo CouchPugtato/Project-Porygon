@@ -18,6 +18,18 @@ typedef struct {
     int opp_fainted_count;
 } EnvRewardSnapshot;
 
+static float action_log_prob(const float* policy, int action) {
+    float p;
+    if (!policy || action < 0) {
+        return 0.0f;
+    }
+    p = policy[action];
+    if (p < 1.0e-8f) {
+        p = 1.0e-8f;
+    }
+    return logf(p);
+}
+
 static EnvSession* find_session(EnvRuntime* runtime, const char* battle_id) {
     size_t i;
     for (i = 0; i < runtime->count; ++i) {
@@ -311,6 +323,15 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     }
     action = validated.slot0_has_action ? (int)validated.action0 : -1;
     action2 = validated.slot1_has_action ? (int)validated.action1 : -1;
+    session->pending_old_log_prob = 0.0f;
+    if (action >= 0) {
+        session->pending_old_log_prob += action_log_prob(slot0_policy, action);
+    }
+    if (action2 >= 0) {
+        session->pending_old_log_prob += action_log_prob(slot1_policy, action2);
+    }
+    session->pending_old_value = value;
+    factorized_action_choice_from_flat_actions(&session->pending_factorized_choice, action, action2);
     strncpy(command, validated.command, sizeof(command) - 1);
     command[sizeof(command) - 1] = '\0';
     free(slot0_policy);
@@ -514,12 +535,21 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 }
                 session->episode.actions[session->episode.count - 1] = accepted_action;
                 session->episode.actions2[session->episode.count - 1] = accepted_action2;
+                session->episode.factorized_actions[session->episode.count - 1] = session->pending_factorized_choice;
+                session->episode.old_log_probs[session->episode.count - 1] = session->pending_old_log_prob;
+                session->episode.old_values[session->episode.count - 1] = session->pending_old_value;
                 session->pending_action = -1;
                 session->pending_action2 = -1;
+                session->pending_old_log_prob = 0.0f;
+                session->pending_old_value = 0.0f;
+                factorized_action_choice_init(&session->pending_factorized_choice);
                 session->pending_command[0] = '\0';
             } else if (msg->accepted == 0) {
                 session->pending_action = -1;
                 session->pending_action2 = -1;
+                session->pending_old_log_prob = 0.0f;
+                session->pending_old_value = 0.0f;
+                factorized_action_choice_init(&session->pending_factorized_choice);
                 session->pending_command[0] = '\0';
             }
             return 1;

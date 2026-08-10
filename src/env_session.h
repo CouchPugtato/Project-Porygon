@@ -47,6 +47,9 @@ typedef struct {
     int prev_opp_fainted_count;
     int pending_action;
     int pending_action2;
+    float pending_old_log_prob;
+    float pending_old_value;
+    FactorizedActionChoice pending_factorized_choice;
     char pending_command[RUNTIME_COMMAND_LEN];
 } EnvSession;
 

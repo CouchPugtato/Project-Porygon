@@ -7,6 +7,126 @@
 static int is_move_action(enum ObsAction action, int* active_slot, int* move_slot, int* tera);
 static int is_switch_action(enum ObsAction action, int* active_slot, int* switch_slot);
 
+void factorized_action_choice_init(FactorizedActionChoice* choice) {
+    if (!choice) {
+        return;
+    }
+    memset(choice, 0, sizeof(*choice));
+}
+
+static void factorized_slot_from_action(
+    FactorizedActionChoice* choice,
+    int slot,
+    int action
+) {
+    int active_slot = -1;
+    int move_slot = 0;
+    int switch_slot = 0;
+    int tera = 0;
+    if (!choice || action < 0) {
+        return;
+    }
+    if (is_move_action((enum ObsAction)action, &active_slot, &move_slot, &tera) && active_slot == slot) {
+        if (slot == 0) {
+            choice->slot0_has_action = 1;
+            choice->slot0_kind = FACTORIZED_ACTION_MOVE;
+            choice->slot0_move_index = (unsigned char)move_slot;
+            choice->slot0_use_tera = (unsigned char)(tera ? 1 : 0);
+        } else {
+            choice->slot1_has_action = 1;
+            choice->slot1_kind = FACTORIZED_ACTION_MOVE;
+            choice->slot1_move_index = (unsigned char)move_slot;
+            choice->slot1_use_tera = (unsigned char)(tera ? 1 : 0);
+        }
+        return;
+    }
+    if (is_switch_action((enum ObsAction)action, &active_slot, &switch_slot) && active_slot == slot) {
+        if (slot == 0) {
+            choice->slot0_has_action = 1;
+            choice->slot0_kind = FACTORIZED_ACTION_SWITCH;
+            choice->slot0_switch_index = (unsigned char)switch_slot;
+            choice->slot0_use_tera = 0;
+        } else {
+            choice->slot1_has_action = 1;
+            choice->slot1_kind = FACTORIZED_ACTION_SWITCH;
+            choice->slot1_switch_index = (unsigned char)switch_slot;
+            choice->slot1_use_tera = 0;
+        }
+    }
+}
+
+void factorized_action_choice_from_flat_actions(FactorizedActionChoice* choice, int action0, int action1) {
+    factorized_action_choice_init(choice);
+    factorized_slot_from_action(choice, 0, action0);
+    factorized_slot_from_action(choice, 1, action1);
+}
+
+static int factorized_slot_to_action(
+    int slot,
+    unsigned char has_action,
+    unsigned char kind,
+    unsigned char move_index,
+    unsigned char switch_index,
+    unsigned char use_tera,
+    int* out_action
+) {
+    if (!out_action) {
+        return 0;
+    }
+    *out_action = -1;
+    if (!has_action || kind == FACTORIZED_ACTION_NONE) {
+        return 1;
+    }
+    if (kind == FACTORIZED_ACTION_MOVE) {
+        if (move_index >= 4) {
+            return 0;
+        }
+        if (slot == 0) {
+            *out_action = (int)(use_tera ? OBS_A1_MOVE1_TERA : OBS_A1_MOVE1) + (int)move_index;
+        } else {
+            *out_action = (int)(use_tera ? OBS_A2_MOVE1_TERA : OBS_A2_MOVE1) + (int)move_index;
+        }
+        return 1;
+    }
+    if (kind == FACTORIZED_ACTION_SWITCH) {
+        if (switch_index >= 6) {
+            return 0;
+        }
+        if (slot == 0) {
+            *out_action = (int)OBS_A1_SWITCH1 + (int)switch_index;
+        } else {
+            *out_action = (int)OBS_A2_SWITCH1 + (int)switch_index;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int factorized_action_choice_to_flat_actions(const FactorizedActionChoice* choice, int* action0, int* action1) {
+    if (!choice || !action0 || !action1) {
+        return 0;
+    }
+    if (!factorized_slot_to_action(0,
+            choice->slot0_has_action,
+            choice->slot0_kind,
+            choice->slot0_move_index,
+            choice->slot0_switch_index,
+            choice->slot0_use_tera,
+            action0)) {
+        return 0;
+    }
+    if (!factorized_slot_to_action(1,
+            choice->slot1_has_action,
+            choice->slot1_kind,
+            choice->slot1_move_index,
+            choice->slot1_switch_index,
+            choice->slot1_use_tera,
+            action1)) {
+        return 0;
+    }
+    return 1;
+}
+
 void action_mask_init(ActionMask* mask) {
     if (!mask) {
         return;

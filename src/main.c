@@ -2627,8 +2627,9 @@ static int showdown_client_main(int argc, char** argv) {
     if (argc >= 2 &&
             (strcmp(argv[1], "--train-supervised") == 0 ||
              strcmp(argv[1], "--train-rl") == 0 ||
-             strcmp(argv[1], "--train-live-rl") == 0 ||
-             strcmp(argv[1], "--eval-supervised") == 0)) {
+            strcmp(argv[1], "--train-live-rl") == 0 ||
+            strcmp(argv[1], "--train-live-ppo") == 0 ||
+            strcmp(argv[1], "--eval-supervised") == 0)) {
         training_or_eval_mode = 1;
     }
 #ifdef _OPENMP
@@ -2710,6 +2711,25 @@ static int showdown_client_main(int argc, char** argv) {
             anchor_checkpoint_path,
             anchor_kl_coef);
     }
+    if (argc >= 4 && strcmp(argv[1], "--train-live-ppo") == 0) {
+        return train_from_input_file(
+            argv[2],
+            argv[3],
+            1,
+            1,
+            epochs,
+            learning_rate_override,
+            rl_gamma,
+            rl_entropy_coef,
+            rl_advantage_norm,
+            supervised_profile,
+            rl_reward_mode,
+            &reward_config,
+            expected_policy_tag,
+            training_summary_path,
+            "",
+            0.0f);
+    }
     if (argc >= 4 && strcmp(argv[1], "--eval-supervised") == 0) {
         return evaluate_checkpoint_on_replay_file(argv[2], argv[3], &reward_config);
     }
@@ -2741,6 +2761,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-profile 0|1]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
+        "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
         "  showdown_client --export-battle <replay.jsonl> <battle_id> <output.json>\n"

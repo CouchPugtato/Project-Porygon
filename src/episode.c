@@ -176,6 +176,38 @@ static int parse_u8_array(const char* start, const char* end, uint8_t* out, size
     return count == expected_count;
 }
 
+static int parse_optional_u8_field_into_choice(
+    const char* json,
+    const char* key,
+    FactorizedActionChoice* choices,
+    size_t count,
+    size_t field_offset
+) {
+    const char* start;
+    const char* end;
+    uint8_t* tmp;
+    size_t i;
+    if (!json || !choices) {
+        return 0;
+    }
+    if (!extract_json_array_bounds(json, key, &start, &end)) {
+        return 1;
+    }
+    tmp = (uint8_t*)malloc(count * sizeof(uint8_t));
+    if (!tmp) {
+        return 0;
+    }
+    if (!parse_u8_array(start, end, tmp, count)) {
+        free(tmp);
+        return 0;
+    }
+    for (i = 0; i < count; ++i) {
+        *((uint8_t*)(&choices[i]) + field_offset) = tmp[i];
+    }
+    free(tmp);
+    return 1;
+}
+
 static void write_json_escaped(FILE* out, const char* text) {
     const unsigned char* p = (const unsigned char*)(text ? text : "");
     while (*p) {
@@ -201,6 +233,9 @@ static int episode_grow(Episode* episode, size_t min_capacity) {
     uint8_t* new_legal_masks;
     int* new_actions;
     int* new_actions2;
+    FactorizedActionChoice* new_factorized_actions;
+    float* new_old_log_probs;
+    float* new_old_values;
     float* new_rewards;
     uint8_t* new_dones;
 
@@ -217,14 +252,21 @@ static int episode_grow(Episode* episode, size_t min_capacity) {
     new_legal_masks = (uint8_t*)malloc(next_capacity * OBS_NUM_ACTIONS * sizeof(uint8_t));
     new_actions = (int*)malloc(next_capacity * sizeof(int));
     new_actions2 = (int*)malloc(next_capacity * sizeof(int));
+    new_factorized_actions = (FactorizedActionChoice*)malloc(next_capacity * sizeof(FactorizedActionChoice));
+    new_old_log_probs = (float*)malloc(next_capacity * sizeof(float));
+    new_old_values = (float*)malloc(next_capacity * sizeof(float));
     new_rewards = (float*)malloc(next_capacity * sizeof(float));
     new_dones = (uint8_t*)malloc(next_capacity * sizeof(uint8_t));
 
-    if (!new_observations || !new_legal_masks || !new_actions || !new_actions2 || !new_rewards || !new_dones) {
+    if (!new_observations || !new_legal_masks || !new_actions || !new_actions2 || !new_factorized_actions ||
+            !new_old_log_probs || !new_old_values || !new_rewards || !new_dones) {
         free(new_observations);
         free(new_legal_masks);
         free(new_actions);
         free(new_actions2);
+        free(new_factorized_actions);
+        free(new_old_log_probs);
+        free(new_old_values);
         free(new_rewards);
         free(new_dones);
         return 0;
@@ -235,6 +277,9 @@ static int episode_grow(Episode* episode, size_t min_capacity) {
         memcpy(new_legal_masks, episode->legal_masks, episode->count * OBS_NUM_ACTIONS * sizeof(uint8_t));
         memcpy(new_actions, episode->actions, episode->count * sizeof(int));
         memcpy(new_actions2, episode->actions2, episode->count * sizeof(int));
+        memcpy(new_factorized_actions, episode->factorized_actions, episode->count * sizeof(FactorizedActionChoice));
+        memcpy(new_old_log_probs, episode->old_log_probs, episode->count * sizeof(float));
+        memcpy(new_old_values, episode->old_values, episode->count * sizeof(float));
         memcpy(new_rewards, episode->rewards, episode->count * sizeof(float));
         memcpy(new_dones, episode->dones, episode->count * sizeof(uint8_t));
     }
@@ -243,6 +288,9 @@ static int episode_grow(Episode* episode, size_t min_capacity) {
     free(episode->legal_masks);
     free(episode->actions);
     free(episode->actions2);
+    free(episode->factorized_actions);
+    free(episode->old_log_probs);
+    free(episode->old_values);
     free(episode->rewards);
     free(episode->dones);
 
@@ -250,6 +298,9 @@ static int episode_grow(Episode* episode, size_t min_capacity) {
     episode->legal_masks = new_legal_masks;
     episode->actions = new_actions;
     episode->actions2 = new_actions2;
+    episode->factorized_actions = new_factorized_actions;
+    episode->old_log_probs = new_old_log_probs;
+    episode->old_values = new_old_values;
     episode->rewards = new_rewards;
     episode->dones = new_dones;
     episode->capacity = next_capacity;
@@ -273,6 +324,9 @@ void episode_free(Episode* episode) {
     free(episode->legal_masks);
     free(episode->actions);
     free(episode->actions2);
+    free(episode->factorized_actions);
+    free(episode->old_log_probs);
+    free(episode->old_values);
     free(episode->rewards);
     free(episode->dones);
     memset(episode, 0, sizeof(*episode));
@@ -306,6 +360,9 @@ int episode_append(
     }
     episode->actions[episode->count] = action;
     episode->actions2[episode->count] = -1;
+    factorized_action_choice_init(&episode->factorized_actions[episode->count]);
+    episode->old_log_probs[episode->count] = 0.0f;
+    episode->old_values[episode->count] = 0.0f;
     episode->rewards[episode->count] = reward;
     episode->dones[episode->count] = done;
     episode->count += 1;
@@ -351,6 +408,66 @@ int episode_write_json_record(FILE* out, const Episode* episode, const char* bat
     for (i = 0; i < episode->count; ++i) {
         if (i > 0) fputc(',', out);
         fprintf(out, "%d", episode->actions2[i]);
+    }
+    fputs("],\"slot0_has_actions\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot0_has_action);
+    }
+    fputs("],\"slot0_kinds\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot0_kind);
+    }
+    fputs("],\"slot0_move_indices\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot0_move_index);
+    }
+    fputs("],\"slot0_switch_indices\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot0_switch_index);
+    }
+    fputs("],\"slot0_use_teras\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot0_use_tera);
+    }
+    fputs("],\"slot1_has_actions\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot1_has_action);
+    }
+    fputs("],\"slot1_kinds\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot1_kind);
+    }
+    fputs("],\"slot1_move_indices\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot1_move_index);
+    }
+    fputs("],\"slot1_switch_indices\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot1_switch_index);
+    }
+    fputs("],\"slot1_use_teras\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot1_use_tera);
+    }
+    fputs("],\"old_log_probs\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%.9g", episode->old_log_probs[i]);
+    }
+    fputs("],\"old_values\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%.9g", episode->old_values[i]);
     }
     fputs("],\"rewards\":[", out);
     for (i = 0; i < episode->count; ++i) {
@@ -410,6 +527,37 @@ int episode_parse_json_record(
             !parse_float_array(start, end, episode->rewards, count) ||
             !extract_json_array_bounds(json, "dones", &start, &end) ||
             !parse_u8_array(start, end, episode->dones, count)) {
+        episode_free(episode);
+        return 0;
+    }
+    {
+        size_t i;
+        for (i = 0; i < count; ++i) {
+            factorized_action_choice_from_flat_actions(&episode->factorized_actions[i], episode->actions[i], episode->actions2[i]);
+            episode->old_log_probs[i] = 0.0f;
+            episode->old_values[i] = 0.0f;
+        }
+    }
+    if (!parse_optional_u8_field_into_choice(json, "slot0_has_actions", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_has_action)) ||
+            !parse_optional_u8_field_into_choice(json, "slot0_kinds", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_kind)) ||
+            !parse_optional_u8_field_into_choice(json, "slot0_move_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_move_index)) ||
+            !parse_optional_u8_field_into_choice(json, "slot0_switch_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_switch_index)) ||
+            !parse_optional_u8_field_into_choice(json, "slot0_use_teras", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_use_tera)) ||
+            !parse_optional_u8_field_into_choice(json, "slot1_has_actions", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_has_action)) ||
+            !parse_optional_u8_field_into_choice(json, "slot1_kinds", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_kind)) ||
+            !parse_optional_u8_field_into_choice(json, "slot1_move_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_move_index)) ||
+            !parse_optional_u8_field_into_choice(json, "slot1_switch_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_switch_index)) ||
+            !parse_optional_u8_field_into_choice(json, "slot1_use_teras", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_use_tera))) {
+        episode_free(episode);
+        return 0;
+    }
+    if (extract_json_array_bounds(json, "old_log_probs", &start, &end) &&
+            !parse_float_array(start, end, episode->old_log_probs, count)) {
+        episode_free(episode);
+        return 0;
+    }
+    if (extract_json_array_bounds(json, "old_values", &start, &end) &&
+            !parse_float_array(start, end, episode->old_values, count)) {
         episode_free(episode);
         return 0;
     }

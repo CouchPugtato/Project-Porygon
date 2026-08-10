@@ -180,7 +180,7 @@ def build_selfplay_command(args: argparse.Namespace, repo_root: Path, run_name: 
 def build_train_command(args: argparse.Namespace, trainer_exe: Path, episode_batch_path: Path, output_checkpoint: Path) -> list[str]:
     return [
         str(trainer_exe),
-        "--train-live-rl",
+        "--train-live-ppo" if args.training_mode == "ppo" else "--train-live-rl",
         str(episode_batch_path),
         str(output_checkpoint),
         "--policy-tag-expected",
@@ -264,6 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-available-memory-gb", type=float, default=2.0)
     parser.add_argument("--min-available-pagefile-gb", type=float, default=4.0)
     parser.add_argument("--trainer-exe", default=str(DEFAULT_TRAINER_EXE))
+    parser.add_argument("--training-mode", choices=["rl", "ppo"], default="ppo")
     parser.add_argument("--checkpoint-prefix", default="live_rl")
     parser.add_argument("--episode-side", choices=["a", "b"], default="a")
     parser.add_argument("--epochs", type=positive_int, default=1)

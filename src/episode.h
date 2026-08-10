@@ -5,11 +5,16 @@
 #include <stdio.h>
 #include <stdint.h>
 
+#include "action_mapper.h"
+
 typedef struct {
     float* observations;
     uint8_t* legal_masks;
     int* actions;
     int* actions2;
+    FactorizedActionChoice* factorized_actions;
+    float* old_log_probs;
+    float* old_values;
     float* rewards;
     uint8_t* dones;
     size_t count;
