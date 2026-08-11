@@ -71,6 +71,22 @@ typedef struct {
     float* bn;
     float* policy_head;
     float* policy_bias;
+    float* slot0_kind_head;
+    float* slot0_kind_bias;
+    float* slot0_move_head;
+    float* slot0_move_bias;
+    float* slot0_switch_head;
+    float* slot0_switch_bias;
+    float* slot0_tera_head;
+    float* slot0_tera_bias;
+    float* slot1_kind_head;
+    float* slot1_kind_bias;
+    float* slot1_move_head;
+    float* slot1_move_bias;
+    float* slot1_switch_head;
+    float* slot1_switch_bias;
+    float* slot1_tera_head;
+    float* slot1_tera_bias;
     float* value_head;
     float value_bias;
     size_t count;
@@ -99,6 +115,22 @@ typedef struct {
     float* policy_head_v;
     float* policy_bias_m;
     float* policy_bias_v;
+    float* slot0_kind_head_m; float* slot0_kind_head_v;
+    float* slot0_kind_bias_m; float* slot0_kind_bias_v;
+    float* slot0_move_head_m; float* slot0_move_head_v;
+    float* slot0_move_bias_m; float* slot0_move_bias_v;
+    float* slot0_switch_head_m; float* slot0_switch_head_v;
+    float* slot0_switch_bias_m; float* slot0_switch_bias_v;
+    float* slot0_tera_head_m; float* slot0_tera_head_v;
+    float* slot0_tera_bias_m; float* slot0_tera_bias_v;
+    float* slot1_kind_head_m; float* slot1_kind_head_v;
+    float* slot1_kind_bias_m; float* slot1_kind_bias_v;
+    float* slot1_move_head_m; float* slot1_move_head_v;
+    float* slot1_move_bias_m; float* slot1_move_bias_v;
+    float* slot1_switch_head_m; float* slot1_switch_head_v;
+    float* slot1_switch_bias_m; float* slot1_switch_bias_v;
+    float* slot1_tera_head_m; float* slot1_tera_head_v;
+    float* slot1_tera_bias_m; float* slot1_tera_bias_v;
     float* value_head_m;
     float* value_head_v;
     float value_bias_m;
@@ -125,6 +157,22 @@ struct GruModel {
 
     Matrix policy_head;
     float* policy_bias;
+    Matrix slot0_kind_head;
+    float* slot0_kind_bias;
+    Matrix slot0_move_head;
+    float* slot0_move_bias;
+    Matrix slot0_switch_head;
+    float* slot0_switch_bias;
+    Matrix slot0_tera_head;
+    float* slot0_tera_bias;
+    Matrix slot1_kind_head;
+    float* slot1_kind_bias;
+    Matrix slot1_move_head;
+    float* slot1_move_bias;
+    Matrix slot1_switch_head;
+    float* slot1_switch_bias;
+    Matrix slot1_tera_head;
+    float* slot1_tera_bias;
 
     float* value_head;
     float value_bias;
@@ -721,6 +769,81 @@ static void softmax(const float* logits, size_t n, float* out) {
     }
 }
 
+static void masked_softmax_small(const float* logits, const unsigned char* mask, size_t n, float* out) {
+    size_t i;
+    float max_logit = 0.0f;
+    float sum = 0.0f;
+    int any = 0;
+    for (i = 0; i < n; ++i) {
+        out[i] = 0.0f;
+        if (!mask || mask[i]) {
+            if (!any || logits[i] > max_logit) {
+                max_logit = logits[i];
+            }
+            any = 1;
+        }
+    }
+    if (!any) {
+        return;
+    }
+    for (i = 0; i < n; ++i) {
+        if (!mask || mask[i]) {
+            out[i] = expf(logits[i] - max_logit);
+            sum += out[i];
+        }
+    }
+    if (sum <= 0.0f) {
+        return;
+    }
+    for (i = 0; i < n; ++i) {
+        out[i] /= sum;
+    }
+}
+
+static void evaluate_small_head(const Matrix* head, const float* bias, const float* hidden_state, const unsigned char* mask, size_t dim, float* out) {
+    float logits[FACTORIZED_SWITCH_DIM];
+    size_t i;
+    size_t h;
+    for (i = 0; i < dim; ++i) {
+        float sum = bias ? bias[i] : 0.0f;
+        for (h = 0; h < head->cols; ++h) {
+            sum += head->data[i * head->cols + h] * hidden_state[h];
+        }
+        logits[i] = sum;
+    }
+    masked_softmax_small(logits, mask, dim, out);
+}
+
+static void build_factorized_masks(const unsigned char* legal_mask, int slot, unsigned char* kind_mask, unsigned char* move_mask, unsigned char* switch_mask, unsigned char* tera_mask) {
+    int base = slot == 0 ? 0 : 14;
+    int i;
+    memset(kind_mask, 0, FACTORIZED_KIND_DIM);
+    memset(move_mask, 0, FACTORIZED_MOVE_DIM);
+    memset(switch_mask, 0, FACTORIZED_SWITCH_DIM);
+    memset(tera_mask, 0, FACTORIZED_TERA_DIM);
+    if (!legal_mask) {
+        return;
+    }
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
+        if (legal_mask[base + i] || legal_mask[base + 4 + i]) {
+            move_mask[i] = 1;
+            kind_mask[0] = 1;
+        }
+        if (legal_mask[base + i]) {
+            tera_mask[0] = 1;
+        }
+        if (legal_mask[base + 4 + i]) {
+            tera_mask[1] = 1;
+        }
+    }
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) {
+        if (legal_mask[base + 8 + i]) {
+            switch_mask[i] = 1;
+            kind_mask[1] = 1;
+        }
+    }
+}
+
 static void evaluate_hidden_internal(
     const GruModel* model,
     const float* hidden_state,
@@ -780,12 +903,33 @@ GruModel* gru_model_create(size_t input_dim, size_t hidden_dim, size_t num_actio
     model->bn = vector_make(hidden_dim);
     model->policy_head = matrix_make(num_actions, hidden_dim, p_scale);
     model->policy_bias = vector_make(num_actions);
+    model->slot0_kind_head = matrix_make(FACTORIZED_KIND_DIM, hidden_dim, p_scale);
+    model->slot0_kind_bias = vector_make(FACTORIZED_KIND_DIM);
+    model->slot0_move_head = matrix_make(FACTORIZED_MOVE_DIM, hidden_dim, p_scale);
+    model->slot0_move_bias = vector_make(FACTORIZED_MOVE_DIM);
+    model->slot0_switch_head = matrix_make(FACTORIZED_SWITCH_DIM, hidden_dim, p_scale);
+    model->slot0_switch_bias = vector_make(FACTORIZED_SWITCH_DIM);
+    model->slot0_tera_head = matrix_make(FACTORIZED_TERA_DIM, hidden_dim, p_scale);
+    model->slot0_tera_bias = vector_make(FACTORIZED_TERA_DIM);
+    model->slot1_kind_head = matrix_make(FACTORIZED_KIND_DIM, hidden_dim, p_scale);
+    model->slot1_kind_bias = vector_make(FACTORIZED_KIND_DIM);
+    model->slot1_move_head = matrix_make(FACTORIZED_MOVE_DIM, hidden_dim, p_scale);
+    model->slot1_move_bias = vector_make(FACTORIZED_MOVE_DIM);
+    model->slot1_switch_head = matrix_make(FACTORIZED_SWITCH_DIM, hidden_dim, p_scale);
+    model->slot1_switch_bias = vector_make(FACTORIZED_SWITCH_DIM);
+    model->slot1_tera_head = matrix_make(FACTORIZED_TERA_DIM, hidden_dim, p_scale);
+    model->slot1_tera_bias = vector_make(FACTORIZED_TERA_DIM);
     model->value_head = (float*)malloc(hidden_dim * sizeof(float));
 
     if (!model->wzx.data || !model->wzh.data || !model->bz ||
         !model->wrx.data || !model->wrh.data || !model->br ||
         !model->wnx.data || !model->wnh.data || !model->bn ||
-        !model->policy_head.data || !model->policy_bias || !model->value_head) {
+        !model->policy_head.data || !model->policy_bias ||
+        !model->slot0_kind_head.data || !model->slot0_kind_bias || !model->slot0_move_head.data || !model->slot0_move_bias ||
+        !model->slot0_switch_head.data || !model->slot0_switch_bias || !model->slot0_tera_head.data || !model->slot0_tera_bias ||
+        !model->slot1_kind_head.data || !model->slot1_kind_bias || !model->slot1_move_head.data || !model->slot1_move_bias ||
+        !model->slot1_switch_head.data || !model->slot1_switch_bias || !model->slot1_tera_head.data || !model->slot1_tera_bias ||
+        !model->value_head) {
         gru_model_destroy(model);
         return NULL;
     }
@@ -815,6 +959,14 @@ void gru_model_destroy(GruModel* model) {
     free(model->bn);
     matrix_free(&model->policy_head);
     free(model->policy_bias);
+    matrix_free(&model->slot0_kind_head); free(model->slot0_kind_bias);
+    matrix_free(&model->slot0_move_head); free(model->slot0_move_bias);
+    matrix_free(&model->slot0_switch_head); free(model->slot0_switch_bias);
+    matrix_free(&model->slot0_tera_head); free(model->slot0_tera_bias);
+    matrix_free(&model->slot1_kind_head); free(model->slot1_kind_bias);
+    matrix_free(&model->slot1_move_head); free(model->slot1_move_bias);
+    matrix_free(&model->slot1_switch_head); free(model->slot1_switch_bias);
+    matrix_free(&model->slot1_tera_head); free(model->slot1_tera_bias);
     free(model->value_head);
     gru_adam_state_free(&model->adam_state);
     gru_forward_scratch_free(&model->forward_scratch);
@@ -1090,6 +1242,51 @@ void gru_model_evaluate_hidden(
     }
     evaluate_hidden_internal(model, hidden_state, legal_mask, logits, policy_out, value_out);
     free(logits);
+}
+
+int gru_model_evaluate_factorized_hidden(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    float* slot0_kind_policy,
+    float* slot0_move_policy,
+    float* slot0_switch_policy,
+    float* slot0_tera_policy,
+    float* slot1_kind_policy,
+    float* slot1_move_policy,
+    float* slot1_switch_policy,
+    float* slot1_tera_policy,
+    float* value_out
+) {
+    unsigned char slot0_kind_mask[FACTORIZED_KIND_DIM];
+    unsigned char slot0_move_mask[FACTORIZED_MOVE_DIM];
+    unsigned char slot0_switch_mask[FACTORIZED_SWITCH_DIM];
+    unsigned char slot0_tera_mask[FACTORIZED_TERA_DIM];
+    unsigned char slot1_kind_mask[FACTORIZED_KIND_DIM];
+    unsigned char slot1_move_mask[FACTORIZED_MOVE_DIM];
+    unsigned char slot1_switch_mask[FACTORIZED_SWITCH_DIM];
+    unsigned char slot1_tera_mask[FACTORIZED_TERA_DIM];
+    size_t i;
+    if (!model || !hidden_state) {
+        return 0;
+    }
+    build_factorized_masks(legal_mask, 0, slot0_kind_mask, slot0_move_mask, slot0_switch_mask, slot0_tera_mask);
+    build_factorized_masks(legal_mask, 1, slot1_kind_mask, slot1_move_mask, slot1_switch_mask, slot1_tera_mask);
+    if (slot0_kind_policy) evaluate_small_head(&model->slot0_kind_head, model->slot0_kind_bias, hidden_state, slot0_kind_mask, FACTORIZED_KIND_DIM, slot0_kind_policy);
+    if (slot0_move_policy) evaluate_small_head(&model->slot0_move_head, model->slot0_move_bias, hidden_state, slot0_move_mask, FACTORIZED_MOVE_DIM, slot0_move_policy);
+    if (slot0_switch_policy) evaluate_small_head(&model->slot0_switch_head, model->slot0_switch_bias, hidden_state, slot0_switch_mask, FACTORIZED_SWITCH_DIM, slot0_switch_policy);
+    if (slot0_tera_policy) evaluate_small_head(&model->slot0_tera_head, model->slot0_tera_bias, hidden_state, slot0_tera_mask, FACTORIZED_TERA_DIM, slot0_tera_policy);
+    if (slot1_kind_policy) evaluate_small_head(&model->slot1_kind_head, model->slot1_kind_bias, hidden_state, slot1_kind_mask, FACTORIZED_KIND_DIM, slot1_kind_policy);
+    if (slot1_move_policy) evaluate_small_head(&model->slot1_move_head, model->slot1_move_bias, hidden_state, slot1_move_mask, FACTORIZED_MOVE_DIM, slot1_move_policy);
+    if (slot1_switch_policy) evaluate_small_head(&model->slot1_switch_head, model->slot1_switch_bias, hidden_state, slot1_switch_mask, FACTORIZED_SWITCH_DIM, slot1_switch_policy);
+    if (slot1_tera_policy) evaluate_small_head(&model->slot1_tera_head, model->slot1_tera_bias, hidden_state, slot1_tera_mask, FACTORIZED_TERA_DIM, slot1_tera_policy);
+    if (value_out) {
+        *value_out = model->value_bias;
+        for (i = 0; i < model->hidden_dim; ++i) {
+            *value_out += model->value_head[i] * hidden_state[i];
+        }
+    }
+    return 1;
 }
 
 static int recurrent_update_sequence(

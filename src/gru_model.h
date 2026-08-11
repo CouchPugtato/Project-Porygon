@@ -3,6 +3,11 @@
 
 #include <stddef.h>
 
+#define FACTORIZED_KIND_DIM 2
+#define FACTORIZED_MOVE_DIM 4
+#define FACTORIZED_SWITCH_DIM 6
+#define FACTORIZED_TERA_DIM 2
+
 typedef struct GruModel GruModel;
 
 GruModel* gru_model_create(size_t input_dim, size_t hidden_dim, size_t num_actions);
@@ -61,6 +66,20 @@ void gru_model_evaluate_hidden(
     const float* hidden_state,
     const unsigned char* legal_mask,
     float* policy_out,
+    float* value_out
+);
+int gru_model_evaluate_factorized_hidden(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    float* slot0_kind_policy,
+    float* slot0_move_policy,
+    float* slot0_switch_policy,
+    float* slot0_tera_policy,
+    float* slot1_kind_policy,
+    float* slot1_move_policy,
+    float* slot1_switch_policy,
+    float* slot1_tera_policy,
     float* value_out
 );
 int gru_model_supervised_update_heads(
