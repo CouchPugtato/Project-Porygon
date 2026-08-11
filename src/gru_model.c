@@ -182,6 +182,8 @@ struct GruModel {
     GruAdamState adam_state;
 };
 
+static void bootstrap_factorized_heads_from_flat(GruModel* model);
+
 static float rand_uniform(void) {
     return ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
 }
@@ -572,6 +574,7 @@ int gru_model_apply_accumulated_supervised_updates(GruModel* model, float learni
 #endif
     for (i = 0; i < model->hidden_dim; ++i) model->value_head[i] -= scale * accum->value_head[i];
     model->value_bias -= scale * accum->value_bias;
+    bootstrap_factorized_heads_from_flat(model);
     gru_model_clear_accumulated_supervised_updates(model);
     return 1;
 }
@@ -668,6 +671,7 @@ int gru_model_apply_accumulated_adam_updates(
     state->value_bias_m = beta1 * state->value_bias_m + (1.0f - beta1) * accum->value_bias;
     state->value_bias_v = beta2 * state->value_bias_v + (1.0f - beta2) * accum->value_bias * accum->value_bias;
     model->value_bias -= learning_rate * (state->value_bias_m / bias_correction1) / (sqrtf(state->value_bias_v / bias_correction2) + epsilon);
+    bootstrap_factorized_heads_from_flat(model);
     gru_model_clear_accumulated_supervised_updates(model);
     return 1;
 }
@@ -1703,6 +1707,7 @@ static int recurrent_update_sequence(
 #endif
         for (h = 0; h < hdim; ++h) model->value_head[h] -= learning_rate * grad_value_head[h];
         model->value_bias -= learning_rate * grad_value_bias;
+        bootstrap_factorized_heads_from_flat(model);
     }
 
     return 1;
@@ -1920,6 +1925,7 @@ int gru_model_policy_gradient_update_heads(
         model->value_head[h] -= learning_rate * dv * hidden_state[h];
     }
     model->value_bias -= learning_rate * dv;
+    bootstrap_factorized_heads_from_flat(model);
     free(logits);
     free(policy);
     return 1;
