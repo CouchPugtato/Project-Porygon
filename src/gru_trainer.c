@@ -30,6 +30,9 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
     trainer->ppo_value_clip_epsilon = 0.2f;
     trainer->target_kl = 0.02f;
     trainer->gae_lambda = 0.95f;
+    trainer->adam_beta1 = 0.9f;
+    trainer->adam_beta2 = 0.999f;
+    trainer->adam_epsilon = 1.0e-8f;
     trainer->supervised_minibatch_size = 8;
     trainer->supervised_profile_enabled = 1;
 }
@@ -896,6 +899,8 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         return 0;
     }
 
+    gru_model_clear_accumulated_supervised_updates(model);
+
     gru_model_zero_state(model, hidden);
     for (t = 0; t < episode->count; ++t) {
         gru_model_forward_step(
@@ -1023,7 +1028,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
             build_step_slot_legal_mask(episode, t, 0, slot_mask_a);
             build_step_slot_legal_mask(episode, t, 1, slot_mask_b);
             if (fabsf(effective_advantage) > 0.0f) {
-                if (!gru_model_policy_gradient_update_sequence_window_dual(
+                if (!gru_model_policy_gradient_accumulate_sequence_window_dual(
                         model,
                         episode->observations + (start * episode->obs_dim),
                         steps,
@@ -1034,8 +1039,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
                         episode->actions2[t],
                         effective_advantage,
                         value_target,
-                        trainer->entropy_coef,
-                        trainer->learning_rate)) {
+                        trainer->entropy_coef)) {
                     free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
                     return 0;
                 }
@@ -1044,7 +1048,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         } else if (episode->actions[t] >= 0) {
             build_step_slot_legal_mask(episode, t, 0, slot_mask_a);
             if (fabsf(effective_advantage) > 0.0f) {
-                if (!gru_model_policy_gradient_update_sequence_window(
+                if (!gru_model_policy_gradient_accumulate_sequence_window(
                         model,
                         episode->observations + (start * episode->obs_dim),
                         steps,
@@ -1053,8 +1057,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
                         episode->actions[t],
                         effective_advantage,
                         value_target,
-                        trainer->entropy_coef,
-                        trainer->learning_rate)) {
+                        trainer->entropy_coef)) {
                     free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
                     return 0;
                 }
@@ -1063,7 +1066,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         } else if (episode->actions2[t] >= 0) {
             build_step_slot_legal_mask(episode, t, 1, slot_mask_b);
             if (fabsf(effective_advantage) > 0.0f) {
-                if (!gru_model_policy_gradient_update_sequence_window(
+                if (!gru_model_policy_gradient_accumulate_sequence_window(
                         model,
                         episode->observations + (start * episode->obs_dim),
                         steps,
@@ -1072,8 +1075,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
                         episode->actions2[t],
                         effective_advantage,
                         value_target,
-                        trainer->entropy_coef,
-                        trainer->learning_rate)) {
+                        trainer->entropy_coef)) {
                     free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
                     return 0;
                 }
@@ -1082,6 +1084,22 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         }
         labeled_indices[labeled_steps++] = t;
         ++trainer->step;
+    }
+
+    if (!gru_model_apply_accumulated_adam_updates(
+            model,
+            trainer->learning_rate,
+            trainer->adam_beta1,
+            trainer->adam_beta2,
+            trainer->adam_epsilon,
+            trainer->gradient_clip)) {
+        free(advantages);
+        free(returns);
+        free(labeled_indices);
+        free(hidden);
+        free(next_hidden);
+        free(hidden_after);
+        return 0;
     }
 
     trainer->last_policy_loss = labeled_steps > 0 ? policy_loss_sum / (float)labeled_steps : 0.0f;

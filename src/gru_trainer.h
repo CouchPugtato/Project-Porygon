@@ -42,6 +42,9 @@ typedef struct {
     float ppo_value_clip_epsilon;
     float target_kl;
     float gae_lambda;
+    float adam_beta1;
+    float adam_beta2;
+    float adam_epsilon;
 } GruTrainer;
 
 void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_window, float gradient_clip, unsigned int seed);

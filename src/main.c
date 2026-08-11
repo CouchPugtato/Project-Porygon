@@ -2146,6 +2146,9 @@ static int train_from_input_file(
     float ppo_clip_epsilon,
     float ppo_value_clip_epsilon,
     float ppo_target_kl,
+    float adam_beta1,
+    float adam_beta2,
+    float adam_epsilon,
     int supervised_profile,
     const char* rl_reward_mode,
     const RewardConfig* reward_config,
@@ -2254,6 +2257,9 @@ static int train_from_input_file(
         trainer.ppo_clip_epsilon = ppo_clip_epsilon;
         trainer.ppo_value_clip_epsilon = ppo_value_clip_epsilon;
         trainer.target_kl = ppo_target_kl;
+        trainer.adam_beta1 = adam_beta1;
+        trainer.adam_beta2 = adam_beta2;
+        trainer.adam_epsilon = adam_epsilon;
         trainer.anchor_model = anchor_model;
         trainer.anchor_kl_coef = anchor_kl_coef;
     } else {
@@ -2632,6 +2638,9 @@ static int showdown_client_main(int argc, char** argv) {
     float ppo_clip_epsilon = parse_float_flag(argc, argv, "--ppo-clip-epsilon", 0.2f);
     float ppo_value_clip_epsilon = parse_float_flag(argc, argv, "--ppo-value-clip-epsilon", 0.2f);
     float ppo_target_kl = parse_float_flag(argc, argv, "--target-kl", 0.02f);
+    float adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", 0.9f);
+    float adam_beta2 = parse_float_flag(argc, argv, "--adam-beta2", 0.999f);
+    float adam_epsilon = parse_float_flag(argc, argv, "--adam-epsilon", 1.0e-8f);
     int supervised_profile = parse_bool01_flag(argc, argv, "--supervised-profile", 1);
     const char* rl_reward_mode = parse_string_flag(argc, argv, "--reward-mode", "terminal");
     RewardConfig reward_config;
@@ -2708,6 +2717,9 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_clip_epsilon,
             ppo_value_clip_epsilon,
             ppo_target_kl,
+            adam_beta1,
+            adam_beta2,
+            adam_epsilon,
             supervised_profile,
             rl_reward_mode,
             &reward_config,
@@ -2732,6 +2744,9 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_clip_epsilon,
             ppo_value_clip_epsilon,
             ppo_target_kl,
+            adam_beta1,
+            adam_beta2,
+            adam_epsilon,
             supervised_profile,
             rl_reward_mode,
             &reward_config,
@@ -2756,6 +2771,9 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_clip_epsilon,
             ppo_value_clip_epsilon,
             ppo_target_kl,
+            adam_beta1,
+            adam_beta2,
+            adam_epsilon,
             supervised_profile,
             rl_reward_mode,
             &reward_config,
@@ -2780,6 +2798,9 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_clip_epsilon,
             ppo_value_clip_epsilon,
             ppo_target_kl,
+            adam_beta1,
+            adam_beta2,
+            adam_epsilon,
             supervised_profile,
             rl_reward_mode,
             &reward_config,

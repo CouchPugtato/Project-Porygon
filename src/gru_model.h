@@ -141,6 +141,14 @@ int gru_model_supervised_accumulate_sequence_window_dual(
     float* accuracy_out
 );
 int gru_model_apply_accumulated_supervised_updates(GruModel* model, float learning_rate);
+int gru_model_apply_accumulated_adam_updates(
+    GruModel* model,
+    float learning_rate,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float gradient_clip
+);
 void gru_model_clear_accumulated_supervised_updates(GruModel* model);
 int gru_model_policy_gradient_update_heads(
     GruModel* model,
@@ -175,6 +183,17 @@ int gru_model_policy_gradient_update_sequence_window(
     float entropy_coef,
     float learning_rate
 );
+int gru_model_policy_gradient_accumulate_sequence_window(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask,
+    int action,
+    float advantage,
+    float target_value,
+    float entropy_coef
+);
 int gru_model_policy_gradient_update_sequence_window_anchored(
     GruModel* model,
     const float* sequence,
@@ -186,6 +205,19 @@ int gru_model_policy_gradient_update_sequence_window_anchored(
     float target_value,
     float entropy_coef,
     float learning_rate,
+    const float* anchor_policy,
+    float anchor_kl_coef
+);
+int gru_model_policy_gradient_accumulate_sequence_window_anchored(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask,
+    int action,
+    float advantage,
+    float target_value,
+    float entropy_coef,
     const float* anchor_policy,
     float anchor_kl_coef
 );
@@ -202,6 +234,19 @@ int gru_model_policy_gradient_update_sequence_window_dual(
     float target_value,
     float entropy_coef,
     float learning_rate
+);
+int gru_model_policy_gradient_accumulate_sequence_window_dual(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    int action_a,
+    const unsigned char* legal_mask_b,
+    int action_b,
+    float advantage,
+    float target_value,
+    float entropy_coef
 );
 int gru_model_policy_gradient_update_sequence_window_dual_anchored(
     GruModel* model,
