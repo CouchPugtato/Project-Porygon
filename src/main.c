@@ -51,6 +51,8 @@ typedef struct {
     double entropy_sum;
     double anchor_loss_sum;
     double anchor_kl_mean_sum;
+    double approx_kl_sum;
+    double clip_fraction_sum;
     float anchor_kl_max;
     double value_mean_sum;
     double advantage_mean_sum;
@@ -156,6 +158,8 @@ static void rl_training_summary_record_trainer(RlTrainingSummary* summary, const
     summary->entropy_sum += (double)trainer->last_entropy * (double)trainer->last_rl_labels;
     summary->anchor_loss_sum += (double)trainer->last_anchor_loss * (double)trainer->last_rl_labels;
     summary->anchor_kl_mean_sum += (double)trainer->last_anchor_kl_mean * (double)trainer->last_rl_labels;
+    summary->approx_kl_sum += (double)trainer->last_approx_kl * (double)trainer->last_rl_labels;
+    summary->clip_fraction_sum += (double)trainer->last_clip_fraction * (double)trainer->last_rl_labels;
     summary->value_mean_sum += (double)trainer->last_mean_value * (double)trainer->last_rl_labels;
     summary->advantage_mean_sum += (double)trainer->last_mean_advantage * (double)trainer->last_rl_labels;
     summary->abs_advantage_mean_sum += (double)trainer->last_mean_abs_advantage * (double)trainer->last_rl_labels;
@@ -1327,6 +1331,8 @@ static int write_rl_training_summary_json(
     fprintf(out, "  \"entropy\": %.6f,\n", summary->label_weight_sum > 0 ? summary->entropy_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"anchor_loss\": %.6f,\n", summary->label_weight_sum > 0 ? summary->anchor_loss_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"anchor_kl_mean\": %.6f,\n", summary->label_weight_sum > 0 ? summary->anchor_kl_mean_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"approx_kl\": %.6f,\n", summary->label_weight_sum > 0 ? summary->approx_kl_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"clip_fraction\": %.6f,\n", summary->label_weight_sum > 0 ? summary->clip_fraction_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"anchor_kl_max\": %.6f,\n", summary->anchor_kl_max);
     fprintf(out, "  \"labels\": %zu\n", summary->label_weight_sum);
     fputs("}\n", out);
@@ -2130,11 +2136,15 @@ static int train_from_input_file(
     const char* checkpoint_path,
     int input_is_episode_batch,
     int rl_mode,
+    int ppo_mode,
     int epochs,
     float learning_rate_override,
     float rl_gamma,
     float rl_entropy_coef,
     int rl_advantage_norm,
+    float ppo_clip_epsilon,
+    float ppo_value_clip_epsilon,
+    float ppo_target_kl,
     int supervised_profile,
     const char* rl_reward_mode,
     const RewardConfig* reward_config,
@@ -2239,6 +2249,9 @@ static int train_from_input_file(
         trainer.gamma = rl_gamma;
         trainer.entropy_coef = rl_entropy_coef;
         trainer.advantage_norm = rl_advantage_norm ? 1 : 0;
+        trainer.ppo_clip_epsilon = ppo_clip_epsilon;
+        trainer.ppo_value_clip_epsilon = ppo_value_clip_epsilon;
+        trainer.target_kl = ppo_target_kl;
         trainer.anchor_model = anchor_model;
         trainer.anchor_kl_coef = anchor_kl_coef;
     } else {
@@ -2316,7 +2329,9 @@ static int train_from_input_file(
         for (size_t order_i = 0; order_i < train_sessions; ++order_i) {
             size_t session_index = train_indices[order_i];
             if (rl_mode) {
-                if (!gru_trainer_policy_gradient_episode(&trainer, model, &runtime.sessions[session_index].episode)) {
+                if (!(ppo_mode
+                        ? gru_trainer_ppo_episode(&trainer, model, &runtime.sessions[session_index].episode)
+                        : gru_trainer_policy_gradient_episode(&trainer, model, &runtime.sessions[session_index].episode))) {
                     fprintf(stderr, "Failed RL training episode\n");
                     free(train_indices);
                     free(val_indices);
@@ -2351,7 +2366,8 @@ static int train_from_input_file(
                     eta = (double)(train_sessions - trained_in_epoch) / train_eta_rate_ema;
                 }
                 if (rl_mode) {
-                    printf("[train-rl] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f mean_advantage=%.4f entropy=%.4f labels=%zu\n",
+                    printf("[train-%s] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f clip_fraction=%.4f labels=%zu\n",
+                        ppo_mode ? "ppo" : "rl",
                         epoch,
                         trained_in_epoch,
                         train_sessions,
@@ -2361,6 +2377,8 @@ static int train_from_input_file(
                         trainer.last_value_loss,
                         trainer.last_mean_advantage,
                         trainer.last_entropy,
+                        trainer.last_approx_kl,
+                        trainer.last_clip_fraction,
                         trainer.last_rl_labels);
                 } else {
                     printf("[train] epoch=%d episodes=%zu/%zu step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f\n",
@@ -2496,13 +2514,16 @@ static int train_from_input_file(
         return 1;
     }
     if (rl_mode) {
-        printf("trained mode=rl step=%zu policy_loss=%.4f value_loss=%.4f mean_return=%.4f mean_advantage=%.4f entropy=%.4f labels=%zu sessions=%zu\n",
+        printf("trained mode=%s step=%zu policy_loss=%.4f value_loss=%.4f mean_return=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f clip_fraction=%.4f labels=%zu sessions=%zu\n",
+            ppo_mode ? "ppo" : "rl",
             trainer.step,
             trainer.last_policy_loss,
             trainer.last_value_loss,
             trainer.last_mean_return,
             trainer.last_mean_advantage,
             trainer.last_entropy,
+            trainer.last_approx_kl,
+            trainer.last_clip_fraction,
             trainer.last_rl_labels,
             runtime.count);
         if (training_summary_path && *training_summary_path) {
@@ -2594,6 +2615,9 @@ static int showdown_client_main(int argc, char** argv) {
     float rl_gamma = parse_float_flag(argc, argv, "--gamma", 1.0f);
     float rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef", 0.001f);
     int rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", 1);
+    float ppo_clip_epsilon = parse_float_flag(argc, argv, "--ppo-clip-epsilon", 0.2f);
+    float ppo_value_clip_epsilon = parse_float_flag(argc, argv, "--ppo-value-clip-epsilon", 0.2f);
+    float ppo_target_kl = parse_float_flag(argc, argv, "--target-kl", 0.02f);
     int supervised_profile = parse_bool01_flag(argc, argv, "--supervised-profile", 1);
     const char* rl_reward_mode = parse_string_flag(argc, argv, "--reward-mode", "terminal");
     RewardConfig reward_config;
@@ -2660,11 +2684,15 @@ static int showdown_client_main(int argc, char** argv) {
             argv[3],
             0,
             0,
+            0,
             epochs,
             learning_rate_override,
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            ppo_clip_epsilon,
+            ppo_value_clip_epsilon,
+            ppo_target_kl,
             supervised_profile,
             rl_reward_mode,
             &reward_config,
@@ -2679,11 +2707,15 @@ static int showdown_client_main(int argc, char** argv) {
             argv[3],
             0,
             1,
+            0,
             epochs,
             learning_rate_override,
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            ppo_clip_epsilon,
+            ppo_value_clip_epsilon,
+            ppo_target_kl,
             supervised_profile,
             rl_reward_mode,
             &reward_config,
@@ -2698,11 +2730,15 @@ static int showdown_client_main(int argc, char** argv) {
             argv[3],
             1,
             1,
+            0,
             epochs,
             learning_rate_override,
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            ppo_clip_epsilon,
+            ppo_value_clip_epsilon,
+            ppo_target_kl,
             supervised_profile,
             rl_reward_mode,
             &reward_config,
@@ -2717,11 +2753,15 @@ static int showdown_client_main(int argc, char** argv) {
             argv[3],
             1,
             1,
+            1,
             epochs,
             learning_rate_override,
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            ppo_clip_epsilon,
+            ppo_value_clip_epsilon,
+            ppo_target_kl,
             supervised_profile,
             rl_reward_mode,
             &reward_config,

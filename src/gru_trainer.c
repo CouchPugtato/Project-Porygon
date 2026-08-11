@@ -26,8 +26,83 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
     trainer->entropy_coef = 0.001f;
     trainer->advantage_norm = 1;
     trainer->anchor_kl_coef = 0.0f;
+    trainer->ppo_clip_epsilon = 0.2f;
+    trainer->ppo_value_clip_epsilon = 0.2f;
+    trainer->target_kl = 0.02f;
     trainer->supervised_minibatch_size = 8;
     trainer->supervised_profile_enabled = 1;
+}
+
+static float masked_action_log_prob(const float* policy, int action) {
+    float p;
+    if (!policy || action < 0) {
+        return 0.0f;
+    }
+    p = policy[action];
+    if (p < 1.0e-8f) {
+        p = 1.0e-8f;
+    }
+    return logf(p);
+}
+
+static int evaluate_joint_step(
+    GruModel* model,
+    const float* hidden_state,
+    const Episode* episode,
+    size_t step_index,
+    float* joint_log_prob_out,
+    float* value_out,
+    float* entropy_out
+) {
+    uint8_t slot_mask[OBS_NUM_ACTIONS];
+    float* policy = NULL;
+    float joint_log_prob = 0.0f;
+    float entropy = 0.0f;
+    float value = 0.0f;
+    size_t action_dim;
+    size_t a;
+    int actions[2];
+    int slots[2];
+    size_t idx;
+    if (!model || !hidden_state || !episode || step_index >= episode->count) {
+        return 0;
+    }
+    action_dim = gru_model_num_actions(model);
+    policy = (float*)malloc(action_dim * sizeof(float));
+    if (!policy) {
+        return 0;
+    }
+    actions[0] = episode->actions[step_index];
+    actions[1] = episode->actions2[step_index];
+    slots[0] = 0;
+    slots[1] = 1;
+    for (idx = 0; idx < 2; ++idx) {
+        if (actions[idx] < 0) {
+            continue;
+        }
+        build_step_slot_legal_mask(episode, step_index, slots[idx], slot_mask);
+        gru_model_evaluate_hidden(model, hidden_state, slot_mask, policy, &value);
+        joint_log_prob += masked_action_log_prob(policy, actions[idx]);
+        for (a = 0; a < action_dim; ++a) {
+            float p;
+            if (!slot_mask[a]) {
+                continue;
+            }
+            p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
+            entropy -= p * logf(p);
+        }
+    }
+    free(policy);
+    if (joint_log_prob_out) {
+        *joint_log_prob_out = joint_log_prob;
+    }
+    if (value_out) {
+        *value_out = value;
+    }
+    if (entropy_out) {
+        *entropy_out = entropy;
+    }
+    return 1;
 }
 
 TrainerCheckpointState gru_trainer_checkpoint_state(const GruTrainer* trainer) {
@@ -759,5 +834,248 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     free(anchor_hidden_after);
     free(anchor_policy);
     free(labeled_indices);
+    return 1;
+}
+
+int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode* episode) {
+    size_t t;
+    size_t hidden_dim;
+    size_t labeled_steps = 0;
+    size_t trained_labels = 0;
+    float* advantages = NULL;
+    float* returns = NULL;
+    size_t* labeled_indices = NULL;
+    float* hidden = NULL;
+    float* next_hidden = NULL;
+    float* hidden_after = NULL;
+    float reward_to_go = 0.0f;
+    float advantage_sum = 0.0f;
+    float return_sum = 0.0f;
+    float mean_value_sum = 0.0f;
+    float abs_advantage_sum = 0.0f;
+    float policy_loss_sum = 0.0f;
+    float value_loss_sum = 0.0f;
+    float entropy_sum = 0.0f;
+    float approx_kl_sum = 0.0f;
+    float clip_fraction_sum = 0.0f;
+    uint8_t slot_mask_a[OBS_NUM_ACTIONS];
+    uint8_t slot_mask_b[OBS_NUM_ACTIONS];
+
+    if (!trainer || !model || !episode) {
+        return 0;
+    }
+    if (episode->count == 0) {
+        trainer->last_policy_loss = 0.0f;
+        trainer->last_value_loss = 0.0f;
+        trainer->last_mean_return = 0.0f;
+        trainer->last_mean_advantage = 0.0f;
+        trainer->last_mean_abs_advantage = 0.0f;
+        trainer->last_mean_value = 0.0f;
+        trainer->last_entropy = 0.0f;
+        trainer->last_approx_kl = 0.0f;
+        trainer->last_clip_fraction = 0.0f;
+        trainer->last_rl_labels = 0;
+        return 1;
+    }
+
+    hidden_dim = gru_model_hidden_dim(model);
+    advantages = (float*)calloc(episode->count, sizeof(float));
+    returns = (float*)calloc(episode->count, sizeof(float));
+    labeled_indices = (size_t*)malloc(episode->count * sizeof(size_t));
+    hidden = (float*)calloc(hidden_dim, sizeof(float));
+    next_hidden = (float*)malloc(hidden_dim * sizeof(float));
+    hidden_after = (float*)calloc(episode->count * hidden_dim, sizeof(float));
+    if (!advantages || !returns || !labeled_indices || !hidden || !next_hidden || !hidden_after) {
+        free(advantages);
+        free(returns);
+        free(labeled_indices);
+        free(hidden);
+        free(next_hidden);
+        free(hidden_after);
+        return 0;
+    }
+
+    gru_model_zero_state(model, hidden);
+    for (t = 0; t < episode->count; ++t) {
+        gru_model_forward_step(
+            model,
+            episode->observations + (t * episode->obs_dim),
+            hidden,
+            next_hidden,
+            NULL,
+            NULL);
+        memcpy(hidden_after + (t * hidden_dim), next_hidden, hidden_dim * sizeof(float));
+        memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
+    }
+
+    for (t = episode->count; t > 0; --t) {
+        size_t idx = t - 1;
+        reward_to_go = episode->rewards[idx] + trainer->gamma * reward_to_go * (episode->dones[idx] ? 0.0f : 1.0f);
+        returns[idx] = reward_to_go;
+        advantages[idx] = returns[idx] - episode->old_values[idx];
+    }
+
+    if (trainer->advantage_norm && episode->count > 1) {
+        float mean = 0.0f;
+        float variance = 0.0f;
+        for (t = 0; t < episode->count; ++t) {
+            mean += advantages[t];
+        }
+        mean /= (float)episode->count;
+        for (t = 0; t < episode->count; ++t) {
+            float centered = advantages[t] - mean;
+            variance += centered * centered;
+        }
+        variance /= (float)episode->count;
+        variance = sqrtf(variance);
+        if (variance > 1.0e-6f) {
+            for (t = 0; t < episode->count; ++t) {
+                advantages[t] = (advantages[t] - mean) / variance;
+            }
+        }
+    }
+
+    for (t = 0; t < episode->count; ++t) {
+        float current_log_prob;
+        float current_value;
+        float current_entropy;
+        float ratio;
+        float clipped_ratio;
+        float effective_advantage;
+        float approx_kl;
+        float surrogate_a;
+        float surrogate_b;
+        size_t start;
+        size_t steps;
+        const float* initial_hidden;
+        const float* stored_hidden;
+
+        if (episode->actions[t] < 0 && episode->actions2[t] < 0) {
+            continue;
+        }
+        stored_hidden = hidden_after + (t * hidden_dim);
+        if (!evaluate_joint_step(model, stored_hidden, episode, t, &current_log_prob, &current_value, &current_entropy)) {
+            free(advantages);
+            free(returns);
+            free(labeled_indices);
+            free(hidden);
+            free(next_hidden);
+            free(hidden_after);
+            return 0;
+        }
+        ratio = expf(current_log_prob - episode->old_log_probs[t]);
+        clipped_ratio = ratio;
+        if (clipped_ratio < 1.0f - trainer->ppo_clip_epsilon) {
+            clipped_ratio = 1.0f - trainer->ppo_clip_epsilon;
+        }
+        if (clipped_ratio > 1.0f + trainer->ppo_clip_epsilon) {
+            clipped_ratio = 1.0f + trainer->ppo_clip_epsilon;
+        }
+        surrogate_a = ratio * advantages[t];
+        surrogate_b = clipped_ratio * advantages[t];
+        effective_advantage = 0.0f;
+        if ((advantages[t] >= 0.0f && ratio <= 1.0f + trainer->ppo_clip_epsilon) ||
+                (advantages[t] < 0.0f && ratio >= 1.0f - trainer->ppo_clip_epsilon)) {
+            effective_advantage = ratio * advantages[t];
+        }
+        approx_kl = episode->old_log_probs[t] - current_log_prob;
+        approx_kl_sum += approx_kl;
+        if ((advantages[t] >= 0.0f && surrogate_b < surrogate_a) ||
+                (advantages[t] < 0.0f && surrogate_b < surrogate_a)) {
+            clip_fraction_sum += 1.0f;
+        }
+        policy_loss_sum += -(surrogate_a < surrogate_b ? surrogate_a : surrogate_b);
+        value_loss_sum += 0.5f * (current_value - returns[t]) * (current_value - returns[t]);
+        entropy_sum += current_entropy;
+        advantage_sum += advantages[t];
+        abs_advantage_sum += fabsf(advantages[t]);
+        return_sum += returns[t];
+        mean_value_sum += current_value;
+
+        start = (t + 1 > trainer->bptt_window) ? (t + 1 - trainer->bptt_window) : 0;
+        steps = (t - start) + 1;
+        initial_hidden = start > 0 ? (hidden_after + ((start - 1) * hidden_dim)) : NULL;
+        if (episode->actions[t] >= 0 && episode->actions2[t] >= 0) {
+            build_step_slot_legal_mask(episode, t, 0, slot_mask_a);
+            build_step_slot_legal_mask(episode, t, 1, slot_mask_b);
+            if (fabsf(effective_advantage) > 0.0f) {
+                if (!gru_model_policy_gradient_update_sequence_window_dual(
+                        model,
+                        episode->observations + (start * episode->obs_dim),
+                        steps,
+                        initial_hidden,
+                        slot_mask_a,
+                        episode->actions[t],
+                        slot_mask_b,
+                        episode->actions2[t],
+                        effective_advantage,
+                        returns[t],
+                        trainer->entropy_coef,
+                        trainer->learning_rate)) {
+                    free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
+                    return 0;
+                }
+            }
+            ++trained_labels;
+        } else if (episode->actions[t] >= 0) {
+            build_step_slot_legal_mask(episode, t, 0, slot_mask_a);
+            if (fabsf(effective_advantage) > 0.0f) {
+                if (!gru_model_policy_gradient_update_sequence_window(
+                        model,
+                        episode->observations + (start * episode->obs_dim),
+                        steps,
+                        initial_hidden,
+                        slot_mask_a,
+                        episode->actions[t],
+                        effective_advantage,
+                        returns[t],
+                        trainer->entropy_coef,
+                        trainer->learning_rate)) {
+                    free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
+                    return 0;
+                }
+            }
+            ++trained_labels;
+        } else if (episode->actions2[t] >= 0) {
+            build_step_slot_legal_mask(episode, t, 1, slot_mask_b);
+            if (fabsf(effective_advantage) > 0.0f) {
+                if (!gru_model_policy_gradient_update_sequence_window(
+                        model,
+                        episode->observations + (start * episode->obs_dim),
+                        steps,
+                        initial_hidden,
+                        slot_mask_b,
+                        episode->actions2[t],
+                        effective_advantage,
+                        returns[t],
+                        trainer->entropy_coef,
+                        trainer->learning_rate)) {
+                    free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
+                    return 0;
+                }
+            }
+            ++trained_labels;
+        }
+        labeled_indices[labeled_steps++] = t;
+        ++trainer->step;
+    }
+
+    trainer->last_policy_loss = labeled_steps > 0 ? policy_loss_sum / (float)labeled_steps : 0.0f;
+    trainer->last_value_loss = labeled_steps > 0 ? value_loss_sum / (float)labeled_steps : 0.0f;
+    trainer->last_mean_return = labeled_steps > 0 ? return_sum / (float)labeled_steps : 0.0f;
+    trainer->last_mean_advantage = labeled_steps > 0 ? advantage_sum / (float)labeled_steps : 0.0f;
+    trainer->last_mean_abs_advantage = labeled_steps > 0 ? abs_advantage_sum / (float)labeled_steps : 0.0f;
+    trainer->last_mean_value = labeled_steps > 0 ? mean_value_sum / (float)labeled_steps : 0.0f;
+    trainer->last_entropy = labeled_steps > 0 ? entropy_sum / (float)labeled_steps : 0.0f;
+    trainer->last_approx_kl = labeled_steps > 0 ? approx_kl_sum / (float)labeled_steps : 0.0f;
+    trainer->last_clip_fraction = labeled_steps > 0 ? clip_fraction_sum / (float)labeled_steps : 0.0f;
+    trainer->last_rl_labels = trained_labels;
+
+    free(advantages);
+    free(returns);
+    free(labeled_indices);
+    free(hidden);
+    free(next_hidden);
+    free(hidden_after);
     return 1;
 }
