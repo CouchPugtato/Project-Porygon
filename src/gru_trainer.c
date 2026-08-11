@@ -49,6 +49,75 @@ static float masked_action_log_prob(const float* policy, int action) {
     return logf(p);
 }
 
+static float masked_small_log_prob(const float* policy, const unsigned char* mask, size_t dim, int index) {
+    float sum = 0.0f;
+    float p;
+    size_t i;
+    if (!policy || !mask || index < 0 || (size_t)index >= dim || !mask[index]) {
+        return 0.0f;
+    }
+    for (i = 0; i < dim; ++i) {
+        if (mask[i]) {
+            sum += policy[i];
+        }
+    }
+    if (sum <= 1.0e-8f) {
+        return 0.0f;
+    }
+    p = policy[index] / sum;
+    if (p < 1.0e-8f) {
+        p = 1.0e-8f;
+    }
+    return logf(p);
+}
+
+static float masked_small_entropy(const float* policy, const unsigned char* mask, size_t dim) {
+    float sum = 0.0f;
+    float entropy = 0.0f;
+    size_t i;
+    for (i = 0; i < dim; ++i) {
+        if (mask[i]) {
+            sum += policy[i];
+        }
+    }
+    if (sum <= 1.0e-8f) {
+        return 0.0f;
+    }
+    for (i = 0; i < dim; ++i) {
+        float p;
+        if (!mask[i]) {
+            continue;
+        }
+        p = policy[i] / sum;
+        if (p < 1.0e-8f) {
+            p = 1.0e-8f;
+        }
+        entropy -= p * logf(p);
+    }
+    return entropy;
+}
+
+static void build_factor_masks_from_episode(const Episode* episode, size_t step_index, int slot, unsigned char* kind_mask, unsigned char* move_mask, unsigned char* switch_mask) {
+    const uint8_t* legal_mask = episode->legal_masks + (step_index * OBS_NUM_ACTIONS);
+    int base = slot == 0 ? 0 : 14;
+    int i;
+    memset(kind_mask, 0, FACTORIZED_KIND_DIM);
+    memset(move_mask, 0, FACTORIZED_MOVE_DIM);
+    memset(switch_mask, 0, FACTORIZED_SWITCH_DIM);
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
+        if (legal_mask[base + i] || legal_mask[base + 4 + i]) {
+            move_mask[i] = 1;
+            kind_mask[0] = 1;
+        }
+    }
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) {
+        if (legal_mask[base + 8 + i]) {
+            switch_mask[i] = 1;
+            kind_mask[1] = 1;
+        }
+    }
+}
+
 static int evaluate_joint_step(
     GruModel* model,
     const float* hidden_state,
@@ -58,45 +127,77 @@ static int evaluate_joint_step(
     float* value_out,
     float* entropy_out
 ) {
-    uint8_t slot_mask[OBS_NUM_ACTIONS];
-    float* policy = NULL;
+    unsigned char kind_mask[FACTORIZED_KIND_DIM];
+    unsigned char move_mask[FACTORIZED_MOVE_DIM];
+    unsigned char switch_mask[FACTORIZED_SWITCH_DIM];
+    unsigned char tera_mask[FACTORIZED_TERA_DIM];
+    float slot0_kind_policy[FACTORIZED_KIND_DIM];
+    float slot0_move_policy[FACTORIZED_MOVE_DIM];
+    float slot0_switch_policy[FACTORIZED_SWITCH_DIM];
+    float slot0_tera_policy[FACTORIZED_TERA_DIM];
+    float slot1_kind_policy[FACTORIZED_KIND_DIM];
+    float slot1_move_policy[FACTORIZED_MOVE_DIM];
+    float slot1_switch_policy[FACTORIZED_SWITCH_DIM];
+    float slot1_tera_policy[FACTORIZED_TERA_DIM];
     float joint_log_prob = 0.0f;
     float entropy = 0.0f;
     float value = 0.0f;
-    size_t action_dim;
-    size_t a;
-    int actions[2];
-    int slots[2];
-    size_t idx;
+    const FactorizedActionChoice* choice;
     if (!model || !hidden_state || !episode || step_index >= episode->count) {
         return 0;
     }
-    action_dim = gru_model_num_actions(model);
-    policy = (float*)malloc(action_dim * sizeof(float));
-    if (!policy) {
+    if (!gru_model_evaluate_factorized_hidden(
+            model,
+            hidden_state,
+            episode->legal_masks + (step_index * OBS_NUM_ACTIONS),
+            slot0_kind_policy,
+            slot0_move_policy,
+            slot0_switch_policy,
+            slot0_tera_policy,
+            slot1_kind_policy,
+            slot1_move_policy,
+            slot1_switch_policy,
+            slot1_tera_policy,
+            &value)) {
         return 0;
     }
-    actions[0] = episode->actions[step_index];
-    actions[1] = episode->actions2[step_index];
-    slots[0] = 0;
-    slots[1] = 1;
-    for (idx = 0; idx < 2; ++idx) {
-        if (actions[idx] < 0) {
-            continue;
-        }
-        build_step_slot_legal_mask(episode, step_index, slots[idx], slot_mask);
-        gru_model_evaluate_hidden(model, hidden_state, slot_mask, policy, &value);
-        joint_log_prob += masked_action_log_prob(policy, actions[idx]);
-        for (a = 0; a < action_dim; ++a) {
-            float p;
-            if (!slot_mask[a]) {
-                continue;
-            }
-            p = policy[a] > 1.0e-8f ? policy[a] : 1.0e-8f;
-            entropy -= p * logf(p);
+    choice = &episode->factorized_actions[step_index];
+    if (choice->slot0_has_action) {
+        build_factor_masks_from_episode(episode, step_index, 0, kind_mask, move_mask, switch_mask);
+        if (choice->slot0_kind == FACTORIZED_ACTION_MOVE) {
+            tera_mask[0] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + (choice->slot0_move_index - 1)] ? 1 : 0;
+            tera_mask[1] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 4 + (choice->slot0_move_index - 1)] ? 1 : 0;
+            joint_log_prob += masked_small_log_prob(slot0_kind_policy, kind_mask, FACTORIZED_KIND_DIM, 0);
+            joint_log_prob += masked_small_log_prob(slot0_move_policy, move_mask, FACTORIZED_MOVE_DIM, choice->slot0_move_index - 1);
+            joint_log_prob += masked_small_log_prob(slot0_tera_policy, tera_mask, FACTORIZED_TERA_DIM, choice->slot0_use_tera ? 1 : 0);
+            entropy += masked_small_entropy(slot0_kind_policy, kind_mask, FACTORIZED_KIND_DIM);
+            entropy += masked_small_entropy(slot0_move_policy, move_mask, FACTORIZED_MOVE_DIM);
+            entropy += masked_small_entropy(slot0_tera_policy, tera_mask, FACTORIZED_TERA_DIM);
+        } else if (choice->slot0_kind == FACTORIZED_ACTION_SWITCH) {
+            joint_log_prob += masked_small_log_prob(slot0_kind_policy, kind_mask, FACTORIZED_KIND_DIM, 1);
+            joint_log_prob += masked_small_log_prob(slot0_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM, choice->slot0_switch_index - 1);
+            entropy += masked_small_entropy(slot0_kind_policy, kind_mask, FACTORIZED_KIND_DIM);
+            entropy += masked_small_entropy(slot0_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM);
         }
     }
-    free(policy);
+    if (choice->slot1_has_action) {
+        build_factor_masks_from_episode(episode, step_index, 1, kind_mask, move_mask, switch_mask);
+        if (choice->slot1_kind == FACTORIZED_ACTION_MOVE) {
+            tera_mask[0] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 14 + (choice->slot1_move_index - 1)] ? 1 : 0;
+            tera_mask[1] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 18 + (choice->slot1_move_index - 1)] ? 1 : 0;
+            joint_log_prob += masked_small_log_prob(slot1_kind_policy, kind_mask, FACTORIZED_KIND_DIM, 0);
+            joint_log_prob += masked_small_log_prob(slot1_move_policy, move_mask, FACTORIZED_MOVE_DIM, choice->slot1_move_index - 1);
+            joint_log_prob += masked_small_log_prob(slot1_tera_policy, tera_mask, FACTORIZED_TERA_DIM, choice->slot1_use_tera ? 1 : 0);
+            entropy += masked_small_entropy(slot1_kind_policy, kind_mask, FACTORIZED_KIND_DIM);
+            entropy += masked_small_entropy(slot1_move_policy, move_mask, FACTORIZED_MOVE_DIM);
+            entropy += masked_small_entropy(slot1_tera_policy, tera_mask, FACTORIZED_TERA_DIM);
+        } else if (choice->slot1_kind == FACTORIZED_ACTION_SWITCH) {
+            joint_log_prob += masked_small_log_prob(slot1_kind_policy, kind_mask, FACTORIZED_KIND_DIM, 1);
+            joint_log_prob += masked_small_log_prob(slot1_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM, choice->slot1_switch_index - 1);
+            entropy += masked_small_entropy(slot1_kind_policy, kind_mask, FACTORIZED_KIND_DIM);
+            entropy += masked_small_entropy(slot1_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM);
+        }
+    }
     if (joint_log_prob_out) {
         *joint_log_prob_out = joint_log_prob;
     }

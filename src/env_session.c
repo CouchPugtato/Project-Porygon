@@ -30,6 +30,82 @@ static float action_log_prob(const float* policy, int action) {
     return logf(p);
 }
 
+static float masked_binary_log_prob(const float* policy, const unsigned char* mask, int choice_index) {
+    float probs[FACTORIZED_TERA_DIM];
+    float sum = 0.0f;
+    size_t i;
+    if (!policy || !mask || choice_index < 0 || choice_index >= FACTORIZED_TERA_DIM || !mask[choice_index]) {
+        return 0.0f;
+    }
+    for (i = 0; i < FACTORIZED_TERA_DIM; ++i) {
+        probs[i] = mask[i] ? policy[i] : 0.0f;
+        sum += probs[i];
+    }
+    if (sum <= 1.0e-8f) {
+        return 0.0f;
+    }
+    probs[choice_index] /= sum;
+    if (probs[choice_index] < 1.0e-8f) {
+        probs[choice_index] = 1.0e-8f;
+    }
+    return logf(probs[choice_index]);
+}
+
+static int sample_small_masked(const float* policy, const unsigned char* mask, size_t n) {
+    float total = 0.0f;
+    float draw;
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        if (mask[i]) {
+            total += policy[i] > 0.0f ? policy[i] : 0.0f;
+        }
+    }
+    if (total <= 1.0e-8f) {
+        for (i = 0; i < n; ++i) {
+            if (mask[i]) {
+                return (int)i;
+            }
+        }
+        return -1;
+    }
+    draw = ((float)rand() / (float)RAND_MAX) * total;
+    for (i = 0; i < n; ++i) {
+        if (!mask[i]) {
+            continue;
+        }
+        draw -= policy[i] > 0.0f ? policy[i] : 0.0f;
+        if (draw <= 0.0f) {
+            return (int)i;
+        }
+    }
+    for (i = 0; i < n; ++i) {
+        if (mask[i]) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void build_runtime_factor_masks(const unsigned char* legal_mask, int slot, unsigned char* kind_mask, unsigned char* move_mask, unsigned char* switch_mask) {
+    int base = slot == 0 ? 0 : 14;
+    int i;
+    memset(kind_mask, 0, FACTORIZED_KIND_DIM);
+    memset(move_mask, 0, FACTORIZED_MOVE_DIM);
+    memset(switch_mask, 0, FACTORIZED_SWITCH_DIM);
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
+        if (legal_mask[base + i] || legal_mask[base + 4 + i]) {
+            move_mask[i] = 1;
+            kind_mask[0] = 1;
+        }
+    }
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) {
+        if (legal_mask[base + 8 + i]) {
+            switch_mask[i] = 1;
+            kind_mask[1] = 1;
+        }
+    }
+}
+
 static EnvSession* find_session(EnvRuntime* runtime, const char* battle_id) {
     size_t i;
     for (i = 0; i < runtime->count; ++i) {
@@ -238,8 +314,14 @@ void env_runtime_free(EnvRuntime* runtime) {
 }
 
 static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
-    float* slot0_policy;
-    float* slot1_policy;
+    float slot0_kind_policy[FACTORIZED_KIND_DIM];
+    float slot0_move_policy[FACTORIZED_MOVE_DIM];
+    float slot0_switch_policy[FACTORIZED_SWITCH_DIM];
+    float slot0_tera_policy[FACTORIZED_TERA_DIM];
+    float slot1_kind_policy[FACTORIZED_KIND_DIM];
+    float slot1_move_policy[FACTORIZED_MOVE_DIM];
+    float slot1_switch_policy[FACTORIZED_SWITCH_DIM];
+    float slot1_tera_policy[FACTORIZED_TERA_DIM];
     float* pair_policy;
     float value;
     int action = -1;
@@ -249,19 +331,22 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     int slot1_needs_action;
     unsigned char slot0_mask[OBS_NUM_ACTIONS];
     unsigned char slot1_mask[OBS_NUM_ACTIONS];
+    unsigned char slot0_kind_mask[FACTORIZED_KIND_DIM];
+    unsigned char slot0_move_mask[FACTORIZED_MOVE_DIM];
+    unsigned char slot0_switch_mask[FACTORIZED_SWITCH_DIM];
+    unsigned char slot1_kind_mask[FACTORIZED_KIND_DIM];
+    unsigned char slot1_move_mask[FACTORIZED_MOVE_DIM];
+    unsigned char slot1_switch_mask[FACTORIZED_SWITCH_DIM];
     char command[256];
     char json[512];
     int i;
     ValidatedRequestChoice validated;
+    FactorizedActionChoice sampled_choice;
     if (!runtime || !session || !out || runtime->replay_only) {
         return 1;
     }
-    slot0_policy = (float*)malloc(OBS_NUM_ACTIONS * sizeof(float));
-    slot1_policy = (float*)malloc(OBS_NUM_ACTIONS * sizeof(float));
     pair_policy = (float*)calloc(OBS_NUM_ACTIONS, sizeof(float));
-    if (!slot0_policy || !slot1_policy || !pair_policy) {
-        free(slot0_policy);
-        free(slot1_policy);
+    if (!pair_policy) {
         free(pair_policy);
         return 0;
     }
@@ -275,8 +360,6 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         fputs(json, out);
         fputc('\n', out);
         fflush(out);
-        free(slot0_policy);
-        free(slot1_policy);
         free(pair_policy);
         return 0;
     }
@@ -284,24 +367,73 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     slot1_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 1);
     build_slot_legal_mask(session->observation.legal_mask, 0, slot0_mask);
     build_slot_legal_mask(session->observation.legal_mask, 1, slot1_mask);
-    gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, slot0_policy, &value);
+    build_runtime_factor_masks(session->observation.legal_mask, 0, slot0_kind_mask, slot0_move_mask, slot0_switch_mask);
+    build_runtime_factor_masks(session->observation.legal_mask, 1, slot1_kind_mask, slot1_move_mask, slot1_switch_mask);
+    factorized_action_choice_init(&sampled_choice);
+    gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, NULL, &value);
+    if (!gru_model_evaluate_factorized_hidden(
+            runtime->model,
+            session->hidden_state,
+            session->observation.legal_mask,
+            slot0_kind_policy,
+            slot0_move_policy,
+            slot0_switch_policy,
+            slot0_tera_policy,
+            slot1_kind_policy,
+            slot1_move_policy,
+            slot1_switch_policy,
+            slot1_tera_policy,
+            &value)) {
+        free(pair_policy);
+        return 0;
+    }
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
+        pair_policy[i] = slot0_kind_policy[0] * slot0_move_policy[i] * (slot0_mask[i] ? slot0_tera_policy[0] : 0.0f);
+        pair_policy[4 + i] = slot0_kind_policy[0] * slot0_move_policy[i] * (slot0_mask[4 + i] ? slot0_tera_policy[1] : 0.0f);
+        pair_policy[14 + i] = slot1_kind_policy[0] * slot1_move_policy[i] * (slot1_mask[i] ? slot1_tera_policy[0] : 0.0f);
+        pair_policy[18 + i] = slot1_kind_policy[0] * slot1_move_policy[i] * (slot1_mask[4 + i] ? slot1_tera_policy[1] : 0.0f);
+    }
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) {
+        pair_policy[8 + i] = slot0_kind_policy[1] * slot0_switch_policy[i];
+        pair_policy[22 + i] = slot1_kind_policy[1] * slot1_switch_policy[i];
+    }
     if (slot0_needs_action) {
-        gru_model_evaluate_hidden(runtime->model, session->hidden_state, slot0_mask, slot0_policy, &value);
-        for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
-            if (slot0_mask[i]) {
-                pair_policy[i] = slot0_policy[i];
-            }
+        int kind = sample_small_masked(slot0_kind_policy, slot0_kind_mask, FACTORIZED_KIND_DIM);
+        sampled_choice.slot0_has_action = 1;
+        if (kind == 0) {
+            unsigned char tera_mask[FACTORIZED_TERA_DIM];
+            int move = sample_small_masked(slot0_move_policy, slot0_move_mask, FACTORIZED_MOVE_DIM);
+            sampled_choice.slot0_kind = FACTORIZED_ACTION_MOVE;
+            sampled_choice.slot0_move_index = (unsigned char)(move + 1);
+            tera_mask[0] = slot0_mask[move] ? 1 : 0;
+            tera_mask[1] = slot0_mask[4 + move] ? 1 : 0;
+            sampled_choice.slot0_use_tera = (unsigned char)(sample_small_masked(slot0_tera_policy, tera_mask, FACTORIZED_TERA_DIM) == 1 ? 1 : 0);
+        } else {
+            int sw = sample_small_masked(slot0_switch_policy, slot0_switch_mask, FACTORIZED_SWITCH_DIM);
+            sampled_choice.slot0_kind = FACTORIZED_ACTION_SWITCH;
+            sampled_choice.slot0_switch_index = (unsigned char)(sw + 1);
         }
-        action = gru_model_sample_action(slot0_policy, slot0_mask, OBS_NUM_ACTIONS);
     }
     if (slot1_needs_action) {
-        gru_model_evaluate_hidden(runtime->model, session->hidden_state, slot1_mask, slot1_policy, &value);
-        for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
-            if (slot1_mask[i]) {
-                pair_policy[i] = slot1_policy[i];
-            }
+        int kind = sample_small_masked(slot1_kind_policy, slot1_kind_mask, FACTORIZED_KIND_DIM);
+        sampled_choice.slot1_has_action = 1;
+        if (kind == 0) {
+            unsigned char tera_mask[FACTORIZED_TERA_DIM];
+            int move = sample_small_masked(slot1_move_policy, slot1_move_mask, FACTORIZED_MOVE_DIM);
+            sampled_choice.slot1_kind = FACTORIZED_ACTION_MOVE;
+            sampled_choice.slot1_move_index = (unsigned char)(move + 1);
+            tera_mask[0] = slot1_mask[move] ? 1 : 0;
+            tera_mask[1] = slot1_mask[4 + move] ? 1 : 0;
+            sampled_choice.slot1_use_tera = (unsigned char)(sample_small_masked(slot1_tera_policy, tera_mask, FACTORIZED_TERA_DIM) == 1 ? 1 : 0);
+        } else {
+            int sw = sample_small_masked(slot1_switch_policy, slot1_switch_mask, FACTORIZED_SWITCH_DIM);
+            sampled_choice.slot1_kind = FACTORIZED_ACTION_SWITCH;
+            sampled_choice.slot1_switch_index = (unsigned char)(sw + 1);
         }
-        action2 = gru_model_sample_action(slot1_policy, slot1_mask, OBS_NUM_ACTIONS);
+    }
+    if (!factorized_action_choice_to_flat_actions(&sampled_choice, &action, &action2)) {
+        free(pair_policy);
+        return 0;
     }
     if (!validate_or_resample_request_choice(
             &session->parsed_request,
@@ -312,8 +444,6 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             slot1_needs_action,
             (enum ObsAction)(action2 >= 0 ? action2 : OBS_A2_MOVE1),
             &validated)) {
-        free(slot0_policy);
-        free(slot1_policy);
         free(pair_policy);
         runtime_emit_error_json(json, sizeof(json), session->battle_id, "failed to validate or resample request choice");
         fputs(json, out);
@@ -323,19 +453,39 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     }
     action = validated.slot0_has_action ? (int)validated.action0 : -1;
     action2 = validated.slot1_has_action ? (int)validated.action1 : -1;
+    factorized_action_choice_from_flat_actions(&session->pending_factorized_choice, action, action2);
     session->pending_old_log_prob = 0.0f;
-    if (action >= 0) {
-        session->pending_old_log_prob += action_log_prob(slot0_policy, action);
+    if (session->pending_factorized_choice.slot0_has_action) {
+        if (session->pending_factorized_choice.slot0_kind == FACTORIZED_ACTION_MOVE) {
+            unsigned char tera_mask[FACTORIZED_TERA_DIM] = {
+                slot0_mask[session->pending_factorized_choice.slot0_move_index - 1] ? 1 : 0,
+                slot0_mask[4 + session->pending_factorized_choice.slot0_move_index - 1] ? 1 : 0
+            };
+            session->pending_old_log_prob += action_log_prob(slot0_kind_policy, 0);
+            session->pending_old_log_prob += action_log_prob(slot0_move_policy, session->pending_factorized_choice.slot0_move_index - 1);
+            session->pending_old_log_prob += masked_binary_log_prob(slot0_tera_policy, tera_mask, session->pending_factorized_choice.slot0_use_tera ? 1 : 0);
+        } else {
+            session->pending_old_log_prob += action_log_prob(slot0_kind_policy, 1);
+            session->pending_old_log_prob += action_log_prob(slot0_switch_policy, session->pending_factorized_choice.slot0_switch_index - 1);
+        }
     }
-    if (action2 >= 0) {
-        session->pending_old_log_prob += action_log_prob(slot1_policy, action2);
+    if (session->pending_factorized_choice.slot1_has_action) {
+        if (session->pending_factorized_choice.slot1_kind == FACTORIZED_ACTION_MOVE) {
+            unsigned char tera_mask[FACTORIZED_TERA_DIM] = {
+                slot1_mask[session->pending_factorized_choice.slot1_move_index - 1] ? 1 : 0,
+                slot1_mask[4 + session->pending_factorized_choice.slot1_move_index - 1] ? 1 : 0
+            };
+            session->pending_old_log_prob += action_log_prob(slot1_kind_policy, 0);
+            session->pending_old_log_prob += action_log_prob(slot1_move_policy, session->pending_factorized_choice.slot1_move_index - 1);
+            session->pending_old_log_prob += masked_binary_log_prob(slot1_tera_policy, tera_mask, session->pending_factorized_choice.slot1_use_tera ? 1 : 0);
+        } else {
+            session->pending_old_log_prob += action_log_prob(slot1_kind_policy, 1);
+            session->pending_old_log_prob += action_log_prob(slot1_switch_policy, session->pending_factorized_choice.slot1_switch_index - 1);
+        }
     }
     session->pending_old_value = value;
-    factorized_action_choice_from_flat_actions(&session->pending_factorized_choice, action, action2);
     strncpy(command, validated.command, sizeof(command) - 1);
     command[sizeof(command) - 1] = '\0';
-    free(slot0_policy);
-    free(slot1_policy);
     free(pair_policy);
     session->pending_action = action;
     session->pending_action2 = action2;

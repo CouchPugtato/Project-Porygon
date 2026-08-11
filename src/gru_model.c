@@ -869,6 +869,40 @@ static void evaluate_hidden_internal(
     }
 }
 
+static void bootstrap_factorized_heads_from_flat(GruModel* model) {
+    size_t h;
+    int i;
+    if (!model) {
+        return;
+    }
+    for (h = 0; h < model->hidden_dim; ++h) {
+        model->slot0_kind_head.data[0 * model->hidden_dim + h] = 0.5f * (model->policy_head.data[0 * model->hidden_dim + h] + model->policy_head.data[4 * model->hidden_dim + h]);
+        model->slot0_kind_head.data[1 * model->hidden_dim + h] = (model->policy_head.data[8 * model->hidden_dim + h] + model->policy_head.data[9 * model->hidden_dim + h] + model->policy_head.data[10 * model->hidden_dim + h] + model->policy_head.data[11 * model->hidden_dim + h] + model->policy_head.data[12 * model->hidden_dim + h] + model->policy_head.data[13 * model->hidden_dim + h]) / 6.0f;
+        model->slot1_kind_head.data[0 * model->hidden_dim + h] = 0.5f * (model->policy_head.data[14 * model->hidden_dim + h] + model->policy_head.data[18 * model->hidden_dim + h]);
+        model->slot1_kind_head.data[1 * model->hidden_dim + h] = (model->policy_head.data[22 * model->hidden_dim + h] + model->policy_head.data[23 * model->hidden_dim + h] + model->policy_head.data[24 * model->hidden_dim + h] + model->policy_head.data[25 * model->hidden_dim + h] + model->policy_head.data[26 * model->hidden_dim + h] + model->policy_head.data[27 * model->hidden_dim + h]) / 6.0f;
+    }
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
+        memcpy(model->slot0_move_head.data + (i * model->hidden_dim), model->policy_head.data + (i * model->hidden_dim), model->hidden_dim * sizeof(float));
+        memcpy(model->slot1_move_head.data + (i * model->hidden_dim), model->policy_head.data + ((14 + i) * model->hidden_dim), model->hidden_dim * sizeof(float));
+        model->slot0_move_bias[i] = model->policy_bias[i];
+        model->slot1_move_bias[i] = model->policy_bias[14 + i];
+    }
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) {
+        memcpy(model->slot0_switch_head.data + (i * model->hidden_dim), model->policy_head.data + ((8 + i) * model->hidden_dim), model->hidden_dim * sizeof(float));
+        memcpy(model->slot1_switch_head.data + (i * model->hidden_dim), model->policy_head.data + ((22 + i) * model->hidden_dim), model->hidden_dim * sizeof(float));
+        model->slot0_switch_bias[i] = model->policy_bias[8 + i];
+        model->slot1_switch_bias[i] = model->policy_bias[22 + i];
+    }
+    model->slot0_kind_bias[0] = 0.5f * (model->policy_bias[0] + model->policy_bias[4]);
+    model->slot0_kind_bias[1] = (model->policy_bias[8] + model->policy_bias[9] + model->policy_bias[10] + model->policy_bias[11] + model->policy_bias[12] + model->policy_bias[13]) / 6.0f;
+    model->slot1_kind_bias[0] = 0.5f * (model->policy_bias[14] + model->policy_bias[18]);
+    model->slot1_kind_bias[1] = (model->policy_bias[22] + model->policy_bias[23] + model->policy_bias[24] + model->policy_bias[25] + model->policy_bias[26] + model->policy_bias[27]) / 6.0f;
+    model->slot0_tera_bias[0] = 0.0f;
+    model->slot0_tera_bias[1] = 0.0f;
+    model->slot1_tera_bias[0] = 0.0f;
+    model->slot1_tera_bias[1] = 0.0f;
+}
+
 GruModel* gru_model_create(size_t input_dim, size_t hidden_dim, size_t num_actions) {
     GruModel* model;
     float x_scale;
@@ -2172,6 +2206,14 @@ size_t gru_model_parameter_count(const GruModel* model) {
         model->hidden_dim +
         model->policy_head.rows * model->policy_head.cols +
         model->num_actions +
+        model->slot0_kind_head.rows * model->slot0_kind_head.cols + FACTORIZED_KIND_DIM +
+        model->slot0_move_head.rows * model->slot0_move_head.cols + FACTORIZED_MOVE_DIM +
+        model->slot0_switch_head.rows * model->slot0_switch_head.cols + FACTORIZED_SWITCH_DIM +
+        model->slot0_tera_head.rows * model->slot0_tera_head.cols + FACTORIZED_TERA_DIM +
+        model->slot1_kind_head.rows * model->slot1_kind_head.cols + FACTORIZED_KIND_DIM +
+        model->slot1_move_head.rows * model->slot1_move_head.cols + FACTORIZED_MOVE_DIM +
+        model->slot1_switch_head.rows * model->slot1_switch_head.cols + FACTORIZED_SWITCH_DIM +
+        model->slot1_tera_head.rows * model->slot1_tera_head.cols + FACTORIZED_TERA_DIM +
         model->hidden_dim +
         1;
 }
@@ -2202,6 +2244,22 @@ int gru_model_export_parameters(const GruModel* model, float* out, size_t count)
     copy_out(out, &idx, model->bn, model->hidden_dim);
     copy_out(out, &idx, model->policy_head.data, model->policy_head.rows * model->policy_head.cols);
     copy_out(out, &idx, model->policy_bias, model->num_actions);
+    copy_out(out, &idx, model->slot0_kind_head.data, model->slot0_kind_head.rows * model->slot0_kind_head.cols);
+    copy_out(out, &idx, model->slot0_kind_bias, FACTORIZED_KIND_DIM);
+    copy_out(out, &idx, model->slot0_move_head.data, model->slot0_move_head.rows * model->slot0_move_head.cols);
+    copy_out(out, &idx, model->slot0_move_bias, FACTORIZED_MOVE_DIM);
+    copy_out(out, &idx, model->slot0_switch_head.data, model->slot0_switch_head.rows * model->slot0_switch_head.cols);
+    copy_out(out, &idx, model->slot0_switch_bias, FACTORIZED_SWITCH_DIM);
+    copy_out(out, &idx, model->slot0_tera_head.data, model->slot0_tera_head.rows * model->slot0_tera_head.cols);
+    copy_out(out, &idx, model->slot0_tera_bias, FACTORIZED_TERA_DIM);
+    copy_out(out, &idx, model->slot1_kind_head.data, model->slot1_kind_head.rows * model->slot1_kind_head.cols);
+    copy_out(out, &idx, model->slot1_kind_bias, FACTORIZED_KIND_DIM);
+    copy_out(out, &idx, model->slot1_move_head.data, model->slot1_move_head.rows * model->slot1_move_head.cols);
+    copy_out(out, &idx, model->slot1_move_bias, FACTORIZED_MOVE_DIM);
+    copy_out(out, &idx, model->slot1_switch_head.data, model->slot1_switch_head.rows * model->slot1_switch_head.cols);
+    copy_out(out, &idx, model->slot1_switch_bias, FACTORIZED_SWITCH_DIM);
+    copy_out(out, &idx, model->slot1_tera_head.data, model->slot1_tera_head.rows * model->slot1_tera_head.cols);
+    copy_out(out, &idx, model->slot1_tera_bias, FACTORIZED_TERA_DIM);
     copy_out(out, &idx, model->value_head, model->hidden_dim);
     out[idx++] = model->value_bias;
     return idx == gru_model_parameter_count(model);
@@ -2209,7 +2267,20 @@ int gru_model_export_parameters(const GruModel* model, float* out, size_t count)
 
 int gru_model_import_parameters(GruModel* model, const float* in, size_t count) {
     size_t idx = 0;
-    if (!model || !in || count < gru_model_parameter_count(model)) {
+    size_t legacy_count;
+    if (!model || !in) {
+        return 0;
+    }
+    legacy_count =
+        model->wzx.rows * model->wzx.cols +
+        model->wzh.rows * model->wzh.cols + model->hidden_dim +
+        model->wrx.rows * model->wrx.cols +
+        model->wrh.rows * model->wrh.cols + model->hidden_dim +
+        model->wnx.rows * model->wnx.cols +
+        model->wnh.rows * model->wnh.cols + model->hidden_dim +
+        model->policy_head.rows * model->policy_head.cols + model->num_actions +
+        model->hidden_dim + 1;
+    if (count < legacy_count) {
         return 0;
     }
     copy_in(model->wzx.data, in, &idx, model->wzx.rows * model->wzx.cols);
@@ -2223,7 +2294,27 @@ int gru_model_import_parameters(GruModel* model, const float* in, size_t count) 
     copy_in(model->bn, in, &idx, model->hidden_dim);
     copy_in(model->policy_head.data, in, &idx, model->policy_head.rows * model->policy_head.cols);
     copy_in(model->policy_bias, in, &idx, model->num_actions);
+    if (count >= gru_model_parameter_count(model)) {
+        copy_in(model->slot0_kind_head.data, in, &idx, model->slot0_kind_head.rows * model->slot0_kind_head.cols);
+        copy_in(model->slot0_kind_bias, in, &idx, FACTORIZED_KIND_DIM);
+        copy_in(model->slot0_move_head.data, in, &idx, model->slot0_move_head.rows * model->slot0_move_head.cols);
+        copy_in(model->slot0_move_bias, in, &idx, FACTORIZED_MOVE_DIM);
+        copy_in(model->slot0_switch_head.data, in, &idx, model->slot0_switch_head.rows * model->slot0_switch_head.cols);
+        copy_in(model->slot0_switch_bias, in, &idx, FACTORIZED_SWITCH_DIM);
+        copy_in(model->slot0_tera_head.data, in, &idx, model->slot0_tera_head.rows * model->slot0_tera_head.cols);
+        copy_in(model->slot0_tera_bias, in, &idx, FACTORIZED_TERA_DIM);
+        copy_in(model->slot1_kind_head.data, in, &idx, model->slot1_kind_head.rows * model->slot1_kind_head.cols);
+        copy_in(model->slot1_kind_bias, in, &idx, FACTORIZED_KIND_DIM);
+        copy_in(model->slot1_move_head.data, in, &idx, model->slot1_move_head.rows * model->slot1_move_head.cols);
+        copy_in(model->slot1_move_bias, in, &idx, FACTORIZED_MOVE_DIM);
+        copy_in(model->slot1_switch_head.data, in, &idx, model->slot1_switch_head.rows * model->slot1_switch_head.cols);
+        copy_in(model->slot1_switch_bias, in, &idx, FACTORIZED_SWITCH_DIM);
+        copy_in(model->slot1_tera_head.data, in, &idx, model->slot1_tera_head.rows * model->slot1_tera_head.cols);
+        copy_in(model->slot1_tera_bias, in, &idx, FACTORIZED_TERA_DIM);
+    } else {
+        bootstrap_factorized_heads_from_flat(model);
+    }
     copy_in(model->value_head, in, &idx, model->hidden_dim);
     model->value_bias = in[idx++];
-    return idx == gru_model_parameter_count(model);
+    return idx == count;
 }
