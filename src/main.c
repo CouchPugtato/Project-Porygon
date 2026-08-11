@@ -2142,6 +2142,7 @@ static int train_from_input_file(
     float rl_gamma,
     float rl_entropy_coef,
     int rl_advantage_norm,
+    float gae_lambda,
     float ppo_clip_epsilon,
     float ppo_value_clip_epsilon,
     float ppo_target_kl,
@@ -2249,6 +2250,7 @@ static int train_from_input_file(
         trainer.gamma = rl_gamma;
         trainer.entropy_coef = rl_entropy_coef;
         trainer.advantage_norm = rl_advantage_norm ? 1 : 0;
+        trainer.gae_lambda = gae_lambda;
         trainer.ppo_clip_epsilon = ppo_clip_epsilon;
         trainer.ppo_value_clip_epsilon = ppo_value_clip_epsilon;
         trainer.target_kl = ppo_target_kl;
@@ -2309,6 +2311,7 @@ static int train_from_input_file(
 
     for (epoch = 1; epoch <= epochs; ++epoch) {
         size_t trained_in_epoch = 0;
+        int ppo_early_stop = 0;
         float val_action_loss = 0.0f;
         float val_value_loss = 0.0f;
         float val_accuracy = 0.0f;
@@ -2342,6 +2345,13 @@ static int train_from_input_file(
                 }
                 rl_training_summary_record_episode(&rl_summary, &runtime.sessions[session_index].episode);
                 rl_training_summary_record_trainer(&rl_summary, &trainer);
+                if (ppo_mode && trainer.target_kl > 0.0f && trainer.last_approx_kl > trainer.target_kl) {
+                    printf("[train-ppo] early stop epoch=%d reason=target_kl_exceeded approx_kl=%.4f target_kl=%.4f\n",
+                        epoch,
+                        trainer.last_approx_kl,
+                        trainer.target_kl);
+                    ppo_early_stop = 1;
+                }
             } else {
                 if (!gru_trainer_supervised_episode(&trainer, model, &runtime.sessions[session_index].episode)) {
                     fprintf(stderr, "Failed supervised training episode\n");
@@ -2412,6 +2422,9 @@ static int train_from_input_file(
                         episodes_per_sec);
                 }
                 fflush(stdout);
+            }
+            if (ppo_early_stop) {
+                break;
             }
             if (!rl_mode && ((trained_in_epoch % 500u) == 0u || trained_in_epoch == train_sessions)) {
                 TrainerCheckpointState periodic_state = gru_trainer_checkpoint_state(&trainer);
@@ -2615,6 +2628,7 @@ static int showdown_client_main(int argc, char** argv) {
     float rl_gamma = parse_float_flag(argc, argv, "--gamma", 1.0f);
     float rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef", 0.001f);
     int rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", 1);
+    float gae_lambda = parse_float_flag(argc, argv, "--gae-lambda", 0.95f);
     float ppo_clip_epsilon = parse_float_flag(argc, argv, "--ppo-clip-epsilon", 0.2f);
     float ppo_value_clip_epsilon = parse_float_flag(argc, argv, "--ppo-value-clip-epsilon", 0.2f);
     float ppo_target_kl = parse_float_flag(argc, argv, "--target-kl", 0.02f);
@@ -2690,6 +2704,7 @@ static int showdown_client_main(int argc, char** argv) {
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            gae_lambda,
             ppo_clip_epsilon,
             ppo_value_clip_epsilon,
             ppo_target_kl,
@@ -2713,6 +2728,7 @@ static int showdown_client_main(int argc, char** argv) {
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            gae_lambda,
             ppo_clip_epsilon,
             ppo_value_clip_epsilon,
             ppo_target_kl,
@@ -2736,6 +2752,7 @@ static int showdown_client_main(int argc, char** argv) {
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            gae_lambda,
             ppo_clip_epsilon,
             ppo_value_clip_epsilon,
             ppo_target_kl,
@@ -2759,6 +2776,7 @@ static int showdown_client_main(int argc, char** argv) {
             rl_gamma,
             rl_entropy_coef,
             rl_advantage_norm,
+            gae_lambda,
             ppo_clip_epsilon,
             ppo_value_clip_epsilon,
             ppo_target_kl,

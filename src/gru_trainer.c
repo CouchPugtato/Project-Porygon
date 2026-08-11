@@ -29,6 +29,7 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
     trainer->ppo_clip_epsilon = 0.2f;
     trainer->ppo_value_clip_epsilon = 0.2f;
     trainer->target_kl = 0.02f;
+    trainer->gae_lambda = 0.95f;
     trainer->supervised_minibatch_size = 8;
     trainer->supervised_profile_enabled = 1;
 }
@@ -848,7 +849,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
     float* hidden = NULL;
     float* next_hidden = NULL;
     float* hidden_after = NULL;
-    float reward_to_go = 0.0f;
+    float gae = 0.0f;
     float advantage_sum = 0.0f;
     float return_sum = 0.0f;
     float mean_value_sum = 0.0f;
@@ -910,9 +911,16 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
 
     for (t = episode->count; t > 0; --t) {
         size_t idx = t - 1;
-        reward_to_go = episode->rewards[idx] + trainer->gamma * reward_to_go * (episode->dones[idx] ? 0.0f : 1.0f);
-        returns[idx] = reward_to_go;
-        advantages[idx] = returns[idx] - episode->old_values[idx];
+        float next_value = 0.0f;
+        float nonterminal = episode->dones[idx] ? 0.0f : 1.0f;
+        float delta;
+        if (idx + 1 < episode->count) {
+            next_value = episode->old_values[idx + 1];
+        }
+        delta = episode->rewards[idx] + trainer->gamma * next_value * nonterminal - episode->old_values[idx];
+        gae = delta + trainer->gamma * trainer->gae_lambda * nonterminal * gae;
+        advantages[idx] = gae;
+        returns[idx] = advantages[idx] + episode->old_values[idx];
     }
 
     if (trainer->advantage_norm && episode->count > 1) {
@@ -945,6 +953,11 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         float approx_kl;
         float surrogate_a;
         float surrogate_b;
+        float value_delta;
+        float clipped_value_target;
+        float unclipped_value_loss;
+        float clipped_value_loss;
+        float value_target;
         size_t start;
         size_t steps;
         const float* initial_hidden;
@@ -979,13 +992,24 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
             effective_advantage = ratio * advantages[t];
         }
         approx_kl = episode->old_log_probs[t] - current_log_prob;
+        value_delta = returns[t] - episode->old_values[t];
+        if (value_delta < -trainer->ppo_value_clip_epsilon) {
+            value_delta = -trainer->ppo_value_clip_epsilon;
+        }
+        if (value_delta > trainer->ppo_value_clip_epsilon) {
+            value_delta = trainer->ppo_value_clip_epsilon;
+        }
+        clipped_value_target = episode->old_values[t] + value_delta;
+        unclipped_value_loss = 0.5f * (current_value - returns[t]) * (current_value - returns[t]);
+        clipped_value_loss = 0.5f * (current_value - clipped_value_target) * (current_value - clipped_value_target);
+        value_target = unclipped_value_loss >= clipped_value_loss ? returns[t] : clipped_value_target;
         approx_kl_sum += approx_kl;
         if ((advantages[t] >= 0.0f && surrogate_b < surrogate_a) ||
                 (advantages[t] < 0.0f && surrogate_b < surrogate_a)) {
             clip_fraction_sum += 1.0f;
         }
         policy_loss_sum += -(surrogate_a < surrogate_b ? surrogate_a : surrogate_b);
-        value_loss_sum += 0.5f * (current_value - returns[t]) * (current_value - returns[t]);
+        value_loss_sum += unclipped_value_loss >= clipped_value_loss ? unclipped_value_loss : clipped_value_loss;
         entropy_sum += current_entropy;
         advantage_sum += advantages[t];
         abs_advantage_sum += fabsf(advantages[t]);
@@ -1009,7 +1033,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
                         slot_mask_b,
                         episode->actions2[t],
                         effective_advantage,
-                        returns[t],
+                        value_target,
                         trainer->entropy_coef,
                         trainer->learning_rate)) {
                     free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
@@ -1028,7 +1052,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
                         slot_mask_a,
                         episode->actions[t],
                         effective_advantage,
-                        returns[t],
+                        value_target,
                         trainer->entropy_coef,
                         trainer->learning_rate)) {
                     free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
@@ -1047,7 +1071,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
                         slot_mask_b,
                         episode->actions2[t],
                         effective_advantage,
-                        returns[t],
+                        value_target,
                         trainer->entropy_coef,
                         trainer->learning_rate)) {
                     free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
