@@ -11,6 +11,7 @@ from pathlib import Path
 DEFAULT_REGISTRY_PATH = Path("models") / "league" / "league_registry.json"
 DEFAULT_MAX_ACTIVE_MEMBERS = 5
 VALID_MEMBER_STATUSES = {"candidate", "active", "inactive", "rejected"}
+VALID_MEMBER_ROLES = {"main", "main_exploiter", "league_exploiter", "historical_snapshot", "champion"}
 PROMOTABLE_STATUSES = {"candidate", "active"}
 
 
@@ -78,11 +79,15 @@ class LeagueMember:
     generation: int
     status: str
     collection_weight: float
+    role: str = "main"
     notes: str = ""
     parent_id: str = ""
+    exploit_target_id: str = ""
     regime: str = ""
     source_run: str = ""
     experiment_id: str = ""
+    training_config_id: str = ""
+    snapshot_eligible: bool = True
     eval: LeagueEval = field(default_factory=LeagueEval)
     promoted_at: str = ""
     created_at: str = field(default_factory=utc_now_iso)
@@ -103,11 +108,15 @@ def member_to_json_dict(member: LeagueMember) -> dict[str, object]:
         "generation": member.generation,
         "status": member.status,
         "collection_weight": member.collection_weight,
+        "role": member.role,
         "notes": member.notes,
         "parent_id": member.parent_id,
+        "exploit_target_id": member.exploit_target_id,
         "regime": member.regime,
         "source_run": member.source_run,
         "experiment_id": member.experiment_id,
+        "training_config_id": member.training_config_id,
+        "snapshot_eligible": member.snapshot_eligible,
         "eval": {
             "vs_random_win_rate": member.eval.vs_random_win_rate,
             "vs_champion_win_rate": member.eval.vs_champion_win_rate,
@@ -145,11 +154,15 @@ def league_member_from_json(raw: dict[str, object]) -> LeagueMember:
         generation=int(raw.get("generation", 0)),
         status=str(raw.get("status", "")).strip(),
         collection_weight=float(raw.get("collection_weight", 0.0)),
+        role=str(raw.get("role", "main")).strip() or "main",
         notes=str(raw.get("notes", "")),
         parent_id=str(raw.get("parent_id", "")).strip(),
+        exploit_target_id=str(raw.get("exploit_target_id", "")).strip(),
         regime=str(raw.get("regime", "")).strip(),
         source_run=str(raw.get("source_run", "")).strip(),
         experiment_id=str(raw.get("experiment_id", "")).strip(),
+        training_config_id=str(raw.get("training_config_id", "")).strip(),
+        snapshot_eligible=bool(raw.get("snapshot_eligible", True)),
         eval=league_eval_from_json(raw.get("eval")),
         promoted_at=str(raw.get("promoted_at", "")),
         created_at=str(raw.get("created_at", "")),
@@ -235,8 +248,12 @@ def validate_registry(registry: LeagueRegistry) -> None:
             raise SystemExit(f"invalid registry member '{member.id}': bad status '{member.status}'")
         if member.collection_weight <= 0.0:
             raise SystemExit(f"invalid registry member '{member.id}': collection_weight must be > 0")
+        if member.role not in VALID_MEMBER_ROLES:
+            raise SystemExit(f"invalid registry member '{member.id}': bad role '{member.role}'")
         if member.parent_id and member.parent_id == member.id:
             raise SystemExit(f"invalid registry member '{member.id}': parent_id cannot self-reference")
+        if member.exploit_target_id and member.exploit_target_id == member.id:
+            raise SystemExit(f"invalid registry member '{member.id}': exploit_target_id cannot self-reference")
         if member.eval.vs_random_win_rate is not None and not (0.0 <= member.eval.vs_random_win_rate <= 1.0):
             raise SystemExit(f"invalid registry member '{member.id}': vs_random_win_rate must be between 0 and 1")
         if member.eval.vs_champion_win_rate is not None and not (0.0 <= member.eval.vs_champion_win_rate <= 1.0):
@@ -249,6 +266,10 @@ def validate_registry(registry: LeagueRegistry) -> None:
         if member.parent_id and member.parent_id not in ids:
             raise SystemExit(
                 f"invalid registry member '{member.id}': parent_id references unknown member '{member.parent_id}'"
+            )
+        if member.exploit_target_id and member.exploit_target_id not in ids:
+            raise SystemExit(
+                f"invalid registry member '{member.id}': exploit_target_id references unknown member '{member.exploit_target_id}'"
             )
     if registry.champion_id:
         if registry.champion_id not in ids:
@@ -340,7 +361,7 @@ def print_registry_summary(registry: LeagueRegistry) -> None:
     for member in sorted(registry.members, key=lambda item: (item.generation, item.id)):
         print(
             f"  - id={member.id} generation={member.generation} status={member_public_status(registry, member)} "
-            f"weight={member.collection_weight:g} path={member.path} regime={member.regime or '(unset)'}"
+            f"role={member.role} weight={member.collection_weight:g} path={member.path} regime={member.regime or '(unset)'}"
             f" source_run={member.source_run or '(unset)'}"
         )
 
@@ -379,11 +400,15 @@ def command_add_checkpoint(args: argparse.Namespace) -> None:
         generation=generation,
         status=status,
         collection_weight=args.collection_weight,
+        role=args.role,
         notes=args.notes,
         parent_id=parent_id,
+        exploit_target_id=args.exploit_target_id,
         regime=args.regime,
         source_run=args.source_run,
         experiment_id=args.experiment_id,
+        training_config_id=args.training_config_id,
+        snapshot_eligible=args.snapshot_eligible,
         created_at=utc_now_iso(),
     )
     registry.members.append(member)
@@ -399,6 +424,8 @@ def command_update_member(args: argparse.Namespace) -> None:
     member = find_member(registry, args.id)
     if args.collection_weight is not None:
         member.collection_weight = args.collection_weight
+    if args.role is not None:
+        member.role = args.role
     if args.status is not None:
         member.status = "active" if args.status == "champion" else args.status
     if args.notes is not None:
@@ -408,12 +435,21 @@ def command_update_member(args: argparse.Namespace) -> None:
         if parent_id:
             find_member(registry, parent_id)
         member.parent_id = parent_id
+    if args.exploit_target_id is not None:
+        exploit_target_id = args.exploit_target_id.strip()
+        if exploit_target_id:
+            find_member(registry, exploit_target_id)
+        member.exploit_target_id = exploit_target_id
     if args.regime is not None:
         member.regime = args.regime
     if args.source_run is not None:
         member.source_run = args.source_run
     if args.experiment_id is not None:
         member.experiment_id = args.experiment_id
+    if args.training_config_id is not None:
+        member.training_config_id = args.training_config_id
+    if args.snapshot_eligible is not None:
+        member.snapshot_eligible = args.snapshot_eligible
     if args.vs_random_win_rate is not None:
         member.eval.vs_random_win_rate = args.vs_random_win_rate
     if args.vs_champion_win_rate is not None:
@@ -498,10 +534,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--generation", type=nonnegative_int, default=None)
     add_parser.add_argument("--collection-weight", type=positive_float, default=1.0)
     add_parser.add_argument("--status", choices=["candidate", "active", "inactive", "rejected", "champion"], default="candidate")
+    add_parser.add_argument("--role", choices=sorted(VALID_MEMBER_ROLES), default="main")
     add_parser.add_argument("--parent-id", default="")
+    add_parser.add_argument("--exploit-target-id", default="")
     add_parser.add_argument("--regime", choices=["supervised", "rl"], default="")
     add_parser.add_argument("--source-run", default="")
     add_parser.add_argument("--experiment-id", default="")
+    add_parser.add_argument("--training-config-id", default="")
+    add_parser.add_argument("--snapshot-eligible", type=parse_bool01, default=True)
     add_parser.add_argument("--notes", default="")
     add_parser.set_defaults(func=command_add_checkpoint)
 
@@ -510,11 +550,15 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--id", required=True)
     update_parser.add_argument("--collection-weight", type=positive_float, default=None)
     update_parser.add_argument("--status", choices=["candidate", "active", "inactive", "rejected", "champion"], default=None)
+    update_parser.add_argument("--role", choices=sorted(VALID_MEMBER_ROLES), default=None)
     update_parser.add_argument("--notes", default=None)
     update_parser.add_argument("--parent-id", default=None)
+    update_parser.add_argument("--exploit-target-id", default=None)
     update_parser.add_argument("--regime", choices=["supervised", "rl"], default=None)
     update_parser.add_argument("--source-run", default=None)
     update_parser.add_argument("--experiment-id", default=None)
+    update_parser.add_argument("--training-config-id", default=None)
+    update_parser.add_argument("--snapshot-eligible", type=parse_bool01, default=None)
     update_parser.add_argument("--vs-random-win-rate", type=win_rate_float, default=None)
     update_parser.add_argument("--vs-champion-win-rate", type=win_rate_float, default=None)
     update_parser.add_argument("--eval-summary-path", default=None)
