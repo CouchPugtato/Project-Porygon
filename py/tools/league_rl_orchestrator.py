@@ -110,6 +110,10 @@ def run_command(command: list[str], cwd: Path) -> None:
         raise SystemExit(completed.returncode)
 
 
+def registry_has_member(registry: LeagueRegistry, member_id: str) -> bool:
+    return any(member.id == member_id for member in registry.members)
+
+
 def utc_now_unix() -> float:
     return time.time()
 
@@ -267,6 +271,10 @@ def build_live_command(args: argparse.Namespace, repo_root: Path, pool_path: Pat
         str(args.min_available_pagefile_gb),
         "--stop-on-collapse",
         "true" if args.stop_on_collapse else "false",
+        "--omp-threads",
+        str(args.omp_threads),
+        "--resume",
+        "true" if args.resume else "false",
     ]
     return command
 
@@ -396,6 +404,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-available-memory-gb", type=float, default=3.0)
     parser.add_argument("--min-available-pagefile-gb", type=float, default=6.0)
     parser.add_argument("--stop-on-collapse", type=parse_bool, default=True)
+    parser.add_argument("--omp-threads", type=int, default=8)
+    parser.add_argument("--resume", type=parse_bool, default=True)
     parser.add_argument("--include-random-weight", type=float, default=0.0)
     parser.add_argument("--eval-games", type=positive_int, default=500)
     parser.add_argument("--eval-concurrent-games", type=positive_int, default=40)
@@ -426,17 +436,27 @@ def main() -> None:
     pool_payload = build_weighted_pool(registry, args.learner_role, parent_member.id, args.include_random_weight)
     write_json(pool_path, pool_payload)
 
-    workflow_manifest: dict[str, object] = {
-        "run_name": args.run_name,
-        "status": "running",
-        "started_at_unix": utc_now_unix(),
-        "registry": str(registry_path),
-        "learner_role": args.learner_role,
-        "parent_id": parent_member.id,
-        "parent_checkpoint": parent_member.path,
-        "pool_path": str(pool_path),
-        "pool_payload": pool_payload,
-    }
+    if args.resume and workflow_manifest_path.exists():
+        workflow_manifest = load_json(workflow_manifest_path)
+        workflow_manifest["status"] = "running"
+        workflow_manifest["resumed_at_unix"] = utc_now_unix()
+        workflow_manifest["parent_id"] = parent_member.id
+        workflow_manifest["parent_checkpoint"] = parent_member.path
+        workflow_manifest["pool_path"] = str(pool_path)
+        workflow_manifest["pool_payload"] = pool_payload
+        log(f"resuming league workflow from {workflow_manifest_path}")
+    else:
+        workflow_manifest = {
+            "run_name": args.run_name,
+            "status": "running",
+            "started_at_unix": utc_now_unix(),
+            "registry": str(registry_path),
+            "learner_role": args.learner_role,
+            "parent_id": parent_member.id,
+            "parent_checkpoint": parent_member.path,
+            "pool_path": str(pool_path),
+            "pool_payload": pool_payload,
+        }
     write_json(workflow_manifest_path, workflow_manifest)
 
     live_command = build_live_command(args, repo_root, pool_path, Path(parent_member.path))
@@ -461,14 +481,19 @@ def main() -> None:
         eval_command = build_eval_command(args, repo_root, candidate_checkpoint, Path(champion.path))
         workflow_manifest["eval_command"] = eval_command
         write_json(workflow_manifest_path, workflow_manifest)
-        run_command(eval_command, repo_root)
         eval_summary_path = (repo_root / "matches" / "runs" / args.eval_run_name / f"{args.eval_run_name}_summary.json").resolve()
+        if not (args.resume and eval_summary_path.exists()):
+            run_command(eval_command, repo_root)
         eval_summary = load_json(eval_summary_path)
         collapse_flags.extend([str(flag) for flag in ((eval_summary.get("group_collapse_flags", {}) or {}).get("a", []) or [])])
 
-    candidate = create_member_from_run(args, registry, candidate_checkpoint, parent_member, eval_summary_path, eval_summary, collapse_flags)
-    registry.members.append(candidate)
-    registry.current_generation = max(registry.current_generation, candidate.generation)
+    candidate_id = args.member_id or args.run_name
+    if registry_has_member(registry, candidate_id):
+        candidate = find_member(registry, candidate_id)
+    else:
+        candidate = create_member_from_run(args, registry, candidate_checkpoint, parent_member, eval_summary_path, eval_summary, collapse_flags)
+        registry.members.append(candidate)
+        registry.current_generation = max(registry.current_generation, candidate.generation)
 
     if args.learner_role == "main" and args.rounds >= args.snapshot_cadence:
         snapshot_member = LeagueMember(

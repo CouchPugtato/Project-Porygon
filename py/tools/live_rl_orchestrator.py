@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -89,9 +90,15 @@ def log(message: str) -> None:
     print(f"[live-rl] {message}", flush=True)
 
 
-def run_command(command: list[str], cwd: Path) -> None:
+def run_command(command: list[str], cwd: Path, extra_env: dict[str, str] | None = None) -> None:
     log("exec: " + " ".join(f'"{part}"' if " " in part else part for part in command))
-    completed = subprocess.run(command, cwd=str(cwd))
+    env = None
+    if extra_env:
+        env = dict(**extra_env)
+        merged = dict(os.environ)
+        merged.update(env)
+        env = merged
+    completed = subprocess.run(command, cwd=str(cwd), env=env)
     if completed.returncode != 0:
         raise SystemExit(completed.returncode)
 
@@ -216,6 +223,26 @@ def load_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def round_manifest_completed(round_manifest_path: Path) -> bool:
+    if not round_manifest_path.exists():
+        return False
+    try:
+        payload = load_json(round_manifest_path)
+    except Exception:
+        return False
+    if payload.get("status") != "completed":
+        return False
+    output_checkpoint = Path(str(payload.get("output_checkpoint", "")))
+    training_summary = Path(str(payload.get("training_round_stats_path", "")))
+    return output_checkpoint.exists() and training_summary.exists()
+
+
+def trainer_env(args: argparse.Namespace) -> dict[str, str] | None:
+    if args.omp_threads <= 0:
+        return None
+    return {"PORYGON_OMP_THREADS": str(args.omp_threads)}
+
+
 def collapse_flags_from_training_summary(summary: dict[str, object], baseline_tera_rate: float, min_episodes_warn: int, anchor_kl_warn_threshold: float) -> list[str]:
     flags: list[str] = []
     episode_count = int(summary.get("episode_count", 0) or 0)
@@ -282,6 +309,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-kl-warn-threshold", type=float, default=0.10)
     parser.add_argument("--min-episodes-warn", type=int, default=100)
     parser.add_argument("--stop-on-collapse", type=parse_bool, default=True)
+    parser.add_argument("--omp-threads", type=int, default=0)
+    parser.add_argument("--resume", type=parse_bool, default=True)
     return parser
 
 
@@ -306,41 +335,54 @@ def main() -> None:
     workflow_dir.mkdir(parents=True, exist_ok=True)
     workflow_manifest_path = workflow_dir / f"{args.run_name}_live_rl_manifest.json"
 
-    workflow_manifest: dict[str, object] = {
-        "run_name": args.run_name,
-        "status": "running",
-        "started_at_unix": time.time(),
-        "init_checkpoint": str(init_checkpoint),
-        "trainer_exe": str(trainer_exe),
-        "rounds": args.rounds,
-        "games": args.games,
-        "concurrent_games": args.concurrent_games,
-        "worker_pairs": args.worker_pairs,
-        "worker_games": args.worker_games,
-        "launch_stagger_seconds": args.launch_stagger_seconds,
-        "resource_check_seconds": args.resource_check_seconds,
-        "min_available_memory_gb": args.min_available_memory_gb,
-        "min_available_pagefile_gb": args.min_available_pagefile_gb,
-        "ensure_shard_count": args.ensure_shard_count,
-        "reward_mode": args.reward_mode,
-        "dense_additive_hp_swing_weight": args.dense_additive_hp_swing_weight,
-        "dense_additive_faint_swing_weight": args.dense_additive_faint_swing_weight,
-        "dense_additive_reward_clip": args.dense_additive_reward_clip,
-        "anchor_checkpoint": args.anchor_checkpoint,
-        "anchor_kl_coef": args.anchor_kl_coef,
-        "gamma": args.gamma,
-        "entropy_coef": args.entropy_coef,
-        "advantage_norm": args.advantage_norm,
-        "episode_side": args.episode_side,
-        "opponent": {
-            "model_b": args.model_b,
-            "model_b_pool": args.model_b_pool,
-        },
-        "round_manifests": [],
-    }
+    if args.resume and workflow_manifest_path.exists():
+        workflow_manifest = load_json(workflow_manifest_path)
+        workflow_manifest["status"] = "running"
+        workflow_manifest.pop("failure_reason", None)
+        workflow_manifest["resumed_at_unix"] = time.time()
+        workflow_manifest.setdefault("round_manifests", [])
+        log(f"resuming workflow from {workflow_manifest_path}")
+    else:
+        workflow_manifest = {
+            "run_name": args.run_name,
+            "status": "running",
+            "started_at_unix": time.time(),
+            "init_checkpoint": str(init_checkpoint),
+            "trainer_exe": str(trainer_exe),
+            "rounds": args.rounds,
+            "games": args.games,
+            "concurrent_games": args.concurrent_games,
+            "worker_pairs": args.worker_pairs,
+            "worker_games": args.worker_games,
+            "launch_stagger_seconds": args.launch_stagger_seconds,
+            "resource_check_seconds": args.resource_check_seconds,
+            "min_available_memory_gb": args.min_available_memory_gb,
+            "min_available_pagefile_gb": args.min_available_pagefile_gb,
+            "ensure_shard_count": args.ensure_shard_count,
+            "reward_mode": args.reward_mode,
+            "dense_additive_hp_swing_weight": args.dense_additive_hp_swing_weight,
+            "dense_additive_faint_swing_weight": args.dense_additive_faint_swing_weight,
+            "dense_additive_reward_clip": args.dense_additive_reward_clip,
+            "anchor_checkpoint": args.anchor_checkpoint,
+            "anchor_kl_coef": args.anchor_kl_coef,
+            "gamma": args.gamma,
+            "entropy_coef": args.entropy_coef,
+            "advantage_norm": args.advantage_norm,
+            "episode_side": args.episode_side,
+            "omp_threads": args.omp_threads,
+            "opponent": {
+                "model_b": args.model_b,
+                "model_b_pool": args.model_b_pool,
+            },
+            "round_manifests": [],
+        }
     write_json(workflow_manifest_path, workflow_manifest)
 
-    current_checkpoint = init_checkpoint
+    completed_round_paths = [Path(path) for path in workflow_manifest.get("round_manifests", []) if round_manifest_completed(Path(path))]
+    workflow_manifest["round_manifests"] = [str(path) for path in completed_round_paths]
+    current_checkpoint = Path(str(workflow_manifest.get("latest_checkpoint", init_checkpoint))).resolve()
+    if not completed_round_paths or not current_checkpoint.exists():
+        current_checkpoint = init_checkpoint
     try:
         for round_index in range(1, args.rounds + 1):
             round_token = f"round{round_index:02d}"
@@ -351,6 +393,16 @@ def main() -> None:
             training_summary_path = round_dir / f"{args.run_name}_{round_token}_training_summary.json"
             episode_batch_path = run_dir_for_name(repo_root, collect_run_name) / f"episode_batch_{args.episode_side}.jsonl"
             round_manifest_path = round_dir / f"{args.run_name}_{round_token}_manifest.json"
+
+            if args.resume and round_manifest_completed(round_manifest_path):
+                round_manifest = load_json(round_manifest_path)
+                current_checkpoint = Path(str(round_manifest.get("output_checkpoint", current_checkpoint))).resolve()
+                if str(round_manifest_path) not in workflow_manifest["round_manifests"]:
+                    workflow_manifest["round_manifests"].append(str(round_manifest_path))
+                workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
+                write_json(workflow_manifest_path, workflow_manifest)
+                log(f"skipping completed {round_token}")
+                continue
 
             round_manifest: dict[str, object] = {
                 "round": round_index,
@@ -384,7 +436,7 @@ def main() -> None:
             train_command = build_train_command(args, trainer_exe, episode_batch_path, output_checkpoint)
             round_manifest["train_command"] = train_command
             write_json(round_manifest_path, round_manifest)
-            run_command(train_command, repo_root)
+            run_command(train_command, repo_root, extra_env=trainer_env(args))
 
             training_summary = load_json(training_summary_path)
             collapse_flags = collapse_flags_from_training_summary(
