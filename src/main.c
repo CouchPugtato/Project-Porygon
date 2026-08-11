@@ -2352,10 +2352,6 @@ static int train_from_input_file(
                 rl_training_summary_record_episode(&rl_summary, &runtime.sessions[session_index].episode);
                 rl_training_summary_record_trainer(&rl_summary, &trainer);
                 if (ppo_mode && trainer.target_kl > 0.0f && trainer.last_approx_kl > trainer.target_kl) {
-                    printf("[train-ppo] early stop epoch=%d reason=target_kl_exceeded approx_kl=%.4f target_kl=%.4f\n",
-                        epoch,
-                        trainer.last_approx_kl,
-                        trainer.target_kl);
                     ppo_early_stop = 1;
                 }
             } else {
@@ -2429,9 +2425,6 @@ static int train_from_input_file(
                 }
                 fflush(stdout);
             }
-            if (ppo_early_stop) {
-                break;
-            }
             if (!rl_mode && ((trained_in_epoch % 500u) == 0u || trained_in_epoch == train_sessions)) {
                 TrainerCheckpointState periodic_state = gru_trainer_checkpoint_state(&trainer);
                 char* periodic_path = make_periodic_checkpoint_path(resolved_checkpoint_path, ((size_t)(epoch - 1) * train_sessions) + trained_in_epoch);
@@ -2444,6 +2437,13 @@ static int train_from_input_file(
                     free(periodic_path);
                 }
             }
+        }
+
+        if (ppo_early_stop) {
+            printf("[train-ppo] early stop after epoch=%d reason=target_kl_exceeded approx_kl=%.4f target_kl=%.4f\n",
+                epoch,
+                trainer.last_approx_kl,
+                trainer.target_kl);
         }
 
         if (val_sessions > 0 && !rl_mode) {
@@ -2519,6 +2519,10 @@ static int train_from_input_file(
                 }
                 free(epoch_path);
             }
+        }
+
+        if (ppo_early_stop) {
+            break;
         }
     }
 
