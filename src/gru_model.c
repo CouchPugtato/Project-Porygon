@@ -1,4 +1,5 @@
 #include "gru_model.h"
+#include "action_mapper.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -183,6 +184,7 @@ struct GruModel {
 };
 
 static void bootstrap_factorized_heads_from_flat(GruModel* model);
+static void sync_flat_heads_from_factorized(GruModel* model);
 
 static float rand_uniform(void) {
     return ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
@@ -405,6 +407,22 @@ static void gru_adam_state_free(GruAdamState* state) {
     free(state->bn_m); free(state->bn_v);
     free(state->policy_head_m); free(state->policy_head_v);
     free(state->policy_bias_m); free(state->policy_bias_v);
+    free(state->slot0_kind_head_m); free(state->slot0_kind_head_v);
+    free(state->slot0_kind_bias_m); free(state->slot0_kind_bias_v);
+    free(state->slot0_move_head_m); free(state->slot0_move_head_v);
+    free(state->slot0_move_bias_m); free(state->slot0_move_bias_v);
+    free(state->slot0_switch_head_m); free(state->slot0_switch_head_v);
+    free(state->slot0_switch_bias_m); free(state->slot0_switch_bias_v);
+    free(state->slot0_tera_head_m); free(state->slot0_tera_head_v);
+    free(state->slot0_tera_bias_m); free(state->slot0_tera_bias_v);
+    free(state->slot1_kind_head_m); free(state->slot1_kind_head_v);
+    free(state->slot1_kind_bias_m); free(state->slot1_kind_bias_v);
+    free(state->slot1_move_head_m); free(state->slot1_move_head_v);
+    free(state->slot1_move_bias_m); free(state->slot1_move_bias_v);
+    free(state->slot1_switch_head_m); free(state->slot1_switch_head_v);
+    free(state->slot1_switch_bias_m); free(state->slot1_switch_bias_v);
+    free(state->slot1_tera_head_m); free(state->slot1_tera_head_v);
+    free(state->slot1_tera_bias_m); free(state->slot1_tera_bias_v);
     free(state->value_head_m); free(state->value_head_v);
     memset(state, 0, sizeof(*state));
 }
@@ -419,6 +437,14 @@ static int gru_adam_state_ensure(GruModel* model) {
             state->wrx_m && state->wrx_v && state->wrh_m && state->wrh_v && state->br_m && state->br_v &&
             state->wnx_m && state->wnx_v && state->wnh_m && state->wnh_v && state->bn_m && state->bn_v &&
             state->policy_head_m && state->policy_head_v && state->policy_bias_m && state->policy_bias_v &&
+            state->slot0_kind_head_m && state->slot0_kind_head_v && state->slot0_kind_bias_m && state->slot0_kind_bias_v &&
+            state->slot0_move_head_m && state->slot0_move_head_v && state->slot0_move_bias_m && state->slot0_move_bias_v &&
+            state->slot0_switch_head_m && state->slot0_switch_head_v && state->slot0_switch_bias_m && state->slot0_switch_bias_v &&
+            state->slot0_tera_head_m && state->slot0_tera_head_v && state->slot0_tera_bias_m && state->slot0_tera_bias_v &&
+            state->slot1_kind_head_m && state->slot1_kind_head_v && state->slot1_kind_bias_m && state->slot1_kind_bias_v &&
+            state->slot1_move_head_m && state->slot1_move_head_v && state->slot1_move_bias_m && state->slot1_move_bias_v &&
+            state->slot1_switch_head_m && state->slot1_switch_head_v && state->slot1_switch_bias_m && state->slot1_switch_bias_v &&
+            state->slot1_tera_head_m && state->slot1_tera_head_v && state->slot1_tera_bias_m && state->slot1_tera_bias_v &&
             state->value_head_m && state->value_head_v) {
         return 1;
     }
@@ -445,12 +471,52 @@ static int gru_adam_state_ensure(GruModel* model) {
     state->policy_head_v = (float*)calloc(model->policy_head.rows * model->policy_head.cols, sizeof(float));
     state->policy_bias_m = (float*)calloc(model->num_actions, sizeof(float));
     state->policy_bias_v = (float*)calloc(model->num_actions, sizeof(float));
+    state->slot0_kind_head_m = (float*)calloc(model->slot0_kind_head.rows * model->slot0_kind_head.cols, sizeof(float));
+    state->slot0_kind_head_v = (float*)calloc(model->slot0_kind_head.rows * model->slot0_kind_head.cols, sizeof(float));
+    state->slot0_kind_bias_m = (float*)calloc(FACTORIZED_KIND_DIM, sizeof(float));
+    state->slot0_kind_bias_v = (float*)calloc(FACTORIZED_KIND_DIM, sizeof(float));
+    state->slot0_move_head_m = (float*)calloc(model->slot0_move_head.rows * model->slot0_move_head.cols, sizeof(float));
+    state->slot0_move_head_v = (float*)calloc(model->slot0_move_head.rows * model->slot0_move_head.cols, sizeof(float));
+    state->slot0_move_bias_m = (float*)calloc(FACTORIZED_MOVE_DIM, sizeof(float));
+    state->slot0_move_bias_v = (float*)calloc(FACTORIZED_MOVE_DIM, sizeof(float));
+    state->slot0_switch_head_m = (float*)calloc(model->slot0_switch_head.rows * model->slot0_switch_head.cols, sizeof(float));
+    state->slot0_switch_head_v = (float*)calloc(model->slot0_switch_head.rows * model->slot0_switch_head.cols, sizeof(float));
+    state->slot0_switch_bias_m = (float*)calloc(FACTORIZED_SWITCH_DIM, sizeof(float));
+    state->slot0_switch_bias_v = (float*)calloc(FACTORIZED_SWITCH_DIM, sizeof(float));
+    state->slot0_tera_head_m = (float*)calloc(model->slot0_tera_head.rows * model->slot0_tera_head.cols, sizeof(float));
+    state->slot0_tera_head_v = (float*)calloc(model->slot0_tera_head.rows * model->slot0_tera_head.cols, sizeof(float));
+    state->slot0_tera_bias_m = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
+    state->slot0_tera_bias_v = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
+    state->slot1_kind_head_m = (float*)calloc(model->slot1_kind_head.rows * model->slot1_kind_head.cols, sizeof(float));
+    state->slot1_kind_head_v = (float*)calloc(model->slot1_kind_head.rows * model->slot1_kind_head.cols, sizeof(float));
+    state->slot1_kind_bias_m = (float*)calloc(FACTORIZED_KIND_DIM, sizeof(float));
+    state->slot1_kind_bias_v = (float*)calloc(FACTORIZED_KIND_DIM, sizeof(float));
+    state->slot1_move_head_m = (float*)calloc(model->slot1_move_head.rows * model->slot1_move_head.cols, sizeof(float));
+    state->slot1_move_head_v = (float*)calloc(model->slot1_move_head.rows * model->slot1_move_head.cols, sizeof(float));
+    state->slot1_move_bias_m = (float*)calloc(FACTORIZED_MOVE_DIM, sizeof(float));
+    state->slot1_move_bias_v = (float*)calloc(FACTORIZED_MOVE_DIM, sizeof(float));
+    state->slot1_switch_head_m = (float*)calloc(model->slot1_switch_head.rows * model->slot1_switch_head.cols, sizeof(float));
+    state->slot1_switch_head_v = (float*)calloc(model->slot1_switch_head.rows * model->slot1_switch_head.cols, sizeof(float));
+    state->slot1_switch_bias_m = (float*)calloc(FACTORIZED_SWITCH_DIM, sizeof(float));
+    state->slot1_switch_bias_v = (float*)calloc(FACTORIZED_SWITCH_DIM, sizeof(float));
+    state->slot1_tera_head_m = (float*)calloc(model->slot1_tera_head.rows * model->slot1_tera_head.cols, sizeof(float));
+    state->slot1_tera_head_v = (float*)calloc(model->slot1_tera_head.rows * model->slot1_tera_head.cols, sizeof(float));
+    state->slot1_tera_bias_m = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
+    state->slot1_tera_bias_v = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
     state->value_head_m = (float*)calloc(model->hidden_dim, sizeof(float));
     state->value_head_v = (float*)calloc(model->hidden_dim, sizeof(float));
     if (!state->wzx_m || !state->wzx_v || !state->wzh_m || !state->wzh_v || !state->bz_m || !state->bz_v ||
             !state->wrx_m || !state->wrx_v || !state->wrh_m || !state->wrh_v || !state->br_m || !state->br_v ||
             !state->wnx_m || !state->wnx_v || !state->wnh_m || !state->wnh_v || !state->bn_m || !state->bn_v ||
             !state->policy_head_m || !state->policy_head_v || !state->policy_bias_m || !state->policy_bias_v ||
+            !state->slot0_kind_head_m || !state->slot0_kind_head_v || !state->slot0_kind_bias_m || !state->slot0_kind_bias_v ||
+            !state->slot0_move_head_m || !state->slot0_move_head_v || !state->slot0_move_bias_m || !state->slot0_move_bias_v ||
+            !state->slot0_switch_head_m || !state->slot0_switch_head_v || !state->slot0_switch_bias_m || !state->slot0_switch_bias_v ||
+            !state->slot0_tera_head_m || !state->slot0_tera_head_v || !state->slot0_tera_bias_m || !state->slot0_tera_bias_v ||
+            !state->slot1_kind_head_m || !state->slot1_kind_head_v || !state->slot1_kind_bias_m || !state->slot1_kind_bias_v ||
+            !state->slot1_move_head_m || !state->slot1_move_head_v || !state->slot1_move_bias_m || !state->slot1_move_bias_v ||
+            !state->slot1_switch_head_m || !state->slot1_switch_head_v || !state->slot1_switch_bias_m || !state->slot1_switch_bias_v ||
+            !state->slot1_tera_head_m || !state->slot1_tera_head_v || !state->slot1_tera_bias_m || !state->slot1_tera_bias_v ||
             !state->value_head_m || !state->value_head_v) {
         gru_adam_state_free(state);
         return 0;
@@ -466,6 +532,10 @@ static int gru_gradient_accum_ensure(GruModel* model) {
     accum = &model->grad_accum;
     if (accum->wzx && accum->wzh && accum->bz && accum->wrx && accum->wrh && accum->br &&
             accum->wnx && accum->wnh && accum->bn && accum->policy_head && accum->policy_bias &&
+            accum->slot0_kind_head && accum->slot0_kind_bias && accum->slot0_move_head && accum->slot0_move_bias &&
+            accum->slot0_switch_head && accum->slot0_switch_bias && accum->slot0_tera_head && accum->slot0_tera_bias &&
+            accum->slot1_kind_head && accum->slot1_kind_bias && accum->slot1_move_head && accum->slot1_move_bias &&
+            accum->slot1_switch_head && accum->slot1_switch_bias && accum->slot1_tera_head && accum->slot1_tera_bias &&
             accum->value_head) {
         return 1;
     }
@@ -481,9 +551,29 @@ static int gru_gradient_accum_ensure(GruModel* model) {
     accum->bn = (float*)calloc(model->hidden_dim, sizeof(float));
     accum->policy_head = (float*)calloc(model->policy_head.rows * model->policy_head.cols, sizeof(float));
     accum->policy_bias = (float*)calloc(model->num_actions, sizeof(float));
+    accum->slot0_kind_head = (float*)calloc(model->slot0_kind_head.rows * model->slot0_kind_head.cols, sizeof(float));
+    accum->slot0_kind_bias = (float*)calloc(FACTORIZED_KIND_DIM, sizeof(float));
+    accum->slot0_move_head = (float*)calloc(model->slot0_move_head.rows * model->slot0_move_head.cols, sizeof(float));
+    accum->slot0_move_bias = (float*)calloc(FACTORIZED_MOVE_DIM, sizeof(float));
+    accum->slot0_switch_head = (float*)calloc(model->slot0_switch_head.rows * model->slot0_switch_head.cols, sizeof(float));
+    accum->slot0_switch_bias = (float*)calloc(FACTORIZED_SWITCH_DIM, sizeof(float));
+    accum->slot0_tera_head = (float*)calloc(model->slot0_tera_head.rows * model->slot0_tera_head.cols, sizeof(float));
+    accum->slot0_tera_bias = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
+    accum->slot1_kind_head = (float*)calloc(model->slot1_kind_head.rows * model->slot1_kind_head.cols, sizeof(float));
+    accum->slot1_kind_bias = (float*)calloc(FACTORIZED_KIND_DIM, sizeof(float));
+    accum->slot1_move_head = (float*)calloc(model->slot1_move_head.rows * model->slot1_move_head.cols, sizeof(float));
+    accum->slot1_move_bias = (float*)calloc(FACTORIZED_MOVE_DIM, sizeof(float));
+    accum->slot1_switch_head = (float*)calloc(model->slot1_switch_head.rows * model->slot1_switch_head.cols, sizeof(float));
+    accum->slot1_switch_bias = (float*)calloc(FACTORIZED_SWITCH_DIM, sizeof(float));
+    accum->slot1_tera_head = (float*)calloc(model->slot1_tera_head.rows * model->slot1_tera_head.cols, sizeof(float));
+    accum->slot1_tera_bias = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
     accum->value_head = (float*)calloc(model->hidden_dim, sizeof(float));
     if (!accum->wzx || !accum->wzh || !accum->bz || !accum->wrx || !accum->wrh || !accum->br ||
             !accum->wnx || !accum->wnh || !accum->bn || !accum->policy_head || !accum->policy_bias ||
+            !accum->slot0_kind_head || !accum->slot0_kind_bias || !accum->slot0_move_head || !accum->slot0_move_bias ||
+            !accum->slot0_switch_head || !accum->slot0_switch_bias || !accum->slot0_tera_head || !accum->slot0_tera_bias ||
+            !accum->slot1_kind_head || !accum->slot1_kind_bias || !accum->slot1_move_head || !accum->slot1_move_bias ||
+            !accum->slot1_switch_head || !accum->slot1_switch_bias || !accum->slot1_tera_head || !accum->slot1_tera_bias ||
             !accum->value_head) {
         gru_gradient_accum_free(accum);
         return 0;
@@ -508,6 +598,22 @@ void gru_model_clear_accumulated_supervised_updates(GruModel* model) {
     memset(accum->bn, 0, model->hidden_dim * sizeof(float));
     memset(accum->policy_head, 0, model->policy_head.rows * model->policy_head.cols * sizeof(float));
     memset(accum->policy_bias, 0, model->num_actions * sizeof(float));
+    memset(accum->slot0_kind_head, 0, model->slot0_kind_head.rows * model->slot0_kind_head.cols * sizeof(float));
+    memset(accum->slot0_kind_bias, 0, FACTORIZED_KIND_DIM * sizeof(float));
+    memset(accum->slot0_move_head, 0, model->slot0_move_head.rows * model->slot0_move_head.cols * sizeof(float));
+    memset(accum->slot0_move_bias, 0, FACTORIZED_MOVE_DIM * sizeof(float));
+    memset(accum->slot0_switch_head, 0, model->slot0_switch_head.rows * model->slot0_switch_head.cols * sizeof(float));
+    memset(accum->slot0_switch_bias, 0, FACTORIZED_SWITCH_DIM * sizeof(float));
+    memset(accum->slot0_tera_head, 0, model->slot0_tera_head.rows * model->slot0_tera_head.cols * sizeof(float));
+    memset(accum->slot0_tera_bias, 0, FACTORIZED_TERA_DIM * sizeof(float));
+    memset(accum->slot1_kind_head, 0, model->slot1_kind_head.rows * model->slot1_kind_head.cols * sizeof(float));
+    memset(accum->slot1_kind_bias, 0, FACTORIZED_KIND_DIM * sizeof(float));
+    memset(accum->slot1_move_head, 0, model->slot1_move_head.rows * model->slot1_move_head.cols * sizeof(float));
+    memset(accum->slot1_move_bias, 0, FACTORIZED_MOVE_DIM * sizeof(float));
+    memset(accum->slot1_switch_head, 0, model->slot1_switch_head.rows * model->slot1_switch_head.cols * sizeof(float));
+    memset(accum->slot1_switch_bias, 0, FACTORIZED_SWITCH_DIM * sizeof(float));
+    memset(accum->slot1_tera_head, 0, model->slot1_tera_head.rows * model->slot1_tera_head.cols * sizeof(float));
+    memset(accum->slot1_tera_bias, 0, FACTORIZED_TERA_DIM * sizeof(float));
     memset(accum->value_head, 0, model->hidden_dim * sizeof(float));
     accum->value_bias = 0.0f;
     accum->count = 0;
@@ -569,12 +675,28 @@ int gru_model_apply_accumulated_supervised_updates(GruModel* model, float learni
     #pragma omp parallel for if(model->num_actions >= 16)
 #endif
     for (i = 0; i < model->num_actions; ++i) model->policy_bias[i] -= scale * accum->policy_bias[i];
+    for (i = 0; i < model->slot0_kind_head.rows * model->slot0_kind_head.cols; ++i) model->slot0_kind_head.data[i] -= scale * accum->slot0_kind_head[i];
+    for (i = 0; i < FACTORIZED_KIND_DIM; ++i) model->slot0_kind_bias[i] -= scale * accum->slot0_kind_bias[i];
+    for (i = 0; i < model->slot0_move_head.rows * model->slot0_move_head.cols; ++i) model->slot0_move_head.data[i] -= scale * accum->slot0_move_head[i];
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) model->slot0_move_bias[i] -= scale * accum->slot0_move_bias[i];
+    for (i = 0; i < model->slot0_switch_head.rows * model->slot0_switch_head.cols; ++i) model->slot0_switch_head.data[i] -= scale * accum->slot0_switch_head[i];
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) model->slot0_switch_bias[i] -= scale * accum->slot0_switch_bias[i];
+    for (i = 0; i < model->slot0_tera_head.rows * model->slot0_tera_head.cols; ++i) model->slot0_tera_head.data[i] -= scale * accum->slot0_tera_head[i];
+    for (i = 0; i < FACTORIZED_TERA_DIM; ++i) model->slot0_tera_bias[i] -= scale * accum->slot0_tera_bias[i];
+    for (i = 0; i < model->slot1_kind_head.rows * model->slot1_kind_head.cols; ++i) model->slot1_kind_head.data[i] -= scale * accum->slot1_kind_head[i];
+    for (i = 0; i < FACTORIZED_KIND_DIM; ++i) model->slot1_kind_bias[i] -= scale * accum->slot1_kind_bias[i];
+    for (i = 0; i < model->slot1_move_head.rows * model->slot1_move_head.cols; ++i) model->slot1_move_head.data[i] -= scale * accum->slot1_move_head[i];
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) model->slot1_move_bias[i] -= scale * accum->slot1_move_bias[i];
+    for (i = 0; i < model->slot1_switch_head.rows * model->slot1_switch_head.cols; ++i) model->slot1_switch_head.data[i] -= scale * accum->slot1_switch_head[i];
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) model->slot1_switch_bias[i] -= scale * accum->slot1_switch_bias[i];
+    for (i = 0; i < model->slot1_tera_head.rows * model->slot1_tera_head.cols; ++i) model->slot1_tera_head.data[i] -= scale * accum->slot1_tera_head[i];
+    for (i = 0; i < FACTORIZED_TERA_DIM; ++i) model->slot1_tera_bias[i] -= scale * accum->slot1_tera_bias[i];
 #ifdef _OPENMP
     #pragma omp parallel for if(model->hidden_dim >= 64)
 #endif
     for (i = 0; i < model->hidden_dim; ++i) model->value_head[i] -= scale * accum->value_head[i];
     model->value_bias -= scale * accum->value_bias;
-    bootstrap_factorized_heads_from_flat(model);
+    sync_flat_heads_from_factorized(model);
     gru_model_clear_accumulated_supervised_updates(model);
     return 1;
 }
@@ -629,6 +751,22 @@ int gru_model_apply_accumulated_adam_updates(
     for (i = 0; i < model->hidden_dim; ++i) { float g = accum->bn[i] * scale; global_sq_norm += (double)g * (double)g; }
     for (i = 0; i < model->policy_head.rows * model->policy_head.cols; ++i) { float g = accum->policy_head[i] * scale; global_sq_norm += (double)g * (double)g; }
     for (i = 0; i < model->num_actions; ++i) { float g = accum->policy_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->slot0_kind_head.rows * model->slot0_kind_head.cols; ++i) { float g = accum->slot0_kind_head[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < FACTORIZED_KIND_DIM; ++i) { float g = accum->slot0_kind_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->slot0_move_head.rows * model->slot0_move_head.cols; ++i) { float g = accum->slot0_move_head[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) { float g = accum->slot0_move_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->slot0_switch_head.rows * model->slot0_switch_head.cols; ++i) { float g = accum->slot0_switch_head[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) { float g = accum->slot0_switch_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->slot0_tera_head.rows * model->slot0_tera_head.cols; ++i) { float g = accum->slot0_tera_head[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < FACTORIZED_TERA_DIM; ++i) { float g = accum->slot0_tera_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->slot1_kind_head.rows * model->slot1_kind_head.cols; ++i) { float g = accum->slot1_kind_head[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < FACTORIZED_KIND_DIM; ++i) { float g = accum->slot1_kind_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->slot1_move_head.rows * model->slot1_move_head.cols; ++i) { float g = accum->slot1_move_head[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) { float g = accum->slot1_move_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->slot1_switch_head.rows * model->slot1_switch_head.cols; ++i) { float g = accum->slot1_switch_head[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) { float g = accum->slot1_switch_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->slot1_tera_head.rows * model->slot1_tera_head.cols; ++i) { float g = accum->slot1_tera_head[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < FACTORIZED_TERA_DIM; ++i) { float g = accum->slot1_tera_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
     for (i = 0; i < model->hidden_dim; ++i) { float g = accum->value_head[i] * scale; global_sq_norm += (double)g * (double)g; }
     {
         float g = accum->value_bias * scale;
@@ -654,6 +792,22 @@ int gru_model_apply_accumulated_adam_updates(
     for (i = 0; i < model->hidden_dim; ++i) accum->bn[i] *= scale;
     for (i = 0; i < model->policy_head.rows * model->policy_head.cols; ++i) accum->policy_head[i] *= scale;
     for (i = 0; i < model->num_actions; ++i) accum->policy_bias[i] *= scale;
+    for (i = 0; i < model->slot0_kind_head.rows * model->slot0_kind_head.cols; ++i) accum->slot0_kind_head[i] *= scale;
+    for (i = 0; i < FACTORIZED_KIND_DIM; ++i) accum->slot0_kind_bias[i] *= scale;
+    for (i = 0; i < model->slot0_move_head.rows * model->slot0_move_head.cols; ++i) accum->slot0_move_head[i] *= scale;
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) accum->slot0_move_bias[i] *= scale;
+    for (i = 0; i < model->slot0_switch_head.rows * model->slot0_switch_head.cols; ++i) accum->slot0_switch_head[i] *= scale;
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) accum->slot0_switch_bias[i] *= scale;
+    for (i = 0; i < model->slot0_tera_head.rows * model->slot0_tera_head.cols; ++i) accum->slot0_tera_head[i] *= scale;
+    for (i = 0; i < FACTORIZED_TERA_DIM; ++i) accum->slot0_tera_bias[i] *= scale;
+    for (i = 0; i < model->slot1_kind_head.rows * model->slot1_kind_head.cols; ++i) accum->slot1_kind_head[i] *= scale;
+    for (i = 0; i < FACTORIZED_KIND_DIM; ++i) accum->slot1_kind_bias[i] *= scale;
+    for (i = 0; i < model->slot1_move_head.rows * model->slot1_move_head.cols; ++i) accum->slot1_move_head[i] *= scale;
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) accum->slot1_move_bias[i] *= scale;
+    for (i = 0; i < model->slot1_switch_head.rows * model->slot1_switch_head.cols; ++i) accum->slot1_switch_head[i] *= scale;
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) accum->slot1_switch_bias[i] *= scale;
+    for (i = 0; i < model->slot1_tera_head.rows * model->slot1_tera_head.cols; ++i) accum->slot1_tera_head[i] *= scale;
+    for (i = 0; i < FACTORIZED_TERA_DIM; ++i) accum->slot1_tera_bias[i] *= scale;
     for (i = 0; i < model->hidden_dim; ++i) accum->value_head[i] *= scale;
     accum->value_bias *= scale;
     adam_apply_array(model->wzx.data, state->wzx_m, state->wzx_v, accum->wzx, model->wzx.rows * model->wzx.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
@@ -667,11 +821,27 @@ int gru_model_apply_accumulated_adam_updates(
     adam_apply_array(model->bn, state->bn_m, state->bn_v, accum->bn, model->hidden_dim, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     adam_apply_array(model->policy_head.data, state->policy_head_m, state->policy_head_v, accum->policy_head, model->policy_head.rows * model->policy_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     adam_apply_array(model->policy_bias, state->policy_bias_m, state->policy_bias_v, accum->policy_bias, model->num_actions, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot0_kind_head.data, state->slot0_kind_head_m, state->slot0_kind_head_v, accum->slot0_kind_head, model->slot0_kind_head.rows * model->slot0_kind_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot0_kind_bias, state->slot0_kind_bias_m, state->slot0_kind_bias_v, accum->slot0_kind_bias, FACTORIZED_KIND_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot0_move_head.data, state->slot0_move_head_m, state->slot0_move_head_v, accum->slot0_move_head, model->slot0_move_head.rows * model->slot0_move_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot0_move_bias, state->slot0_move_bias_m, state->slot0_move_bias_v, accum->slot0_move_bias, FACTORIZED_MOVE_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot0_switch_head.data, state->slot0_switch_head_m, state->slot0_switch_head_v, accum->slot0_switch_head, model->slot0_switch_head.rows * model->slot0_switch_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot0_switch_bias, state->slot0_switch_bias_m, state->slot0_switch_bias_v, accum->slot0_switch_bias, FACTORIZED_SWITCH_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot0_tera_head.data, state->slot0_tera_head_m, state->slot0_tera_head_v, accum->slot0_tera_head, model->slot0_tera_head.rows * model->slot0_tera_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot0_tera_bias, state->slot0_tera_bias_m, state->slot0_tera_bias_v, accum->slot0_tera_bias, FACTORIZED_TERA_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot1_kind_head.data, state->slot1_kind_head_m, state->slot1_kind_head_v, accum->slot1_kind_head, model->slot1_kind_head.rows * model->slot1_kind_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot1_kind_bias, state->slot1_kind_bias_m, state->slot1_kind_bias_v, accum->slot1_kind_bias, FACTORIZED_KIND_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot1_move_head.data, state->slot1_move_head_m, state->slot1_move_head_v, accum->slot1_move_head, model->slot1_move_head.rows * model->slot1_move_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot1_move_bias, state->slot1_move_bias_m, state->slot1_move_bias_v, accum->slot1_move_bias, FACTORIZED_MOVE_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot1_switch_head.data, state->slot1_switch_head_m, state->slot1_switch_head_v, accum->slot1_switch_head, model->slot1_switch_head.rows * model->slot1_switch_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot1_switch_bias, state->slot1_switch_bias_m, state->slot1_switch_bias_v, accum->slot1_switch_bias, FACTORIZED_SWITCH_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot1_tera_head.data, state->slot1_tera_head_m, state->slot1_tera_head_v, accum->slot1_tera_head, model->slot1_tera_head.rows * model->slot1_tera_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->slot1_tera_bias, state->slot1_tera_bias_m, state->slot1_tera_bias_v, accum->slot1_tera_bias, FACTORIZED_TERA_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     adam_apply_array(model->value_head, state->value_head_m, state->value_head_v, accum->value_head, model->hidden_dim, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     state->value_bias_m = beta1 * state->value_bias_m + (1.0f - beta1) * accum->value_bias;
     state->value_bias_v = beta2 * state->value_bias_v + (1.0f - beta2) * accum->value_bias * accum->value_bias;
     model->value_bias -= learning_rate * (state->value_bias_m / bias_correction1) / (sqrtf(state->value_bias_v / bias_correction2) + epsilon);
-    bootstrap_factorized_heads_from_flat(model);
+    sync_flat_heads_from_factorized(model);
     gru_model_clear_accumulated_supervised_updates(model);
     return 1;
 }
@@ -846,6 +1016,166 @@ static void build_factorized_masks(const unsigned char* legal_mask, int slot, un
             kind_mask[1] = 1;
         }
     }
+}
+
+static void sync_flat_heads_from_factorized(GruModel* model) {
+    size_t h;
+    int i;
+    if (!model) {
+        return;
+    }
+    for (h = 0; h < model->hidden_dim; ++h) {
+        for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
+            model->policy_head.data[(0 + i) * model->hidden_dim + h] =
+                model->slot0_kind_head.data[0 * model->hidden_dim + h] +
+                model->slot0_move_head.data[i * model->hidden_dim + h] +
+                model->slot0_tera_head.data[0 * model->hidden_dim + h];
+            model->policy_head.data[(4 + i) * model->hidden_dim + h] =
+                model->slot0_kind_head.data[0 * model->hidden_dim + h] +
+                model->slot0_move_head.data[i * model->hidden_dim + h] +
+                model->slot0_tera_head.data[1 * model->hidden_dim + h];
+            model->policy_head.data[(14 + i) * model->hidden_dim + h] =
+                model->slot1_kind_head.data[0 * model->hidden_dim + h] +
+                model->slot1_move_head.data[i * model->hidden_dim + h] +
+                model->slot1_tera_head.data[0 * model->hidden_dim + h];
+            model->policy_head.data[(18 + i) * model->hidden_dim + h] =
+                model->slot1_kind_head.data[0 * model->hidden_dim + h] +
+                model->slot1_move_head.data[i * model->hidden_dim + h] +
+                model->slot1_tera_head.data[1 * model->hidden_dim + h];
+        }
+        for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) {
+            model->policy_head.data[(8 + i) * model->hidden_dim + h] =
+                model->slot0_kind_head.data[1 * model->hidden_dim + h] +
+                model->slot0_switch_head.data[i * model->hidden_dim + h];
+            model->policy_head.data[(22 + i) * model->hidden_dim + h] =
+                model->slot1_kind_head.data[1 * model->hidden_dim + h] +
+                model->slot1_switch_head.data[i * model->hidden_dim + h];
+        }
+    }
+    for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
+        model->policy_bias[0 + i] = model->slot0_kind_bias[0] + model->slot0_move_bias[i] + model->slot0_tera_bias[0];
+        model->policy_bias[4 + i] = model->slot0_kind_bias[0] + model->slot0_move_bias[i] + model->slot0_tera_bias[1];
+        model->policy_bias[14 + i] = model->slot1_kind_bias[0] + model->slot1_move_bias[i] + model->slot1_tera_bias[0];
+        model->policy_bias[18 + i] = model->slot1_kind_bias[0] + model->slot1_move_bias[i] + model->slot1_tera_bias[1];
+    }
+    for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) {
+        model->policy_bias[8 + i] = model->slot0_kind_bias[1] + model->slot0_switch_bias[i];
+        model->policy_bias[22 + i] = model->slot1_kind_bias[1] + model->slot1_switch_bias[i];
+    }
+}
+
+static void factorized_slot_policy_gradients(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    int slot,
+    const FactorizedActionChoice* choice,
+    float policy_scale,
+    float entropy_coef,
+    float* action_loss_sum,
+    float* accuracy_sum,
+    float* grad_h,
+    float* grad_kind_head,
+    float* grad_kind_bias,
+    float* grad_move_head,
+    float* grad_move_bias,
+    float* grad_switch_head,
+    float* grad_switch_bias,
+    float* grad_tera_head,
+    float* grad_tera_bias
+) {
+    unsigned char kind_mask[FACTORIZED_KIND_DIM];
+    unsigned char move_mask[FACTORIZED_MOVE_DIM];
+    unsigned char switch_mask[FACTORIZED_SWITCH_DIM];
+    unsigned char tera_mask[FACTORIZED_TERA_DIM];
+    float kind_policy[FACTORIZED_KIND_DIM];
+    float move_policy[FACTORIZED_MOVE_DIM];
+    float switch_policy[FACTORIZED_SWITCH_DIM];
+    float tera_policy[FACTORIZED_TERA_DIM];
+    float grad_logits[FACTORIZED_SWITCH_DIM];
+    const Matrix* kind_head = slot == 0 ? &model->slot0_kind_head : &model->slot1_kind_head;
+    const float* kind_bias = slot == 0 ? model->slot0_kind_bias : model->slot1_kind_bias;
+    const Matrix* move_head = slot == 0 ? &model->slot0_move_head : &model->slot1_move_head;
+    const float* move_bias = slot == 0 ? model->slot0_move_bias : model->slot1_move_bias;
+    const Matrix* switch_head = slot == 0 ? &model->slot0_switch_head : &model->slot1_switch_head;
+    const float* switch_bias = slot == 0 ? model->slot0_switch_bias : model->slot1_switch_bias;
+    const Matrix* tera_head = slot == 0 ? &model->slot0_tera_head : &model->slot1_tera_head;
+    const float* tera_bias = slot == 0 ? model->slot0_tera_bias : model->slot1_tera_bias;
+    int target_kind;
+    int accuracy_ok = 1;
+    int i;
+    int h;
+    build_factorized_masks(legal_mask, slot, kind_mask, move_mask, switch_mask, tera_mask);
+    evaluate_small_head(kind_head, kind_bias, hidden_state, kind_mask, FACTORIZED_KIND_DIM, kind_policy);
+    evaluate_small_head(move_head, move_bias, hidden_state, move_mask, FACTORIZED_MOVE_DIM, move_policy);
+    evaluate_small_head(switch_head, switch_bias, hidden_state, switch_mask, FACTORIZED_SWITCH_DIM, switch_policy);
+    target_kind = (slot == 0 ? choice->slot0_kind : choice->slot1_kind) == FACTORIZED_ACTION_SWITCH ? 1 : 0;
+    *action_loss_sum += -logf(kind_policy[target_kind] > 1.0e-8f ? kind_policy[target_kind] : 1.0e-8f);
+    accuracy_ok &= (kind_policy[1] > kind_policy[0] ? 1 : 0) == target_kind;
+    {
+        float neg_entropy = 0.0f;
+        for (i = 0; i < FACTORIZED_KIND_DIM; ++i) if (kind_mask[i]) { float p = kind_policy[i] > 1.0e-8f ? kind_policy[i] : 1.0e-8f; neg_entropy += p * logf(p); }
+        for (i = 0; i < FACTORIZED_KIND_DIM; ++i) {
+            if (!kind_mask[i]) { grad_logits[i] = 0.0f; continue; }
+            grad_logits[i] = (kind_policy[i] - (i == target_kind ? 1.0f : 0.0f)) * policy_scale;
+            if (entropy_coef != 0.0f) { float p = kind_policy[i] > 1.0e-8f ? kind_policy[i] : 1.0e-8f; grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy); }
+            grad_kind_bias[i] += grad_logits[i];
+            for (h = 0; h < (int)model->hidden_dim; ++h) grad_kind_head[i * model->hidden_dim + h] += grad_logits[i] * hidden_state[h];
+        }
+        matrix_transpose_vec_mul_accum(kind_head, grad_logits, grad_h);
+    }
+    if (target_kind == 0) {
+        int move_index = (slot == 0 ? choice->slot0_move_index : choice->slot1_move_index) - 1;
+        int tera_index = (slot == 0 ? choice->slot0_use_tera : choice->slot1_use_tera) ? 1 : 0;
+        tera_mask[0] = legal_mask[(slot == 0 ? 0 : 14) + move_index] ? 1 : 0;
+        tera_mask[1] = legal_mask[(slot == 0 ? 4 : 18) + move_index] ? 1 : 0;
+        evaluate_small_head(tera_head, tera_bias, hidden_state, tera_mask, FACTORIZED_TERA_DIM, tera_policy);
+        *action_loss_sum += -logf(move_policy[move_index] > 1.0e-8f ? move_policy[move_index] : 1.0e-8f);
+        *action_loss_sum += -logf(tera_policy[tera_index] > 1.0e-8f ? tera_policy[tera_index] : 1.0e-8f);
+        for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) if (move_policy[i] > move_policy[move_index]) accuracy_ok = 0;
+        for (i = 0; i < FACTORIZED_TERA_DIM; ++i) if (tera_mask[i] && tera_policy[i] > tera_policy[tera_index]) accuracy_ok = 0;
+        {
+            float neg_entropy = 0.0f;
+            for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) if (move_mask[i]) { float p = move_policy[i] > 1.0e-8f ? move_policy[i] : 1.0e-8f; neg_entropy += p * logf(p); }
+            for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
+                if (!move_mask[i]) { grad_logits[i] = 0.0f; continue; }
+                grad_logits[i] = (move_policy[i] - (i == move_index ? 1.0f : 0.0f)) * policy_scale;
+                if (entropy_coef != 0.0f) { float p = move_policy[i] > 1.0e-8f ? move_policy[i] : 1.0e-8f; grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy); }
+                grad_move_bias[i] += grad_logits[i];
+                for (h = 0; h < (int)model->hidden_dim; ++h) grad_move_head[i * model->hidden_dim + h] += grad_logits[i] * hidden_state[h];
+            }
+            matrix_transpose_vec_mul_accum(move_head, grad_logits, grad_h);
+        }
+        {
+            float neg_entropy = 0.0f;
+            for (i = 0; i < FACTORIZED_TERA_DIM; ++i) if (tera_mask[i]) { float p = tera_policy[i] > 1.0e-8f ? tera_policy[i] : 1.0e-8f; neg_entropy += p * logf(p); }
+            for (i = 0; i < FACTORIZED_TERA_DIM; ++i) {
+                if (!tera_mask[i]) { grad_logits[i] = 0.0f; continue; }
+                grad_logits[i] = (tera_policy[i] - (i == tera_index ? 1.0f : 0.0f)) * policy_scale;
+                if (entropy_coef != 0.0f) { float p = tera_policy[i] > 1.0e-8f ? tera_policy[i] : 1.0e-8f; grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy); }
+                grad_tera_bias[i] += grad_logits[i];
+                for (h = 0; h < (int)model->hidden_dim; ++h) grad_tera_head[i * model->hidden_dim + h] += grad_logits[i] * hidden_state[h];
+            }
+            matrix_transpose_vec_mul_accum(tera_head, grad_logits, grad_h);
+        }
+    } else {
+        int switch_index = (slot == 0 ? choice->slot0_switch_index : choice->slot1_switch_index) - 1;
+        *action_loss_sum += -logf(switch_policy[switch_index] > 1.0e-8f ? switch_policy[switch_index] : 1.0e-8f);
+        for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) if (switch_policy[i] > switch_policy[switch_index]) accuracy_ok = 0;
+        {
+            float neg_entropy = 0.0f;
+            for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) if (switch_mask[i]) { float p = switch_policy[i] > 1.0e-8f ? switch_policy[i] : 1.0e-8f; neg_entropy += p * logf(p); }
+            for (i = 0; i < FACTORIZED_SWITCH_DIM; ++i) {
+                if (!switch_mask[i]) { grad_logits[i] = 0.0f; continue; }
+                grad_logits[i] = (switch_policy[i] - (i == switch_index ? 1.0f : 0.0f)) * policy_scale;
+                if (entropy_coef != 0.0f) { float p = switch_policy[i] > 1.0e-8f ? switch_policy[i] : 1.0e-8f; grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy); }
+                grad_switch_bias[i] += grad_logits[i];
+                for (h = 0; h < (int)model->hidden_dim; ++h) grad_switch_head[i * model->hidden_dim + h] += grad_logits[i] * hidden_state[h];
+            }
+            matrix_transpose_vec_mul_accum(switch_head, grad_logits, grad_h);
+        }
+    }
+    *accuracy_sum += accuracy_ok ? 1.0f : 0.0f;
 }
 
 static void evaluate_hidden_internal(
@@ -1374,6 +1704,14 @@ static int recurrent_update_sequence(
     float* grad_wnx = NULL; float* grad_wnh = NULL; float* grad_bn = NULL;
     float* grad_policy_head = NULL; float* grad_policy_bias = NULL;
     float* grad_value_head = NULL;
+    float* grad_slot0_kind_head = NULL; float* grad_slot0_kind_bias = NULL;
+    float* grad_slot0_move_head = NULL; float* grad_slot0_move_bias = NULL;
+    float* grad_slot0_switch_head = NULL; float* grad_slot0_switch_bias = NULL;
+    float* grad_slot0_tera_head = NULL; float* grad_slot0_tera_bias = NULL;
+    float* grad_slot1_kind_head = NULL; float* grad_slot1_kind_bias = NULL;
+    float* grad_slot1_move_head = NULL; float* grad_slot1_move_bias = NULL;
+    float* grad_slot1_switch_head = NULL; float* grad_slot1_switch_bias = NULL;
+    float* grad_slot1_tera_head = NULL; float* grad_slot1_tera_bias = NULL;
     float grad_value_bias = 0.0f;
     float value = 0.0f;
     float dv;
@@ -1382,6 +1720,8 @@ static int recurrent_update_sequence(
     float action_loss_sum = 0.0f;
     const float* start_hidden;
     GruGradientAccum* accum = NULL;
+    unsigned char combined_legal[OBS_NUM_ACTIONS];
+    FactorizedActionChoice target_choice;
 
     if (!model || !sequence || steps == 0 || target_action < 0 || (size_t)target_action >= model->num_actions) {
         return 0;
@@ -1454,11 +1794,41 @@ static int recurrent_update_sequence(
     memset(grad_policy_head, 0, model->policy_head.rows * model->policy_head.cols * sizeof(float));
     memset(grad_policy_bias, 0, adim * sizeof(float));
     memset(grad_value_head, 0, hdim * sizeof(float));
+    grad_slot0_kind_head = (float*)calloc(model->slot0_kind_head.rows * model->slot0_kind_head.cols, sizeof(float));
+    grad_slot0_kind_bias = (float*)calloc(FACTORIZED_KIND_DIM, sizeof(float));
+    grad_slot0_move_head = (float*)calloc(model->slot0_move_head.rows * model->slot0_move_head.cols, sizeof(float));
+    grad_slot0_move_bias = (float*)calloc(FACTORIZED_MOVE_DIM, sizeof(float));
+    grad_slot0_switch_head = (float*)calloc(model->slot0_switch_head.rows * model->slot0_switch_head.cols, sizeof(float));
+    grad_slot0_switch_bias = (float*)calloc(FACTORIZED_SWITCH_DIM, sizeof(float));
+    grad_slot0_tera_head = (float*)calloc(model->slot0_tera_head.rows * model->slot0_tera_head.cols, sizeof(float));
+    grad_slot0_tera_bias = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
+    grad_slot1_kind_head = (float*)calloc(model->slot1_kind_head.rows * model->slot1_kind_head.cols, sizeof(float));
+    grad_slot1_kind_bias = (float*)calloc(FACTORIZED_KIND_DIM, sizeof(float));
+    grad_slot1_move_head = (float*)calloc(model->slot1_move_head.rows * model->slot1_move_head.cols, sizeof(float));
+    grad_slot1_move_bias = (float*)calloc(FACTORIZED_MOVE_DIM, sizeof(float));
+    grad_slot1_switch_head = (float*)calloc(model->slot1_switch_head.rows * model->slot1_switch_head.cols, sizeof(float));
+    grad_slot1_switch_bias = (float*)calloc(FACTORIZED_SWITCH_DIM, sizeof(float));
+    grad_slot1_tera_head = (float*)calloc(model->slot1_tera_head.rows * model->slot1_tera_head.cols, sizeof(float));
+    grad_slot1_tera_bias = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
+    if (!grad_slot0_kind_head || !grad_slot0_kind_bias || !grad_slot0_move_head || !grad_slot0_move_bias || !grad_slot0_switch_head || !grad_slot0_switch_bias || !grad_slot0_tera_head || !grad_slot0_tera_bias ||
+            !grad_slot1_kind_head || !grad_slot1_kind_bias || !grad_slot1_move_head || !grad_slot1_move_bias || !grad_slot1_switch_head || !grad_slot1_switch_bias || !grad_slot1_tera_head || !grad_slot1_tera_bias) {
+        free(grad_slot0_kind_head); free(grad_slot0_kind_bias); free(grad_slot0_move_head); free(grad_slot0_move_bias); free(grad_slot0_switch_head); free(grad_slot0_switch_bias); free(grad_slot0_tera_head); free(grad_slot0_tera_bias);
+        free(grad_slot1_kind_head); free(grad_slot1_kind_bias); free(grad_slot1_move_head); free(grad_slot1_move_bias); free(grad_slot1_switch_head); free(grad_slot1_switch_bias); free(grad_slot1_tera_head); free(grad_slot1_tera_bias);
+        return 0;
+    }
 
     start_hidden = initial_hidden_state ? initial_hidden_state : zero_hidden;
     if (target_action_secondary >= 0) {
         target_count = 2;
     }
+    memset(combined_legal, 0, sizeof(combined_legal));
+    if (legal_mask) memcpy(combined_legal, legal_mask, OBS_NUM_ACTIONS * sizeof(unsigned char));
+    if (legal_mask_secondary) {
+        for (a = 0; a < OBS_NUM_ACTIONS; ++a) {
+            if (legal_mask_secondary[a]) combined_legal[a] = 1;
+        }
+    }
+    factorized_action_choice_from_flat_actions(&target_choice, target_action, target_action_secondary >= 0 ? target_action_secondary : -1);
 
     for (t = 0; t < steps; ++t) {
         const float* input = sequence + (t * xdim);
@@ -1488,10 +1858,11 @@ static int recurrent_update_sequence(
         }
     }
 
-    evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), legal_mask, logits, policy, &value);
-    action_loss_sum += -logf(policy[target_action] > 1.0e-8f ? policy[target_action] : 1.0e-8f);
-    accuracy_sum += (gru_model_select_action(policy, legal_mask, adim) == target_action) ? 1.0f : 0.0f;
-    {
+    if (anchor_policy) {
+        evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), legal_mask, logits, policy, &value);
+        action_loss_sum += -logf(policy[target_action] > 1.0e-8f ? policy[target_action] : 1.0e-8f);
+        accuracy_sum += (gru_model_select_action(policy, legal_mask, adim) == target_action) ? 1.0f : 0.0f;
+        {
         float neg_entropy = 0.0f;
         for (a = 0; a < adim; ++a) {
             float p;
@@ -1515,10 +1886,10 @@ static int recurrent_update_sequence(
                     grad_policy_head[a * hdim + h] += grad_logits[a] * h_states[(steps - 1) * hdim + h];
                 }
             }
-    }
-    matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
+        }
+        matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
 
-    if (target_action_secondary >= 0) {
+        if (target_action_secondary >= 0) {
         evaluate_hidden_internal(model, h_states + ((steps - 1) * hdim), legal_mask_secondary, logits, policy, &value);
         action_loss_sum += -logf(policy[target_action_secondary] > 1.0e-8f ? policy[target_action_secondary] : 1.0e-8f);
         accuracy_sum += (gru_model_select_action(policy, legal_mask_secondary, adim) == target_action_secondary) ? 1.0f : 0.0f;
@@ -1547,7 +1918,25 @@ static int recurrent_update_sequence(
                 }
             }
         }
-        matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
+            matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
+        }
+    } else {
+        if (target_choice.slot0_has_action) {
+            factorized_slot_policy_gradients(model, h_states + ((steps - 1) * hdim), combined_legal, 0, &target_choice, policy_scale, entropy_coef,
+                &action_loss_sum, &accuracy_sum, grad_h,
+                grad_slot0_kind_head, grad_slot0_kind_bias,
+                grad_slot0_move_head, grad_slot0_move_bias,
+                grad_slot0_switch_head, grad_slot0_switch_bias,
+                grad_slot0_tera_head, grad_slot0_tera_bias);
+        }
+        if (target_choice.slot1_has_action) {
+            factorized_slot_policy_gradients(model, h_states + ((steps - 1) * hdim), combined_legal, 1, &target_choice, policy_scale, entropy_coef,
+                &action_loss_sum, &accuracy_sum, grad_h,
+                grad_slot1_kind_head, grad_slot1_kind_bias,
+                grad_slot1_move_head, grad_slot1_move_bias,
+                grad_slot1_switch_head, grad_slot1_switch_bias,
+                grad_slot1_tera_head, grad_slot1_tera_bias);
+        }
     }
 
     dv = value - target_value;
@@ -1651,6 +2040,22 @@ static int recurrent_update_sequence(
         #pragma omp parallel for if(adim >= 16)
 #endif
         for (a = 0; a < adim; ++a) accum->policy_bias[a] += grad_policy_bias[a];
+        for (a = 0; a < model->slot0_kind_head.rows * model->slot0_kind_head.cols; ++a) accum->slot0_kind_head[a] += grad_slot0_kind_head[a];
+        for (a = 0; a < FACTORIZED_KIND_DIM; ++a) accum->slot0_kind_bias[a] += grad_slot0_kind_bias[a];
+        for (a = 0; a < model->slot0_move_head.rows * model->slot0_move_head.cols; ++a) accum->slot0_move_head[a] += grad_slot0_move_head[a];
+        for (a = 0; a < FACTORIZED_MOVE_DIM; ++a) accum->slot0_move_bias[a] += grad_slot0_move_bias[a];
+        for (a = 0; a < model->slot0_switch_head.rows * model->slot0_switch_head.cols; ++a) accum->slot0_switch_head[a] += grad_slot0_switch_head[a];
+        for (a = 0; a < FACTORIZED_SWITCH_DIM; ++a) accum->slot0_switch_bias[a] += grad_slot0_switch_bias[a];
+        for (a = 0; a < model->slot0_tera_head.rows * model->slot0_tera_head.cols; ++a) accum->slot0_tera_head[a] += grad_slot0_tera_head[a];
+        for (a = 0; a < FACTORIZED_TERA_DIM; ++a) accum->slot0_tera_bias[a] += grad_slot0_tera_bias[a];
+        for (a = 0; a < model->slot1_kind_head.rows * model->slot1_kind_head.cols; ++a) accum->slot1_kind_head[a] += grad_slot1_kind_head[a];
+        for (a = 0; a < FACTORIZED_KIND_DIM; ++a) accum->slot1_kind_bias[a] += grad_slot1_kind_bias[a];
+        for (a = 0; a < model->slot1_move_head.rows * model->slot1_move_head.cols; ++a) accum->slot1_move_head[a] += grad_slot1_move_head[a];
+        for (a = 0; a < FACTORIZED_MOVE_DIM; ++a) accum->slot1_move_bias[a] += grad_slot1_move_bias[a];
+        for (a = 0; a < model->slot1_switch_head.rows * model->slot1_switch_head.cols; ++a) accum->slot1_switch_head[a] += grad_slot1_switch_head[a];
+        for (a = 0; a < FACTORIZED_SWITCH_DIM; ++a) accum->slot1_switch_bias[a] += grad_slot1_switch_bias[a];
+        for (a = 0; a < model->slot1_tera_head.rows * model->slot1_tera_head.cols; ++a) accum->slot1_tera_head[a] += grad_slot1_tera_head[a];
+        for (a = 0; a < FACTORIZED_TERA_DIM; ++a) accum->slot1_tera_bias[a] += grad_slot1_tera_bias[a];
 #ifdef _OPENMP
         #pragma omp parallel for if(hdim >= 64)
 #endif
@@ -1702,13 +2107,34 @@ static int recurrent_update_sequence(
         #pragma omp parallel for if(adim >= 16)
 #endif
         for (a = 0; a < adim; ++a) model->policy_bias[a] -= learning_rate * grad_policy_bias[a];
+        for (a = 0; a < model->slot0_kind_head.rows * model->slot0_kind_head.cols; ++a) model->slot0_kind_head.data[a] -= learning_rate * grad_slot0_kind_head[a];
+        for (a = 0; a < FACTORIZED_KIND_DIM; ++a) model->slot0_kind_bias[a] -= learning_rate * grad_slot0_kind_bias[a];
+        for (a = 0; a < model->slot0_move_head.rows * model->slot0_move_head.cols; ++a) model->slot0_move_head.data[a] -= learning_rate * grad_slot0_move_head[a];
+        for (a = 0; a < FACTORIZED_MOVE_DIM; ++a) model->slot0_move_bias[a] -= learning_rate * grad_slot0_move_bias[a];
+        for (a = 0; a < model->slot0_switch_head.rows * model->slot0_switch_head.cols; ++a) model->slot0_switch_head.data[a] -= learning_rate * grad_slot0_switch_head[a];
+        for (a = 0; a < FACTORIZED_SWITCH_DIM; ++a) model->slot0_switch_bias[a] -= learning_rate * grad_slot0_switch_bias[a];
+        for (a = 0; a < model->slot0_tera_head.rows * model->slot0_tera_head.cols; ++a) model->slot0_tera_head.data[a] -= learning_rate * grad_slot0_tera_head[a];
+        for (a = 0; a < FACTORIZED_TERA_DIM; ++a) model->slot0_tera_bias[a] -= learning_rate * grad_slot0_tera_bias[a];
+        for (a = 0; a < model->slot1_kind_head.rows * model->slot1_kind_head.cols; ++a) model->slot1_kind_head.data[a] -= learning_rate * grad_slot1_kind_head[a];
+        for (a = 0; a < FACTORIZED_KIND_DIM; ++a) model->slot1_kind_bias[a] -= learning_rate * grad_slot1_kind_bias[a];
+        for (a = 0; a < model->slot1_move_head.rows * model->slot1_move_head.cols; ++a) model->slot1_move_head.data[a] -= learning_rate * grad_slot1_move_head[a];
+        for (a = 0; a < FACTORIZED_MOVE_DIM; ++a) model->slot1_move_bias[a] -= learning_rate * grad_slot1_move_bias[a];
+        for (a = 0; a < model->slot1_switch_head.rows * model->slot1_switch_head.cols; ++a) model->slot1_switch_head.data[a] -= learning_rate * grad_slot1_switch_head[a];
+        for (a = 0; a < FACTORIZED_SWITCH_DIM; ++a) model->slot1_switch_bias[a] -= learning_rate * grad_slot1_switch_bias[a];
+        for (a = 0; a < model->slot1_tera_head.rows * model->slot1_tera_head.cols; ++a) model->slot1_tera_head.data[a] -= learning_rate * grad_slot1_tera_head[a];
+        for (a = 0; a < FACTORIZED_TERA_DIM; ++a) model->slot1_tera_bias[a] -= learning_rate * grad_slot1_tera_bias[a];
 #ifdef _OPENMP
         #pragma omp parallel for if(hdim >= 64)
 #endif
         for (h = 0; h < hdim; ++h) model->value_head[h] -= learning_rate * grad_value_head[h];
         model->value_bias -= learning_rate * grad_value_bias;
-        bootstrap_factorized_heads_from_flat(model);
+        sync_flat_heads_from_factorized(model);
     }
+
+    free(grad_slot0_kind_head); free(grad_slot0_kind_bias); free(grad_slot0_move_head); free(grad_slot0_move_bias);
+    free(grad_slot0_switch_head); free(grad_slot0_switch_bias); free(grad_slot0_tera_head); free(grad_slot0_tera_bias);
+    free(grad_slot1_kind_head); free(grad_slot1_kind_bias); free(grad_slot1_move_head); free(grad_slot1_move_bias);
+    free(grad_slot1_switch_head); free(grad_slot1_switch_bias); free(grad_slot1_tera_head); free(grad_slot1_tera_bias);
 
     return 1;
 }
