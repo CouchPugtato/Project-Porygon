@@ -404,14 +404,14 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             unsigned char tera_mask[FACTORIZED_TERA_DIM];
             int move = sample_small_masked(slot0_move_policy, slot0_move_mask, FACTORIZED_MOVE_DIM);
             sampled_choice.slot0_kind = FACTORIZED_ACTION_MOVE;
-            sampled_choice.slot0_move_index = (unsigned char)(move + 1);
+            sampled_choice.slot0_move_index = (unsigned char)move;
             tera_mask[0] = slot0_mask[move] ? 1 : 0;
             tera_mask[1] = slot0_mask[4 + move] ? 1 : 0;
             sampled_choice.slot0_use_tera = (unsigned char)(sample_small_masked(slot0_tera_policy, tera_mask, FACTORIZED_TERA_DIM) == 1 ? 1 : 0);
         } else {
             int sw = sample_small_masked(slot0_switch_policy, slot0_switch_mask, FACTORIZED_SWITCH_DIM);
             sampled_choice.slot0_kind = FACTORIZED_ACTION_SWITCH;
-            sampled_choice.slot0_switch_index = (unsigned char)(sw + 1);
+            sampled_choice.slot0_switch_index = (unsigned char)sw;
         }
     }
     if (slot1_needs_action) {
@@ -421,14 +421,14 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             unsigned char tera_mask[FACTORIZED_TERA_DIM];
             int move = sample_small_masked(slot1_move_policy, slot1_move_mask, FACTORIZED_MOVE_DIM);
             sampled_choice.slot1_kind = FACTORIZED_ACTION_MOVE;
-            sampled_choice.slot1_move_index = (unsigned char)(move + 1);
+            sampled_choice.slot1_move_index = (unsigned char)move;
             tera_mask[0] = slot1_mask[move] ? 1 : 0;
             tera_mask[1] = slot1_mask[4 + move] ? 1 : 0;
             sampled_choice.slot1_use_tera = (unsigned char)(sample_small_masked(slot1_tera_policy, tera_mask, FACTORIZED_TERA_DIM) == 1 ? 1 : 0);
         } else {
             int sw = sample_small_masked(slot1_switch_policy, slot1_switch_mask, FACTORIZED_SWITCH_DIM);
             sampled_choice.slot1_kind = FACTORIZED_ACTION_SWITCH;
-            sampled_choice.slot1_switch_index = (unsigned char)(sw + 1);
+            sampled_choice.slot1_switch_index = (unsigned char)sw;
         }
     }
     if (!factorized_action_choice_to_flat_actions(&sampled_choice, &action, &action2)) {
@@ -458,29 +458,29 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     if (session->pending_factorized_choice.slot0_has_action) {
         if (session->pending_factorized_choice.slot0_kind == FACTORIZED_ACTION_MOVE) {
             unsigned char tera_mask[FACTORIZED_TERA_DIM] = {
-                slot0_mask[session->pending_factorized_choice.slot0_move_index - 1] ? 1 : 0,
-                slot0_mask[4 + session->pending_factorized_choice.slot0_move_index - 1] ? 1 : 0
+                slot0_mask[session->pending_factorized_choice.slot0_move_index] ? 1 : 0,
+                slot0_mask[4 + session->pending_factorized_choice.slot0_move_index] ? 1 : 0
             };
             session->pending_old_log_prob += action_log_prob(slot0_kind_policy, 0);
-            session->pending_old_log_prob += action_log_prob(slot0_move_policy, session->pending_factorized_choice.slot0_move_index - 1);
+            session->pending_old_log_prob += action_log_prob(slot0_move_policy, session->pending_factorized_choice.slot0_move_index);
             session->pending_old_log_prob += masked_binary_log_prob(slot0_tera_policy, tera_mask, session->pending_factorized_choice.slot0_use_tera ? 1 : 0);
         } else {
             session->pending_old_log_prob += action_log_prob(slot0_kind_policy, 1);
-            session->pending_old_log_prob += action_log_prob(slot0_switch_policy, session->pending_factorized_choice.slot0_switch_index - 1);
+            session->pending_old_log_prob += action_log_prob(slot0_switch_policy, session->pending_factorized_choice.slot0_switch_index);
         }
     }
     if (session->pending_factorized_choice.slot1_has_action) {
         if (session->pending_factorized_choice.slot1_kind == FACTORIZED_ACTION_MOVE) {
             unsigned char tera_mask[FACTORIZED_TERA_DIM] = {
-                slot1_mask[session->pending_factorized_choice.slot1_move_index - 1] ? 1 : 0,
-                slot1_mask[4 + session->pending_factorized_choice.slot1_move_index - 1] ? 1 : 0
+                slot1_mask[session->pending_factorized_choice.slot1_move_index] ? 1 : 0,
+                slot1_mask[4 + session->pending_factorized_choice.slot1_move_index] ? 1 : 0
             };
             session->pending_old_log_prob += action_log_prob(slot1_kind_policy, 0);
-            session->pending_old_log_prob += action_log_prob(slot1_move_policy, session->pending_factorized_choice.slot1_move_index - 1);
+            session->pending_old_log_prob += action_log_prob(slot1_move_policy, session->pending_factorized_choice.slot1_move_index);
             session->pending_old_log_prob += masked_binary_log_prob(slot1_tera_policy, tera_mask, session->pending_factorized_choice.slot1_use_tera ? 1 : 0);
         } else {
             session->pending_old_log_prob += action_log_prob(slot1_kind_policy, 1);
-            session->pending_old_log_prob += action_log_prob(slot1_switch_policy, session->pending_factorized_choice.slot1_switch_index - 1);
+            session->pending_old_log_prob += action_log_prob(slot1_switch_policy, session->pending_factorized_choice.slot1_switch_index);
         }
     }
     session->pending_old_value = value;

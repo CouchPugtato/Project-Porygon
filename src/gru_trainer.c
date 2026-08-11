@@ -165,17 +165,17 @@ static int evaluate_joint_step(
     if (choice->slot0_has_action) {
         build_factor_masks_from_episode(episode, step_index, 0, kind_mask, move_mask, switch_mask);
         if (choice->slot0_kind == FACTORIZED_ACTION_MOVE) {
-            tera_mask[0] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + (choice->slot0_move_index - 1)] ? 1 : 0;
-            tera_mask[1] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 4 + (choice->slot0_move_index - 1)] ? 1 : 0;
+            tera_mask[0] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + choice->slot0_move_index] ? 1 : 0;
+            tera_mask[1] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 4 + choice->slot0_move_index] ? 1 : 0;
             joint_log_prob += masked_small_log_prob(slot0_kind_policy, kind_mask, FACTORIZED_KIND_DIM, 0);
-            joint_log_prob += masked_small_log_prob(slot0_move_policy, move_mask, FACTORIZED_MOVE_DIM, choice->slot0_move_index - 1);
+            joint_log_prob += masked_small_log_prob(slot0_move_policy, move_mask, FACTORIZED_MOVE_DIM, choice->slot0_move_index);
             joint_log_prob += masked_small_log_prob(slot0_tera_policy, tera_mask, FACTORIZED_TERA_DIM, choice->slot0_use_tera ? 1 : 0);
             entropy += masked_small_entropy(slot0_kind_policy, kind_mask, FACTORIZED_KIND_DIM);
             entropy += masked_small_entropy(slot0_move_policy, move_mask, FACTORIZED_MOVE_DIM);
             entropy += masked_small_entropy(slot0_tera_policy, tera_mask, FACTORIZED_TERA_DIM);
         } else if (choice->slot0_kind == FACTORIZED_ACTION_SWITCH) {
             joint_log_prob += masked_small_log_prob(slot0_kind_policy, kind_mask, FACTORIZED_KIND_DIM, 1);
-            joint_log_prob += masked_small_log_prob(slot0_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM, choice->slot0_switch_index - 1);
+            joint_log_prob += masked_small_log_prob(slot0_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM, choice->slot0_switch_index);
             entropy += masked_small_entropy(slot0_kind_policy, kind_mask, FACTORIZED_KIND_DIM);
             entropy += masked_small_entropy(slot0_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM);
         }
@@ -183,17 +183,17 @@ static int evaluate_joint_step(
     if (choice->slot1_has_action) {
         build_factor_masks_from_episode(episode, step_index, 1, kind_mask, move_mask, switch_mask);
         if (choice->slot1_kind == FACTORIZED_ACTION_MOVE) {
-            tera_mask[0] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 14 + (choice->slot1_move_index - 1)] ? 1 : 0;
-            tera_mask[1] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 18 + (choice->slot1_move_index - 1)] ? 1 : 0;
+            tera_mask[0] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 14 + choice->slot1_move_index] ? 1 : 0;
+            tera_mask[1] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 18 + choice->slot1_move_index] ? 1 : 0;
             joint_log_prob += masked_small_log_prob(slot1_kind_policy, kind_mask, FACTORIZED_KIND_DIM, 0);
-            joint_log_prob += masked_small_log_prob(slot1_move_policy, move_mask, FACTORIZED_MOVE_DIM, choice->slot1_move_index - 1);
+            joint_log_prob += masked_small_log_prob(slot1_move_policy, move_mask, FACTORIZED_MOVE_DIM, choice->slot1_move_index);
             joint_log_prob += masked_small_log_prob(slot1_tera_policy, tera_mask, FACTORIZED_TERA_DIM, choice->slot1_use_tera ? 1 : 0);
             entropy += masked_small_entropy(slot1_kind_policy, kind_mask, FACTORIZED_KIND_DIM);
             entropy += masked_small_entropy(slot1_move_policy, move_mask, FACTORIZED_MOVE_DIM);
             entropy += masked_small_entropy(slot1_tera_policy, tera_mask, FACTORIZED_TERA_DIM);
         } else if (choice->slot1_kind == FACTORIZED_ACTION_SWITCH) {
             joint_log_prob += masked_small_log_prob(slot1_kind_policy, kind_mask, FACTORIZED_KIND_DIM, 1);
-            joint_log_prob += masked_small_log_prob(slot1_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM, choice->slot1_switch_index - 1);
+            joint_log_prob += masked_small_log_prob(slot1_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM, choice->slot1_switch_index);
             entropy += masked_small_entropy(slot1_kind_policy, kind_mask, FACTORIZED_KIND_DIM);
             entropy += masked_small_entropy(slot1_switch_policy, switch_mask, FACTORIZED_SWITCH_DIM);
         }
