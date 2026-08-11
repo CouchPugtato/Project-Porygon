@@ -163,11 +163,11 @@ def build_weighted_pool(registry: LeagueRegistry, learner_role: str, parent_id: 
     bucket_members: list[tuple[float, list[LeagueMember], str]] = []
     if learner_role == "main":
         bucket_members.extend([
-            (0.35, historical, "pfsp"),
-            (0.25, [champion] if champion and champion.id != parent_id else [], "uniform"),
-            (0.20, sort_recent(recent_main)[:4], "uniform"),
+            (0.40, [champion] if champion and champion.id != parent_id else [], "uniform"),
+            (0.25, sort_recent(recent_main)[:4], "uniform"),
+            (0.20, historical, "pfsp"),
             (0.10, sort_recent(main_exploiters)[:3], "uniform"),
-            (0.10, sort_recent(league_exploiters)[:3], "uniform"),
+            (0.05, sort_recent(league_exploiters)[:3], "uniform"),
         ])
     elif learner_role == "main_exploiter":
         targets = [parent_member]
