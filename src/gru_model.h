@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+#include "action_mapper.h"
+
 #define FACTORIZED_KIND_DIM 2
 #define FACTORIZED_MOVE_DIM 4
 #define FACTORIZED_SWITCH_DIM 6
@@ -76,10 +78,12 @@ int gru_model_evaluate_factorized_hidden(
     float* slot0_move_policy,
     float* slot0_switch_policy,
     float* slot0_tera_policy,
+    float* slot0_target_policy,
     float* slot1_kind_policy,
     float* slot1_move_policy,
     float* slot1_switch_policy,
     float* slot1_tera_policy,
+    float* slot1_target_policy,
     float* value_out
 );
 int gru_model_supervised_update_heads(
@@ -154,6 +158,19 @@ int gru_model_supervised_accumulate_sequence_window_dual(
     int target_action_a,
     const unsigned char* legal_mask_b,
     int target_action_b,
+    float target_value,
+    float* action_loss_out,
+    float* value_loss_out,
+    float* accuracy_out
+);
+int gru_model_supervised_accumulate_sequence_window_factorized(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    const unsigned char* legal_mask_b,
+    const FactorizedActionChoice* choice,
     float target_value,
     float* action_loss_out,
     float* value_loss_out,
@@ -267,6 +284,18 @@ int gru_model_policy_gradient_accumulate_sequence_window_dual(
     float target_value,
     float entropy_coef
 );
+int gru_model_policy_gradient_accumulate_sequence_window_factorized(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    const unsigned char* legal_mask_b,
+    const FactorizedActionChoice* choice,
+    float advantage,
+    float target_value,
+    float entropy_coef
+);
 int gru_model_policy_gradient_update_sequence_window_dual_anchored(
     GruModel* model,
     const float* sequence,
@@ -285,6 +314,7 @@ int gru_model_policy_gradient_update_sequence_window_dual_anchored(
     float anchor_kl_coef
 );
 size_t gru_model_parameter_count(const GruModel* model);
+size_t gru_model_pre_target_parameter_count(const GruModel* model);
 size_t gru_model_legacy_parameter_count(const GruModel* model);
 int gru_model_export_parameters(const GruModel* model, float* out, size_t count);
 int gru_model_import_parameters(GruModel* model, const float* in, size_t count);

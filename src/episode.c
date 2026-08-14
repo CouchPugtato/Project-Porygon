@@ -434,6 +434,16 @@ int episode_write_json_record(FILE* out, const Episode* episode, const char* bat
         if (i > 0) fputc(',', out);
         fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot0_use_tera);
     }
+    fputs("],\"slot0_target_indices\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot0_target_index);
+    }
+    fputs("],\"slot0_target_masks\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot0_target_mask);
+    }
     fputs("],\"slot1_has_actions\":[", out);
     for (i = 0; i < episode->count; ++i) {
         if (i > 0) fputc(',', out);
@@ -458,6 +468,16 @@ int episode_write_json_record(FILE* out, const Episode* episode, const char* bat
     for (i = 0; i < episode->count; ++i) {
         if (i > 0) fputc(',', out);
         fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot1_use_tera);
+    }
+    fputs("],\"slot1_target_indices\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot1_target_index);
+    }
+    fputs("],\"slot1_target_masks\":[", out);
+    for (i = 0; i < episode->count; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)episode->factorized_actions[i].slot1_target_mask);
     }
     fputs("],\"old_log_probs\":[", out);
     for (i = 0; i < episode->count; ++i) {
@@ -543,11 +563,15 @@ int episode_parse_json_record(
             !parse_optional_u8_field_into_choice(json, "slot0_move_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_move_index)) ||
             !parse_optional_u8_field_into_choice(json, "slot0_switch_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_switch_index)) ||
             !parse_optional_u8_field_into_choice(json, "slot0_use_teras", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_use_tera)) ||
+            !parse_optional_u8_field_into_choice(json, "slot0_target_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_target_index)) ||
+            !parse_optional_u8_field_into_choice(json, "slot0_target_masks", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot0_target_mask)) ||
             !parse_optional_u8_field_into_choice(json, "slot1_has_actions", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_has_action)) ||
             !parse_optional_u8_field_into_choice(json, "slot1_kinds", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_kind)) ||
             !parse_optional_u8_field_into_choice(json, "slot1_move_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_move_index)) ||
             !parse_optional_u8_field_into_choice(json, "slot1_switch_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_switch_index)) ||
-            !parse_optional_u8_field_into_choice(json, "slot1_use_teras", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_use_tera))) {
+            !parse_optional_u8_field_into_choice(json, "slot1_use_teras", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_use_tera)) ||
+            !parse_optional_u8_field_into_choice(json, "slot1_target_indices", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_target_index)) ||
+            !parse_optional_u8_field_into_choice(json, "slot1_target_masks", episode->factorized_actions, count, offsetof(FactorizedActionChoice, slot1_target_mask))) {
         episode_free(episode);
         return 0;
     }

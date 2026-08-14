@@ -6,6 +6,9 @@
 
 #include <stddef.h>
 
+#define FACTORIZED_TARGET_DIM 4
+#define FACTORIZED_TARGET_BIT(index) ((unsigned char)(1u << (index)))
+
 typedef struct {
     unsigned char legal[OBS_NUM_ACTIONS];
 } ActionMask;
@@ -16,17 +19,28 @@ typedef enum {
     FACTORIZED_ACTION_SWITCH = 2
 } FactorizedActionKind;
 
+typedef enum {
+    FACTORIZED_TARGET_SELF = 0,
+    FACTORIZED_TARGET_ALLY = 1,
+    FACTORIZED_TARGET_FOE_LEFT = 2,
+    FACTORIZED_TARGET_FOE_RIGHT = 3
+} FactorizedMoveTarget;
+
 typedef struct {
     unsigned char slot0_has_action;
     unsigned char slot0_kind;
     unsigned char slot0_move_index;
     unsigned char slot0_switch_index;
     unsigned char slot0_use_tera;
+    unsigned char slot0_target_index;
+    unsigned char slot0_target_mask;
     unsigned char slot1_has_action;
     unsigned char slot1_kind;
     unsigned char slot1_move_index;
     unsigned char slot1_switch_index;
     unsigned char slot1_use_tera;
+    unsigned char slot1_target_index;
+    unsigned char slot1_target_mask;
 } FactorizedActionChoice;
 
 typedef struct {
@@ -44,6 +58,8 @@ void factorized_action_choice_init(FactorizedActionChoice* choice);
 void factorized_action_choice_from_flat_actions(FactorizedActionChoice* choice, int action0, int action1);
 int factorized_action_choice_to_flat_actions(const FactorizedActionChoice* choice, int* action0, int* action1);
 void build_slot_legal_mask(const unsigned char* legal_mask, int slot, unsigned char* out);
+unsigned char build_move_target_mask(const ParsedRequest* req, int active_slot, int move_slot);
+void factorized_target_mask_to_array(unsigned char target_mask, unsigned char* out);
 int action_to_showdown_command(
     char* out,
     size_t out_len,
@@ -81,6 +97,12 @@ int request_choice_to_command(
     char* out,
     size_t out_len
 );
+int factorized_choice_to_command(
+    const ParsedRequest* req,
+    const FactorizedActionChoice* choice,
+    char* out,
+    size_t out_len
+);
 int command_to_request_choice(
     const char* command,
     const ParsedRequest* req,
@@ -88,6 +110,11 @@ int command_to_request_choice(
     enum ObsAction* action0,
     int* slot1_has_action,
     enum ObsAction* action1
+);
+int command_to_factorized_request_choice(
+    const char* command,
+    const ParsedRequest* req,
+    FactorizedActionChoice* choice
 );
 size_t collect_slot_legal_actions(
     const ParsedRequest* req,

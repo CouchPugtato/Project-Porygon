@@ -2928,12 +2928,99 @@ static int flip_test_checkpoint_byte(const char* path, long offset) {
     return ok;
 }
 
+static int test_episode_target_roundtrip(void) {
+    const char* replay_path = "target_replay_test.jsonl";
+    Episode episode;
+    Episode parsed;
+    float observation[4] = {0};
+    unsigned char legal_mask[OBS_NUM_ACTIONS] = {0};
+    FILE* file = NULL;
+    char json[8192];
+    char battle_id[64] = {0};
+    char policy_tag[64] = {0};
+    int ok = 1;
+    memset(&episode, 0, sizeof(episode));
+    memset(&parsed, 0, sizeof(parsed));
+    legal_mask[OBS_A1_MOVE1] = 1;
+    ok &= assert_true(episode_init(&episode, 1u, 4u), "initialize target replay episode");
+    ok &= assert_true(episode_append(&episode, observation, legal_mask, OBS_A1_MOVE1, 1.0f, 1),
+        "append target replay step");
+    episode.factorized_actions[0].slot0_has_action = 1;
+    episode.factorized_actions[0].slot0_kind = FACTORIZED_ACTION_MOVE;
+    episode.factorized_actions[0].slot0_move_index = 0;
+    episode.factorized_actions[0].slot0_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    episode.factorized_actions[0].slot0_target_mask =
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+    remove(replay_path);
+    file = fopen(replay_path, "w+b");
+    ok &= assert_true(file != NULL, "open target replay temporary file");
+    if (file) {
+        ok &= assert_true(episode_write_json_record(file, &episode, "battle-target", "policy-target"),
+            "write target replay JSON");
+        rewind(file);
+        ok &= assert_true(fgets(json, sizeof(json), file) != NULL, "read target replay JSON");
+        fclose(file);
+        file = NULL;
+        ok &= assert_true(episode_parse_json_record(json, &parsed, battle_id, sizeof(battle_id), policy_tag, sizeof(policy_tag)),
+            "parse target replay JSON");
+        ok &= assert_true(parsed.factorized_actions[0].slot0_target_index == FACTORIZED_TARGET_FOE_RIGHT,
+            "target replay preserves selected target");
+        ok &= assert_true(parsed.factorized_actions[0].slot0_target_mask == episode.factorized_actions[0].slot0_target_mask,
+            "target replay preserves legal target mask");
+    }
+    if (file) fclose(file);
+    remove(replay_path);
+    episode_free(&episode);
+    episode_free(&parsed);
+    return ok;
+}
+
+static int test_factorized_target_head_training(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    float sequence[4] = {0};
+    float hidden[8] = {0};
+    unsigned char legal_mask[OBS_NUM_ACTIONS] = {0};
+    FactorizedActionChoice choice;
+    float before[FACTORIZED_TARGET_DIM] = {0};
+    float after[FACTORIZED_TARGET_DIM] = {0};
+    float value = 0.0f;
+    int ok = 1;
+    if (!assert_true(model != NULL, "create target-head training model")) return 0;
+    legal_mask[OBS_A1_MOVE1] = 1;
+    factorized_action_choice_init(&choice);
+    choice.slot0_has_action = 1;
+    choice.slot0_kind = FACTORIZED_ACTION_MOVE;
+    choice.slot0_move_index = 0;
+    choice.slot0_target_mask = FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+    choice.slot0_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    ok &= assert_true(gru_model_evaluate_factorized_hidden(
+        model, hidden, legal_mask,
+        NULL, NULL, NULL, NULL, before,
+        NULL, NULL, NULL, NULL, NULL, &value), "evaluate target head before update");
+    gru_model_clear_accumulated_supervised_updates(model);
+    ok &= assert_true(gru_model_supervised_accumulate_sequence_window_factorized(
+        model, sequence, 1u, NULL, legal_mask, NULL, &choice, 1.0f,
+        NULL, NULL, NULL), "accumulate target-head supervised update");
+    ok &= assert_true(gru_model_apply_accumulated_supervised_updates(model, 0.1f), "apply target-head supervised update");
+    ok &= assert_true(gru_model_evaluate_factorized_hidden(
+        model, hidden, legal_mask,
+        NULL, NULL, NULL, NULL, after,
+        NULL, NULL, NULL, NULL, NULL, &value), "evaluate target head after update");
+    ok &= assert_true(after[FACTORIZED_TARGET_FOE_RIGHT] > before[FACTORIZED_TARGET_FOE_RIGHT],
+        "target-head update increases labeled target probability");
+    gru_model_destroy(model);
+    return ok;
+}
+
 static int test_checkpoint_compatibility_validation(void) {
     const char* current_path = "checkpoint_test_current.bin";
     const char* current_temporary_path = "checkpoint_test_current.bin.tmp";
     const char* replacement_failure_path = "checkpoint_test_replace_failure";
     const char* replacement_failure_temporary_path = "checkpoint_test_replace_failure.tmp";
     const char* legacy_path = "checkpoint_test_legacy.bin";
+    const char* pre_target_path = "checkpoint_test_pre_target.bin";
     const char* version_path = "checkpoint_test_version.bin";
     const char* header_corrupt_path = "checkpoint_test_header_corrupt.bin";
     const char* parameter_corrupt_path = "checkpoint_test_parameter_corrupt.bin";
@@ -2950,7 +3037,9 @@ static int test_checkpoint_compatibility_validation(void) {
     TestCheckpointHeader header;
     float* current_parameters = NULL;
     float* legacy_parameters = NULL;
+    float* pre_target_parameters = NULL;
     size_t current_count;
+    size_t pre_target_count;
     size_t legacy_count;
     size_t value_count;
     size_t prefix_count;
@@ -2962,6 +3051,7 @@ static int test_checkpoint_compatibility_validation(void) {
     remove(replacement_failure_temporary_path);
     TEST_RMDIR(replacement_failure_path);
     remove(legacy_path);
+    remove(pre_target_path);
     remove(version_path);
     remove(header_corrupt_path);
     remove(parameter_corrupt_path);
@@ -3041,16 +3131,57 @@ static int test_checkpoint_compatibility_validation(void) {
         "checkpoint rejects action count mismatch");
 
     current_count = gru_model_parameter_count(model);
+    pre_target_count = gru_model_pre_target_parameter_count(model);
     legacy_count = gru_model_legacy_parameter_count(model);
     value_count = gru_model_hidden_dim(model) + 1u;
     prefix_count = legacy_count - value_count;
     current_parameters = (float*)malloc(current_count * sizeof(float));
     legacy_parameters = (float*)malloc(legacy_count * sizeof(float));
-    ok &= assert_true(current_parameters != NULL && legacy_parameters != NULL,
+    pre_target_parameters = (float*)malloc(pre_target_count * sizeof(float));
+    ok &= assert_true(current_parameters != NULL && legacy_parameters != NULL && pre_target_parameters != NULL,
         "checkpoint test allocates legacy fixture parameters");
-    if (!current_parameters || !legacy_parameters) goto cleanup;
+    if (!current_parameters || !legacy_parameters || !pre_target_parameters) goto cleanup;
     ok &= assert_true(gru_model_export_parameters(model, current_parameters, current_count),
         "checkpoint test exports current parameters");
+    {
+        size_t target_chunk = (gru_model_hidden_dim(model) * FACTORIZED_TARGET_DIM) + FACTORIZED_TARGET_DIM;
+        size_t slot1_factorized_chunk =
+            (gru_model_hidden_dim(model) * FACTORIZED_KIND_DIM) + FACTORIZED_KIND_DIM +
+            (gru_model_hidden_dim(model) * FACTORIZED_MOVE_DIM) + FACTORIZED_MOVE_DIM +
+            (gru_model_hidden_dim(model) * FACTORIZED_SWITCH_DIM) + FACTORIZED_SWITCH_DIM +
+            (gru_model_hidden_dim(model) * FACTORIZED_TERA_DIM) + FACTORIZED_TERA_DIM;
+        size_t target1_offset = current_count - value_count - target_chunk;
+        size_t target0_offset = target1_offset - slot1_factorized_chunk - target_chunk;
+        size_t out_index = 0;
+        memcpy(pre_target_parameters, current_parameters, target0_offset * sizeof(float));
+        out_index += target0_offset;
+        memcpy(pre_target_parameters + out_index,
+            current_parameters + target0_offset + target_chunk,
+            slot1_factorized_chunk * sizeof(float));
+        out_index += slot1_factorized_chunk;
+        memcpy(pre_target_parameters + out_index,
+            current_parameters + target1_offset + target_chunk,
+            value_count * sizeof(float));
+        out_index += value_count;
+        ok &= assert_true(out_index == pre_target_count, "checkpoint test builds pre-target fixture layout");
+    }
+    memset(&header, 0, sizeof(header));
+    memcpy(header.magic, "PORYCHK", 7);
+    header.version = CHECKPOINT_MIN_SUPPORTED_VERSION;
+    header.input_dim = gru_model_input_dim(model);
+    header.hidden_dim = gru_model_hidden_dim(model);
+    header.num_actions = gru_model_num_actions(model);
+    header.parameter_count = pre_target_count;
+    header.trainer = state;
+    ok &= assert_true(write_test_checkpoint(pre_target_path, &header, pre_target_parameters),
+        "checkpoint test writes pre-target factorized layout");
+    loaded = checkpoint_load_compatible(pre_target_path, &loaded_state, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded != NULL && result.status == CHECKPOINT_LOAD_OK &&
+            result.parameter_layout == CHECKPOINT_LAYOUT_FACTORIZED,
+        "pre-target factorized checkpoint loads with neutral target heads");
+    gru_model_destroy(loaded);
+    loaded = NULL;
+
     memcpy(legacy_parameters, current_parameters, prefix_count * sizeof(float));
     memcpy(legacy_parameters + prefix_count, current_parameters + current_count - value_count, value_count * sizeof(float));
     memset(&header, 0, sizeof(header));
@@ -3152,11 +3283,13 @@ cleanup:
     gru_model_destroy(model);
     free(current_parameters);
     free(legacy_parameters);
+    free(pre_target_parameters);
     remove(current_path);
     remove(current_temporary_path);
     remove(replacement_failure_temporary_path);
     TEST_RMDIR(replacement_failure_path);
     remove(legacy_path);
+    remove(pre_target_path);
     remove(version_path);
     remove(header_corrupt_path);
     remove(parameter_corrupt_path);
@@ -3182,6 +3315,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "  %s --batch-replay <jsonl_path>\n", argv[0]);
         return 1;
     }
+    if (!test_episode_target_roundtrip()) return 1;
+    if (!test_factorized_target_head_training()) return 1;
     if (!test_checkpoint_compatibility_validation()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;

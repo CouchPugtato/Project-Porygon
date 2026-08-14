@@ -206,26 +206,59 @@ static int is_switch_action(enum ObsAction action, int* active_slot, int* switch
     return 0;
 }
 
-static int move_target_suffix(const ParsedRequest* req, int active_slot, int move_slot, char* out, size_t out_len) {
-    ParsedMoveTarget target;
-    if (!req || !out || out_len == 0 || active_slot < 0 || active_slot >= PARSED_REQUEST_ACTIVE_SLOTS ||
-        move_slot < 0 || move_slot >= PARSED_REQUEST_MOVE_SLOTS) {
-        return 0;
+void factorized_target_mask_to_array(unsigned char target_mask, unsigned char* out) {
+    int i;
+    if (!out) {
+        return;
     }
-    out[0] = '\0';
+    for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) {
+        out[i] = (target_mask & FACTORIZED_TARGET_BIT(i)) ? 1 : 0;
+    }
+}
+
+unsigned char build_move_target_mask(const ParsedRequest* req, int active_slot, int move_slot) {
+    ParsedMoveTarget target;
+    unsigned char mask = 0;
+    int ally_available;
+    if (!req || active_slot < 0 || active_slot >= PARSED_REQUEST_ACTIVE_SLOTS ||
+        move_slot < 0 || move_slot >= PARSED_REQUEST_MOVE_SLOTS) {
+        return 0u;
+    }
+    ally_available = req->is_doubles && req->slot_present[1 - active_slot] &&
+        !req->active[1 - active_slot].fainted;
     target = req->active[active_slot].move_target[move_slot];
     switch (target) {
         case REQUEST_TARGET_NORMAL:
+            mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT);
+            if (req->is_doubles) {
+                if (ally_available) mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_ALLY);
+                mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+            }
+            break;
         case REQUEST_TARGET_ADJACENT_FOE:
+            mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT);
+            if (req->is_doubles) {
+                mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+            }
+            break;
         case REQUEST_TARGET_ANY:
-            snprintf(out, out_len, " 1");
-            return 1;
+            mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT);
+            if (req->is_doubles) {
+                if (ally_available) mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_ALLY);
+                mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+            }
+            break;
         case REQUEST_TARGET_ADJACENT_ALLY:
-            snprintf(out, out_len, active_slot == 0 ? " -2" : " -1");
-            return 1;
+            if (ally_available) {
+                mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_ALLY);
+            }
+            break;
         case REQUEST_TARGET_ADJACENT_ALLY_OR_SELF:
-            snprintf(out, out_len, active_slot == 0 ? " -1" : " -2");
-            return 1;
+            mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_SELF);
+            if (ally_available) {
+                mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_ALLY);
+            }
+            break;
         case REQUEST_TARGET_SELF:
         case REQUEST_TARGET_ALL_ADJACENT_FOES:
         case REQUEST_TARGET_ALL:
@@ -233,8 +266,64 @@ static int move_target_suffix(const ParsedRequest* req, int active_slot, int mov
         case REQUEST_TARGET_FOE_SIDE:
         case REQUEST_TARGET_UNKNOWN:
         default:
-            return 1;
+            break;
     }
+    return mask;
+}
+
+static int first_target_from_mask(unsigned char target_mask) {
+    static const int preference[FACTORIZED_TARGET_DIM] = {
+        FACTORIZED_TARGET_FOE_LEFT,
+        FACTORIZED_TARGET_FOE_RIGHT,
+        FACTORIZED_TARGET_ALLY,
+        FACTORIZED_TARGET_SELF
+    };
+    int i;
+    for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) {
+        if (target_mask & FACTORIZED_TARGET_BIT(preference[i])) return preference[i];
+    }
+    return FACTORIZED_TARGET_SELF;
+}
+
+static int move_target_suffix(
+    const ParsedRequest* req,
+    int active_slot,
+    int move_slot,
+    int target_index,
+    char* out,
+    size_t out_len
+) {
+    unsigned char target_mask;
+    int target_location;
+    if (!req || !out || out_len == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    target_mask = build_move_target_mask(req, active_slot, move_slot);
+    if (target_mask == 0u) {
+        return 1;
+    }
+    if (target_index < 0 || target_index >= FACTORIZED_TARGET_DIM ||
+            !(target_mask & FACTORIZED_TARGET_BIT(target_index))) {
+        target_index = first_target_from_mask(target_mask);
+    }
+    switch ((FactorizedMoveTarget)target_index) {
+        case FACTORIZED_TARGET_SELF:
+            target_location = -(active_slot + 1);
+            break;
+        case FACTORIZED_TARGET_ALLY:
+            target_location = active_slot == 0 ? -2 : -1;
+            break;
+        case FACTORIZED_TARGET_FOE_RIGHT:
+            target_location = 2;
+            break;
+        case FACTORIZED_TARGET_FOE_LEFT:
+        default:
+            target_location = 1;
+            break;
+    }
+    snprintf(out, out_len, " %d", target_location);
+    return 1;
 }
 
 static int request_choice_pair_is_valid(
@@ -395,11 +484,12 @@ int action_to_showdown_command(
     return 1;
 }
 
-int action_to_showdown_part(
+static int action_to_showdown_part_target(
     char* out,
     size_t out_len,
     enum ObsAction action,
-    const ParsedRequest* req
+    const ParsedRequest* req,
+    int target_index
 ) {
     int active_slot;
     int move_slot;
@@ -421,7 +511,7 @@ int action_to_showdown_part(
     }
 
     if (is_move_action(action, &active_slot, &move_slot, &tera)) {
-        if (!move_target_suffix(req, active_slot, move_slot, target_suffix, sizeof(target_suffix))) {
+        if (!move_target_suffix(req, active_slot, move_slot, target_index, target_suffix, sizeof(target_suffix))) {
             return 0;
         }
         snprintf(out, out_len, "move %d%s%s",
@@ -432,6 +522,15 @@ int action_to_showdown_part(
         return 0;
     }
     return 1;
+}
+
+int action_to_showdown_part(
+    char* out,
+    size_t out_len,
+    enum ObsAction action,
+    const ParsedRequest* req
+) {
+    return action_to_showdown_part_target(out, out_len, action, req, -1);
 }
 
 int doubles_actions_to_showdown_command(
@@ -516,7 +615,221 @@ int request_choice_to_command(
     char* out,
     size_t out_len
 ) {
-    return request_actions_to_showdown_command(out, out_len, req, slot0_has_action, action0, slot1_has_action, action1);
+    FactorizedActionChoice choice;
+    factorized_action_choice_from_flat_actions(
+        &choice,
+        slot0_has_action ? (int)action0 : -1,
+        slot1_has_action ? (int)action1 : -1);
+    return factorized_choice_to_command(req, &choice, out, out_len);
+}
+
+int factorized_choice_to_command(
+    const ParsedRequest* req,
+    const FactorizedActionChoice* choice,
+    char* out,
+    size_t out_len
+) {
+    int action0 = -1;
+    int action1 = -1;
+    char part0[64];
+    char part1[64];
+    int target0 = -1;
+    int target1 = -1;
+    if (!req || !choice || !out || out_len == 0 ||
+            !factorized_action_choice_to_flat_actions(choice, &action0, &action1)) {
+        return 0;
+    }
+    out[0] = '\0';
+    if (choice->slot0_has_action && choice->slot0_kind == FACTORIZED_ACTION_MOVE) {
+        target0 = choice->slot0_target_index;
+    }
+    if (choice->slot1_has_action && choice->slot1_kind == FACTORIZED_ACTION_MOVE) {
+        target1 = choice->slot1_target_index;
+    }
+    if (choice->slot0_has_action &&
+            !action_to_showdown_part_target(part0, sizeof(part0), (enum ObsAction)action0, req, target0)) {
+        return 0;
+    }
+    if (choice->slot1_has_action &&
+            !action_to_showdown_part_target(part1, sizeof(part1), (enum ObsAction)action1, req, target1)) {
+        return 0;
+    }
+    if (choice->slot0_has_action && choice->slot1_has_action) {
+        snprintf(out, out_len, "/choose %s, %s", part0, part1);
+        return 1;
+    }
+    if (choice->slot0_has_action) {
+        snprintf(out, out_len, req->forced_switch_any && req->force_switch[1]
+            ? "/choose %s, pass" : "/choose %s", part0);
+        return 1;
+    }
+    if (choice->slot1_has_action) {
+        snprintf(out, out_len, req->forced_switch_any && req->force_switch[1]
+            ? "/choose pass, %s" : "/choose %s", part1);
+        return 1;
+    }
+    return 0;
+}
+
+static char* trim_command_part(char* part) {
+    char* end;
+    while (part && (*part == ' ' || *part == '\t')) {
+        ++part;
+    }
+    if (!part) {
+        return NULL;
+    }
+    end = part + strlen(part);
+    while (end > part && (end[-1] == ' ' || end[-1] == '\t')) {
+        --end;
+    }
+    *end = '\0';
+    return part;
+}
+
+static int target_index_from_location(int active_slot, int location) {
+    if (location == 1) return FACTORIZED_TARGET_FOE_LEFT;
+    if (location == 2) return FACTORIZED_TARGET_FOE_RIGHT;
+    if (location == -(active_slot + 1)) return FACTORIZED_TARGET_SELF;
+    if (location < 0) return FACTORIZED_TARGET_ALLY;
+    return -1;
+}
+
+static int parse_factorized_command_part(
+    const char* part,
+    const ParsedRequest* req,
+    int slot,
+    FactorizedActionChoice* choice
+) {
+    char buffer[96];
+    char* token;
+    char* next;
+    int index;
+    int target_location = 0;
+    int target_index;
+    int tera = 0;
+    unsigned char target_mask;
+    if (!part || !req || !choice || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS) {
+        return 0;
+    }
+    snprintf(buffer, sizeof(buffer), "%s", part);
+    token = strtok(buffer, " \t");
+    if (!token) return 0;
+    if (strcmp(token, "pass") == 0) return 1;
+    if (strcmp(token, "team") == 0) {
+        next = strtok(NULL, " \t");
+        if (slot != 0 || !next) return 0;
+        index = atoi(next) - 1;
+        if (index < 0 || index >= PARSED_REQUEST_TEAM_SIZE) return 0;
+        choice->slot0_has_action = 1;
+        choice->slot0_kind = FACTORIZED_ACTION_SWITCH;
+        choice->slot0_switch_index = (unsigned char)index;
+        return 1;
+    }
+    if (strcmp(token, "switch") == 0) {
+        next = strtok(NULL, " \t");
+        if (!next) return 0;
+        index = atoi(next) - 1;
+        if (index < 0 || index >= PARSED_REQUEST_TEAM_SIZE) return 0;
+        if (slot == 0) {
+            choice->slot0_has_action = 1;
+            choice->slot0_kind = FACTORIZED_ACTION_SWITCH;
+            choice->slot0_switch_index = (unsigned char)index;
+        } else {
+            choice->slot1_has_action = 1;
+            choice->slot1_kind = FACTORIZED_ACTION_SWITCH;
+            choice->slot1_switch_index = (unsigned char)index;
+        }
+        return 1;
+    }
+    if (strcmp(token, "move") != 0) return 0;
+    next = strtok(NULL, " \t");
+    if (!next) return 0;
+    index = atoi(next) - 1;
+    if (index < 0 || index >= PARSED_REQUEST_MOVE_SLOTS) return 0;
+    while ((next = strtok(NULL, " \t")) != NULL) {
+        if (strcmp(next, "terastallize") == 0) {
+            tera = 1;
+        } else {
+            target_location = atoi(next);
+        }
+    }
+    target_mask = build_move_target_mask(req, slot, index);
+    target_index = target_location == 0 ? first_target_from_mask(target_mask)
+        : target_index_from_location(slot, target_location);
+    if (target_mask != 0u && (target_index < 0 ||
+            !(target_mask & FACTORIZED_TARGET_BIT(target_index)))) {
+        return 0;
+    }
+    if (slot == 0) {
+        choice->slot0_has_action = 1;
+        choice->slot0_kind = FACTORIZED_ACTION_MOVE;
+        choice->slot0_move_index = (unsigned char)index;
+        choice->slot0_use_tera = (unsigned char)tera;
+        choice->slot0_target_index = (unsigned char)(target_index < 0 ? 0 : target_index);
+        choice->slot0_target_mask = target_mask;
+    } else {
+        choice->slot1_has_action = 1;
+        choice->slot1_kind = FACTORIZED_ACTION_MOVE;
+        choice->slot1_move_index = (unsigned char)index;
+        choice->slot1_use_tera = (unsigned char)tera;
+        choice->slot1_target_index = (unsigned char)(target_index < 0 ? 0 : target_index);
+        choice->slot1_target_mask = target_mask;
+    }
+    return 1;
+}
+
+int command_to_factorized_request_choice(
+    const char* command,
+    const ParsedRequest* req,
+    FactorizedActionChoice* choice
+) {
+    char buffer[256];
+    char* body;
+    char* comma;
+    char* part0;
+    char* part1 = NULL;
+    int slot_for_single;
+    int action0 = -1;
+    int action1 = -1;
+    ActionMask mask;
+    if (!command || !req || !choice || strncmp(command, "/choose ", 8) != 0) {
+        return 0;
+    }
+    factorized_action_choice_init(choice);
+    snprintf(buffer, sizeof(buffer), "%s", command + 8);
+    body = buffer;
+    comma = strchr(body, ',');
+    if (comma) {
+        *comma = '\0';
+        part1 = trim_command_part(comma + 1);
+    }
+    part0 = trim_command_part(body);
+    if (part1) {
+        if (!parse_factorized_command_part(part0, req, 0, choice) ||
+                !parse_factorized_command_part(part1, req, 1, choice)) {
+            return 0;
+        }
+    } else {
+        slot_for_single = (!req->team_preview && !parsed_request_slot_needs_choice(req, 0) &&
+            parsed_request_slot_needs_choice(req, 1)) ? 1 : 0;
+        if (!parse_factorized_command_part(part0, req, slot_for_single, choice)) {
+            return 0;
+        }
+    }
+    if (!factorized_action_choice_to_flat_actions(choice, &action0, &action1) ||
+            !build_action_mask_from_request(&mask, req)) {
+        return 0;
+    }
+    if (choice->slot0_has_action && !action_index_legal_for_request(req, &mask, 0, (enum ObsAction)action0)) {
+        return 0;
+    }
+    if (choice->slot1_has_action && !action_index_legal_for_request(req, &mask, 1, (enum ObsAction)action1)) {
+        return 0;
+    }
+    return request_choice_pair_is_valid(req,
+        choice->slot0_has_action, (enum ObsAction)(action0 < 0 ? OBS_A1_MOVE1 : action0),
+        choice->slot1_has_action, (enum ObsAction)(action1 < 0 ? OBS_A2_MOVE1 : action1));
 }
 
 int command_to_request_choice(
@@ -527,6 +840,7 @@ int command_to_request_choice(
     int* slot1_has_action,
     enum ObsAction* action1
 ) {
+    FactorizedActionChoice parsed_choice;
     ActionMask mask;
     char candidate[128];
     int need0;
@@ -540,6 +854,19 @@ int command_to_request_choice(
 
     if (!command || !req || !slot0_has_action || !action0 || !slot1_has_action || !action1) {
         return 0;
+    }
+
+    if (command_to_factorized_request_choice(command, req, &parsed_choice)) {
+        int parsed_action0 = -1;
+        int parsed_action1 = -1;
+        if (!factorized_action_choice_to_flat_actions(&parsed_choice, &parsed_action0, &parsed_action1)) {
+            return 0;
+        }
+        *slot0_has_action = parsed_choice.slot0_has_action;
+        *action0 = (enum ObsAction)(parsed_action0 < 0 ? OBS_A1_MOVE1 : parsed_action0);
+        *slot1_has_action = parsed_choice.slot1_has_action;
+        *action1 = (enum ObsAction)(parsed_action1 < 0 ? OBS_A2_MOVE1 : parsed_action1);
+        return 1;
     }
 
     need0 = parsed_request_slot_needs_choice(req, 0);

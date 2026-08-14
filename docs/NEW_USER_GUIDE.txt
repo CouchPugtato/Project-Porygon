@@ -586,11 +586,15 @@ For each active slot, the policy has factorized heads for:
 - move slot: 1 through 4
 - switch target: 1 through 6
 - tera choice: no or yes
+- move target when the selected move requires one: self, ally, left foe, or right foe
+- move target when the selected move requires one: self, ally, left foe, or right foe
 
 The runtime still maps these choices through the flat legal-action representation and finally into one validated Showdown command. Live episode records store:
 
 - both flat actions
 - the factorized choices
+- per-slot move-target choices and their legal masks
+- per-slot move-target choices and their legal masks
 - rollout-time log probability
 - rollout-time value estimate
 - the actor checkpoint path as `policy_tag`

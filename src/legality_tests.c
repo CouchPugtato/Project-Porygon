@@ -49,6 +49,53 @@ static int test_normal_doubles_roundtrip(void) {
     return 1;
 }
 
+static int test_explicit_move_targets_roundtrip(void) {
+    const char* json =
+        "{\"active\":["
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\"},{\"id\":\"leafstorm\",\"pp\":8,\"maxpp\":8,\"target\":\"normal\"}],\"canTerastallize\":\"Grass\"},"
+        "{\"moves\":[{\"id\":\"helpinghand\",\"pp\":32,\"maxpp\":32,\"target\":\"adjacentAllyOrSelf\"},{\"id\":\"suckerpunch\",\"pp\":8,\"maxpp\":8,\"target\":\"adjacentFoe\"}]}"
+        "],"
+        "\"side\":{\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/100\",\"active\":true},"
+        "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77, M\",\"condition\":\"100/100\",\"active\":true},"
+        "{\"ident\":\"p1: C\",\"details\":\"Armarouge, L80, M\",\"condition\":\"100/100\",\"active\":false}"
+        "]}}";
+    ParsedRequest req;
+    FactorizedActionChoice choice;
+    FactorizedActionChoice parsed;
+    char command[256];
+    unsigned char normal_mask;
+    unsigned char ally_or_self_mask;
+
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 26, 1), "parse explicit-target request")) return 0;
+    normal_mask = build_move_target_mask(&req, 0, 1);
+    ally_or_self_mask = build_move_target_mask(&req, 1, 0);
+    if (!assert_true((normal_mask & FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT)) != 0, "normal move can target left foe")) return 0;
+    if (!assert_true((normal_mask & FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT)) != 0, "normal move can target right foe")) return 0;
+    if (!assert_true((ally_or_self_mask & FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_SELF)) != 0, "ally-or-self move can target self")) return 0;
+    if (!assert_true((ally_or_self_mask & FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_ALLY)) != 0, "ally-or-self move can target ally")) return 0;
+
+    factorized_action_choice_init(&choice);
+    choice.slot0_has_action = 1;
+    choice.slot0_kind = FACTORIZED_ACTION_MOVE;
+    choice.slot0_move_index = 1;
+    choice.slot0_target_mask = normal_mask;
+    choice.slot0_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    choice.slot1_has_action = 1;
+    choice.slot1_kind = FACTORIZED_ACTION_MOVE;
+    choice.slot1_move_index = 0;
+    choice.slot1_target_mask = ally_or_self_mask;
+    choice.slot1_target_index = FACTORIZED_TARGET_SELF;
+    if (!assert_true(factorized_choice_to_command(&req, &choice, command, sizeof(command)), "format explicit targets")) return 0;
+    if (!assert_true(strcmp(command, "/choose move 2 2, move 1 -2") == 0, "explicit target command shape")) return 0;
+    if (!assert_true(command_to_factorized_request_choice(command, &req, &parsed), "parse explicit target command")) return 0;
+    if (!assert_true(parsed.slot0_target_index == FACTORIZED_TARGET_FOE_RIGHT, "roundtrip right-foe target")) return 0;
+    if (!assert_true(parsed.slot1_target_index == FACTORIZED_TARGET_SELF, "roundtrip self target")) return 0;
+    if (!assert_true(parsed.slot0_target_mask == normal_mask && parsed.slot1_target_mask == ally_or_self_mask, "roundtrip target masks")) return 0;
+    return 1;
+}
+
 static int test_partial_forced_switch_roundtrip(void) {
     const char* json =
         "{\"forceSwitch\":[false,true],"
@@ -146,6 +193,8 @@ static int test_single_living_active_uses_single_choice(void) {
     if (!assert_true(build_action_mask_from_request(&mask, &req), "build single-living-active mask")) return 0;
     if (!assert_true(mask.legal[OBS_A1_MOVE1] == 0, "slot0 moves illegal")) return 0;
     if (!assert_true(mask.legal[OBS_A2_MOVE1] == 1, "slot1 move legal")) return 0;
+    if (!assert_true((build_move_target_mask(&req, 1, 1) & FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_ALLY)) == 0,
+            "fainted ally is excluded from target mask")) return 0;
     if (!assert_true(request_choice_to_command(&req, 0, OBS_A1_MOVE1, 1, OBS_A2_MOVE2, command, sizeof(command)), "map single-living-active command")) return 0;
     if (!assert_true(strcmp(command, "/choose move 2 1") == 0, "single-living-active command shape")) return 0;
     return 1;
@@ -208,6 +257,7 @@ int main(void) {
         fprintf(stderr, "failed to initialize id tables\n");
         return 1;
     }
+    if (!test_explicit_move_targets_roundtrip()) return 1;
     if (!test_normal_doubles_roundtrip()) {
         return 1;
     }
