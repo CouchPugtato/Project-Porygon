@@ -280,6 +280,9 @@ class ResolvedPool:
     members: list[PoolMember]
     cumulative_weights: list[float]
     total_weight: float
+    coverage_enabled: bool
+    min_category_starts: int
+    prefer_under_sampled_members: bool
 
 
 @dataclass(frozen=True)
@@ -288,6 +291,7 @@ class SampledIdentity:
     kind: Literal["random", "checkpoint"]
     path: str | None
     category: str
+    selection_reason: str
 
 
 @dataclass(frozen=True)
@@ -310,6 +314,7 @@ class WorkerLaunchIdentity:
     sampled_member_kind: str | None = None
     sampled_member_path: str | None = None
     sampled_member_category: str | None = None
+    sampled_selection_reason: str | None = None
     sampled_from_pool: bool = False
 
 
@@ -395,6 +400,21 @@ def load_model_pool(path: Path) -> ResolvedPool:
         raise SystemExit(f"invalid pool file {resolved_path}: 'members' must be a non-empty list")
     seen_names: set[str] = set()
     members = [validate_pool_member(raw, resolved_path, seen_names) for raw in members_raw]
+    coverage_raw = payload.get("coverage")
+    coverage_enabled = False
+    min_category_starts = 0
+    prefer_under_sampled_members = False
+    if isinstance(coverage_raw, dict):
+        coverage_enabled = bool(coverage_raw.get("enabled", True))
+        try:
+            min_category_starts = int(coverage_raw.get("min_category_starts", 1))
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(f"invalid pool coverage in {resolved_path}: bad min_category_starts") from exc
+        prefer_under_sampled_members = bool(coverage_raw.get("prefer_under_sampled_members", True))
+        if min_category_starts < 0:
+            raise SystemExit(f"invalid pool coverage in {resolved_path}: min_category_starts must be >= 0")
+        if min_category_starts == 0:
+            coverage_enabled = False
     cumulative_weights: list[float] = []
     total_weight = 0.0
     for member in members:
@@ -405,16 +425,130 @@ def load_model_pool(path: Path) -> ResolvedPool:
         members=members,
         cumulative_weights=cumulative_weights,
         total_weight=total_weight,
+        coverage_enabled=coverage_enabled,
+        min_category_starts=min_category_starts,
+        prefer_under_sampled_members=prefer_under_sampled_members,
     )
 
 
-def sample_pool_member(pool: ResolvedPool, rng: random.Random) -> SampledIdentity:
-    roll = rng.uniform(0.0, pool.total_weight)
-    for member, cumulative_weight in zip(pool.members, pool.cumulative_weights):
-        if roll <= cumulative_weight:
-            return SampledIdentity(member_name=member.name, kind=member.kind, path=member.path, category=member.category)
-    member = pool.members[-1]
-    return SampledIdentity(member_name=member.name, kind=member.kind, path=member.path, category=member.category)
+def weighted_member_choice(members: list[PoolMember], rng: random.Random) -> PoolMember:
+    total_weight = sum(member.weight for member in members)
+    roll = rng.uniform(0.0, total_weight)
+    cumulative = 0.0
+    for member in members:
+        cumulative += member.weight
+        if roll <= cumulative:
+            return member
+    return members[-1]
+
+
+def sample_pool_member(
+    pool: ResolvedPool,
+    rng: random.Random,
+    member_starts: dict[str, int] | None = None,
+) -> SampledIdentity:
+    if not pool.coverage_enabled or member_starts is None:
+        roll = rng.uniform(0.0, pool.total_weight)
+        for member, cumulative_weight in zip(pool.members, pool.cumulative_weights):
+            if roll <= cumulative_weight:
+                return SampledIdentity(member.name, member.kind, member.path, member.category, "weighted_random")
+        member = pool.members[-1]
+        return SampledIdentity(member.name, member.kind, member.path, member.category, "weighted_random")
+
+    category_members: dict[str, list[PoolMember]] = {}
+    for member in pool.members:
+        category_members.setdefault(member.category, []).append(member)
+    category_starts = {
+        category: sum(max(0, int(member_starts.get(member.name, 0))) for member in members)
+        for category, members in category_members.items()
+    }
+    uncovered = [
+        category for category, starts in category_starts.items()
+        if starts < pool.min_category_starts
+    ]
+    if uncovered:
+        largest_deficit = max(pool.min_category_starts - category_starts[category] for category in uncovered)
+        candidate_categories = [
+            category for category in uncovered
+            if pool.min_category_starts - category_starts[category] == largest_deficit
+        ]
+        selection_reason = "category_quota"
+    else:
+        candidate_categories = list(category_members)
+        selection_reason = "weighted_balance"
+    category_weights = {
+        category: sum(member.weight for member in category_members[category])
+        for category in candidate_categories
+    }
+    category_roll = rng.uniform(0.0, sum(category_weights.values()))
+    cumulative = 0.0
+    selected_category = candidate_categories[-1]
+    for category in candidate_categories:
+        cumulative += category_weights[category]
+        if category_roll <= cumulative:
+            selected_category = category
+            break
+
+    candidates = category_members[selected_category]
+    if pool.prefer_under_sampled_members and len(candidates) > 1:
+        next_category_start = category_starts[selected_category] + 1
+        category_weight = sum(member.weight for member in candidates)
+        deficits = {
+            member.name: (
+                (next_category_start * member.weight / category_weight)
+                - max(0, int(member_starts.get(member.name, 0)))
+            )
+            for member in candidates
+        }
+        largest_deficit = max(deficits.values())
+        candidates = [
+            member for member in candidates
+            if math.isclose(deficits[member.name], largest_deficit, rel_tol=1e-12, abs_tol=1e-12)
+        ]
+    member = weighted_member_choice(candidates, rng)
+    return SampledIdentity(member.name, member.kind, member.path, member.category, selection_reason)
+
+
+def pool_coverage_summary(
+    pool: ResolvedPool,
+    member_stats: dict[str, dict[str, int]],
+) -> dict[str, object]:
+    category_members: dict[str, list[PoolMember]] = {}
+    for member in pool.members:
+        category_members.setdefault(member.category, []).append(member)
+    categories: dict[str, dict[str, object]] = {}
+    total_worker_starts = 0
+    required_category_starts = 0
+    for category, members in sorted(category_members.items()):
+        worker_starts = sum(int(member_stats.get(member.name, {}).get("worker_starts", 0)) for member in members)
+        completed_games = sum(int(member_stats.get(member.name, {}).get("completed_games", 0)) for member in members)
+        target_starts = pool.min_category_starts if pool.coverage_enabled else 0
+        total_worker_starts += worker_starts
+        required_category_starts += target_starts
+        categories[category] = {
+            "member_count": len(members),
+            "configured_weight": sum(member.weight for member in members),
+            "target_worker_starts": target_starts,
+            "worker_starts": worker_starts,
+            "completed_games": completed_games,
+            "assignment_shortfall": max(0, target_starts - worker_starts),
+            "completed_game_shortfall": max(0, target_starts - completed_games),
+        }
+    return {
+        "enabled": pool.coverage_enabled,
+        "min_category_starts": pool.min_category_starts,
+        "prefer_under_sampled_members": pool.prefer_under_sampled_members,
+        "total_worker_starts": total_worker_starts,
+        "required_category_starts": required_category_starts,
+        "assignment_capacity_sufficient": total_worker_starts >= required_category_starts,
+        "assignment_coverage_met": all(
+            int(category["assignment_shortfall"]) == 0 for category in categories.values()
+        ),
+        "completed_game_coverage_met": all(
+            int(category["completed_game_shortfall"]) == 0 for category in categories.values()
+        ),
+        "categories": categories,
+    }
 
 
 class ServerProcess:
@@ -990,7 +1124,12 @@ class PoolOrchestrator:
                 checkpoint_path=checkpoint_path,
                 agent_label=checkpoint_path if checkpoint_path else "random",
             )
-        sampled = sample_pool_member(side_config.pool, self.pool_rng)
+        side_stats = self._group_member_stats.get(spec.model_group, {})
+        member_starts = {
+            member_name: int(stats.get("worker_starts", 0))
+            for member_name, stats in side_stats.items()
+        }
+        sampled = sample_pool_member(side_config.pool, self.pool_rng, member_starts)
         sampled_spec = "random" if sampled.kind == "random" else (sampled.path or "")
         checkpoint_path = checkpoint_for_model_spec(sampled_spec)
         return WorkerLaunchIdentity(
@@ -1001,6 +1140,7 @@ class PoolOrchestrator:
             sampled_member_kind=sampled.kind,
             sampled_member_path=sampled.path,
             sampled_member_category=sampled.category,
+            sampled_selection_reason=sampled.selection_reason,
             sampled_from_pool=True,
         )
 
@@ -1013,6 +1153,8 @@ class PoolOrchestrator:
                 "wins": 0,
                 "losses": 0,
                 "draws": 0,
+                "quota_starts": 0,
+                "weighted_starts": 0,
             }
         return side_stats[member_name]
 
@@ -1032,6 +1174,8 @@ class PoolOrchestrator:
                     "wins": 0,
                     "losses": 0,
                     "draws": 0,
+                    "quota_starts": 0,
+                    "weighted_starts": 0,
                 })
                 completed_games = int(stats.get("completed_games", 0))
                 wins = int(stats.get("wins", 0))
@@ -1052,6 +1196,17 @@ class PoolOrchestrator:
                     "score_rate": safe_rate(wins + (0.5 * draws), completed_games),
                 }
             summary[side] = side_summary
+        return summary
+
+    def _build_group_pool_coverage_summary(self) -> dict[str, dict[str, object]]:
+        summary: dict[str, dict[str, object]] = {}
+        for side, side_config in self.side_configs.items():
+            if not isinstance(side_config, PoolSideSpec):
+                continue
+            summary[side] = pool_coverage_summary(
+                side_config.pool,
+                self._group_member_stats.get(side, {}),
+            )
         return summary
 
     def _collapse_flags_for_group(self, group: dict[str, object], baseline_group: dict[str, object] | None) -> list[str]:
@@ -1199,9 +1354,14 @@ class PoolOrchestrator:
         if launch_identity.sampled_from_pool and launch_identity.sampled_member_name:
             member_stats = self._touch_member_stats(spec.model_group, launch_identity.sampled_member_name)
             member_stats["worker_starts"] += 1
+            if launch_identity.sampled_selection_reason == "category_quota":
+                member_stats["quota_starts"] += 1
+            else:
+                member_stats["weighted_starts"] += 1
             self.log(
                 f"started {spec.worker_token} user={spec.username} mode={launch_identity.mode} "
-                f"agent={launch_identity.agent_label} member={launch_identity.sampled_member_name}"
+                f"agent={launch_identity.agent_label} member={launch_identity.sampled_member_name} "
+                f"category={launch_identity.sampled_member_category} selection={launch_identity.sampled_selection_reason}"
             )
         else:
             self.log(f"started {spec.worker_token} user={spec.username} mode={launch_identity.mode} agent={launch_identity.agent_label}")
@@ -1475,6 +1635,7 @@ class PoolOrchestrator:
             "b": sorted(self.group_modes_seen["b"] or {spec.mode for spec in self.worker_specs if spec.model_group == "b"}),
         }
         pool_members = self._build_group_pool_members_summary()
+        pool_coverage = self._build_group_pool_coverage_summary()
         pool_mode = bool(pool_members)
         group_stats = self._build_group_stats_summary()
         model_specs = self._resolve_model_specs()
@@ -1525,6 +1686,7 @@ class PoolOrchestrator:
         if pool_mode:
             summary["group_pool_members"] = pool_members
             summary["group_member_stats"] = self._build_group_member_stats_summary()
+            summary["group_pool_coverage"] = pool_coverage
             if self.args.model_a_pool:
                 summary["model_a_pool_path"] = str(Path(self.args.model_a_pool).resolve())
             if self.args.model_b_pool:

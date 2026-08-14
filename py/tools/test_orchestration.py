@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,7 @@ from league_manage import LeagueEval, LeagueMember, LeagueRegistry, OpponentStat
 from league_rl_orchestrator import build_weighted_pool, collect_recent_opponent_stats, matchup_difficulty_weight, maybe_promote_candidate
 from live_rl_orchestrator import build_selfplay_command, collapse_flags_from_training_summary, round_manifest_completed
 from opponent_sampling import refresh_adaptive_pool
-from selfplay_server import validate_pool_member
+from selfplay_server import load_model_pool, pool_coverage_summary, sample_pool_member, validate_pool_member
 
 
 def member(
@@ -195,6 +196,85 @@ class LeaguePoolTests(unittest.TestCase):
             self.assertEqual(parsed.learner_win_rate, 0.52)
             self.assertEqual(parsed.matchup_games, 40)
             self.assertEqual(parsed.difficulty_weight, 0.96)
+
+    def test_category_quota_assigns_every_category_before_weighted_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pool_path = Path(temp_dir) / "pool.json"
+            pool_path.write_text(json.dumps({
+                "coverage": {
+                    "enabled": True,
+                    "min_category_starts": 1,
+                    "prefer_under_sampled_members": True,
+                },
+                "members": [
+                    {"name": "champion", "kind": "random", "weight": 0.6, "category": "champion"},
+                    {"name": "recent", "kind": "random", "weight": 0.3, "category": "recent"},
+                    {"name": "history", "kind": "random", "weight": 0.1, "category": "historical"},
+                ],
+            }), encoding="utf-8")
+            pool = load_model_pool(pool_path)
+            rng = random.Random(7)
+            starts: dict[str, int] = {}
+            samples = []
+            for _ in range(3):
+                sample = sample_pool_member(pool, rng, starts)
+                samples.append(sample)
+                starts[sample.member_name] = starts.get(sample.member_name, 0) + 1
+
+            self.assertEqual({sample.category for sample in samples}, {"champion", "recent", "historical"})
+            self.assertTrue(all(sample.selection_reason == "category_quota" for sample in samples))
+            self.assertEqual(sample_pool_member(pool, rng, starts).selection_reason, "weighted_balance")
+
+    def test_category_assignment_prefers_member_behind_its_weighted_share(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pool_path = Path(temp_dir) / "pool.json"
+            pool_path.write_text(json.dumps({
+                "coverage": {"enabled": True, "min_category_starts": 1},
+                "members": [
+                    {"name": "common", "kind": "random", "weight": 0.75, "category": "historical"},
+                    {"name": "rare", "kind": "random", "weight": 0.25, "category": "historical"},
+                ],
+            }), encoding="utf-8")
+            pool = load_model_pool(pool_path)
+            sample = sample_pool_member(pool, random.Random(11), {"common": 3, "rare": 0})
+            self.assertEqual(sample.member_name, "rare")
+            self.assertEqual(sample.selection_reason, "weighted_balance")
+
+    def test_pool_coverage_reports_assignment_and_completed_game_shortfalls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pool_path = Path(temp_dir) / "pool.json"
+            pool_path.write_text(json.dumps({
+                "coverage": {"enabled": True, "min_category_starts": 1},
+                "members": [
+                    {"name": "champion", "kind": "random", "weight": 0.7, "category": "champion"},
+                    {"name": "history", "kind": "random", "weight": 0.3, "category": "historical"},
+                ],
+            }), encoding="utf-8")
+            pool = load_model_pool(pool_path)
+            summary = pool_coverage_summary(pool, {
+                "champion": {"worker_starts": 1, "completed_games": 1},
+            })
+            self.assertFalse(summary["assignment_coverage_met"])
+            self.assertEqual(summary["categories"]["historical"]["assignment_shortfall"], 1)
+
+            summary = pool_coverage_summary(pool, {
+                "champion": {"worker_starts": 1, "completed_games": 1},
+                "history": {"worker_starts": 1, "completed_games": 0},
+            })
+            self.assertTrue(summary["assignment_coverage_met"])
+            self.assertFalse(summary["completed_game_coverage_met"])
+            self.assertEqual(summary["categories"]["historical"]["completed_game_shortfall"], 1)
+
+    def test_static_pool_keeps_weighted_random_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pool_path = Path(temp_dir) / "pool.json"
+            pool_path.write_text(json.dumps({
+                "members": [{"name": "random", "kind": "random", "weight": 1.0}],
+            }), encoding="utf-8")
+            pool = load_model_pool(pool_path)
+            sample = sample_pool_member(pool, random.Random(3), {})
+            self.assertFalse(pool.coverage_enabled)
+            self.assertEqual(sample.selection_reason, "weighted_random")
 
 
 class PromotionTests(unittest.TestCase):

@@ -613,6 +613,8 @@ Supported training roles are:
 
 Main-agent opponent pools preserve separate allocations for the champion, recent mains, historical snapshots, and exploiters. Within each allocation, opponents with recent learner win rates near 50% receive more weight. Small matchup samples are pulled toward 50% before weighting, and a minimum weight keeps easier and harder opponents in circulation.
 
+Before adaptive weighting takes over, generated league pools assign at least one worker start to every active category. The shared `league_min_category_starts` default or `--min-category-starts` changes that quota; `0` disables it. Members that are behind their expected share are preferred within the chosen category. Run summaries report assignment shortfalls separately from completed-game shortfalls, which makes worker failures visible instead of treating a launch as a completed matchup.
+
 Every pool collection summary records per-opponent wins, losses, draws, score rate, configured weight, and realized sample rate. League workflows aggregate these results from the learner's perspective into each member's `opponent_stats`, so later pools adapt using recent direct matchups instead of unrelated global evaluation rates.
 
 Multi-round live workflows refresh those weights immediately after each collection round while preserving the champion/recent/history/exploiter allocations. Each round manifest identifies both the pool used and the refreshed pool prepared for the next round, so resumed runs continue from the same opponent curriculum.

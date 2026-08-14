@@ -31,6 +31,7 @@ DEFAULT_LEAGUE_ROOT = Path("models") / "league"
 DEFAULT_MATCHUP_TARGET_WIN_RATE = float_default("league_matchup_target_win_rate")
 DEFAULT_MATCHUP_MIN_WEIGHT = float_default("league_matchup_min_weight")
 DEFAULT_MATCHUP_CONFIDENCE_GAMES = int_default("league_matchup_confidence_games")
+DEFAULT_MIN_CATEGORY_STARTS = int_default("league_min_category_starts")
 
 
 def positive_int(value: str) -> int:
@@ -196,6 +197,7 @@ def build_weighted_pool(
     target_win_rate: float = DEFAULT_MATCHUP_TARGET_WIN_RATE,
     min_difficulty_weight: float = DEFAULT_MATCHUP_MIN_WEIGHT,
     confidence_games: int = DEFAULT_MATCHUP_CONFIDENCE_GAMES,
+    min_category_starts: int = DEFAULT_MIN_CATEGORY_STARTS,
 ) -> dict[str, object]:
     members: list[dict[str, object]] = []
     parent_member = find_member(registry, parent_id)
@@ -303,6 +305,11 @@ def build_weighted_pool(
             "matchup_games": 0,
         })
     return {
+        "coverage": {
+            "enabled": min_category_starts > 0,
+            "min_category_starts": min_category_starts,
+            "prefer_under_sampled_members": True,
+        },
         "sampling": {
             "strategy": ADAPTIVE_STRATEGY,
             "target_win_rate": target_win_rate,
@@ -576,6 +583,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--matchup-target-win-rate", type=target_win_rate_float, default=DEFAULT_MATCHUP_TARGET_WIN_RATE)
     parser.add_argument("--matchup-min-weight", type=positive_unit_float, default=DEFAULT_MATCHUP_MIN_WEIGHT)
     parser.add_argument("--matchup-confidence-games", type=positive_int, default=DEFAULT_MATCHUP_CONFIDENCE_GAMES)
+    parser.add_argument("--min-category-starts", type=nonnegative_int, default=DEFAULT_MIN_CATEGORY_STARTS)
     parser.add_argument("--eval-games", type=positive_int, default=500)
     parser.add_argument("--eval-concurrent-games", type=positive_int, default=40)
     parser.add_argument("--eval-worker-pairs", type=positive_int, default=120)
@@ -610,6 +618,7 @@ def main() -> None:
         target_win_rate=args.matchup_target_win_rate,
         min_difficulty_weight=args.matchup_min_weight,
         confidence_games=args.matchup_confidence_games,
+        min_category_starts=args.min_category_starts,
     )
     write_json(pool_path, pool_payload)
 

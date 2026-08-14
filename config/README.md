@@ -156,6 +156,11 @@ Pool files are JSON with this schema:
 
 ```json
 {
+  "coverage": {
+    "enabled": true,
+    "min_category_starts": 1,
+    "prefer_under_sampled_members": true
+  },
   "members": [
     {
       "name": "random",
@@ -185,17 +190,23 @@ Rules:
 - `checkpoint` members require an existing `path`
 - weights are normalized internally; they do not need to sum to `1.0`
 - `category`, `learner_win_rate`, `matchup_games`, and `difficulty_weight` are optional provenance fields emitted by league workflows
+- `coverage` is optional; pools without it retain ordinary weighted-random assignment
+- `coverage.min_category_starts` must be non-negative; `0` disables category quotas
 
 Sampling behavior:
 
 - pool sampling happens per worker start, not per battle
 - if a worker respawns, it samples again from that side's pool
+- when coverage is enabled, categories below `min_category_starts` are assigned first
+- after every category reaches its target, category selection returns to the pool's configured/adaptive weights
+- within the selected category, `prefer_under_sampled_members` favors members behind their weighted assignment share
 - existing `--model-a` / `--model-b` behavior is unchanged when pool args are omitted
 - every run now writes both:
   - `<run_name>_summary.json`
   - `<run_name>_manifest.json`
 - the manifest records pool provenance, sampled member counts, worker settings, and candidate/parent checkpoint info when available
 - pool summaries report each member's configured weight, realized sample rate, category, result record, and score rate
+- `group_pool_coverage` reports per-category assignment targets and shortfalls separately from completed-game shortfalls
 - eval/collection summaries now include automatic collapse flags for each side using the current RL guardrail thresholds
 
 Examples:
@@ -381,7 +392,7 @@ Registry additions:
   - `active-mixed`
   - `top-k`
 
-`league_rl_orchestrator.py` builds role-aware pools with separate champion, recent-main, historical, and exploiter budgets. Within each category it favors opponents whose recent learner win rate is closest to `league_matchup_target_win_rate` (default `0.50`). Low-sample results are shrunk toward the target using `league_matchup_confidence_games`, and `league_matchup_min_weight` keeps every eligible opponent in circulation.
+`league_rl_orchestrator.py` builds role-aware pools with separate champion, recent-main, historical, and exploiter budgets. Within each category it favors opponents whose recent learner win rate is closest to `league_matchup_target_win_rate` (default `0.50`). Low-sample results are shrunk toward the target using `league_matchup_confidence_games`, and `league_matchup_min_weight` keeps every eligible opponent in circulation. Generated pools require `league_min_category_starts` worker assignments per active category (default `1`); override it with `--min-category-starts`, or set it to `0` to disable quotas.
 
 Examples:
 
