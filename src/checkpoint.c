@@ -13,10 +13,13 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <io.h>
+#include <windows.h>
 #define MKDIR(path) _mkdir(path)
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #define MKDIR(path) mkdir(path, 0777)
 #endif
 
@@ -56,20 +59,47 @@ static int ensure_parent_directory(const char* path) {
     return 1;
 }
 
-int checkpoint_save(const char* path, const GruModel* model, const TrainerCheckpointState* state) {
-    FILE* f;
-    CheckpointHeader header;
-    float* params;
-    size_t count;
+static int flush_checkpoint_file(FILE* file) {
+    if (!file || fflush(file) != 0) {
+        return 0;
+    }
+#ifdef _WIN32
+    return _commit(_fileno(file)) == 0;
+#else
+    return fsync(fileno(file)) == 0;
+#endif
+}
 
-    if (!path || !model || !state) {
+static int replace_checkpoint_file(const char* temporary_path, const char* path) {
+#ifdef _WIN32
+    return MoveFileExA(
+        temporary_path,
+        path,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    ) != 0;
+#else
+    return rename(temporary_path, path) == 0;
+#endif
+}
+
+int checkpoint_save(const char* path, const GruModel* model, const TrainerCheckpointState* state) {
+    static const char temporary_suffix[] = ".tmp";
+    FILE* f = NULL;
+    CheckpointHeader header;
+    float* params = NULL;
+    char* temporary_path = NULL;
+    size_t count;
+    size_t path_length;
+    int saved = 0;
+
+    if (!path || !*path || !model || !state) {
         return 0;
     }
     if (!ensure_parent_directory(path)) {
         return 0;
     }
-    f = fopen(path, "wb");
-    if (!f) {
+    path_length = strlen(path);
+    if (path_length > SIZE_MAX - sizeof(temporary_suffix)) {
         return 0;
     }
 
@@ -83,24 +113,55 @@ int checkpoint_save(const char* path, const GruModel* model, const TrainerCheckp
     header.trainer = *state;
 
     count = header.parameter_count;
+    if (count == 0 || count > SIZE_MAX / sizeof(float)) {
+        return 0;
+    }
     params = (float*)malloc(count * sizeof(float));
     if (!params) {
-        fclose(f);
         return 0;
     }
     if (!gru_model_export_parameters(model, params, count)) {
-        free(params);
-        fclose(f);
-        return 0;
+        goto cleanup;
     }
+
+    temporary_path = (char*)malloc(path_length + sizeof(temporary_suffix));
+    if (!temporary_path) {
+        goto cleanup;
+    }
+    memcpy(temporary_path, path, path_length);
+    memcpy(temporary_path + path_length, temporary_suffix, sizeof(temporary_suffix));
+    f = fopen(temporary_path, "wb");
+    if (!f) {
+        goto cleanup;
+    }
+
     if (fwrite(&header, sizeof(header), 1, f) != 1 ||
             fwrite(params, sizeof(float), count, f) != count) {
-        free(params);
+        goto cleanup;
+    }
+    if (!flush_checkpoint_file(f)) {
+        goto cleanup;
+    }
+    if (fclose(f) != 0) {
+        f = NULL;
+        goto cleanup;
+    }
+    f = NULL;
+    if (!replace_checkpoint_file(temporary_path, path)) {
+        goto cleanup;
+    }
+    saved = 1;
+
+cleanup:
+    if (f) {
         fclose(f);
-        return 0;
+    }
+    if (!saved && temporary_path) {
+        remove(temporary_path);
     }
     free(params);
-    return fclose(f) == 0;
+    free(temporary_path);
+    return saved;
 }
 
 static void checkpoint_load_result_init(

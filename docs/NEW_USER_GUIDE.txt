@@ -360,6 +360,8 @@ A model checkpoint stores its expected input dimension. The runtime now logs:
 
 The loader now validates format version, observation dimension, action count, supported parameter layout, and exact file length before model use. Errors identify the rejected field or file condition.
 
+Checkpoint saves are crash-safe: the runtime writes and flushes a same-directory `.tmp` file before atomically replacing the destination. A failed or interrupted save therefore leaves the previous completed checkpoint intact; the next save cleans up any stale temporary payload. Do not run multiple writers against the same checkpoint path.
+
 Bottom line:
 
 - old checkpoints are not good evaluation baselines anymore

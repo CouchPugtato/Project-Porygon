@@ -8,6 +8,17 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#define TEST_MKDIR(path) _mkdir(path)
+#define TEST_RMDIR(path) _rmdir(path)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define TEST_MKDIR(path) mkdir(path, 0777)
+#define TEST_RMDIR(path) rmdir(path)
+#endif
+
 #define TEST_JSONL_LINE_MAX 65536
 #define TEST_CAPTURE_PATH "matches/runs/run_0010_postfix_smoke/run_0010_postfix_smoke_raw.jsonl"
 #define TEST_RANDOM_CAPTURE_PATH "matches/runs/run_0011_new_random/run_0011_new_random_raw.jsonl"
@@ -2900,6 +2911,9 @@ static int write_test_checkpoint(
 
 static int test_checkpoint_compatibility_validation(void) {
     const char* current_path = "checkpoint_test_current.bin";
+    const char* current_temporary_path = "checkpoint_test_current.bin.tmp";
+    const char* replacement_failure_path = "checkpoint_test_replace_failure";
+    const char* replacement_failure_temporary_path = "checkpoint_test_replace_failure.tmp";
     const char* legacy_path = "checkpoint_test_legacy.bin";
     const char* version_path = "checkpoint_test_version.bin";
     const char* truncated_path = "checkpoint_test_truncated.bin";
@@ -2908,6 +2922,7 @@ static int test_checkpoint_compatibility_validation(void) {
     GruModel* model = NULL;
     GruModel* loaded = NULL;
     TrainerCheckpointState state;
+    TrainerCheckpointState replacement_state;
     TrainerCheckpointState loaded_state;
     CheckpointLoadResult result;
     TestCheckpointHeader header;
@@ -2921,6 +2936,9 @@ static int test_checkpoint_compatibility_validation(void) {
     FILE* file = NULL;
 
     remove(current_path);
+    remove(current_temporary_path);
+    remove(replacement_failure_temporary_path);
+    TEST_RMDIR(replacement_failure_path);
     remove(legacy_path);
     remove(version_path);
     remove(truncated_path);
@@ -2945,6 +2963,47 @@ static int test_checkpoint_compatibility_validation(void) {
     ok &= assert_true(loaded_state.step == state.step, "current checkpoint restores trainer state");
     gru_model_destroy(loaded);
     loaded = NULL;
+
+    file = fopen(current_temporary_path, "wb");
+    ok &= assert_true(file != NULL, "checkpoint test creates interrupted temporary write");
+    if (file) {
+        fwrite("partial", 1, 7u, file);
+        fclose(file);
+        file = NULL;
+    }
+    loaded = checkpoint_load_compatible(current_path, &loaded_state, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded != NULL && loaded_state.step == state.step,
+        "interrupted temporary write preserves existing checkpoint");
+    gru_model_destroy(loaded);
+    loaded = NULL;
+
+    replacement_state = state;
+    replacement_state.step = 84u;
+    ok &= assert_true(checkpoint_save(current_path, model, &replacement_state),
+        "checkpoint save recovers from interrupted temporary write");
+    file = fopen(current_temporary_path, "rb");
+    ok &= assert_true(file == NULL, "successful checkpoint replacement leaves no temporary file");
+    if (file) {
+        fclose(file);
+        file = NULL;
+    }
+    loaded = checkpoint_load_compatible(current_path, &loaded_state, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded != NULL && loaded_state.step == replacement_state.step,
+        "atomic checkpoint replacement publishes new trainer state");
+    gru_model_destroy(loaded);
+    loaded = NULL;
+
+    ok &= assert_true(TEST_MKDIR(replacement_failure_path) == 0,
+        "checkpoint test creates replacement failure target");
+    ok &= assert_true(!checkpoint_save(replacement_failure_path, model, &state),
+        "checkpoint save reports atomic replacement failure");
+    file = fopen(replacement_failure_temporary_path, "rb");
+    ok &= assert_true(file == NULL, "failed checkpoint replacement removes temporary file");
+    if (file) {
+        fclose(file);
+        file = NULL;
+    }
+    TEST_RMDIR(replacement_failure_path);
 
     loaded = checkpoint_load_compatible(current_path, NULL, 9u, OBS_NUM_ACTIONS, &result);
     ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_INPUT_DIM_MISMATCH,
@@ -3036,6 +3095,9 @@ cleanup:
     free(current_parameters);
     free(legacy_parameters);
     remove(current_path);
+    remove(current_temporary_path);
+    remove(replacement_failure_temporary_path);
+    TEST_RMDIR(replacement_failure_path);
     remove(legacy_path);
     remove(version_path);
     remove(truncated_path);

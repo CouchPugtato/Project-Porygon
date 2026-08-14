@@ -18,6 +18,14 @@ Current checkpoints serialize:
 - value head
 - basic trainer state
 
+## Crash-safe saving
+
+Checkpoint saves are staged in `<checkpoint>.tmp` in the same directory as the destination. The saver writes the complete header and parameter payload, flushes the C stream, forces the file data to disk, closes it, and only then atomically replaces the destination.
+
+If serialization, flushing, closing, or replacement fails, the staging file is removed and an existing destination checkpoint is left unchanged. A process interruption before replacement can leave a partial `.tmp` file, but the previous checkpoint remains loadable and the next save safely overwrites the stale staging file.
+
+Only one process should write a given checkpoint path at a time. Different training runs should continue to use distinct output paths.
+
 ## Legacy flat-head loading
 
 `gru_model_import_parameters()` recognizes the older parameter layout that ends after the flat policy and value heads. When that layout is loaded, it bootstraps the factorized heads from the flat policy head.
@@ -32,6 +40,7 @@ This supports migration, but does not make every old checkpoint a valid baseline
 - A migrated flat-head checkpoint should be evaluated before training or promotion.
 - New serious training runs should start from a checkpoint produced by the current observation and reconstruction code.
 - Promotion comparisons must identify the exact checkpoint paths in their manifests.
+- A reported save failure leaves the last successfully published checkpoint in place.
 
 The loader validates:
 
