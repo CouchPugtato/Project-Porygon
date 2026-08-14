@@ -44,6 +44,8 @@ static void copy_pokemon(ObsPokemon* out, const RawPokemon* in) {
     int i;
     out->known = (unsigned char)in->known;
     out->active = (unsigned char)in->active;
+    out->active_slot = (unsigned char)(in->active && in->active_slot >= 1 && in->active_slot <= 2
+        ? in->active_slot : 0);
     out->fainted = (unsigned char)in->fainted;
     out->revealed = (unsigned char)in->revealed;
     out->hp_frac = (in->max_hp > 0) ? ((float)in->current_hp / (float)in->max_hp) : 0.0f;

@@ -376,6 +376,7 @@ Factorized-head compatibility:
 - current checkpoints contain the original flat policy head, per-slot kind/move/switch/tera/target heads, a symmetric joint-action compatibility head, and one shared Pokemon entity encoder
 - doubles turns score both actions together; slot-specific scores preserve which Pokemon acts, while the shared unordered-pair score learns whether the choices work well together
 - the entity encoder processes every known Pokemon with the same weights, so learned concepts transfer across self/opponent roster positions while the original slot signal remains available
+- each Pokemon observation explicitly identifies non-active, left-active, or right-active board role, allowing action heads to follow the correct Pokemon through switches
 - pre-entity checkpoints preserve their old behavior with a neutral residual path; pre-joint and pre-target checkpoints likewise initialize their missing heads neutrally
 - a legacy checkpoint with a compatible observation dimension and flat policy layout can load; the factorized heads are bootstrapped from the flat head
 - this bootstrap is a migration aid, not proof that the checkpoint is a valid evaluation baseline

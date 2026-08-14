@@ -64,6 +64,7 @@ static size_t flatten_pokemon(float* out, size_t idx, const ObsPokemon* p) {
 
     idx = write_flag(out, idx, p->known);
     idx = write_flag(out, idx, p->active);
+    idx = write_one_hot(out, idx, p->active_slot, OBS_ACTIVE_SLOT_CLASSES);
     idx = write_flag(out, idx, p->fainted);
     idx = write_flag(out, idx, p->revealed);
     idx = write_scalar(out, idx, p->hp_frac);
@@ -242,6 +243,7 @@ void observation_fill_demo(Observation* obs) {
 
     obs->self_team[0].known = 1;
     obs->self_team[0].active = 1;
+    obs->self_team[0].active_slot = 1;
     obs->self_team[0].revealed = 1;
     obs->self_team[0].hp_frac = 0.82f;
     obs->self_team[0].status_id = 0;
@@ -272,6 +274,7 @@ void observation_fill_demo(Observation* obs) {
 
     obs->opp_team[0].known = 1;
     obs->opp_team[0].active = 1;
+    obs->opp_team[0].active_slot = 1;
     obs->opp_team[0].revealed = 1;
     obs->opp_team[0].hp_frac = 0.66f;
     obs->opp_team[0].status_id = 2;

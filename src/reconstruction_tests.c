@@ -510,6 +510,79 @@ static int test_observation_request_flags_and_side_features(void) {
     return 1;
 }
 
+static int test_observation_exports_active_slot_identity(void) {
+    RawBattleState state;
+    Observation obs;
+    float* flat = NULL;
+    size_t entity_offset = OBS_GLOBAL_FEATURES + 2u * OBS_SIDE_FEATURES;
+    int self_left;
+    int self_right;
+    int opp_left;
+    int opp_right;
+    int replacement;
+    int ok = 1;
+    raw_battle_state_init(&state, 1);
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: Left|Pikachu, L80|100/100");
+    raw_battle_state_update_from_event_line(&state, "|switch|p1b: Right|Raichu, L80|100/100");
+    raw_battle_state_update_from_event_line(&state, "|switch|p2a: Foe Left|Eevee, L80|100/100");
+    raw_battle_state_update_from_event_line(&state, "|switch|p2b: Foe Right|Vaporeon, L80|100/100");
+    self_left = state.self_active_slot_to_team_index[0];
+    self_right = state.self_active_slot_to_team_index[1];
+    opp_left = state.opp_active_slot_to_team_index[0];
+    opp_right = state.opp_active_slot_to_team_index[1];
+    ok &= assert_true(self_left >= 0 && self_right >= 0 && opp_left >= 0 && opp_right >= 0,
+        "active-slot observation test reconstructs all four board positions");
+    observation_from_raw_state(&obs, &state, NULL, NULL);
+    ok &= assert_true(obs.self_team[self_left].active_slot == 1 && obs.self_team[self_right].active_slot == 2,
+        "structured self observation distinguishes left and right active slots");
+    ok &= assert_true(obs.opp_team[opp_left].active_slot == 1 && obs.opp_team[opp_right].active_slot == 2,
+        "structured opponent observation distinguishes left and right active slots");
+    flat = (float*)malloc(observation_flat_size() * sizeof(float));
+    ok &= assert_true(flat != NULL &&
+            observation_flatten(flat, observation_flat_size(), &obs) == observation_flat_size(),
+        "active-slot observation test flattens features");
+    if (flat) {
+        size_t self_left_base = entity_offset + (size_t)self_left * OBS_POKEMON_FEATURES;
+        size_t self_right_base = entity_offset + (size_t)self_right * OBS_POKEMON_FEATURES;
+        size_t opp_left_base = entity_offset + (OBS_TEAM_SIZE + (size_t)opp_left) * OBS_POKEMON_FEATURES;
+        size_t opp_right_base = entity_offset + (OBS_TEAM_SIZE + (size_t)opp_right) * OBS_POKEMON_FEATURES;
+        ok &= assert_true(flat[self_left_base + OBS_POKEMON_ACTIVE_SLOT_OFFSET + 1u] == 1.0f &&
+                flat[self_left_base + OBS_POKEMON_ACTIVE_SLOT_OFFSET + 2u] == 0.0f,
+            "flattened self-left entity selects left-slot class");
+        ok &= assert_true(flat[self_right_base + OBS_POKEMON_ACTIVE_SLOT_OFFSET + 2u] == 1.0f &&
+                flat[self_right_base + OBS_POKEMON_ACTIVE_SLOT_OFFSET + 1u] == 0.0f,
+            "flattened self-right entity selects right-slot class");
+        ok &= assert_true(flat[opp_left_base + OBS_POKEMON_ACTIVE_SLOT_OFFSET + 1u] == 1.0f &&
+                flat[opp_right_base + OBS_POKEMON_ACTIVE_SLOT_OFFSET + 2u] == 1.0f,
+            "flattened opponent entities preserve board-side slot classes");
+    }
+    free(flat);
+    flat = NULL;
+
+    raw_battle_state_update_from_event_line(&state, "|switch|p1a: Replacement|Jolteon, L80|100/100");
+    replacement = state.self_active_slot_to_team_index[0];
+    observation_from_raw_state(&obs, &state, NULL, NULL);
+    ok &= assert_true(replacement >= 0 && obs.self_team[replacement].active_slot == 1,
+        "replacement inherits the vacated left-slot identity");
+    ok &= assert_true(obs.self_team[self_left].active_slot == 0 && !obs.self_team[self_left].active,
+        "benched Pokemon returns to the non-active slot class");
+    flat = (float*)malloc(observation_flat_size() * sizeof(float));
+    ok &= assert_true(flat != NULL &&
+            observation_flatten(flat, observation_flat_size(), &obs) == observation_flat_size(),
+        "post-switch active-slot observation flattens");
+    if (flat) {
+        size_t benched_base = entity_offset + (size_t)self_left * OBS_POKEMON_FEATURES;
+        size_t replacement_base = entity_offset + (size_t)replacement * OBS_POKEMON_FEATURES;
+        ok &= assert_true(flat[benched_base + OBS_POKEMON_ACTIVE_SLOT_OFFSET] == 1.0f &&
+                flat[benched_base + OBS_POKEMON_ACTIVE_SLOT_OFFSET + 1u] == 0.0f,
+            "flattened benched entity selects non-active class");
+        ok &= assert_true(flat[replacement_base + OBS_POKEMON_ACTIVE_SLOT_OFFSET + 1u] == 1.0f,
+            "flattened replacement selects left-slot class");
+    }
+    free(flat);
+    return ok;
+}
+
 static int test_find_or_make_does_not_overwrite_full_team(void) {
     RawBattleState state;
 
@@ -3227,6 +3300,33 @@ cleanup:
     return ok;
 }
 
+static int test_active_slot_schema_rejects_older_checkpoint(void) {
+    const char* path = "checkpoint_test_pre_active_slot_schema.bin";
+    size_t old_input_dim = observation_flat_size() -
+        2u * OBS_TEAM_SIZE * OBS_ACTIVE_SLOT_CLASSES;
+    GruModel* old_model = gru_model_create(old_input_dim, 4u, OBS_NUM_ACTIONS);
+    GruModel* loaded = NULL;
+    TrainerCheckpointState state;
+    CheckpointLoadResult result;
+    int ok = 1;
+    memset(&state, 0, sizeof(state));
+    remove(path);
+    ok &= assert_true(old_model != NULL, "active-slot schema test creates prior-dimension model");
+    if (old_model) {
+        ok &= assert_true(checkpoint_save(path, old_model, &state),
+            "active-slot schema test writes prior-dimension checkpoint");
+        loaded = checkpoint_load_compatible(path, NULL,
+            observation_flat_size(), OBS_NUM_ACTIONS, &result);
+        ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_INPUT_DIM_MISMATCH &&
+                result.stored_input_dim == old_input_dim,
+            "checkpoint loader rejects schema without explicit active-slot features");
+    }
+    gru_model_destroy(loaded);
+    gru_model_destroy(old_model);
+    remove(path);
+    return ok;
+}
+
 static int test_checkpoint_compatibility_validation(void) {
     const char* current_path = "checkpoint_test_current.bin";
     const char* current_temporary_path = "checkpoint_test_current.bin.tmp";
@@ -3565,9 +3665,11 @@ int main(int argc, char** argv) {
     if (!test_factorized_target_head_training()) return 1;
     if (!test_symmetric_joint_action_training()) return 1;
     if (!test_shared_entity_encoder_training_and_migration()) return 1;
+    if (!test_active_slot_schema_rejects_older_checkpoint()) return 1;
     if (!test_checkpoint_compatibility_validation()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;
+    if (!test_observation_exports_active_slot_identity()) return 1;
     if (!test_find_or_make_does_not_overwrite_full_team()) return 1;
     if (!test_condition_status_without_hp_preserves_hp()) return 1;
     if (!test_turn_number_not_overwritten_by_request()) return 1;

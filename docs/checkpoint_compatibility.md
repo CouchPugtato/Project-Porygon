@@ -46,6 +46,8 @@ Factorized checkpoints created before joint-action scoring also remain loadable.
 
 Checkpoints created before the shared entity encoder remain loadable. Both sides of the residual entity path initialize to zero, preserving the checkpoint's existing GRU input behavior exactly while allowing later training to activate the shared path.
 
+The later addition of explicit non-active/left/right role features changes `observation_flat_size()`. Checkpoints produced before those features are rejected with an observation-dimension mismatch; parameter-layout migration does not override an incompatible input schema.
+
 This supports migration, but does not make every old checkpoint a valid baseline. Reconstruction semantics and observation contents may have changed even when the numeric input dimension happens to match.
 
 ## Operational rules

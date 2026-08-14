@@ -7,6 +7,8 @@
 #define OBS_TEAM_SIZE 6
 #define OBS_MOVE_SLOTS 4
 #define OBS_BOOST_SLOTS 7
+#define OBS_ACTIVE_SLOT_CLASSES 3
+#define OBS_POKEMON_ACTIVE_SLOT_OFFSET 2
 
 #define OBS_NUM_SPECIES 1025
 #define OBS_NUM_MOVES 920
@@ -53,6 +55,7 @@ enum ObsAction {
 typedef struct {
     uint8_t known;
     uint8_t active;
+    uint8_t active_slot;
     uint8_t fainted;
     uint8_t revealed;
 
@@ -175,7 +178,7 @@ typedef struct {
 } Observation;
 
 #define OBS_POKEMON_FEATURES ( \
-    4 + \
+    4 + OBS_ACTIVE_SLOT_CLASSES + \
     1 + \
     OBS_NUM_STATUS + \
     OBS_NUM_TYPES + \
