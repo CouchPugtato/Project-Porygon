@@ -133,6 +133,9 @@ This is the basis for reproducible collection -> train -> eval lineage.
 - `experiment_id`
 - `eval.summary_path`
 - `eval.collapse_flags`
+- `opponent_stats`
+  - the most recent collection window against each sampled opponent
+  - stored from the learner's perspective as wins, losses, draws, game count, and recent win rate
 
 It also supports workflow statuses beyond the original active/inactive pair:
 
@@ -147,6 +150,10 @@ Pool presets are available through `build-pool`:
 - `champion-plus-random`
 - `active-mixed`
 - `top-k`
+
+League RL pools preserve separate budgets for the champion, recent mains, historical snapshots, and exploiters. Within a category, sampling uses the parent's most recent direct matchup record and favors opponents near the configured 50% learner win-rate target. Confidence smoothing prevents small samples from causing abrupt weight changes, while a minimum difficulty weight keeps easy and hard opponents available.
+
+Collection summaries expose both configured and realized sampling shares plus per-opponent records. At workflow completion, `league_rl_orchestrator.py` aggregates those records from the learner's perspective and stores them on both the parent and candidate so the next pool closes the feedback loop.
 
 ## Recommended first RL ladder
 

@@ -15,17 +15,21 @@ from league_manage import (
     DEFAULT_REGISTRY_PATH,
     LeagueMember,
     LeagueRegistry,
+    OpponentStats,
     find_member,
     league_member_from_json,
     load_registry,
     member_to_json_dict,
     save_registry,
 )
-from rl_defaults import bool_default, float_default
+from rl_defaults import bool_default, float_default, int_default
 
 
 DEFAULT_RUNS_ROOT = Path("models") / "runs"
 DEFAULT_LEAGUE_ROOT = Path("models") / "league"
+DEFAULT_MATCHUP_TARGET_WIN_RATE = float_default("league_matchup_target_win_rate")
+DEFAULT_MATCHUP_MIN_WEIGHT = float_default("league_matchup_min_weight")
+DEFAULT_MATCHUP_CONFIDENCE_GAMES = int_default("league_matchup_confidence_games")
 
 
 def positive_int(value: str) -> int:
@@ -46,6 +50,20 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0.0:
         raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
+def positive_unit_float(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 < parsed <= 1.0:
+        raise argparse.ArgumentTypeError("value must be greater than 0 and at most 1")
+    return parsed
+
+
+def target_win_rate_float(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 < parsed < 1.0:
+        raise argparse.ArgumentTypeError("value must be strictly between 0 and 1")
     return parsed
 
 
@@ -119,23 +137,35 @@ def utc_now_unix() -> float:
     return time.time()
 
 
-def clamp_win_rate(value: float | None) -> float:
-    if value is None:
-        return 0.5
-    return min(0.95, max(0.05, float(value)))
+def matchup_reference(
+    learner: LeagueMember,
+    opponent: LeagueMember,
+    champion_id: str,
+    confidence_games: int,
+) -> tuple[float | None, int]:
+    stats = learner.opponent_stats.get(opponent.id)
+    if stats is not None and stats.matches_played > 0:
+        return min(1.0, max(0.0, stats.recent_win_rate)), stats.matches_played
+    if opponent.id == champion_id and learner.eval.vs_champion_win_rate is not None:
+        return min(1.0, max(0.0, learner.eval.vs_champion_win_rate)), confidence_games
+    return None, 0
 
 
-def member_reference_win_rate(member: LeagueMember) -> float:
-    if member.eval.vs_champion_win_rate is not None:
-        return clamp_win_rate(member.eval.vs_champion_win_rate)
-    if member.eval.vs_random_win_rate is not None:
-        return clamp_win_rate(member.eval.vs_random_win_rate)
-    return 0.5
-
-
-def pfs_weight(member: LeagueMember) -> float:
-    win_rate = member_reference_win_rate(member)
-    return (1.0 - win_rate) ** 2
+def matchup_difficulty_weight(
+    win_rate: float | None,
+    matches_played: int,
+    *,
+    target_win_rate: float = DEFAULT_MATCHUP_TARGET_WIN_RATE,
+    min_weight: float = DEFAULT_MATCHUP_MIN_WEIGHT,
+    confidence_games: int = DEFAULT_MATCHUP_CONFIDENCE_GAMES,
+) -> float:
+    if win_rate is None or matches_played <= 0:
+        return 1.0
+    confidence = min(1.0, matches_played / max(1, confidence_games))
+    smoothed_rate = target_win_rate + ((min(1.0, max(0.0, win_rate)) - target_win_rate) * confidence)
+    span = max(target_win_rate, 1.0 - target_win_rate, 1e-9)
+    closeness = 1.0 - min(1.0, abs(smoothed_rate - target_win_rate) / span)
+    return max(min_weight, closeness)
 
 
 def sort_recent(members: list[LeagueMember]) -> list[LeagueMember]:
@@ -156,52 +186,82 @@ def choose_parent_member(registry: LeagueRegistry, parent_id: str, learner_role:
     raise SystemExit("could not infer parent member; provide --parent-id or initialize the registry with a champion")
 
 
-def build_weighted_pool(registry: LeagueRegistry, learner_role: str, parent_id: str, include_random_weight: float) -> dict[str, object]:
+def build_weighted_pool(
+    registry: LeagueRegistry,
+    learner_role: str,
+    parent_id: str,
+    include_random_weight: float,
+    *,
+    target_win_rate: float = DEFAULT_MATCHUP_TARGET_WIN_RATE,
+    min_difficulty_weight: float = DEFAULT_MATCHUP_MIN_WEIGHT,
+    confidence_games: int = DEFAULT_MATCHUP_CONFIDENCE_GAMES,
+) -> dict[str, object]:
     members: list[dict[str, object]] = []
     parent_member = find_member(registry, parent_id)
     champion = find_member(registry, registry.champion_id) if registry.champion_id else None
     historical = [m for m in registry.members if m.role == "historical_snapshot" and m.status == "active"]
-    recent_main = [m for m in registry.members if m.role == "main" and m.status in {"active", "candidate"} and m.id != parent_id]
+    recent_main = [
+        m for m in registry.members
+        if m.role == "main"
+        and m.status in {"active", "candidate"}
+        and m.id not in {parent_id, registry.champion_id}
+    ]
     main_exploiters = [m for m in registry.members if m.role == "main_exploiter" and m.status in {"active", "candidate"}]
     league_exploiters = [m for m in registry.members if m.role == "league_exploiter" and m.status in {"active", "candidate"}]
 
     bucket_members: list[tuple[float, list[LeagueMember], str]] = []
     if learner_role == "main":
         bucket_members.extend([
-            (0.40, [champion] if champion and champion.id != parent_id else [], "uniform"),
-            (0.25, sort_recent(recent_main)[:4], "uniform"),
-            (0.20, historical, "pfsp"),
-            (0.10, sort_recent(main_exploiters)[:3], "uniform"),
-            (0.05, sort_recent(league_exploiters)[:3], "uniform"),
+            (0.40, [champion] if champion else [], "champion"),
+            (0.25, sort_recent(recent_main)[:4], "recent_main"),
+            (0.20, historical, "historical"),
+            (0.10, sort_recent(main_exploiters)[:3], "main_exploiter"),
+            (0.05, sort_recent(league_exploiters)[:3], "league_exploiter"),
         ])
     elif learner_role == "main_exploiter":
         targets = [parent_member]
         bucket_members.extend([
-            (0.60, targets, "uniform"),
-            (0.20, sort_recent(recent_main)[:4], "uniform"),
-            (0.20, [champion] if champion else [], "uniform"),
+            (0.60, targets, "exploit_target"),
+            (0.20, sort_recent(recent_main)[:4], "recent_main"),
+            (0.20, [champion] if champion else [], "champion"),
         ])
     elif learner_role == "league_exploiter":
         bucket_members.extend([
-            (0.50, [champion] if champion else [], "uniform"),
-            (0.30, historical, "pfsp"),
-            (0.20, sort_recent(recent_main)[:4], "uniform"),
+            (0.50, [champion] if champion else [], "champion"),
+            (0.30, historical, "historical"),
+            (0.20, sort_recent(recent_main)[:4], "recent_main"),
         ])
     else:
-        bucket_members.append((1.0, [champion] if champion else [parent_member], "uniform"))
+        bucket_members.append((1.0, [champion] if champion else [parent_member], "champion"))
 
     combined: dict[str, dict[str, object]] = {}
-    for bucket_weight, bucket, mode in bucket_members:
-        filtered = [member for member in bucket if member is not None and member.id != parent_id]
+    for bucket_weight, bucket, category in bucket_members:
+        filtered = [member for member in bucket if member is not None]
         if not filtered or bucket_weight <= 0.0:
             continue
         raw_weights: list[float] = []
+        matchup_metadata: list[tuple[float | None, int, float]] = []
         for member in filtered:
-            raw_weights.append(pfs_weight(member) if mode == "pfsp" else 1.0)
+            reference_rate, matchup_games = matchup_reference(
+                parent_member,
+                member,
+                registry.champion_id,
+                confidence_games,
+            )
+            difficulty_weight = matchup_difficulty_weight(
+                reference_rate,
+                matchup_games,
+                target_win_rate=target_win_rate,
+                min_weight=min_difficulty_weight,
+                confidence_games=confidence_games,
+            )
+            raw_weights.append(member.collection_weight * difficulty_weight)
+            matchup_metadata.append((reference_rate, matchup_games, difficulty_weight))
         total = sum(raw_weights)
         if total <= 0.0:
             continue
-        for member, raw_weight in zip(filtered, raw_weights):
+        for member, raw_weight, metadata in zip(filtered, raw_weights, matchup_metadata):
+            reference_rate, matchup_games, difficulty_weight = metadata
             weight = bucket_weight * (raw_weight / total)
             existing = combined.get(member.id)
             if existing is None:
@@ -210,20 +270,102 @@ def build_weighted_pool(registry: LeagueRegistry, learner_role: str, parent_id: 
                     "kind": "checkpoint",
                     "path": member.path,
                     "weight": weight,
+                    "category": category,
+                    "bucket_weight": bucket_weight,
+                    "learner_win_rate": reference_rate,
+                    "matchup_games": matchup_games,
+                    "difficulty_weight": difficulty_weight,
                 }
             else:
                 existing["weight"] = float(existing["weight"]) + weight
 
     members = sorted(combined.values(), key=lambda item: (-float(item["weight"]), str(item["name"])))
     if include_random_weight > 0.0:
-        members.append({"name": "random", "kind": "random", "weight": include_random_weight})
+        members.append({
+            "name": "random",
+            "kind": "random",
+            "weight": include_random_weight,
+            "category": "random",
+        })
     if not members:
         members.append({"name": champion.id if champion else parent_member.id, "kind": "checkpoint", "path": (champion or parent_member).path, "weight": 1.0})
-    return {"members": members}
+    return {
+        "sampling": {
+            "strategy": "category_matchup_target",
+            "target_win_rate": target_win_rate,
+            "min_difficulty_weight": min_difficulty_weight,
+            "confidence_games": confidence_games,
+        },
+        "members": members,
+    }
 
 
 def load_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def opponent_stats_payload(stats_by_opponent: dict[str, OpponentStats]) -> dict[str, dict[str, object]]:
+    return {
+        opponent_id: {
+            "matches_played": stats.matches_played,
+            "wins": stats.wins,
+            "losses": stats.losses,
+            "draws": stats.draws,
+            "recent_win_rate": stats.recent_win_rate,
+            "source_run": stats.source_run,
+        }
+        for opponent_id, stats in sorted(stats_by_opponent.items())
+    }
+
+
+def collect_recent_opponent_stats(
+    repo_root: Path,
+    round_manifest_paths: list[Path],
+    source_run: str,
+) -> dict[str, OpponentStats]:
+    aggregate: dict[str, OpponentStats] = {}
+    for manifest_path in round_manifest_paths:
+        resolved_manifest = resolve_path(repo_root, manifest_path)
+        if not resolved_manifest.exists():
+            continue
+        round_manifest = load_json(resolved_manifest)
+        collection_run = str(round_manifest.get("collection_run", "")).strip()
+        if not collection_run:
+            continue
+        summary_path = (
+            repo_root
+            / "matches"
+            / "runs"
+            / collection_run
+            / f"{collection_run}_summary.json"
+        ).resolve()
+        if not summary_path.exists():
+            continue
+        summary = load_json(summary_path)
+        group_member_stats = summary.get("group_member_stats", {}) or {}
+        opponent_members = group_member_stats.get("b", {}) if isinstance(group_member_stats, dict) else {}
+        if not isinstance(opponent_members, dict):
+            continue
+        for opponent_id, raw_stats in opponent_members.items():
+            if not isinstance(raw_stats, dict) or not str(opponent_id).strip():
+                continue
+            opponent_wins = max(0, int(raw_stats.get("wins", 0)))
+            opponent_losses = max(0, int(raw_stats.get("losses", 0)))
+            draws = max(0, int(raw_stats.get("draws", 0)))
+            matches_played = opponent_wins + opponent_losses + draws
+            if matches_played <= 0:
+                continue
+            learner_wins = opponent_losses
+            learner_losses = opponent_wins
+            opponent_key = str(opponent_id)
+            stats = aggregate.setdefault(opponent_key, OpponentStats(source_run=source_run))
+            stats.matches_played += matches_played
+            stats.wins += learner_wins
+            stats.losses += learner_losses
+            stats.draws += draws
+            stats.recent_win_rate = learner_wins / matches_played
+            stats.source_run = source_run
+    return aggregate
 
 
 def build_live_command(args: argparse.Namespace, repo_root: Path, pool_path: Path, parent_checkpoint: Path) -> list[str]:
@@ -313,7 +455,16 @@ def build_eval_command(args: argparse.Namespace, repo_root: Path, candidate_chec
     ]
 
 
-def create_member_from_run(args: argparse.Namespace, registry: LeagueRegistry, candidate_checkpoint: Path, parent_member: LeagueMember, eval_summary_path: Path | None, eval_summary: dict[str, object] | None, collapse_flags: list[str]) -> LeagueMember:
+def create_member_from_run(
+    args: argparse.Namespace,
+    registry: LeagueRegistry,
+    candidate_checkpoint: Path,
+    parent_member: LeagueMember,
+    eval_summary_path: Path | None,
+    eval_summary: dict[str, object] | None,
+    collapse_flags: list[str],
+    opponent_stats: dict[str, OpponentStats],
+) -> LeagueMember:
     generation = registry.current_generation + 1
     vs_champion_win_rate = None
     if eval_summary is not None:
@@ -335,6 +486,7 @@ def create_member_from_run(args: argparse.Namespace, registry: LeagueRegistry, c
         training_config_id=args.training_config_id,
         snapshot_eligible=True,
         notes=args.notes,
+        opponent_stats=opponent_stats,
         eval=league_member_from_json({
             "id": "tmp",
             "path": str(candidate_checkpoint),
@@ -408,6 +560,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--omp-threads", type=int, default=8)
     parser.add_argument("--resume", type=parse_bool, default=True)
     parser.add_argument("--include-random-weight", type=float, default=0.0)
+    parser.add_argument("--matchup-target-win-rate", type=target_win_rate_float, default=DEFAULT_MATCHUP_TARGET_WIN_RATE)
+    parser.add_argument("--matchup-min-weight", type=positive_unit_float, default=DEFAULT_MATCHUP_MIN_WEIGHT)
+    parser.add_argument("--matchup-confidence-games", type=positive_int, default=DEFAULT_MATCHUP_CONFIDENCE_GAMES)
     parser.add_argument("--eval-games", type=positive_int, default=500)
     parser.add_argument("--eval-concurrent-games", type=positive_int, default=40)
     parser.add_argument("--eval-worker-pairs", type=positive_int, default=120)
@@ -434,7 +589,15 @@ def main() -> None:
     workflow_run_name = args.run_name
     args.eval_run_name = f"{args.run_name}_vs_champion_{args.eval_games}"
 
-    pool_payload = build_weighted_pool(registry, args.learner_role, parent_member.id, args.include_random_weight)
+    pool_payload = build_weighted_pool(
+        registry,
+        args.learner_role,
+        parent_member.id,
+        args.include_random_weight,
+        target_win_rate=args.matchup_target_win_rate,
+        min_difficulty_weight=args.matchup_min_weight,
+        confidence_games=args.matchup_confidence_games,
+    )
     write_json(pool_path, pool_payload)
 
     if args.resume and workflow_manifest_path.exists():
@@ -474,6 +637,9 @@ def main() -> None:
     round_manifests = [Path(path) for path in live_manifest.get("round_manifests", [])]
     final_round_manifest = load_json(round_manifests[-1]) if round_manifests else {}
     collapse_flags = [str(flag) for flag in final_round_manifest.get("training_round_collapse_flags", [])]
+    recent_opponent_stats = collect_recent_opponent_stats(repo_root, round_manifests, args.run_name)
+    if recent_opponent_stats:
+        parent_member.opponent_stats = recent_opponent_stats
 
     eval_summary = None
     eval_summary_path = None
@@ -491,8 +657,19 @@ def main() -> None:
     candidate_id = args.member_id or args.run_name
     if registry_has_member(registry, candidate_id):
         candidate = find_member(registry, candidate_id)
+        if recent_opponent_stats:
+            candidate.opponent_stats = recent_opponent_stats
     else:
-        candidate = create_member_from_run(args, registry, candidate_checkpoint, parent_member, eval_summary_path, eval_summary, collapse_flags)
+        candidate = create_member_from_run(
+            args,
+            registry,
+            candidate_checkpoint,
+            parent_member,
+            eval_summary_path,
+            eval_summary,
+            collapse_flags,
+            recent_opponent_stats,
+        )
         registry.members.append(candidate)
         registry.current_generation = max(registry.current_generation, candidate.generation)
 
@@ -510,6 +687,7 @@ def main() -> None:
             experiment_id=args.experiment_id,
             training_config_id=args.training_config_id,
             snapshot_eligible=False,
+            opponent_stats=dict(recent_opponent_stats),
         )
         registry.members.append(snapshot_member)
 
@@ -528,6 +706,7 @@ def main() -> None:
     workflow_manifest["candidate_checkpoint"] = str(candidate_checkpoint)
     workflow_manifest["eval_summary_path"] = str(eval_summary_path) if eval_summary_path else ""
     workflow_manifest["post_eval_collapse_flags"] = collapse_flags
+    workflow_manifest["recent_opponent_stats"] = opponent_stats_payload(recent_opponent_stats)
     workflow_manifest["promoted"] = bool(registry.champion_id == candidate.id)
     write_json(workflow_manifest_path, workflow_manifest)
 

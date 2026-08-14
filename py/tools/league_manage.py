@@ -73,6 +73,16 @@ class LeagueEval:
 
 
 @dataclass
+class OpponentStats:
+    matches_played: int = 0
+    wins: int = 0
+    losses: int = 0
+    draws: int = 0
+    recent_win_rate: float = 0.5
+    source_run: str = ""
+
+
+@dataclass
 class LeagueMember:
     id: str
     path: str
@@ -89,6 +99,7 @@ class LeagueMember:
     training_config_id: str = ""
     snapshot_eligible: bool = True
     eval: LeagueEval = field(default_factory=LeagueEval)
+    opponent_stats: dict[str, OpponentStats] = field(default_factory=dict)
     promoted_at: str = ""
     created_at: str = field(default_factory=utc_now_iso)
 
@@ -123,6 +134,17 @@ def member_to_json_dict(member: LeagueMember) -> dict[str, object]:
             "summary_path": member.eval.summary_path,
             "collapse_flags": member.eval.collapse_flags,
         },
+        "opponent_stats": {
+            opponent_id: {
+                "matches_played": stats.matches_played,
+                "wins": stats.wins,
+                "losses": stats.losses,
+                "draws": stats.draws,
+                "recent_win_rate": stats.recent_win_rate,
+                "source_run": stats.source_run,
+            }
+            for opponent_id, stats in sorted(member.opponent_stats.items())
+        },
         "promoted_at": member.promoted_at,
         "created_at": member.created_at,
     }
@@ -147,6 +169,23 @@ def league_eval_from_json(raw: object) -> LeagueEval:
     )
 
 
+def opponent_stats_from_json(raw: object) -> dict[str, OpponentStats]:
+    payload = raw if isinstance(raw, dict) else {}
+    parsed: dict[str, OpponentStats] = {}
+    for opponent_id, value in payload.items():
+        if not isinstance(value, dict) or not str(opponent_id).strip():
+            continue
+        parsed[str(opponent_id)] = OpponentStats(
+            matches_played=int(value.get("matches_played", 0)),
+            wins=int(value.get("wins", 0)),
+            losses=int(value.get("losses", 0)),
+            draws=int(value.get("draws", 0)),
+            recent_win_rate=float(value.get("recent_win_rate", 0.5)),
+            source_run=str(value.get("source_run", "")),
+        )
+    return parsed
+
+
 def league_member_from_json(raw: dict[str, object]) -> LeagueMember:
     return LeagueMember(
         id=str(raw.get("id", "")).strip(),
@@ -164,6 +203,7 @@ def league_member_from_json(raw: dict[str, object]) -> LeagueMember:
         training_config_id=str(raw.get("training_config_id", "")).strip(),
         snapshot_eligible=bool(raw.get("snapshot_eligible", True)),
         eval=league_eval_from_json(raw.get("eval")),
+        opponent_stats=opponent_stats_from_json(raw.get("opponent_stats")),
         promoted_at=str(raw.get("promoted_at", "")),
         created_at=str(raw.get("created_at", "")),
     )
@@ -258,6 +298,19 @@ def validate_registry(registry: LeagueRegistry) -> None:
             raise SystemExit(f"invalid registry member '{member.id}': vs_random_win_rate must be between 0 and 1")
         if member.eval.vs_champion_win_rate is not None and not (0.0 <= member.eval.vs_champion_win_rate <= 1.0):
             raise SystemExit(f"invalid registry member '{member.id}': vs_champion_win_rate must be between 0 and 1")
+        for opponent_id, stats in member.opponent_stats.items():
+            if not opponent_id:
+                raise SystemExit(f"invalid registry member '{member.id}': opponent_stats key must be non-empty")
+            if min(stats.matches_played, stats.wins, stats.losses, stats.draws) < 0:
+                raise SystemExit(f"invalid registry member '{member.id}': opponent_stats counts must be >= 0")
+            if stats.matches_played != stats.wins + stats.losses + stats.draws:
+                raise SystemExit(
+                    f"invalid registry member '{member.id}': opponent_stats '{opponent_id}' counts do not sum to matches_played"
+                )
+            if not (0.0 <= stats.recent_win_rate <= 1.0):
+                raise SystemExit(
+                    f"invalid registry member '{member.id}': opponent_stats '{opponent_id}' recent_win_rate must be between 0 and 1"
+                )
         if member.regime and member.regime not in {"supervised", "rl"}:
             raise SystemExit(f"invalid registry member '{member.id}': regime must be supervised or rl")
         if member.status == "active":

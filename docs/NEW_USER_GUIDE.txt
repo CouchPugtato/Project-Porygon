@@ -611,7 +611,9 @@ Supported training roles are:
 - `historical_snapshot`
 - `champion`
 
-Main-agent opponent pools are champion-heavy and can also include recent mains, historical snapshots, and exploiters. Historical weighting uses a prioritized-fictitious-self-play-style weight that favors opponents with lower recorded win rates.
+Main-agent opponent pools preserve separate allocations for the champion, recent mains, historical snapshots, and exploiters. Within each allocation, opponents with recent learner win rates near 50% receive more weight. Small matchup samples are pulled toward 50% before weighting, and a minimum weight keeps easier and harder opponents in circulation.
+
+Every pool collection summary records per-opponent wins, losses, draws, score rate, configured weight, and realized sample rate. League workflows aggregate these results from the learner's perspective into each member's `opponent_stats`, so later pools adapt using recent direct matchups instead of unrelated global evaluation rates.
 
 A main candidate is promoted only when:
 

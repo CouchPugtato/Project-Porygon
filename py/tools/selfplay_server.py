@@ -268,6 +268,10 @@ class PoolMember:
     kind: Literal["random", "checkpoint"]
     path: str | None
     weight: float
+    category: str
+    learner_win_rate: float | None
+    matchup_games: int
+    difficulty_weight: float
 
 
 @dataclass(frozen=True)
@@ -283,6 +287,7 @@ class SampledIdentity:
     member_name: str
     kind: Literal["random", "checkpoint"]
     path: str | None
+    category: str
 
 
 @dataclass(frozen=True)
@@ -304,6 +309,7 @@ class WorkerLaunchIdentity:
     sampled_member_name: str | None = None
     sampled_member_kind: str | None = None
     sampled_member_path: str | None = None
+    sampled_member_category: str | None = None
     sampled_from_pool: bool = False
 
 
@@ -334,7 +340,7 @@ def validate_pool_member(raw: dict, pool_path: Path, seen_names: set[str]) -> Po
         weight = float(raw.get("weight"))
     except Exception as exc:
         raise SystemExit(f"invalid pool member '{name}' in {pool_path}: bad weight") from exc
-    if weight <= 0.0:
+    if not math.isfinite(weight) or weight <= 0.0:
         raise SystemExit(f"invalid pool member '{name}' in {pool_path}: weight must be > 0")
     member_path: str | None = None
     if kind == "checkpoint":
@@ -347,8 +353,31 @@ def validate_pool_member(raw: dict, pool_path: Path, seen_names: set[str]) -> Po
                 f"invalid pool member '{name}' in {pool_path}: checkpoint path not found: {resolved}"
             )
         member_path = str(resolved)
+    category = str(raw.get("category", "uncategorized")).strip() or "uncategorized"
+    raw_learner_win_rate = raw.get("learner_win_rate")
+    try:
+        learner_win_rate = None if raw_learner_win_rate is None else float(raw_learner_win_rate)
+        matchup_games = int(raw.get("matchup_games", 0))
+        difficulty_weight = float(raw.get("difficulty_weight", 1.0))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"invalid pool member '{name}' in {pool_path}: bad adaptive sampling metadata") from exc
+    if learner_win_rate is not None and (not math.isfinite(learner_win_rate) or not 0.0 <= learner_win_rate <= 1.0):
+        raise SystemExit(f"invalid pool member '{name}' in {pool_path}: learner_win_rate must be between 0 and 1")
+    if matchup_games < 0:
+        raise SystemExit(f"invalid pool member '{name}' in {pool_path}: matchup_games must be >= 0")
+    if not math.isfinite(difficulty_weight) or difficulty_weight <= 0.0:
+        raise SystemExit(f"invalid pool member '{name}' in {pool_path}: difficulty_weight must be > 0")
     seen_names.add(name)
-    return PoolMember(name=name, kind=kind, path=member_path, weight=weight)
+    return PoolMember(
+        name=name,
+        kind=kind,
+        path=member_path,
+        weight=weight,
+        category=category,
+        learner_win_rate=learner_win_rate,
+        matchup_games=matchup_games,
+        difficulty_weight=difficulty_weight,
+    )
 
 
 def load_model_pool(path: Path) -> ResolvedPool:
@@ -383,9 +412,9 @@ def sample_pool_member(pool: ResolvedPool, rng: random.Random) -> SampledIdentit
     roll = rng.uniform(0.0, pool.total_weight)
     for member, cumulative_weight in zip(pool.members, pool.cumulative_weights):
         if roll <= cumulative_weight:
-            return SampledIdentity(member_name=member.name, kind=member.kind, path=member.path)
+            return SampledIdentity(member_name=member.name, kind=member.kind, path=member.path, category=member.category)
     member = pool.members[-1]
-    return SampledIdentity(member_name=member.name, kind=member.kind, path=member.path)
+    return SampledIdentity(member_name=member.name, kind=member.kind, path=member.path, category=member.category)
 
 
 class ServerProcess:
@@ -971,6 +1000,7 @@ class PoolOrchestrator:
             sampled_member_name=sampled.member_name,
             sampled_member_kind=sampled.kind,
             sampled_member_path=sampled.path,
+            sampled_member_category=sampled.category,
             sampled_from_pool=True,
         )
 
@@ -988,20 +1018,38 @@ class PoolOrchestrator:
 
     def _build_group_member_stats_summary(self) -> dict[str, dict[str, dict[str, object]]]:
         summary: dict[str, dict[str, dict[str, object]]] = {}
-        for side, members in self._group_member_stats.items():
-            if not members:
+        for side, side_config in self.side_configs.items():
+            if not isinstance(side_config, PoolSideSpec):
                 continue
+            members = self._group_member_stats.get(side, {})
+            pool_members = {member.name: member for member in side_config.pool.members}
+            total_worker_starts = sum(int(stats.get("worker_starts", 0)) for stats in members.values())
             side_summary: dict[str, dict[str, object]] = {}
-            for member_name, stats in sorted(members.items()):
+            for member_name, pool_member in sorted(pool_members.items()):
+                stats = members.get(member_name, {
+                    "worker_starts": 0,
+                    "completed_games": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "draws": 0,
+                })
                 completed_games = int(stats.get("completed_games", 0))
                 wins = int(stats.get("wins", 0))
                 losses = int(stats.get("losses", 0))
                 draws = int(stats.get("draws", 0))
+                worker_starts = int(stats.get("worker_starts", 0))
                 side_summary[member_name] = {
                     **stats,
+                    "category": pool_member.category,
+                    "configured_weight": pool_member.weight,
+                    "sample_rate": safe_rate(worker_starts, total_worker_starts),
+                    "prior_learner_win_rate": pool_member.learner_win_rate,
+                    "prior_matchup_games": pool_member.matchup_games,
+                    "difficulty_weight": pool_member.difficulty_weight,
                     "win_rate": safe_rate(wins, completed_games),
                     "loss_rate": safe_rate(losses, completed_games),
                     "draw_rate": safe_rate(draws, completed_games),
+                    "score_rate": safe_rate(wins + (0.5 * draws), completed_games),
                 }
             summary[side] = side_summary
         return summary
@@ -1410,6 +1458,10 @@ class PoolOrchestrator:
                     "name": member.name,
                     "kind": member.kind,
                     "weight": member.weight,
+                    "category": member.category,
+                    "learner_win_rate": member.learner_win_rate,
+                    "matchup_games": member.matchup_games,
+                    "difficulty_weight": member.difficulty_weight,
                 }
                 if member.path:
                     payload["path"] = member.path

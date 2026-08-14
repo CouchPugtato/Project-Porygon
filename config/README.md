@@ -166,7 +166,11 @@ Pool files are JSON with this schema:
       "name": "best_v1",
       "kind": "checkpoint",
       "path": "models/runs/run_x/best_v1/best_v1.chk",
-      "weight": 0.5
+      "weight": 0.5,
+      "category": "historical",
+      "learner_win_rate": 0.52,
+      "matchup_games": 100,
+      "difficulty_weight": 0.96
     }
   ]
 }
@@ -180,6 +184,7 @@ Rules:
 - `weight` must be greater than `0`
 - `checkpoint` members require an existing `path`
 - weights are normalized internally; they do not need to sum to `1.0`
+- `category`, `learner_win_rate`, `matchup_games`, and `difficulty_weight` are optional provenance fields emitted by league workflows
 
 Sampling behavior:
 
@@ -190,6 +195,7 @@ Sampling behavior:
   - `<run_name>_summary.json`
   - `<run_name>_manifest.json`
 - the manifest records pool provenance, sampled member counts, worker settings, and candidate/parent checkpoint info when available
+- pool summaries report each member's configured weight, realized sample rate, category, result record, and score rate
 - eval/collection summaries now include automatic collapse flags for each side using the current RL guardrail thresholds
 
 Examples:
@@ -356,6 +362,7 @@ Registry additions:
   - `experiment_id`
   - `eval.summary_path`
   - `eval.collapse_flags`
+  - `opponent_stats`, containing the most recent learner-perspective record for each sampled opponent
 - public statuses now support:
   - `candidate`
   - `active`
@@ -366,6 +373,8 @@ Registry additions:
   - `champion-plus-random`
   - `active-mixed`
   - `top-k`
+
+`league_rl_orchestrator.py` builds role-aware pools with separate champion, recent-main, historical, and exploiter budgets. Within each category it favors opponents whose recent learner win rate is closest to `league_matchup_target_win_rate` (default `0.50`). Low-sample results are shrunk toward the target using `league_matchup_confidence_games`, and `league_matchup_min_weight` keeps every eligible opponent in circulation.
 
 Examples:
 
