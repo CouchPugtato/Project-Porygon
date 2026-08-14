@@ -26,10 +26,22 @@ This supports migration, but does not make every old checkpoint a valid baseline
 
 ## Operational rules
 
-- A checkpoint that fails to load must not be used; runtime fallback to a fresh model is only suitable for smoke testing.
-- A checkpoint that later causes `observation_flatten failed` is incompatible with the current observation schema.
+- Runtime starts a fresh model only when no checkpoint argument is supplied. An explicitly requested invalid checkpoint terminates runtime.
+- Training starts fresh only when its output checkpoint does not exist. An existing but invalid checkpoint terminates training.
+- Evaluation and anchor loading always require a valid compatible checkpoint.
 - A migrated flat-head checkpoint should be evaluated before training or promotion.
 - New serious training runs should start from a checkpoint produced by the current observation and reconstruction code.
 - Promotion comparisons must identify the exact checkpoint paths in their manifests.
 
-The checkpoint header currently records a format version, dimensions, action count, parameter count, and trainer state. Parameter-layout compatibility is enforced by the importer rather than by the header version alone.
+The loader validates:
+
+- magic header and complete header length
+- exact supported format version
+- nonzero, bounded dimensions
+- observation dimension against `observation_flat_size()`
+- action count against `OBS_NUM_ACTIONS`
+- exact current-factorized or legacy-flat parameter count
+- exact file length, rejecting truncation and trailing data
+- successful parameter import
+
+Failures report a specific reason plus stored and expected metadata. Successful legacy loads report `layout=legacy_flat migrated_factorized_heads=1`.

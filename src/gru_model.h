@@ -285,6 +285,7 @@ int gru_model_policy_gradient_update_sequence_window_dual_anchored(
     float anchor_kl_coef
 );
 size_t gru_model_parameter_count(const GruModel* model);
+size_t gru_model_legacy_parameter_count(const GruModel* model);
 int gru_model_export_parameters(const GruModel* model, float* out, size_t count);
 int gru_model_import_parameters(GruModel* model, const float* in, size_t count);
 

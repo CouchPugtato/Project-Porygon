@@ -80,6 +80,53 @@ static GruModel* create_default_model(void) {
     return gru_model_create(observation_flat_size(), 128, OBS_NUM_ACTIONS);
 }
 
+static GruModel* load_current_checkpoint(
+    const char* path,
+    TrainerCheckpointState* state,
+    CheckpointLoadResult* result
+) {
+    return checkpoint_load_compatible(
+        path,
+        state,
+        observation_flat_size(),
+        OBS_NUM_ACTIONS,
+        result);
+}
+
+static void report_checkpoint_load_failure(
+    const char* context,
+    const char* path,
+    const CheckpointLoadResult* result
+) {
+    CheckpointLoadStatus status = result ? result->status : CHECKPOINT_LOAD_INVALID_ARGUMENT;
+    fprintf(stderr,
+        "%s checkpoint='%s' reason='%s' stored_version=%u stored_input=%zu stored_hidden=%zu stored_actions=%zu stored_parameters=%zu expected_input=%zu expected_actions=%zu\n",
+        context ? context : "checkpoint load failed",
+        path ? path : "",
+        checkpoint_load_status_string(status),
+        result ? result->stored_version : 0u,
+        result ? result->stored_input_dim : 0u,
+        result ? result->stored_hidden_dim : 0u,
+        result ? result->stored_num_actions : 0u,
+        result ? result->stored_parameter_count : 0u,
+        result ? result->expected_input_dim : observation_flat_size(),
+        result ? result->expected_num_actions : OBS_NUM_ACTIONS);
+}
+
+static void report_checkpoint_load_success(
+    const char* context,
+    const char* path,
+    const TrainerCheckpointState* state,
+    const CheckpointLoadResult* result
+) {
+    fprintf(stderr, "%s checkpoint='%s' step=%zu layout=%s%s\n",
+        context ? context : "loaded checkpoint",
+        path ? path : "",
+        state ? state->step : 0u,
+        result && result->parameter_layout == CHECKPOINT_LAYOUT_LEGACY_FLAT ? "legacy_flat" : "factorized",
+        result && result->migrated_legacy_heads ? " migrated_factorized_heads=1" : "");
+}
+
 static void rl_training_summary_init(RlTrainingSummary* summary) {
     if (!summary) {
         return;
@@ -2000,6 +2047,7 @@ static int evaluate_checkpoint_on_replay_file(
     GruTrainer trainer;
     EnvRuntime runtime;
     TrainerCheckpointState checkpoint_state;
+    CheckpointLoadResult checkpoint_result;
     size_t* train_indices = NULL;
     size_t* val_indices = NULL;
     size_t train_sessions = 0;
@@ -2026,12 +2074,13 @@ static int evaluate_checkpoint_on_replay_file(
         return 1;
     }
     memset(&checkpoint_state, 0, sizeof(checkpoint_state));
-    model = checkpoint_load(resolved_checkpoint_path, &checkpoint_state);
+    model = load_current_checkpoint(resolved_checkpoint_path, &checkpoint_state, &checkpoint_result);
     if (!model) {
-        fprintf(stderr, "Failed to load checkpoint '%s'\n", resolved_checkpoint_path);
+        report_checkpoint_load_failure("[eval] failed to load", resolved_checkpoint_path, &checkpoint_result);
         free(resolved_checkpoint_path);
         return 1;
     }
+    report_checkpoint_load_success("[eval] loaded", resolved_checkpoint_path, &checkpoint_state, &checkpoint_result);
     gru_trainer_init(&trainer,
         checkpoint_state.learning_rate > 0.0f ? checkpoint_state.learning_rate : 0.01f,
         checkpoint_state.bptt_window ? checkpoint_state.bptt_window : 16,
@@ -2170,6 +2219,7 @@ static int run_demo_gru(void) {
 static int run_runtime_mode(const char* checkpoint_path) {
     GruModel* model = NULL;
     TrainerCheckpointState state;
+    CheckpointLoadResult checkpoint_result;
     EnvRuntime runtime;
     char line[16384];
     char json[512];
@@ -2178,22 +2228,24 @@ static int run_runtime_mode(const char* checkpoint_path) {
     const char* replay_path = getenv("PORYGON_REPLAY_PATH");
 
     memset(&state, 0, sizeof(state));
-    if (checkpoint_path) {
+    memset(&checkpoint_result, 0, sizeof(checkpoint_result));
+    if (checkpoint_path && *checkpoint_path) {
         resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path);
-        model = checkpoint_load(resolved_checkpoint_path, &state);
+        if (!resolved_checkpoint_path) {
+            fprintf(stderr, "[runtime] failed to resolve checkpoint path '%s'\n", checkpoint_path);
+            return 1;
+        }
+        model = load_current_checkpoint(resolved_checkpoint_path, &state, &checkpoint_result);
+        if (!model) {
+            report_checkpoint_load_failure("[runtime] failed to load", resolved_checkpoint_path, &checkpoint_result);
+            free(resolved_checkpoint_path);
+            return 1;
+        }
+        report_checkpoint_load_success("[runtime] loaded", resolved_checkpoint_path, &state, &checkpoint_result);
     }
     if (!model) {
         model = create_default_model();
-        if (checkpoint_path && *checkpoint_path) {
-            fprintf(stderr, "[runtime] failed to load checkpoint %s, starting fresh model\n",
-                resolved_checkpoint_path ? resolved_checkpoint_path : checkpoint_path);
-        } else {
-            fprintf(stderr, "[runtime] no checkpoint provided, starting fresh model\n");
-        }
-    } else {
-        fprintf(stderr, "[runtime] loaded checkpoint %s step=%zu\n",
-            resolved_checkpoint_path ? resolved_checkpoint_path : checkpoint_path,
-            state.step);
+        fprintf(stderr, "[runtime] no checkpoint provided, starting fresh model\n");
     }
     if (!model) {
         fprintf(stderr, "Failed to initialize runtime model\n");
@@ -2276,6 +2328,8 @@ static int train_from_input_file(
     EnvRewardMode reward_mode;
     TrainerCheckpointState checkpoint_state;
     TrainerCheckpointState anchor_checkpoint_state;
+    CheckpointLoadResult checkpoint_result;
+    CheckpointLoadResult anchor_checkpoint_result;
     RlTrainingSummary rl_summary;
     size_t* train_indices = NULL;
     size_t* val_indices = NULL;
@@ -2313,12 +2367,18 @@ static int train_from_input_file(
     }
     memset(&checkpoint_state, 0, sizeof(checkpoint_state));
     memset(&anchor_checkpoint_state, 0, sizeof(anchor_checkpoint_state));
-    model = checkpoint_load(resolved_checkpoint_path, &checkpoint_state);
+    model = load_current_checkpoint(resolved_checkpoint_path, &checkpoint_state, &checkpoint_result);
     if (!model) {
-        model = create_default_model();
-        printf("[train] starting fresh model -> %s\n", resolved_checkpoint_path);
+        if (checkpoint_result.status == CHECKPOINT_LOAD_NOT_FOUND) {
+            model = create_default_model();
+            printf("[train] checkpoint not found; starting fresh model -> %s\n", resolved_checkpoint_path);
+        } else {
+            report_checkpoint_load_failure("[train] refusing incompatible", resolved_checkpoint_path, &checkpoint_result);
+            free(resolved_checkpoint_path);
+            return 1;
+        }
     } else {
-        printf("[train] loaded checkpoint %s step=%zu\n", resolved_checkpoint_path, checkpoint_state.step);
+        report_checkpoint_load_success("[train] loaded", resolved_checkpoint_path, &checkpoint_state, &checkpoint_result);
     }
     if (!model) {
         free(resolved_checkpoint_path);
@@ -2332,14 +2392,15 @@ static int train_from_input_file(
             free(resolved_checkpoint_path);
             return 1;
         }
-        anchor_model = checkpoint_load(resolved_anchor_checkpoint_path, &anchor_checkpoint_state);
+        anchor_model = load_current_checkpoint(resolved_anchor_checkpoint_path, &anchor_checkpoint_state, &anchor_checkpoint_result);
         if (!anchor_model) {
-            fprintf(stderr, "Failed to load anchor checkpoint '%s'\n", resolved_anchor_checkpoint_path);
+            report_checkpoint_load_failure("[train] failed to load anchor", resolved_anchor_checkpoint_path, &anchor_checkpoint_result);
             gru_model_destroy(model);
             free(resolved_anchor_checkpoint_path);
             free(resolved_checkpoint_path);
             return 1;
         }
+        report_checkpoint_load_success("[train] loaded anchor", resolved_anchor_checkpoint_path, &anchor_checkpoint_state, &anchor_checkpoint_result);
         if (gru_model_input_dim(anchor_model) != gru_model_input_dim(model) ||
                 gru_model_hidden_dim(anchor_model) != gru_model_hidden_dim(model) ||
                 gru_model_num_actions(anchor_model) != gru_model_num_actions(model)) {

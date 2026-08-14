@@ -79,6 +79,7 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/runtime_protocol.c
 	src/replay_io.c
 	src/env_session.c
+	src/checkpoint.c
 )
 
 add_executable(showdown_reconstruction_tests ${SHOWDOWN_RECONSTRUCTION_TEST_SOURCES})

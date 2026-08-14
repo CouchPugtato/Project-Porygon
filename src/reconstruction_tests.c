@@ -1,6 +1,7 @@
 #include "env_session.h"
 #include "id_tables.h"
 #include "observation_builder.h"
+#include "checkpoint.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -2870,6 +2871,179 @@ static int test_synthetic_weather_clear_sets_unknown_duration(void) {
     return assert_true(state.weather_id == 0 && state.weather_turns_remaining.knowledge == KNOW_UNKNOWN, "synthetic weather clear resets id and duration knowledge");
 }
 
+typedef struct {
+    char magic[8];
+    unsigned int version;
+    size_t input_dim;
+    size_t hidden_dim;
+    size_t num_actions;
+    size_t parameter_count;
+    TrainerCheckpointState trainer;
+} TestCheckpointHeader;
+
+static int write_test_checkpoint(
+    const char* path,
+    const TestCheckpointHeader* header,
+    const float* parameters
+) {
+    FILE* file = fopen(path, "wb");
+    int ok;
+    if (!file || !header || (!parameters && header->parameter_count > 0)) {
+        if (file) fclose(file);
+        return 0;
+    }
+    ok = fwrite(header, sizeof(*header), 1, file) == 1 &&
+        fwrite(parameters, sizeof(float), header->parameter_count, file) == header->parameter_count;
+    fclose(file);
+    return ok;
+}
+
+static int test_checkpoint_compatibility_validation(void) {
+    const char* current_path = "checkpoint_test_current.bin";
+    const char* legacy_path = "checkpoint_test_legacy.bin";
+    const char* version_path = "checkpoint_test_version.bin";
+    const char* truncated_path = "checkpoint_test_truncated.bin";
+    const char* truncated_parameters_path = "checkpoint_test_truncated_parameters.bin";
+    const char* trailing_path = "checkpoint_test_trailing.bin";
+    GruModel* model = NULL;
+    GruModel* loaded = NULL;
+    TrainerCheckpointState state;
+    TrainerCheckpointState loaded_state;
+    CheckpointLoadResult result;
+    TestCheckpointHeader header;
+    float* current_parameters = NULL;
+    float* legacy_parameters = NULL;
+    size_t current_count;
+    size_t legacy_count;
+    size_t value_count;
+    size_t prefix_count;
+    int ok = 1;
+    FILE* file = NULL;
+
+    remove(current_path);
+    remove(legacy_path);
+    remove(version_path);
+    remove(truncated_path);
+    remove(truncated_parameters_path);
+    remove(trailing_path);
+    memset(&state, 0, sizeof(state));
+    state.step = 42u;
+    state.learning_rate = 0.001f;
+    state.bptt_window = 16u;
+    state.gradient_clip = 1.0f;
+    state.seed = 7u;
+    model = gru_model_create(8u, 4u, OBS_NUM_ACTIONS);
+    ok &= assert_true(model != NULL, "checkpoint test creates model");
+    if (!model) goto cleanup;
+    ok &= assert_true(checkpoint_save(current_path, model, &state), "checkpoint test saves current layout");
+
+    memset(&loaded_state, 0, sizeof(loaded_state));
+    loaded = checkpoint_load_compatible(current_path, &loaded_state, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded != NULL && result.status == CHECKPOINT_LOAD_OK, "current checkpoint loads successfully");
+    ok &= assert_true(result.parameter_layout == CHECKPOINT_LAYOUT_FACTORIZED && !result.migrated_legacy_heads,
+        "current checkpoint reports factorized layout");
+    ok &= assert_true(loaded_state.step == state.step, "current checkpoint restores trainer state");
+    gru_model_destroy(loaded);
+    loaded = NULL;
+
+    loaded = checkpoint_load_compatible(current_path, NULL, 9u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_INPUT_DIM_MISMATCH,
+        "checkpoint rejects observation dimension mismatch");
+    loaded = checkpoint_load_compatible(current_path, NULL, 8u, OBS_NUM_ACTIONS + 1u, &result);
+    ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_ACTION_COUNT_MISMATCH,
+        "checkpoint rejects action count mismatch");
+
+    current_count = gru_model_parameter_count(model);
+    legacy_count = gru_model_legacy_parameter_count(model);
+    value_count = gru_model_hidden_dim(model) + 1u;
+    prefix_count = legacy_count - value_count;
+    current_parameters = (float*)malloc(current_count * sizeof(float));
+    legacy_parameters = (float*)malloc(legacy_count * sizeof(float));
+    ok &= assert_true(current_parameters != NULL && legacy_parameters != NULL,
+        "checkpoint test allocates legacy fixture parameters");
+    if (!current_parameters || !legacy_parameters) goto cleanup;
+    ok &= assert_true(gru_model_export_parameters(model, current_parameters, current_count),
+        "checkpoint test exports current parameters");
+    memcpy(legacy_parameters, current_parameters, prefix_count * sizeof(float));
+    memcpy(legacy_parameters + prefix_count, current_parameters + current_count - value_count, value_count * sizeof(float));
+    memset(&header, 0, sizeof(header));
+    memcpy(header.magic, "PORYCHK", 7);
+    header.version = CHECKPOINT_FORMAT_VERSION;
+    header.input_dim = gru_model_input_dim(model);
+    header.hidden_dim = gru_model_hidden_dim(model);
+    header.num_actions = gru_model_num_actions(model);
+    header.parameter_count = legacy_count;
+    header.trainer = state;
+    ok &= assert_true(write_test_checkpoint(legacy_path, &header, legacy_parameters),
+        "checkpoint test writes legacy flat layout");
+    loaded = checkpoint_load_compatible(legacy_path, &loaded_state, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded != NULL && result.status == CHECKPOINT_LOAD_OK,
+        "legacy flat checkpoint loads successfully");
+    ok &= assert_true(result.parameter_layout == CHECKPOINT_LAYOUT_LEGACY_FLAT && result.migrated_legacy_heads,
+        "legacy checkpoint reports factorized-head migration");
+    gru_model_destroy(loaded);
+    loaded = NULL;
+
+    header.version = CHECKPOINT_FORMAT_VERSION + 1u;
+    header.parameter_count = current_count;
+    ok &= assert_true(write_test_checkpoint(version_path, &header, current_parameters),
+        "checkpoint test writes unsupported version fixture");
+    loaded = checkpoint_load_compatible(version_path, NULL, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_UNSUPPORTED_VERSION,
+        "checkpoint rejects unsupported format version");
+
+    file = fopen(truncated_path, "wb");
+    ok &= assert_true(file != NULL, "checkpoint test opens truncated fixture");
+    if (file) {
+        fwrite(&header, 1, sizeof(header) / 2u, file);
+        fclose(file);
+        file = NULL;
+    }
+    loaded = checkpoint_load_compatible(truncated_path, NULL, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_TRUNCATED_HEADER,
+        "checkpoint rejects truncated header");
+
+    header.version = CHECKPOINT_FORMAT_VERSION;
+    header.parameter_count = current_count;
+    file = fopen(truncated_parameters_path, "wb");
+    ok &= assert_true(file != NULL, "checkpoint test opens truncated parameter fixture");
+    if (file) {
+        fwrite(&header, sizeof(header), 1, file);
+        fclose(file);
+        file = NULL;
+    }
+    loaded = checkpoint_load_compatible(truncated_parameters_path, NULL, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_TRUNCATED_PARAMETERS,
+        "checkpoint rejects truncated parameter payload");
+
+    ok &= assert_true(write_test_checkpoint(trailing_path, &header, current_parameters),
+        "checkpoint test writes trailing-data fixture");
+    file = fopen(trailing_path, "ab");
+    ok &= assert_true(file != NULL, "checkpoint test opens trailing-data fixture");
+    if (file) {
+        fputc(0, file);
+        fclose(file);
+        file = NULL;
+    }
+    loaded = checkpoint_load_compatible(trailing_path, NULL, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_TRAILING_DATA,
+        "checkpoint rejects unexpected trailing data");
+
+cleanup:
+    if (file) fclose(file);
+    gru_model_destroy(loaded);
+    gru_model_destroy(model);
+    free(current_parameters);
+    free(legacy_parameters);
+    remove(current_path);
+    remove(legacy_path);
+    remove(version_path);
+    remove(truncated_path);
+    remove(truncated_parameters_path);
+    remove(trailing_path);
+    return ok;
+}
+
 int main(int argc, char** argv) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
@@ -2885,6 +3059,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "  %s --batch-replay <jsonl_path>\n", argv[0]);
         return 1;
     }
+    if (!test_checkpoint_compatibility_validation()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;
     if (!test_find_or_make_does_not_overwrite_full_team()) return 1;

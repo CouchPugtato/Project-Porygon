@@ -352,19 +352,20 @@ A model checkpoint stores its expected input dimension. The runtime now logs:
 - `[runtime] loaded checkpoint ...`
   - the checkpoint loaded
 
-- `[runtime] failed to load checkpoint ..., starting fresh model`
-  - load failed and the runtime fell back to a default model
+- `[runtime] failed to load checkpoint=... reason=...`
+  - an explicitly requested checkpoint was rejected and runtime exits instead of silently using a fresh model
 
 - `[runtime] no checkpoint provided, starting fresh model`
   - no checkpoint path was given
 
-If a checkpoint loads but later emits `observation_flatten failed`, that usually means the model input dimension does not match the current observation flatten size. In practice, treat that checkpoint as incompatible.
+The loader now validates format version, observation dimension, action count, supported parameter layout, and exact file length before model use. Errors identify the rejected field or file condition.
 
 Bottom line:
 
 - old checkpoints are not good evaluation baselines anymore
 - use no checkpoint for smoke runtime validation
 - train new checkpoints on the current codebase for serious use
+- training starts fresh only when its output checkpoint does not exist; an existing but invalid checkpoint stops the run
 
 Factorized-head compatibility:
 

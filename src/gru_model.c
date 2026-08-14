@@ -2650,6 +2650,21 @@ size_t gru_model_parameter_count(const GruModel* model) {
         1;
 }
 
+size_t gru_model_legacy_parameter_count(const GruModel* model) {
+    if (!model) {
+        return 0;
+    }
+    return
+        model->wzx.rows * model->wzx.cols +
+        model->wzh.rows * model->wzh.cols + model->hidden_dim +
+        model->wrx.rows * model->wrx.cols +
+        model->wrh.rows * model->wrh.cols + model->hidden_dim +
+        model->wnx.rows * model->wnx.cols +
+        model->wnh.rows * model->wnh.cols + model->hidden_dim +
+        model->policy_head.rows * model->policy_head.cols + model->num_actions +
+        model->hidden_dim + 1;
+}
+
 static void copy_out(float* out, size_t* idx, const float* src, size_t count) {
     memcpy(out + *idx, src, count * sizeof(float));
     *idx += count;
@@ -2703,15 +2718,7 @@ int gru_model_import_parameters(GruModel* model, const float* in, size_t count) 
     if (!model || !in) {
         return 0;
     }
-    legacy_count =
-        model->wzx.rows * model->wzx.cols +
-        model->wzh.rows * model->wzh.cols + model->hidden_dim +
-        model->wrx.rows * model->wrx.cols +
-        model->wrh.rows * model->wrh.cols + model->hidden_dim +
-        model->wnx.rows * model->wnx.cols +
-        model->wnh.rows * model->wnh.cols + model->hidden_dim +
-        model->policy_head.rows * model->policy_head.cols + model->num_actions +
-        model->hidden_dim + 1;
+    legacy_count = gru_model_legacy_parameter_count(model);
     if (count < legacy_count) {
         return 0;
     }
