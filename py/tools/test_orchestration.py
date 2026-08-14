@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 from league_manage import LeagueEval, LeagueMember, LeagueRegistry, OpponentStats, build_pool_payload, league_member_from_json, member_to_json_dict
 from league_rl_orchestrator import build_weighted_pool, collect_recent_opponent_stats, matchup_difficulty_weight, maybe_promote_candidate
-from live_rl_orchestrator import collapse_flags_from_training_summary, round_manifest_completed
+from live_rl_orchestrator import build_selfplay_command, collapse_flags_from_training_summary, round_manifest_completed
+from opponent_sampling import refresh_adaptive_pool
 from selfplay_server import validate_pool_member
 
 
@@ -100,6 +101,48 @@ class LeaguePoolTests(unittest.TestCase):
         self.assertGreater(low_confidence, high_confidence)
         self.assertEqual(matchup_difficulty_weight(0.5, 20), 1.0)
 
+    def test_round_refresh_preserves_categories_and_targets_fifty_percent(self) -> None:
+        champion = member("champion", role="champion", generation=10)
+        parent = member("parent", generation=11)
+        balanced = member("balanced", role="historical_snapshot")
+        easy = member("easy", role="historical_snapshot")
+        registry = LeagueRegistry(11, champion.id, 8, [champion, parent, balanced, easy])
+        payload = build_weighted_pool(registry, "main", parent.id, 0.0)
+        refreshed, results = refresh_adaptive_pool(payload, {
+            balanced.id: {"wins": 10, "losses": 10, "draws": 0},
+            easy.id: {"wins": 2, "losses": 18, "draws": 0},
+        }, "round01_collect")
+        members = {str(item["name"]): item for item in refreshed["members"]}
+        historical_total = sum(
+            float(item["weight"])
+            for item in refreshed["members"]
+            if item.get("category") == "historical"
+        )
+        self.assertAlmostEqual(historical_total, 0.20)
+        self.assertAlmostEqual(float(members[champion.id]["weight"]), 0.40)
+        self.assertGreater(float(members[balanced.id]["weight"]), float(members[easy.id]["weight"]))
+        self.assertEqual(results[easy.id]["wins"], 18)
+        self.assertEqual(results[easy.id]["losses"], 2)
+        self.assertEqual(refreshed["sampling"]["refresh_count"], 1)
+        self.assertEqual(refreshed["sampling"]["last_collection_run"], "round01_collect")
+
+        second_refresh, _ = refresh_adaptive_pool(refreshed, {
+            balanced.id: {"wins": 10, "losses": 10, "draws": 0},
+            easy.id: {"wins": 10, "losses": 10, "draws": 0},
+        }, "round02_collect")
+        second_members = {str(item["name"]): item for item in second_refresh["members"]}
+        self.assertAlmostEqual(
+            float(second_members[balanced.id]["weight"]),
+            float(second_members[easy.id]["weight"]),
+        )
+        self.assertEqual(second_refresh["sampling"]["refresh_count"], 2)
+
+    def test_static_pool_is_not_adapted(self) -> None:
+        payload = {"members": [{"name": "random", "kind": "random", "weight": 1.0}]}
+        refreshed, results = refresh_adaptive_pool(payload, {}, "round01_collect")
+        self.assertEqual(refreshed, payload)
+        self.assertEqual(results, {})
+
     def test_recent_opponent_results_are_aggregated_from_learner_perspective(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
@@ -170,6 +213,30 @@ class PromotionTests(unittest.TestCase):
 
 
 class ResumeAndCollapseTests(unittest.TestCase):
+    def test_selfplay_command_uses_round_pool_snapshot(self) -> None:
+        args = SimpleNamespace(
+            games=100,
+            concurrent_games=4,
+            worker_pairs=8,
+            worker_games=0,
+            ensure_shard_count=True,
+            pool_seed=7,
+            format="gen9randomdoublesbattle",
+            worker_think_mode="live",
+            serve_client=False,
+            worker_log_stdout=False,
+            launch_stagger_seconds=0.0,
+            resource_check_seconds=1.0,
+            min_available_memory_gb=1.0,
+            min_available_pagefile_gb=1.0,
+            model_b_pool="initial_pool.json",
+            model_b="",
+        )
+        snapshot = Path("round_pool.json")
+        command = build_selfplay_command(args, Path.cwd(), "collect", Path("actor.chk"), snapshot)
+        pool_index = command.index("--model-b-pool")
+        self.assertEqual(command[pool_index + 1], str(snapshot))
+
     def test_completed_round_requires_manifest_checkpoint_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -185,6 +252,27 @@ class ResumeAndCollapseTests(unittest.TestCase):
             }), encoding="utf-8")
             self.assertTrue(round_manifest_completed(manifest))
             summary.unlink()
+            self.assertFalse(round_manifest_completed(manifest))
+
+    def test_completed_round_requires_recorded_pool_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint = root / "candidate.chk"
+            summary = root / "summary.json"
+            used_pool = root / "used_pool.json"
+            next_pool = root / "next_pool.json"
+            manifest = root / "round.json"
+            for path in (checkpoint, summary, used_pool, next_pool):
+                path.write_bytes(b"artifact")
+            manifest.write_text(json.dumps({
+                "status": "completed",
+                "output_checkpoint": str(checkpoint),
+                "training_round_stats_path": str(summary),
+                "opponent_pool_path": str(used_pool),
+                "next_opponent_pool_path": str(next_pool),
+            }), encoding="utf-8")
+            self.assertTrue(round_manifest_completed(manifest))
+            next_pool.unlink()
             self.assertFalse(round_manifest_completed(manifest))
 
     def test_training_collapse_uses_action_level_tera_metric(self) -> None:

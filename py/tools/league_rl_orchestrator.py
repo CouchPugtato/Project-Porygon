@@ -22,6 +22,7 @@ from league_manage import (
     member_to_json_dict,
     save_registry,
 )
+from opponent_sampling import ADAPTIVE_STRATEGY, matchup_difficulty_weight as calculate_matchup_difficulty_weight
 from rl_defaults import bool_default, float_default, int_default
 
 
@@ -159,13 +160,13 @@ def matchup_difficulty_weight(
     min_weight: float = DEFAULT_MATCHUP_MIN_WEIGHT,
     confidence_games: int = DEFAULT_MATCHUP_CONFIDENCE_GAMES,
 ) -> float:
-    if win_rate is None or matches_played <= 0:
-        return 1.0
-    confidence = min(1.0, matches_played / max(1, confidence_games))
-    smoothed_rate = target_win_rate + ((min(1.0, max(0.0, win_rate)) - target_win_rate) * confidence)
-    span = max(target_win_rate, 1.0 - target_win_rate, 1e-9)
-    closeness = 1.0 - min(1.0, abs(smoothed_rate - target_win_rate) / span)
-    return max(min_weight, closeness)
+    return calculate_matchup_difficulty_weight(
+        win_rate,
+        matches_played,
+        target_win_rate=target_win_rate,
+        min_weight=min_weight,
+        confidence_games=confidence_games,
+    )
 
 
 def sort_recent(members: list[LeagueMember]) -> list[LeagueMember]:
@@ -275,6 +276,7 @@ def build_weighted_pool(
                     "learner_win_rate": reference_rate,
                     "matchup_games": matchup_games,
                     "difficulty_weight": difficulty_weight,
+                    "base_weight": member.collection_weight,
                 }
             else:
                 existing["weight"] = float(existing["weight"]) + weight
@@ -288,10 +290,21 @@ def build_weighted_pool(
             "category": "random",
         })
     if not members:
-        members.append({"name": champion.id if champion else parent_member.id, "kind": "checkpoint", "path": (champion or parent_member).path, "weight": 1.0})
+        members.append({
+            "name": champion.id if champion else parent_member.id,
+            "kind": "checkpoint",
+            "path": (champion or parent_member).path,
+            "weight": 1.0,
+            "category": "fallback",
+            "bucket_weight": 1.0,
+            "difficulty_weight": 1.0,
+            "base_weight": 1.0,
+            "learner_win_rate": None,
+            "matchup_games": 0,
+        })
     return {
         "sampling": {
-            "strategy": "category_matchup_target",
+            "strategy": ADAPTIVE_STRATEGY,
             "target_win_rate": target_win_rate,
             "min_difficulty_weight": min_difficulty_weight,
             "confidence_games": confidence_games,

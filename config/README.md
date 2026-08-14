@@ -276,12 +276,14 @@ python py/tools/eval_collapse_check.py --summary matches/runs/run_0060_g9_teache
 
 Per round it does this:
 
-1. launches `py/tools/selfplay_server.py` with the current checkpoint on side `a`
-2. waits for the collection run to finish
-3. extracts `episode_complete` JSON records from `worker_*_<side>_raw.jsonl`
-4. copies the parent checkpoint to a new child checkpoint path
-5. runs `showdown_client --train-live-rl <episode_batch.jsonl> <child_checkpoint>`
-6. uses that child checkpoint as the next round's actor policy
+1. snapshots the opponent pool that will be used for the round, when configured
+2. launches `py/tools/selfplay_server.py` with the current checkpoint on side `a`
+3. waits for the collection run to finish
+4. refreshes adaptive opponent weights from that round's learner-perspective results
+5. extracts `episode_complete` JSON records from `worker_*_<side>_raw.jsonl`
+6. copies the parent checkpoint to a new child checkpoint path
+7. runs `showdown_client --train-live-rl <episode_batch.jsonl> <child_checkpoint>`
+8. uses the child checkpoint and refreshed pool for the next round
 
 Artifacts:
 
@@ -289,6 +291,9 @@ Artifacts:
   - `models/runs/<run_name>/<run_name>_live_rl_manifest.json`
 - per-round manifests:
   - `models/runs/<run_name>/roundXX/<run_name>_roundXX_manifest.json`
+- per-round opponent pools:
+  - `models/runs/<run_name>/roundXX/<run_name>_roundXX_opponent_pool_used.json`
+  - `models/runs/<run_name>/roundXX/<run_name>_roundXX_opponent_pool_next.json`
 - extracted episode batches:
   - `matches/runs/<collect_run>/episode_batch_<side>.jsonl`
 
@@ -297,6 +302,8 @@ Example:
 ```powershell
 python py/tools/live_rl_orchestrator.py --run-name run_live_rl_g4_test --init-checkpoint "models/runs/run_0056_g4_teacher_sup_pool_collect_200shards_wins/g4_teacher_sup_pool_wins_sup/g4_teacher_sup_pool_wins_sup.chk" --rounds 2 --games 1000 --concurrent-games 70 --worker-pairs 200 --ensure-shard-count true --model-b random --pool-seed 71 --entropy-coef 0.003 --reward-mode terminal
 ```
+
+Pools emitted by `league_rl_orchestrator.py` use the adaptive strategy automatically. Category totals stay fixed while members inside each category are reweighted toward the configured 50% learner win-rate target after every round. Static pool JSON files continue unchanged, though the exact pool used is still snapshotted for reproducibility.
 
 For reduced-board / post-faint curriculum extraction:
 

@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from opponent_sampling import is_adaptive_pool, refresh_adaptive_pool
 from rl_defaults import bool_default, float_default, int_default, reward_float_default
 
 
@@ -140,7 +141,13 @@ def copy_checkpoint(source: Path, destination: Path) -> None:
     shutil.copy2(source, destination)
 
 
-def build_selfplay_command(args: argparse.Namespace, repo_root: Path, run_name: str, checkpoint_path: Path) -> list[str]:
+def build_selfplay_command(
+    args: argparse.Namespace,
+    repo_root: Path,
+    run_name: str,
+    checkpoint_path: Path,
+    model_b_pool_path: Path | None = None,
+) -> list[str]:
     command = [
         sys.executable,
         str((repo_root / "py" / "tools" / "selfplay_server.py").resolve()),
@@ -179,8 +186,9 @@ def build_selfplay_command(args: argparse.Namespace, repo_root: Path, run_name: 
         "--min-available-pagefile-gb",
         str(args.min_available_pagefile_gb),
     ]
-    if args.model_b_pool:
-        command.extend(["--model-b", "", "--model-b-pool", args.model_b_pool])
+    resolved_pool = str(model_b_pool_path) if model_b_pool_path is not None else args.model_b_pool
+    if resolved_pool:
+        command.extend(["--model-b", "", "--model-b-pool", resolved_pool])
     else:
         command.extend(["--model-b-pool", "", "--model-b", args.model_b])
     return command
@@ -250,7 +258,13 @@ def round_manifest_completed(round_manifest_path: Path) -> bool:
         return False
     output_checkpoint = Path(str(payload.get("output_checkpoint", "")))
     training_summary = Path(str(payload.get("training_round_stats_path", "")))
-    return output_checkpoint.exists() and training_summary.exists()
+    if not output_checkpoint.exists() or not training_summary.exists():
+        return False
+    for key in ("opponent_pool_path", "next_opponent_pool_path"):
+        artifact = str(payload.get(key, "")).strip()
+        if artifact and not Path(artifact).exists():
+            return False
+    return True
 
 
 def trainer_env(args: argparse.Namespace) -> dict[str, str] | None:
@@ -356,6 +370,17 @@ def main() -> None:
     if args.model_b and args.model_b_pool:
         raise SystemExit("--model-b and --model-b-pool are mutually exclusive")
 
+    initial_pool_path: Path | None = None
+    current_pool_payload: dict[str, object] | None = None
+    if args.model_b_pool:
+        initial_pool_path = resolve_path(repo_root, args.model_b_pool)
+        if not initial_pool_path.exists():
+            raise SystemExit(f"model B pool not found: {initial_pool_path}")
+        loaded_pool = load_json(initial_pool_path)
+        if not isinstance(loaded_pool, dict):
+            raise SystemExit(f"invalid model B pool: expected object in {initial_pool_path}")
+        current_pool_payload = loaded_pool
+
     init_checkpoint = resolve_path(repo_root, args.init_checkpoint)
     if not init_checkpoint.exists():
         raise SystemExit(f"init checkpoint not found: {init_checkpoint}")
@@ -370,6 +395,12 @@ def main() -> None:
         workflow_manifest.pop("failure_reason", None)
         workflow_manifest["resumed_at_unix"] = time.time()
         workflow_manifest.setdefault("round_manifests", [])
+        workflow_manifest.setdefault("opponent_pool_history", [])
+        workflow_manifest["opponent"] = {
+            "model_b": args.model_b,
+            "model_b_pool": str(initial_pool_path) if initial_pool_path else "",
+            "adaptive": bool(current_pool_payload and is_adaptive_pool(current_pool_payload)),
+        }
         log(f"resuming workflow from {workflow_manifest_path}")
     else:
         workflow_manifest = {
@@ -409,9 +440,11 @@ def main() -> None:
             "omp_threads": args.omp_threads,
             "opponent": {
                 "model_b": args.model_b,
-                "model_b_pool": args.model_b_pool,
+                "model_b_pool": str(initial_pool_path) if initial_pool_path else "",
+                "adaptive": bool(current_pool_payload and is_adaptive_pool(current_pool_payload)),
             },
             "round_manifests": [],
+            "opponent_pool_history": [],
         }
     write_json(workflow_manifest_path, workflow_manifest)
 
@@ -434,12 +467,22 @@ def main() -> None:
             if args.resume and round_manifest_completed(round_manifest_path):
                 round_manifest = load_json(round_manifest_path)
                 current_checkpoint = Path(str(round_manifest.get("output_checkpoint", current_checkpoint))).resolve()
+                next_pool_path_text = str(round_manifest.get("next_opponent_pool_path", "")).strip()
+                if next_pool_path_text:
+                    next_pool_path = Path(next_pool_path_text).resolve()
+                    current_pool_payload = load_json(next_pool_path)
+                    workflow_manifest["latest_opponent_pool_path"] = str(next_pool_path)
                 if str(round_manifest_path) not in workflow_manifest["round_manifests"]:
                     workflow_manifest["round_manifests"].append(str(round_manifest_path))
                 workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
                 write_json(workflow_manifest_path, workflow_manifest)
                 log(f"skipping completed {round_token}")
                 continue
+
+            round_pool_path: Path | None = None
+            if current_pool_payload is not None:
+                round_pool_path = round_dir / f"{args.run_name}_{round_token}_opponent_pool_used.json"
+                write_json(round_pool_path, current_pool_payload)
 
             round_manifest: dict[str, object] = {
                 "round": round_index,
@@ -451,13 +494,62 @@ def main() -> None:
                 "episode_batch_path": str(episode_batch_path),
                 "training_round_stats_path": str(training_summary_path),
                 "trainer_exe": str(trainer_exe),
+                "opponent_pool_path": str(round_pool_path) if round_pool_path else "",
+                "opponent_pool_adaptive": bool(current_pool_payload and is_adaptive_pool(current_pool_payload)),
             }
             write_json(round_manifest_path, round_manifest)
 
-            selfplay_command = build_selfplay_command(args, repo_root, collect_run_name, current_checkpoint)
+            selfplay_command = build_selfplay_command(
+                args,
+                repo_root,
+                collect_run_name,
+                current_checkpoint,
+                round_pool_path,
+            )
             round_manifest["selfplay_command"] = selfplay_command
             write_json(round_manifest_path, round_manifest)
             run_command(selfplay_command, repo_root)
+
+            collection_summary_path = (
+                run_dir_for_name(repo_root, collect_run_name)
+                / f"{collect_run_name}_summary.json"
+            )
+            round_manifest["collection_summary_path"] = str(collection_summary_path)
+            if current_pool_payload is not None and is_adaptive_pool(current_pool_payload):
+                collection_summary = load_json(collection_summary_path)
+                group_member_stats = collection_summary.get("group_member_stats", {}) or {}
+                opponent_member_stats = (
+                    group_member_stats.get("b", {})
+                    if isinstance(group_member_stats, dict)
+                    else {}
+                )
+                if not isinstance(opponent_member_stats, dict):
+                    opponent_member_stats = {}
+                refreshed_pool, refresh_results = refresh_adaptive_pool(
+                    current_pool_payload,
+                    opponent_member_stats,
+                    collect_run_name,
+                )
+                next_pool_path = round_dir / f"{args.run_name}_{round_token}_opponent_pool_next.json"
+                write_json(next_pool_path, refreshed_pool)
+                current_pool_payload = refreshed_pool
+                round_manifest["next_opponent_pool_path"] = str(next_pool_path)
+                round_manifest["opponent_pool_refresh_results"] = refresh_results
+                workflow_manifest["latest_opponent_pool_path"] = str(next_pool_path)
+                pool_history = workflow_manifest.setdefault("opponent_pool_history", [])
+                if isinstance(pool_history, list):
+                    pool_history[:] = [
+                        entry
+                        for entry in pool_history
+                        if not isinstance(entry, dict) or int(entry.get("round", -1)) != round_index
+                    ]
+                    pool_history.append({
+                        "round": round_index,
+                        "used": str(round_pool_path),
+                        "next": str(next_pool_path),
+                    })
+                log(f"refreshed adaptive opponent pool for {round_token}: {next_pool_path}")
+            write_json(round_manifest_path, round_manifest)
 
             extract_stats = extract_episode_batch(run_dir_for_name(repo_root, collect_run_name), args.episode_side, episode_batch_path)
             round_manifest["episode_extract"] = extract_stats
