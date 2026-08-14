@@ -15,6 +15,9 @@ Python to C:
 Replay-only records may additionally contain:
 
 - `decision`
+- `episode_complete`
+
+Live `episode_complete` records contain the full observation sequence, legal masks, paired flat actions, factorized action choices, rewards/dones, rollout-time log probabilities and values, plus the frozen actor checkpoint in `policy_tag`. `--train-live-ppo` validates that tag before accepting the batch.
 
 Canonical messages:
 

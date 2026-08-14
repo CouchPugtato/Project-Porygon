@@ -23,6 +23,7 @@
 
 #define SHOWDOWN_CLIENT_DEFAULT_ARGS_PATH "config/showdown_client.toml"
 #define SHOWDOWN_CLIENT_REWARD_CONFIG_PATH "config/reward_weights.toml"
+#define SHOWDOWN_CLIENT_RL_DEFAULTS_PATH "config/rl_defaults.toml"
 
 typedef struct {
     float terminal_win;
@@ -31,6 +32,21 @@ typedef struct {
     float terminal_disconnect_or_forfeit;
     EnvDenseRewardConfig dense_additive;
 } RewardConfig;
+
+typedef struct {
+    float policy_gradient_gamma;
+    float policy_gradient_entropy_coef;
+    float ppo_gamma;
+    float ppo_entropy_coef;
+    int advantage_norm;
+    float gae_lambda;
+    float ppo_clip_epsilon;
+    float ppo_value_clip_epsilon;
+    float ppo_target_kl;
+    float adam_beta1;
+    float adam_beta2;
+    float adam_epsilon;
+} RlDefaultsConfig;
 
 typedef struct {
     size_t move_slot_counts[4];
@@ -569,6 +585,98 @@ static int load_reward_config_file(const char* path, RewardConfig* out_config) {
         if (!assign_reward_config_value(out_config, key, value)) {
             fclose(fp);
             fprintf(stderr, "invalid reward config %s:%d: bad value for %s\n", path, line_number, key);
+            return 0;
+        }
+    }
+    fclose(fp);
+    return 1;
+}
+
+static void rl_defaults_config_init(RlDefaultsConfig* config) {
+    if (!config) {
+        return;
+    }
+    config->policy_gradient_gamma = 1.0f;
+    config->policy_gradient_entropy_coef = 0.001f;
+    config->ppo_gamma = 0.99f;
+    config->ppo_entropy_coef = 0.001f;
+    config->advantage_norm = 1;
+    config->gae_lambda = 0.95f;
+    config->ppo_clip_epsilon = 0.20f;
+    config->ppo_value_clip_epsilon = 0.20f;
+    config->ppo_target_kl = 0.02f;
+    config->adam_beta1 = 0.90f;
+    config->adam_beta2 = 0.999f;
+    config->adam_epsilon = 1.0e-8f;
+}
+
+static int assign_rl_default_value(RlDefaultsConfig* config, const char* key, const char* value_text) {
+    float value;
+    char* endptr = NULL;
+    if (!config || !key || !value_text) {
+        return 0;
+    }
+    if (strcmp(key, "advantage_norm") == 0) {
+        if (strcmp(value_text, "true") == 0 || strcmp(value_text, "1") == 0) {
+            config->advantage_norm = 1;
+            return 1;
+        }
+        if (strcmp(value_text, "false") == 0 || strcmp(value_text, "0") == 0) {
+            config->advantage_norm = 0;
+            return 1;
+        }
+        return 0;
+    }
+    value = strtof(value_text, &endptr);
+    if (endptr == value_text || (endptr && *trim_whitespace(endptr) != '\0')) {
+        return 0;
+    }
+    if (strcmp(key, "policy_gradient_gamma") == 0) config->policy_gradient_gamma = value;
+    else if (strcmp(key, "policy_gradient_entropy_coef") == 0) config->policy_gradient_entropy_coef = value;
+    else if (strcmp(key, "ppo_gamma") == 0) config->ppo_gamma = value;
+    else if (strcmp(key, "ppo_entropy_coef") == 0) config->ppo_entropy_coef = value;
+    else if (strcmp(key, "gae_lambda") == 0) config->gae_lambda = value;
+    else if (strcmp(key, "ppo_clip_epsilon") == 0) config->ppo_clip_epsilon = value;
+    else if (strcmp(key, "ppo_value_clip_epsilon") == 0) config->ppo_value_clip_epsilon = value;
+    else if (strcmp(key, "ppo_target_kl") == 0) config->ppo_target_kl = value;
+    else if (strcmp(key, "adam_beta1") == 0) config->adam_beta1 = value;
+    else if (strcmp(key, "adam_beta2") == 0) config->adam_beta2 = value;
+    else if (strcmp(key, "adam_epsilon") == 0) config->adam_epsilon = value;
+    return 1;
+}
+
+static int load_rl_defaults_file(const char* path, RlDefaultsConfig* out_config) {
+    FILE* fp;
+    char line[1024];
+    int line_number = 0;
+    if (!out_config) {
+        return 0;
+    }
+    rl_defaults_config_init(out_config);
+    fp = path ? fopen(path, "r") : NULL;
+    if (!fp) {
+        return 1;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        char* comment = strchr(line, '#');
+        char* key;
+        char* value;
+        line_number += 1;
+        if (comment) *comment = '\0';
+        key = trim_whitespace(line);
+        if (!key || !*key) continue;
+        value = strchr(key, '=');
+        if (!value) {
+            fclose(fp);
+            fprintf(stderr, "invalid RL defaults %s:%d: expected key = value\n", path, line_number);
+            return 0;
+        }
+        *value++ = '\0';
+        key = trim_whitespace(key);
+        value = trim_whitespace(value);
+        if (!key || !*key || !value || !*value || !assign_rl_default_value(out_config, key, value)) {
+            fclose(fp);
+            fprintf(stderr, "invalid RL defaults %s:%d: bad key/value\n", path, line_number);
             return 0;
         }
     }
@@ -1310,7 +1418,9 @@ static int write_rl_training_summary_json(
     fprintf(out, "  \"outcome_wins\": %zu,\n", summary->outcome_wins);
     fprintf(out, "  \"outcome_losses\": %zu,\n", summary->outcome_losses);
     fprintf(out, "  \"outcome_draws\": %zu,\n", summary->outcome_draws);
+    fprintf(out, "  \"tera_action_rate\": %.6f,\n", summary->move_count > 0 ? (double)summary->tera_count / (double)summary->move_count : 0.0);
     fprintf(out, "  \"tera_rate\": %.6f,\n", summary->move_count > 0 ? (double)summary->tera_count / (double)summary->move_count : 0.0);
+    fputs("  \"metric_definitions\": {\"tera_action_rate\": \"tera move actions / move actions\", \"tera_rate\": \"backward-compatible alias of tera_action_rate\"},\n", out);
     fputs("  \"move_slot_rates\": {", out);
     for (i = 0; i < 4; ++i) {
         if (i) fputs(", ", out);
@@ -2630,29 +2740,48 @@ static int clean_replay_file(const char* input_path, const char* output_path) {
 
 static int showdown_client_main(int argc, char** argv) {
     int epochs = parse_epochs_arg(argc, argv, 1);
-    float learning_rate_override = parse_float_flag(argc, argv, "--learning-rate", -1.0f);
+    float learning_rate_override;
     const char* expected_policy_tag = parse_string_flag(argc, argv, "--policy-tag-expected", "");
     const char* training_summary_path = parse_string_flag(argc, argv, "--training-summary-path", "");
     const char* anchor_checkpoint_path = parse_string_flag(argc, argv, "--anchor-checkpoint", "");
-    float anchor_kl_coef = parse_float_flag(argc, argv, "--anchor-kl-coef", 0.0f);
-    float rl_gamma = parse_float_flag(argc, argv, "--gamma", 1.0f);
-    float rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef", 0.001f);
-    int rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", 1);
-    float gae_lambda = parse_float_flag(argc, argv, "--gae-lambda", 0.95f);
-    float ppo_clip_epsilon = parse_float_flag(argc, argv, "--ppo-clip-epsilon", 0.2f);
-    float ppo_value_clip_epsilon = parse_float_flag(argc, argv, "--ppo-value-clip-epsilon", 0.2f);
-    float ppo_target_kl = parse_float_flag(argc, argv, "--target-kl", 0.02f);
-    float adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", 0.9f);
-    float adam_beta2 = parse_float_flag(argc, argv, "--adam-beta2", 0.999f);
-    float adam_epsilon = parse_float_flag(argc, argv, "--adam-epsilon", 1.0e-8f);
+    float anchor_kl_coef;
+    float rl_gamma;
+    float rl_entropy_coef;
+    int rl_advantage_norm;
+    float gae_lambda;
+    float ppo_clip_epsilon;
+    float ppo_value_clip_epsilon;
+    float ppo_target_kl;
+    float adam_beta1;
+    float adam_beta2;
+    float adam_epsilon;
     int supervised_profile = parse_bool01_flag(argc, argv, "--supervised-profile", 1);
     const char* rl_reward_mode = parse_string_flag(argc, argv, "--reward-mode", "terminal");
     RewardConfig reward_config;
+    RlDefaultsConfig rl_defaults;
+    int ppo_command = argc >= 2 && strcmp(argv[1], "--train-live-ppo") == 0;
     int training_or_eval_mode = 0;
     srand((unsigned int)time(NULL));
     if (!load_reward_config_file(SHOWDOWN_CLIENT_REWARD_CONFIG_PATH, &reward_config)) {
         return 1;
     }
+    if (!load_rl_defaults_file(SHOWDOWN_CLIENT_RL_DEFAULTS_PATH, &rl_defaults)) {
+        return 1;
+    }
+    learning_rate_override = parse_float_flag(argc, argv, "--learning-rate", -1.0f);
+    anchor_kl_coef = parse_float_flag(argc, argv, "--anchor-kl-coef", 0.0f);
+    rl_gamma = parse_float_flag(argc, argv, "--gamma",
+        ppo_command ? rl_defaults.ppo_gamma : rl_defaults.policy_gradient_gamma);
+    rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef",
+        ppo_command ? rl_defaults.ppo_entropy_coef : rl_defaults.policy_gradient_entropy_coef);
+    rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", rl_defaults.advantage_norm);
+    gae_lambda = parse_float_flag(argc, argv, "--gae-lambda", rl_defaults.gae_lambda);
+    ppo_clip_epsilon = parse_float_flag(argc, argv, "--ppo-clip-epsilon", rl_defaults.ppo_clip_epsilon);
+    ppo_value_clip_epsilon = parse_float_flag(argc, argv, "--ppo-value-clip-epsilon", rl_defaults.ppo_value_clip_epsilon);
+    ppo_target_kl = parse_float_flag(argc, argv, "--target-kl", rl_defaults.ppo_target_kl);
+    adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", rl_defaults.adam_beta1);
+    adam_beta2 = parse_float_flag(argc, argv, "--adam-beta2", rl_defaults.adam_beta2);
+    adam_epsilon = parse_float_flag(argc, argv, "--adam-epsilon", rl_defaults.adam_epsilon);
     {
         float override_value;
         override_value = parse_float_flag(argc, argv, "--dense-additive-hp-swing-weight", NAN);

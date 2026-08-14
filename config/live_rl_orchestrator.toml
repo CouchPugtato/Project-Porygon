@@ -17,7 +17,4 @@ trainer_exe = "build-fresh/showdown_client.exe"
 checkpoint_prefix = "live_rl"
 episode_side = "a"
 epochs = 1
-gamma = 1.0
-entropy_coef = 0.001
-advantage_norm = true
 reward_mode = "terminal"

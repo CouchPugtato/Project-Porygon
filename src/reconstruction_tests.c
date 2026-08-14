@@ -623,6 +623,7 @@ static int test_runtime_dense_additive_rewards(void) {
     EnvRuntime runtime;
     RuntimeMessage msg;
     EnvSession* session;
+    const EnvDenseRewardConfig dense_reward_config = {0.10f, 0.25f, 0.40f};
     static const char* const setup_events[] = {
         "|switch|p1a: A|Sawsbuck, L91, M|100/100",
         "|switch|p1b: B|Kingambit, L77, M|100/100",
@@ -633,7 +634,7 @@ static int test_runtime_dense_additive_rewards(void) {
 
     model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
     if (!assert_true(model != NULL, "create minimal gru model for dense rewards")) return 0;
-    if (!assert_true(env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_DENSE_ADDITIVE, NULL, NULL), "init dense runtime")) {
+    if (!assert_true(env_runtime_init(&runtime, model, NULL, 1, ENV_REWARD_DENSE_ADDITIVE, &dense_reward_config, NULL), "init dense runtime")) {
         gru_model_destroy(model);
         return 0;
     }
@@ -721,7 +722,7 @@ static int test_runtime_dense_additive_rewards(void) {
         gru_model_destroy(model);
         return 0;
     }
-    if (!assert_true(fabs((double)(session->episode.rewards[1] - 0.75f)) < 0.0001, "dense reward clips hp and faint swing at configured maximum")) {
+    if (!assert_true(fabs((double)(session->episode.rewards[1] - 0.40f)) < 0.0001, "dense reward clips hp and faint swing at configured maximum")) {
         env_runtime_free(&runtime);
         gru_model_destroy(model);
         return 0;
@@ -757,7 +758,7 @@ static int test_runtime_dense_additive_rewards(void) {
         gru_model_destroy(model);
         return 0;
     }
-    if (!assert_true(fabs((double)(session->episode.rewards[2] - 0.75f)) < 0.0001, "dense reward clips at configured maximum")) {
+    if (!assert_true(fabs((double)(session->episode.rewards[2] - 0.40f)) < 0.0001, "dense reward clips at configured maximum")) {
         env_runtime_free(&runtime);
         gru_model_destroy(model);
         return 0;
@@ -772,7 +773,7 @@ static int test_runtime_dense_additive_rewards(void) {
         gru_model_destroy(model);
         return 0;
     }
-    if (!assert_true(fabs((double)(session->episode.rewards[2] - 1.75f)) < 0.0001, "terminal reward adds onto dense reward")) {
+    if (!assert_true(fabs((double)(session->episode.rewards[2] - 1.40f)) < 0.0001, "terminal reward adds onto dense reward")) {
         env_runtime_free(&runtime);
         gru_model_destroy(model);
         return 0;

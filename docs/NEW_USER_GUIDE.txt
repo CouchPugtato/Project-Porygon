@@ -1,0 +1,654 @@
+Project Porygon: New User Guide
+================================
+
+1. What This Repository Is
+--------------------------
+
+Project Porygon is a Pokemon Showdown battle AI project built around a GRU-based model.
+
+At a high level, the repo has three jobs:
+
+1. capture or consume Showdown battle traffic
+2. reconstruct battle state from that traffic into a model observation
+3. train or run a neural policy/value model on those observations
+
+The project is currently centered on Gen 9 Random Doubles and uses a Python communicator for live Showdown play. The old native C websocket client is intentionally disabled by default.
+
+
+2. Main Runtime Modes
+---------------------
+
+The main executable is:
+
+- `showdown_client`
+
+Important entrypoints:
+
+- `showdown_client --runtime [checkpoint]`
+  - runs as a subprocess learner
+  - receives battle messages over stdin/stdout JSON protocol
+  - reconstructs state, flattens observations, picks actions
+
+- `showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N]`
+  - trains from captured replay/runtime data
+
+- `showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N]`
+  - trains from captured replay/runtime data with policy-gradient updates
+
+- `showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N]`
+  - trains directly from live-exported `episode_complete` records
+
+- `showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N]`
+  - applies PPO using rollout-time log probabilities, value estimates, policy tags, GAE, clipping, and Adam updates
+
+The Python communicator entrypoint is:
+
+- `py/communicator/main.py`
+
+Important communicator modes:
+
+- `--mode live`
+  - logs into Pokemon Showdown
+  - queues battles
+  - sends runtime messages to `showdown_client`
+  - executes chosen actions
+
+- `--mode capture`
+  - records replay/runtime JSONL without a learner in the loop
+
+The main orchestration entrypoints are:
+
+- `py/tools/selfplay_server.py`
+  - launches many communicator/runtime workers
+  - collects replay shards into `matches/runs/<run_name>/worker_*_{a,b}_raw.jsonl`
+  - used for both data collection and evaluation matches
+
+- `py/tools/train_batch_selfplay.py`
+  - trains one replay shard at a time by repeatedly invoking `showdown_client`
+  - writes per-shard stats/log sidecars
+  - supports a live terminal dashboard and config-driven trainer env vars
+
+- `py/tools/live_rl_orchestrator.py`
+  - runs frozen-policy collection and learner updates in versioned rounds
+  - resumes completed rounds from manifests
+
+- `py/tools/league_rl_orchestrator.py`
+  - selects a role-aware opponent pool, launches live PPO, evaluates the candidate against the champion, and applies promotion gates
+
+- `py/tools/ppo_search.py`
+  - runs a lightweight learning-rate/entropy grid, prunes unstable trials, evaluates survivors, and writes a ranked search manifest
+
+
+3. High-Level Data Flow
+-----------------------
+
+The live system works like this:
+
+1. `py/communicator/showdown_client.py`
+   - connects to Showdown websocket
+   - handles login / guest name / queueing
+   - emits room events
+
+2. `py/communicator/main.py`
+   - turns Showdown room traffic into structured runtime messages
+   - launches `showdown_client --runtime ...` as a subprocess learner
+   - sends `battle_start`, `event`, `request`, `decision`, and `terminal` messages
+   - receives actions back and sends `/choose ...` commands to Showdown
+
+3. `src/main.c`
+   - runtime mode initializes model + environment session
+   - reads JSON messages from stdin
+   - routes each message into the reconstruction/runtime stack
+
+4. Reconstruction stack
+   - `runtime_protocol.*`: parse incoming runtime messages
+   - `env_session.*`: session lifecycle, per-battle runtime handling
+   - `event_parser.*`: apply Showdown event lines to raw battle state
+   - `request_parser.*`: parse private request payloads
+   - `raw_battle_state.*`: canonical reconstructed battle state
+   - `observation_builder.*` + `observation.*`: convert raw state into model observation and flatten it
+   - `action_mapper.*`: build legal action mask and map policy outputs to `/choose` commands
+
+5. Model stack
+   - `gru_model.*`
+   - `neural_net.*`
+   - `state_value.*`
+   - `checkpoint.*`
+   - `episode.*`
+   - `gru_trainer.*`
+
+
+4. Repository Layout
+--------------------
+
+Key directories:
+
+- `src/`
+  - C runtime, reconstruction, model, training, tests
+
+- `py/communicator/`
+  - live Showdown websocket client and subprocess bridge
+
+- `py/tools/`
+  - orchestration scripts for large collection, training, diagnostics, and replay filtering
+
+- `data/`
+  - vocab / identifier / species metadata
+  - includes `species_types.txt` for base typing reconstruction
+
+- `models/`
+  - saved checkpoints
+
+- `matches/`
+  - captured runtime/replay JSONL and run outputs
+
+- `docs/`
+  - project notes and handoff docs
+
+
+5. Important Source Files
+-------------------------
+
+Core runtime:
+
+- `src/main.c`
+  - CLI entrypoint
+  - runtime mode
+  - supervised training mode
+  - debug/export paths
+
+- `src/env_session.c`
+  - per-battle session handling
+  - buffers pre-start messages
+  - reconstructs, builds action masks, flattens observations
+
+- `src/runtime_protocol.c`
+  - runtime JSON protocol parsing
+
+Reconstruction:
+
+- `src/raw_battle_state.h/.c`
+  - central reconstructed battle state
+  - tracks teams, active slots, hazards, statuses, counters, tera, transform, etc.
+
+- `src/event_parser.c`
+  - applies event stream lines such as switch, move, faint, field effects
+
+- `src/request_parser.c`
+  - parses Showdown `|request|...` payloads
+  - carries private self-side move/PP/trap/active information
+
+- `src/inference_engine.c`
+  - inferred knowledge updates from observed battle behavior
+
+Observation and actions:
+
+- `src/observation_builder.c`
+  - maps raw state into structured observation
+
+- `src/observation.c`
+  - flattens structured observation into model input vector
+
+- `src/action_mapper.c`
+  - legal action mask + policy-action to `/choose` command mapping
+
+Model/training:
+
+- `src/gru_model.c`
+  - GRU network wrapper and forward pass
+
+- `src/checkpoint.c`
+  - save/load checkpoints
+
+- `src/gru_trainer.c`
+  - supervised / training-side logic
+
+- `py/tools/rl_defaults.py` + `config/rl_defaults.toml`
+  - shared stable PPO/policy-gradient and collapse-guardrail defaults
+  - experiment TOMLs remain explicit overrides
+
+Tests:
+
+- `src/legality_tests.c`
+  - request/action legality behavior
+
+- `src/reconstruction_tests.c`
+  - battle-state reconstruction regressions
+
+
+6. Build and Test Commands
+--------------------------
+
+Build:
+
+- `cmake --build build-fresh --target showdown_client showdown_reconstruction_tests showdown_legality_tests`
+
+Run tests:
+
+- `.\build-fresh\showdown_reconstruction_tests.exe`
+- `.\build-fresh\showdown_legality_tests.exe`
+
+Live smoke run without a checkpoint:
+
+- `python py/communicator/main.py --mode live --max-games 25 --format gen9randomdoublesbattle --learner-command .\build-fresh\showdown_client.exe --replay-path .\matches\runs\run_smoke\run_smoke_raw.jsonl`
+
+Supervised training:
+
+- `.\build-fresh\showdown_client.exe --train-supervised .\matches\some_run.jsonl .\models\runs\some_run\model.chk`
+
+Batch supervised training:
+
+- `python py/tools/train_batch_selfplay.py --run run_name --mode supervised --pattern "worker_*_a_raw.jsonl" --checkpoint model.chk --epochs 1 --sample-files 200`
+
+Install Python tooling dependencies:
+
+- `pip install -r py\requirements.txt`
+
+
+7. Current Architectural Reality
+--------------------------------
+
+The hardest part of this repo is not the GRU. It is the reconstruction layer.
+
+The model does not observe Showdown directly. It observes a reconstructed battle state assembled incrementally from:
+
+- public event lines
+- private request payloads
+- inferred knowledge
+
+That means bugs usually come from ownership and synchronization problems between layers, not from one obviously broken function.
+
+The most important conceptual split now is:
+
+- base identity state
+  - who the Pokemon really is
+  - species, inferred base moves, item/ability knowledge, etc.
+
+- effective battle state
+  - what the battle is currently presenting
+  - transformed species/types/moves, tera-adjusted typing, effective move view
+
+This split matters because earlier versions were corrupting base state with temporary battle effects.
+
+
+8. Current Reconstruction Strategy
+----------------------------------
+
+The recent work intentionally changed strategy away from patching isolated bugs one at a time.
+
+Current strategy:
+
+1. enforce invariants
+   - transformed state must not permanently mutate base state
+   - request reconciliation must not destroy active battle-only state
+   - ambiguous identity should fail closed rather than silently merge/fork objects
+
+2. separate ownership layers
+   - base identity state
+   - effective battle state
+   - request-private overlays
+   - slot mapping / event chronology
+
+3. prefer slot-backed identity
+   - active-slot maps and request roster identity come before name heuristics
+
+4. fail closed on ambiguity
+   - especially for identity resolution and malformed request structure
+
+5. add regression coverage for invariants
+   - not just one-off scenario fixes
+
+This is the right strategy for this codebase because many earlier fixes were creating new bugs in neighboring layers.
+
+
+9. Current Reconstruction Status
+--------------------------------
+
+What is in better shape now:
+
+- pre-`battle_start` message handling is buffered instead of guessed
+- request parsing is no longer hardcoded to doubles everywhere
+- active-slot/request-private binding is much stronger than before
+- switch-cleared state handling is materially better
+- weather/terrain/type tracking is more explicit
+- transform handling now has an effective-state layer
+- communicator shutdown after max-games/current-battle stop is cleaner
+- runtime mode now logs whether a checkpoint was actually loaded or if it fell back to a fresh model
+
+Required verification:
+
+- rebuild both test executables from the current source tree
+- run `showdown_reconstruction_tests.exe`
+- run `showdown_legality_tests.exe`
+
+Do not infer current test health from an older executable in `build-fresh`; model, reward, or environment code may be newer than the binary.
+
+Last verified from a fresh rebuild on August 13, 2026:
+
+- reconstruction tests passed
+- legality tests passed
+- Python orchestration tests passed
+
+What still requires caution:
+
+- passing tests does not prove reconstruction is bug-free
+- the reconstruction layer is still the highest-risk subsystem
+- live smoke runs and replay-derived regressions remain necessary
+
+
+10. Checkpoints and Observation Compatibility
+---------------------------------------------
+
+Important: old checkpoints are generally not trustworthy with the current runtime.
+
+Reason:
+
+- the observation schema changed
+- reconstruction semantics changed
+- type/effective-state/identity handling changed
+
+A model checkpoint stores its expected input dimension. The runtime now logs:
+
+- `[runtime] loaded checkpoint ...`
+  - the checkpoint loaded
+
+- `[runtime] failed to load checkpoint ..., starting fresh model`
+  - load failed and the runtime fell back to a default model
+
+- `[runtime] no checkpoint provided, starting fresh model`
+  - no checkpoint path was given
+
+If a checkpoint loads but later emits `observation_flatten failed`, that usually means the model input dimension does not match the current observation flatten size. In practice, treat that checkpoint as incompatible.
+
+Bottom line:
+
+- old checkpoints are not good evaluation baselines anymore
+- use no checkpoint for smoke runtime validation
+- train new checkpoints on the current codebase for serious use
+
+Factorized-head compatibility:
+
+- current checkpoints contain the original flat policy head plus per-slot kind/move/switch/tera heads
+- a legacy checkpoint with a compatible observation dimension and flat policy layout can load; the factorized heads are bootstrapped from the flat head
+- this bootstrap is a migration aid, not proof that the checkpoint is a valid evaluation baseline
+- observation-size or action-layout incompatibility remains a hard incompatibility
+- see `docs/checkpoint_compatibility.md` for the exact rules
+
+
+11. Replay Data Compatibility
+-----------------------------
+
+Old replay JSONL data is often still parseable, but it is not ideal.
+
+Why:
+
+- the runtime message format may still parse
+- but reconstruction semantics applied to that data are now different
+- old captured data may also reflect older reconstruction bugs or older acceptance behavior
+
+Practical guidance:
+
+- old replay data is acceptable for quick bootstrapping
+- for serious training, capture fresh data with the current runtime
+
+
+12. Recommended Workflow Right Now
+----------------------------------
+
+Use this order:
+
+1. run reconstruction + legality tests
+2. do a short live smoke run with no checkpoint
+3. inspect a few captured battles, especially weird turns
+4. if clean, capture fresh replay/runtime data
+5. optionally filter that data into a cleaner training set
+   - wins-only
+   - post-faint
+   - other targeted subsets
+6. train a new model on current-code data
+7. use the validation-best checkpoint as the candidate
+8. evaluate the candidate against the current promoted pool leader
+9. only promote if the head-to-head result is convincingly favorable
+
+Do not train a long run first and hope the runtime is correct afterward. That wastes time if live reconstruction is still wrong.
+
+
+13. Current Training / Promotion Flow
+-------------------------------------
+
+The practical training loop in this repo is now:
+
+1. collect games with `py/tools/selfplay_server.py`
+2. optionally filter them with replay tools such as:
+   - `py/tools/replay_extract_wins.py`
+   - `py/tools/replay_extract_postfaint.py`
+3. train with `py/tools/train_batch_selfplay.py`
+4. select the candidate checkpoint from validation
+   - usually `<checkpoint>_best.chk`
+   - not automatically the final `<checkpoint>.chk`
+5. run a head-to-head eval:
+   - candidate model vs current pool leader
+6. promote only if the candidate clears that head-to-head gate
+
+Important:
+
+- win rate against `random` is a sanity check, not the promotion metric
+- the intended promotion rule is candidate vs current promoted leader
+- if a training run finishes successfully but the candidate loses that matchup, do not promote it
+
+
+14. Batch Training Reality
+--------------------------
+
+`py/tools/train_batch_selfplay.py` is the normal way to run larger training jobs now.
+
+What it does:
+
+- finds replay shards in a run folder
+- launches `showdown_client` once per shard
+- can train supervised or RL
+- writes one batch stats JSON per shard
+- can write one raw trainer log per shard
+- shows a live terminal dashboard during the run
+
+Useful config behaviors from `config/train_batch_selfplay.toml`:
+
+- `sample_files = <N>`
+  - cap training to a shuffled subset of shards per epoch
+
+- `supervised_profile = false`
+  - disables supervised profiling work, not just the print line
+  - recommended for real throughput runs
+
+- `env_<NAME> = <value>`
+  - exports subprocess environment variables to `showdown_client`
+  - example:
+    - `env_porygon_omp_threads = 16`
+
+- `dashboard = true`
+  - enables the live terminal dashboard
+
+Artifacts written by batch training:
+
+- checkpoints under:
+  - `models/runs/<run>/<checkpoint_stem>/`
+- shard stats under:
+  - `<checkpoint_stem>_batch_training_stats/`
+- raw trainer logs under:
+  - `<checkpoint_stem>_batch_training_logs/`
+
+
+15. What We Know About Performance Iteration
+--------------------------------------------
+
+Infrastructure improvements helped iteration speed a lot, but they do not automatically mean a better model.
+
+What has clearly helped:
+
+- using validation-best checkpoints instead of blindly taking the final shard state
+- using cleaner supervised datasets such as wins-only runs
+- making training stable and fast enough to iterate repeatedly
+- evaluating candidates against the current pool leader instead of only against `random`
+
+What has not been enough by itself:
+
+- simply training longer on noisier data
+- assuming the last checkpoint is the best checkpoint
+- treating dashboard / UI work as model-quality improvement
+- using `random` eval alone as a promotion signal
+
+The current bottleneck is more about data quality and promotion discipline than raw training throughput.
+
+
+16. Things A New Contributor Should Watch Closely
+-------------------------------------------------
+
+If you touch reconstruction, pay special attention to:
+
+- transform behavior
+- tera typing transitions
+- request reconciliation for active self mons
+- outgoing vs incoming switch cleanup
+- identity resolution between:
+  - slot-specific idents like `p1a: X`
+  - non-slot idents like `p1: X`
+  - same-name edge cases
+- doubles forced-switch / partial-active requests
+- keeping base and effective state separate
+
+If you add a fix, add a regression test for the invariant, not only for the single battle transcript you saw.
+
+
+17. Known Current Risks / Open Questions
+----------------------------------------
+
+No claim should be made that reconstruction is fully bug-free.
+
+Known ongoing risk areas:
+
+- edge-case transform interactions
+- opponent identity ambiguity in unusual event streams
+- event/request ordering combinations not yet covered by tests
+- any code path that can accidentally let temporary effective state mutate base identity state
+
+The project is in a much better state than before, but the reconstruction layer should still be treated as an active engineering surface rather than a finished subsystem.
+
+
+18. What To Do Before Making Big Changes
+----------------------------------------
+
+Before changing reconstruction:
+
+1. identify which state layer owns the field you want to mutate
+2. decide whether the change is:
+   - base identity
+   - effective battle state
+   - request-private overlay
+   - inference
+3. add or update a regression in `src/reconstruction_tests.c`
+4. run both:
+   - `showdown_reconstruction_tests.exe`
+   - `showdown_legality_tests.exe`
+5. if the change affects observation shape, assume old checkpoints are invalid
+
+
+19. Short Summary
+-----------------
+
+This repo is a C battle-state reconstruction + GRU inference engine wrapped by a Python Showdown communicator.
+
+The main technical challenge is not model architecture. It is making the reconstructed state correct, stable, and legal under noisy incremental battle traffic.
+
+The current implementation strategy is:
+
+- enforce invariants
+- separate base vs effective state
+- prefer slot-backed identity
+- fail closed on ambiguity
+- convert real failures into permanent regression tests
+
+If you keep those rules in mind, you will be working with the grain of the codebase instead of against it.
+
+
+20. Current PPO Architecture
+----------------------------
+
+The live actor no longer treats a doubles command as one undifferentiated flat choice during PPO.
+
+For each active slot, the policy has factorized heads for:
+
+- action kind: move or switch
+- move slot: 1 through 4
+- switch target: 1 through 6
+- tera choice: no or yes
+
+The runtime still maps these choices through the flat legal-action representation and finally into one validated Showdown command. Live episode records store:
+
+- both flat actions
+- the factorized choices
+- rollout-time log probability
+- rollout-time value estimate
+- the actor checkpoint path as `policy_tag`
+
+The learner rejects a batch whose policy tag does not match the expected frozen actor checkpoint.
+
+
+21. League and Promotion Workflow
+---------------------------------
+
+`models/league/league_registry.json` is the source of truth for the promoted population.
+
+Supported training roles are:
+
+- `main`
+- `main_exploiter`
+- `league_exploiter`
+- `historical_snapshot`
+- `champion`
+
+Main-agent opponent pools are champion-heavy and can also include recent mains, historical snapshots, and exploiters. Historical weighting uses a prioritized-fictitious-self-play-style weight that favors opponents with lower recorded win rates.
+
+A main candidate is promoted only when:
+
+- its earned head-to-head win rate clears the configured promotion threshold
+- it has no collapse flags
+- its battle-level tera rate is not too low relative to the champion baseline
+
+As of August 13, 2026, `g4_champion` remains the promoted champion. The latest PPO sweep produced a promising single trial, but its confirmation run did not beat G4, so it was not promoted.
+
+
+22. Metric Names That Must Not Be Confused
+-------------------------------------------
+
+Training and evaluation measure tera at different units:
+
+- `tera_action_rate`
+  - written by the C training summary
+  - tera move actions divided by all move actions
+
+- `tera_battle_rate`
+  - written by self-play evaluation summaries
+  - battles with at least one tera divided by matches played
+
+Both artifact types continue to write `tera_rate` as a backward-compatible alias. New code and analysis should use the explicit metric name.
+
+
+23. Shared Defaults and Overrides
+---------------------------------
+
+Stable RL and collapse defaults live in:
+
+- `config/rl_defaults.toml`
+
+They are consumed by:
+
+- the C trainer
+- live RL orchestration
+- league orchestration
+- PPO search
+- self-play collapse summaries
+- standalone collapse checks
+
+`config/reward_weights.toml` remains the source of truth for terminal and dense reward weights because it is also consumed by the communicator.
+
+Experiment TOMLs should contain only intentional deviations from these defaults. Manifests record the resolved values used for a run.

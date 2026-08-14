@@ -1,0 +1,35 @@
+# Shared, stable defaults consumed by the C trainer and Python orchestration tools.
+# Experiment configs may override these values explicitly.
+
+policy_gradient_gamma = 1.0
+policy_gradient_entropy_coef = 0.001
+
+ppo_gamma = 0.99
+live_ppo_learning_rate = 0.001
+ppo_entropy_coef = 0.001
+league_ppo_learning_rate = 0.0003
+league_ppo_entropy_coef = 0.0003
+advantage_norm = true
+gae_lambda = 0.95
+ppo_clip_epsilon = 0.20
+ppo_value_clip_epsilon = 0.20
+ppo_target_kl = 0.02
+adam_beta1 = 0.90
+adam_beta2 = 0.999
+adam_epsilon = 0.00000001
+
+anchor_kl_coef = 0.01
+anchor_kl_warn_threshold = 0.10
+baseline_tera_action_rate = 0.8562992125984252
+min_training_episodes_warn = 100
+
+warn_move_slot_concentration = 0.55
+hard_move_slot_collapse = 0.70
+warn_switch_slot_6_concentration = 0.60
+warn_tera_baseline_ratio = 0.50
+fail_fast_earned_win_rate = 0.40
+fail_fast_min_games = 150
+promotion_earned_win_rate = 0.52
+promotion_min_tera_baseline_ratio = 0.60
+ppo_search_prune_approx_kl = 0.12
+ppo_search_prune_tera_action_rate = 0.02

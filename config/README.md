@@ -7,6 +7,10 @@ Format:
 - CLI args are appended after config-derived defaults, so explicit CLI args override config values
 
 Files:
+- `rl_defaults.toml`
+  - shared stable defaults for policy-gradient/PPO training and collapse guardrails
+  - consumed by the C trainer and Python orchestration tools
+  - experiment TOMLs should only override values intentionally
 - `showdown_client.toml`
   - consumed by `showdown_client` when launched with no CLI args
 - `communicator.toml`

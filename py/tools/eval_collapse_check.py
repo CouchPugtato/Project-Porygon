@@ -4,13 +4,14 @@ import argparse
 import json
 from pathlib import Path
 
+from rl_defaults import float_default, int_default
 
-DEFAULT_WARN_MOVE_SLOT_CONCENTRATION = 0.55
-DEFAULT_HARD_MOVE_SLOT_COLLAPSE = 0.70
-DEFAULT_WARN_SWITCH_SLOT6_CONCENTRATION = 0.60
-DEFAULT_WARN_TERA_BASELINE_RATIO = 0.50
-DEFAULT_FAIL_FAST_EARNED_WIN_RATE = 0.40
-DEFAULT_FAIL_FAST_MIN_GAMES = 150
+DEFAULT_WARN_MOVE_SLOT_CONCENTRATION = float_default("warn_move_slot_concentration")
+DEFAULT_HARD_MOVE_SLOT_COLLAPSE = float_default("hard_move_slot_collapse")
+DEFAULT_WARN_SWITCH_SLOT6_CONCENTRATION = float_default("warn_switch_slot_6_concentration")
+DEFAULT_WARN_TERA_BASELINE_RATIO = float_default("warn_tera_baseline_ratio")
+DEFAULT_FAIL_FAST_EARNED_WIN_RATE = float_default("fail_fast_earned_win_rate")
+DEFAULT_FAIL_FAST_MIN_GAMES = int_default("fail_fast_min_games")
 
 
 def safe_rate(numerator: int | float, denominator: int | float) -> float:
@@ -58,8 +59,8 @@ def collapse_flags_for_group(
         if slot6_rate >= warn_switch_slot6_concentration:
             flags.append(f"warn_switch_slot_6_concentration:{slot6_rate:.3f}")
 
-    tera_rate = float(group.get("tera_rate", 0.0))
-    baseline_tera_rate = float(baseline_group.get("tera_rate", 0.0)) if baseline_group else 0.0
+    tera_rate = float(group.get("tera_battle_rate", group.get("tera_rate", 0.0)))
+    baseline_tera_rate = float(baseline_group.get("tera_battle_rate", baseline_group.get("tera_rate", 0.0))) if baseline_group else 0.0
     if baseline_tera_rate > 0.0 and tera_rate < (baseline_tera_rate * warn_tera_baseline_ratio):
         flags.append(f"warn_tera_rate_low_vs_baseline:{tera_rate:.3f}:{baseline_tera_rate:.3f}")
 
@@ -124,7 +125,8 @@ def main() -> None:
         "parent_checkpoint": summary.get("parent_checkpoint", ""),
         "matches_played": int(candidate_group.get("matches_played", 0)),
         "earned_win_rate": float(candidate_group.get("earned_win_rate", 0.0)),
-        "tera_rate": float(candidate_group.get("tera_rate", 0.0)),
+        "tera_battle_rate": float(candidate_group.get("tera_battle_rate", candidate_group.get("tera_rate", 0.0))),
+        "tera_rate": float(candidate_group.get("tera_battle_rate", candidate_group.get("tera_rate", 0.0))),
         "dominant_move_slot_rate": max(
             (float(rate) for rate in candidate_group.get("move_slot_rates", {}).values()),
             default=0.0,

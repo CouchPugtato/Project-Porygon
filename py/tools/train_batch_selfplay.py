@@ -16,6 +16,8 @@ import threading
 import time
 from typing import TextIO
 
+from rl_defaults import float_default
+
 try:
     from rich.console import Console, Group
     from rich.live import Live
@@ -743,8 +745,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-files", type=positive_int, default=0, help="Train on a random subset of up to N shards per epoch")
     parser.add_argument("--epochs-per-file", type=positive_int, default=1, help="Epochs to pass to showdown_client for each shard")
     parser.add_argument("--learning-rate", type=float, default=-1.0)
-    parser.add_argument("--gamma", type=float, default=1.0)
-    parser.add_argument("--entropy-coef", type=float, default=0.001)
+    parser.add_argument("--gamma", type=float, default=float_default("policy_gradient_gamma"))
+    parser.add_argument("--entropy-coef", type=float, default=float_default("policy_gradient_entropy_coef"))
     parser.add_argument("--advantage-norm", choices=["0", "1"], default="1")
     parser.add_argument("--reward-mode", default="terminal")
     return parser

@@ -79,6 +79,8 @@ Artifacts:
 
 This path is the preferred long-term direction over replay RL because it removes the off-policy mismatch from training on older logged actions.
 
+The preferred live optimizer is now PPO (`--train-live-ppo`). Live episode records include rollout-time log probabilities, values, factorized actions, and a frozen actor `policy_tag`. PPO uses GAE, policy clipping, value clipping, target-KL stopping, and accumulated Adam updates.
+
 ## Eval and collapse guardrails
 
 `py/tools/selfplay_server.py` summaries now include:
@@ -96,6 +98,14 @@ Current default collapse checks:
 - warning when `switch_slot_6` exceeds `60%`
 - warning when candidate tera rate falls below `50%` of the baseline side
 - fail-fast warning when earned win rate is below `40%` after at least `150` games
+
+Metric units:
+
+- training summaries use `tera_action_rate`: tera move actions divided by all move actions
+- evaluation summaries use `tera_battle_rate`: battles containing a tera divided by matches played
+- `tera_rate` remains in both formats as a backward-compatible alias; do not compare the aliases across artifact types without checking the unit
+
+Stable algorithm and guardrail defaults are centralized in `config/rl_defaults.toml`. Reward weights remain in `config/reward_weights.toml` because both the C runtime and Python communicator consume them.
 
 Use `py/tools/eval_collapse_check.py` to re-run those checks from an existing summary JSON.
 

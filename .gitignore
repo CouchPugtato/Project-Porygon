@@ -19,3 +19,4 @@ build.ninja
 __pycache__/
 
 *txt
+!docs/NEW_USER_GUIDE.txt

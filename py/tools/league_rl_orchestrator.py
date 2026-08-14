@@ -21,6 +21,7 @@ from league_manage import (
     member_to_json_dict,
     save_registry,
 )
+from rl_defaults import bool_default, float_default
 
 
 DEFAULT_RUNS_ROOT = Path("models") / "runs"
@@ -353,14 +354,14 @@ def maybe_promote_candidate(args: argparse.Namespace, registry: LeagueRegistry, 
     group_stats = eval_summary.get("group_stats", {}) or {}
     side_a = group_stats.get("a", {}) or {}
     earned_win_rate = float(side_a.get("earned_win_rate", 0.0) or 0.0)
-    tera_rate = float(side_a.get("tera_rate", 0.0) or 0.0)
+    tera_rate = float(side_a.get("tera_battle_rate", side_a.get("tera_rate", 0.0)) or 0.0)
     champion = find_member(registry, registry.champion_id) if registry.champion_id else None
     champion_tera_baseline = 1.0
     if champion and champion.eval.summary_path:
         try:
             champion_eval = load_json(Path(champion.eval.summary_path))
             champion_stats = (champion_eval.get("group_stats", {}) or {}).get("a", {}) or {}
-            champion_tera_baseline = float(champion_stats.get("tera_rate", 1.0) or 1.0)
+            champion_tera_baseline = float(champion_stats.get("tera_battle_rate", champion_stats.get("tera_rate", 1.0)) or 1.0)
         except Exception:
             champion_tera_baseline = 1.0
     if earned_win_rate < args.promote_threshold:
@@ -394,10 +395,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ensure-shard-count", type=parse_bool, default=True)
     parser.add_argument("--pool-seed", type=int, default=1)
     parser.add_argument("--training-mode", choices=["rl", "ppo"], default="ppo")
-    parser.add_argument("--learning-rate", type=float, default=0.0003)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--entropy-coef", type=float, default=0.0003)
-    parser.add_argument("--advantage-norm", type=parse_bool, default=True)
+    parser.add_argument("--learning-rate", type=float, default=float_default("league_ppo_learning_rate"))
+    parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
+    parser.add_argument("--entropy-coef", type=float, default=float_default("league_ppo_entropy_coef"))
+    parser.add_argument("--advantage-norm", type=parse_bool, default=bool_default("advantage_norm"))
     parser.add_argument("--reward-mode", choices=["terminal", "dense_additive"], default="terminal")
     parser.add_argument("--launch-stagger-seconds", type=float, default=0.35)
     parser.add_argument("--resource-check-seconds", type=float, default=2.0)
@@ -411,8 +412,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-concurrent-games", type=positive_int, default=40)
     parser.add_argument("--eval-worker-pairs", type=positive_int, default=120)
     parser.add_argument("--startup-timeout-seconds", type=positive_int, default=120)
-    parser.add_argument("--promote-threshold", type=float, default=0.52)
-    parser.add_argument("--min-promotion-tera-ratio", type=float, default=0.60)
+    parser.add_argument("--promote-threshold", type=float, default=float_default("promotion_earned_win_rate"))
+    parser.add_argument("--min-promotion-tera-ratio", type=float, default=float_default("promotion_min_tera_baseline_ratio"))
     parser.add_argument("--snapshot-cadence", type=positive_int, default=5)
     parser.add_argument("--max-active-historical", type=positive_int, default=20)
     return parser

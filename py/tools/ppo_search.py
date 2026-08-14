@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from rl_defaults import bool_default, float_default
+
 
 DEFAULT_RUNS_ROOT = Path("models") / "runs"
 DEFAULT_MATCH_RUNS_ROOT = Path("matches") / "runs"
@@ -182,7 +184,7 @@ def collect_trial_result(repo_root: Path, run_name: str, learning_rate: float, e
         entropy_coef=entropy_coef,
         approx_kl=float(training_summary.get("approx_kl", 0.0) or 0.0),
         clip_fraction=float(training_summary.get("clip_fraction", 0.0) or 0.0),
-        tera_rate_train=float(training_summary.get("tera_rate", 0.0) or 0.0),
+        tera_rate_train=float(training_summary.get("tera_action_rate", training_summary.get("tera_rate", 0.0)) or 0.0),
         labels=int(training_summary.get("labels", 0) or 0),
         earned_win_rate=float(side_a.get("earned_win_rate", 0.0) or 0.0),
         completed_games=int(eval_summary.get("completed_games", 0) or 0),
@@ -205,8 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-pairs", type=positive_int, default=60)
     parser.add_argument("--ensure-shard-count", type=parse_bool, default=True)
     parser.add_argument("--model-b", default="random")
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--advantage-norm", type=parse_bool, default=True)
+    parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
+    parser.add_argument("--advantage-norm", type=parse_bool, default=bool_default("advantage_norm"))
     parser.add_argument("--reward-mode", choices=["terminal", "dense_additive"], default="terminal")
     parser.add_argument("--learning-rates", type=csv_floats, default=[5e-5, 1e-4, 2e-4])
     parser.add_argument("--entropy-coefs", type=csv_floats, default=[1e-4, 3e-4, 5e-4])
@@ -220,8 +222,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-available-pagefile-gb", type=float, default=6.0)
     parser.add_argument("--startup-timeout-seconds", type=positive_int, default=120)
     parser.add_argument("--omp-threads", type=int, default=8)
-    parser.add_argument("--prune-approx-kl", type=float, default=0.12)
-    parser.add_argument("--prune-train-tera-rate-below", type=float, default=0.02)
+    parser.add_argument("--prune-approx-kl", type=float, default=float_default("ppo_search_prune_approx_kl"))
+    parser.add_argument(
+        "--prune-train-tera-action-rate-below",
+        "--prune-train-tera-rate-below",
+        dest="prune_train_tera_action_rate_below",
+        type=float,
+        default=float_default("ppo_search_prune_tera_action_rate"),
+    )
     return parser
 
 
@@ -248,14 +256,15 @@ def main() -> None:
         run_command(build_train_command(args, repo_root, run_name, learning_rate, entropy_coef, 100 + index), repo_root)
         training_summary = load_json((repo_root / DEFAULT_RUNS_ROOT / run_name / "round01" / f"{run_name}_round01_training_summary.json").resolve())
         approx_kl = float(training_summary.get("approx_kl", 0.0) or 0.0)
-        tera_rate_train = float(training_summary.get("tera_rate", 0.0) or 0.0)
-        pruned = approx_kl > args.prune_approx_kl or tera_rate_train < args.prune_train_tera_rate_below
+        tera_rate_train = float(training_summary.get("tera_action_rate", training_summary.get("tera_rate", 0.0)) or 0.0)
+        pruned = approx_kl > args.prune_approx_kl or tera_rate_train < args.prune_train_tera_action_rate_below
         trial_payload: dict[str, object] = {
             "run_name": run_name,
             "learning_rate": learning_rate,
             "entropy_coef": entropy_coef,
             "approx_kl": approx_kl,
             "tera_rate_train": tera_rate_train,
+            "tera_action_rate_train": tera_rate_train,
             "pruned": pruned,
         }
         if not pruned:

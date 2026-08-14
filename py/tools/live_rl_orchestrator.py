@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from rl_defaults import bool_default, float_default, int_default, reward_float_default
+
 
 DEFAULT_ARGS_PATH = Path("config/live_rl_orchestrator.toml")
 DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
@@ -202,6 +204,20 @@ def build_train_command(args: argparse.Namespace, trainer_exe: Path, episode_bat
         str(args.entropy_coef),
         "--advantage-norm",
         "1" if args.advantage_norm else "0",
+        "--gae-lambda",
+        str(args.gae_lambda),
+        "--ppo-clip-epsilon",
+        str(args.ppo_clip_epsilon),
+        "--ppo-value-clip-epsilon",
+        str(args.ppo_value_clip_epsilon),
+        "--target-kl",
+        str(args.target_kl),
+        "--adam-beta1",
+        str(args.adam_beta1),
+        "--adam-beta2",
+        str(args.adam_beta2),
+        "--adam-epsilon",
+        str(args.adam_epsilon),
         "--reward-mode",
         args.reward_mode,
         "--training-summary-path",
@@ -246,12 +262,12 @@ def trainer_env(args: argparse.Namespace) -> dict[str, str] | None:
 def collapse_flags_from_training_summary(summary: dict[str, object], baseline_tera_rate: float, min_episodes_warn: int, anchor_kl_warn_threshold: float) -> list[str]:
     flags: list[str] = []
     episode_count = int(summary.get("episode_count", 0) or 0)
-    tera_rate = float(summary.get("tera_rate", 0.0) or 0.0)
+    tera_rate = float(summary.get("tera_action_rate", summary.get("tera_rate", 0.0)) or 0.0)
     move_slot_rates = summary.get("move_slot_rates", {}) or {}
     anchor_kl_mean = float(summary.get("anchor_kl_mean", 0.0) or 0.0)
     if episode_count < min_episodes_warn:
         flags.append(f"warn_low_episode_count:{episode_count}")
-    if baseline_tera_rate > 0.0 and tera_rate < (0.5 * baseline_tera_rate):
+    if baseline_tera_rate > 0.0 and tera_rate < (float_default("warn_tera_baseline_ratio") * baseline_tera_rate):
         flags.append(f"warn_tera_rate_low:{tera_rate:.3f}:{baseline_tera_rate:.3f}")
     for key, value in move_slot_rates.items():
         rate = float(value or 0.0)
@@ -295,19 +311,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-prefix", default="live_rl")
     parser.add_argument("--episode-side", choices=["a", "b"], default="a")
     parser.add_argument("--epochs", type=positive_int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=0.001)
-    parser.add_argument("--gamma", type=float, default=1.0)
-    parser.add_argument("--entropy-coef", type=float, default=0.001)
-    parser.add_argument("--advantage-norm", type=parse_bool, default=True)
+    parser.add_argument("--learning-rate", type=float, default=float_default("live_ppo_learning_rate"))
+    parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
+    parser.add_argument("--entropy-coef", type=float, default=float_default("ppo_entropy_coef"))
+    parser.add_argument("--advantage-norm", type=parse_bool, default=bool_default("advantage_norm"))
+    parser.add_argument("--gae-lambda", type=float, default=float_default("gae_lambda"))
+    parser.add_argument("--ppo-clip-epsilon", type=float, default=float_default("ppo_clip_epsilon"))
+    parser.add_argument("--ppo-value-clip-epsilon", type=float, default=float_default("ppo_value_clip_epsilon"))
+    parser.add_argument("--target-kl", type=float, default=float_default("ppo_target_kl"))
+    parser.add_argument("--adam-beta1", type=float, default=float_default("adam_beta1"))
+    parser.add_argument("--adam-beta2", type=float, default=float_default("adam_beta2"))
+    parser.add_argument("--adam-epsilon", type=float, default=float_default("adam_epsilon"))
     parser.add_argument("--reward-mode", choices=["terminal", "dense_additive"], default="terminal")
-    parser.add_argument("--dense-additive-hp-swing-weight", type=float, default=0.10)
-    parser.add_argument("--dense-additive-faint-swing-weight", type=float, default=0.25)
-    parser.add_argument("--dense-additive-reward-clip", type=float, default=0.40)
+    parser.add_argument("--dense-additive-hp-swing-weight", type=float, default=reward_float_default("dense_additive_hp_swing_weight"))
+    parser.add_argument("--dense-additive-faint-swing-weight", type=float, default=reward_float_default("dense_additive_faint_swing_weight"))
+    parser.add_argument("--dense-additive-reward-clip", type=float, default=reward_float_default("dense_additive_reward_clip"))
     parser.add_argument("--anchor-checkpoint", default="")
-    parser.add_argument("--anchor-kl-coef", type=float, default=0.01)
-    parser.add_argument("--baseline-tera-rate", type=float, default=0.8562992125984252)
-    parser.add_argument("--anchor-kl-warn-threshold", type=float, default=0.10)
-    parser.add_argument("--min-episodes-warn", type=int, default=100)
+    parser.add_argument("--anchor-kl-coef", type=float, default=float_default("anchor_kl_coef"))
+    parser.add_argument(
+        "--baseline-tera-action-rate",
+        "--baseline-tera-rate",
+        dest="baseline_tera_action_rate",
+        type=float,
+        default=float_default("baseline_tera_action_rate"),
+    )
+    parser.add_argument("--anchor-kl-warn-threshold", type=float, default=float_default("anchor_kl_warn_threshold"))
+    parser.add_argument("--min-episodes-warn", type=int, default=int_default("min_training_episodes_warn"))
     parser.add_argument("--stop-on-collapse", type=parse_bool, default=True)
     parser.add_argument("--omp-threads", type=int, default=0)
     parser.add_argument("--resume", type=parse_bool, default=True)
@@ -368,6 +397,14 @@ def main() -> None:
             "gamma": args.gamma,
             "entropy_coef": args.entropy_coef,
             "advantage_norm": args.advantage_norm,
+            "baseline_tera_action_rate": args.baseline_tera_action_rate,
+            "gae_lambda": args.gae_lambda,
+            "ppo_clip_epsilon": args.ppo_clip_epsilon,
+            "ppo_value_clip_epsilon": args.ppo_value_clip_epsilon,
+            "target_kl": args.target_kl,
+            "adam_beta1": args.adam_beta1,
+            "adam_beta2": args.adam_beta2,
+            "adam_epsilon": args.adam_epsilon,
             "episode_side": args.episode_side,
             "omp_threads": args.omp_threads,
             "opponent": {
@@ -441,7 +478,7 @@ def main() -> None:
             training_summary = load_json(training_summary_path)
             collapse_flags = collapse_flags_from_training_summary(
                 training_summary,
-                args.baseline_tera_rate,
+                args.baseline_tera_action_rate,
                 args.min_episodes_warn,
                 args.anchor_kl_warn_threshold,
             )

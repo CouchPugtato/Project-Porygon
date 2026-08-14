@@ -21,6 +21,8 @@ from typing import Literal, TextIO
 
 import websockets
 
+from rl_defaults import float_default, int_default
+
 
 DEFAULT_SHOWDOWN_DIR = Path("external/pokemon-showdown")
 DEFAULT_CLIENT_DIR = Path("external/pokemon-showdown-client")
@@ -1012,24 +1014,24 @@ class PoolOrchestrator:
                 ((str(slot), float(rate)) for slot, rate in move_rates.items()),
                 key=lambda item: item[1],
             )
-            if dominant_rate >= 0.70:
+            if dominant_rate >= float_default("hard_move_slot_collapse"):
                 flags.append(f"hard_move_slot_collapse:{dominant_slot}:{dominant_rate:.3f}")
-            elif dominant_rate >= 0.55:
+            elif dominant_rate >= float_default("warn_move_slot_concentration"):
                 flags.append(f"warn_move_slot_concentration:{dominant_slot}:{dominant_rate:.3f}")
         switch_rates = group.get("switch_slot_rates", {})
         if isinstance(switch_rates, dict):
             slot6_rate = float(switch_rates.get("slot_6", 0.0))
-            if slot6_rate >= 0.60:
+            if slot6_rate >= float_default("warn_switch_slot_6_concentration"):
                 flags.append(f"warn_switch_slot_6_concentration:{slot6_rate:.3f}")
-        tera_rate = float(group.get("tera_rate", 0.0))
+        tera_rate = float(group.get("tera_battle_rate", group.get("tera_rate", 0.0)))
         baseline_tera_rate = 0.0
         if baseline_group is not None:
-            baseline_tera_rate = float(baseline_group.get("tera_rate", 0.0))
-        if baseline_tera_rate > 0.0 and tera_rate < (baseline_tera_rate * 0.5):
+            baseline_tera_rate = float(baseline_group.get("tera_battle_rate", baseline_group.get("tera_rate", 0.0)))
+        if baseline_tera_rate > 0.0 and tera_rate < (baseline_tera_rate * float_default("warn_tera_baseline_ratio")):
             flags.append(f"warn_tera_rate_low_vs_baseline:{tera_rate:.3f}:{baseline_tera_rate:.3f}")
         earned_win_rate = float(group.get("earned_win_rate", 0.0))
         matches_played = int(group.get("matches_played", 0))
-        if matches_played >= 150 and earned_win_rate < 0.40:
+        if matches_played >= int_default("fail_fast_min_games") and earned_win_rate < float_default("fail_fast_earned_win_rate"):
             flags.append(f"fail_fast_low_earned_win_rate:{earned_win_rate:.3f}")
         return flags
 
@@ -1375,7 +1377,8 @@ class PoolOrchestrator:
             )
             group["win_rate"] = (float(group["wins"]) / matches_played) if matches_played > 0 else 0.0
             group["earned_win_rate"] = (float(group["earned_wins"]) / matches_played) if matches_played > 0 else 0.0
-            group["tera_rate"] = (tera_battles / matches_played) if matches_played > 0 else 0.0
+            group["tera_battle_rate"] = (tera_battles / matches_played) if matches_played > 0 else 0.0
+            group["tera_rate"] = group["tera_battle_rate"]  # Backward-compatible artifact key.
             group["avg_turns_until_tera"] = (
                 float(group["_weighted_tera_turns"]) / tera_battles if tera_battles > 0 else 0.0
             )
@@ -1448,11 +1451,16 @@ class PoolOrchestrator:
             "group_stats": group_stats,
             "group_collapse_flags": group_collapse_flags,
             "collapse_thresholds": {
-                "warn_move_slot_concentration": 0.55,
-                "hard_move_slot_collapse": 0.70,
-                "warn_switch_slot_6_concentration": 0.60,
-                "warn_tera_rate_low_vs_baseline_ratio": 0.50,
-                "fail_fast_low_earned_win_rate_after_150_games": 0.40,
+                "warn_move_slot_concentration": float_default("warn_move_slot_concentration"),
+                "hard_move_slot_collapse": float_default("hard_move_slot_collapse"),
+                "warn_switch_slot_6_concentration": float_default("warn_switch_slot_6_concentration"),
+                "warn_tera_rate_low_vs_baseline_ratio": float_default("warn_tera_baseline_ratio"),
+                "fail_fast_low_earned_win_rate": float_default("fail_fast_earned_win_rate"),
+                "fail_fast_min_games": int_default("fail_fast_min_games"),
+            },
+            "metric_definitions": {
+                "tera_battle_rate": "battles with at least one tera / matches played",
+                "tera_rate": "backward-compatible alias of tera_battle_rate",
             },
             "pool_mode": pool_mode,
             "run_duration_seconds": max(time.monotonic() - self._start_time, 0.0),
