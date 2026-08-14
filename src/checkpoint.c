@@ -33,6 +33,50 @@ typedef struct {
     TrainerCheckpointState trainer;
 } CheckpointHeader;
 
+static void crc32_build_table(uint32_t table[256]) {
+    uint32_t i;
+    for (i = 0; i < 256u; ++i) {
+        uint32_t value = i;
+        int bit;
+        for (bit = 0; bit < 8; ++bit) {
+            value = (value >> 1u) ^ ((value & 1u) ? UINT32_C(0xedb88320) : 0u);
+        }
+        table[i] = value;
+    }
+}
+
+static uint32_t crc32_update(
+    uint32_t checksum,
+    const void* data,
+    size_t length,
+    const uint32_t table[256]
+) {
+    const unsigned char* bytes = (const unsigned char*)data;
+    size_t i;
+    for (i = 0; i < length; ++i) {
+        checksum = table[(checksum ^ bytes[i]) & 0xffu] ^ (checksum >> 8u);
+    }
+    return checksum;
+}
+
+static uint32_t checkpoint_checksum(
+    const CheckpointHeader* header,
+    const float* parameters,
+    size_t parameter_count
+) {
+    uint32_t table[256];
+    uint32_t checksum = UINT32_MAX;
+    crc32_build_table(table);
+    checksum = crc32_update(checksum, header, sizeof(*header), table);
+    checksum = crc32_update(
+        checksum,
+        parameters,
+        parameter_count * sizeof(float),
+        table
+    );
+    return checksum ^ UINT32_MAX;
+}
+
 static int ensure_parent_directory(const char* path) {
     char buffer[1024];
     size_t len;
@@ -90,6 +134,7 @@ int checkpoint_save(const char* path, const GruModel* model, const TrainerCheckp
     char* temporary_path = NULL;
     size_t count;
     size_t path_length;
+    uint32_t checksum;
     int saved = 0;
 
     if (!path || !*path || !model || !state) {
@@ -123,6 +168,7 @@ int checkpoint_save(const char* path, const GruModel* model, const TrainerCheckp
     if (!gru_model_export_parameters(model, params, count)) {
         goto cleanup;
     }
+    checksum = checkpoint_checksum(&header, params, count);
 
     temporary_path = (char*)malloc(path_length + sizeof(temporary_suffix));
     if (!temporary_path) {
@@ -136,7 +182,8 @@ int checkpoint_save(const char* path, const GruModel* model, const TrainerCheckp
     }
 
     if (fwrite(&header, sizeof(header), 1, f) != 1 ||
-            fwrite(params, sizeof(float), count, f) != count) {
+            fwrite(params, sizeof(float), count, f) != count ||
+            fwrite(&checksum, sizeof(checksum), 1, f) != 1) {
         goto cleanup;
     }
     if (!flush_checkpoint_file(f)) {
@@ -204,7 +251,9 @@ const char* checkpoint_load_status_string(CheckpointLoadStatus status) {
         case CHECKPOINT_LOAD_MODEL_CREATE_FAILED: return "failed to create checkpoint model";
         case CHECKPOINT_LOAD_PARAMETER_LAYOUT_MISMATCH: return "unsupported checkpoint parameter layout";
         case CHECKPOINT_LOAD_TRUNCATED_PARAMETERS: return "truncated checkpoint parameter payload";
+        case CHECKPOINT_LOAD_TRUNCATED_CHECKSUM: return "truncated checkpoint checksum";
         case CHECKPOINT_LOAD_TRAILING_DATA: return "unexpected trailing checkpoint data";
+        case CHECKPOINT_LOAD_CHECKSUM_MISMATCH: return "checkpoint checksum mismatch";
         case CHECKPOINT_LOAD_FILE_SIZE_FAILED: return "failed to determine checkpoint file size";
         case CHECKPOINT_LOAD_ALLOCATION_FAILED: return "checkpoint allocation failed";
         case CHECKPOINT_LOAD_PARAMETER_IMPORT_FAILED: return "checkpoint parameter import failed";
@@ -225,8 +274,11 @@ GruModel* checkpoint_load_compatible(
     float* params = NULL;
     size_t current_parameter_count;
     size_t legacy_parameter_count;
+    size_t parameter_end_offset;
     size_t expected_file_size;
     long actual_file_size;
+    uint32_t stored_checksum = 0;
+    uint32_t computed_checksum = 0;
     CheckpointLoadResult local_result;
     CheckpointLoadResult* result = result_out ? result_out : &local_result;
 
@@ -255,7 +307,8 @@ GruModel* checkpoint_load_compatible(
         return NULL;
     }
     checkpoint_load_result_header(result, &header);
-    if (header.version != CHECKPOINT_FORMAT_VERSION) {
+    if (header.version < CHECKPOINT_MIN_SUPPORTED_VERSION ||
+            header.version > CHECKPOINT_FORMAT_VERSION) {
         result->status = CHECKPOINT_LOAD_UNSUPPORTED_VERSION;
         fclose(f);
         return NULL;
@@ -301,7 +354,15 @@ GruModel* checkpoint_load_compatible(
         fclose(f);
         return NULL;
     }
-    expected_file_size = sizeof(header) + (header.parameter_count * sizeof(float));
+    parameter_end_offset = sizeof(header) + (header.parameter_count * sizeof(float));
+    if (header.version >= 2u && parameter_end_offset > SIZE_MAX - sizeof(stored_checksum)) {
+        result->status = CHECKPOINT_LOAD_FILE_SIZE_FAILED;
+        gru_model_destroy(model);
+        fclose(f);
+        return NULL;
+    }
+    expected_file_size = parameter_end_offset +
+        (header.version >= 2u ? sizeof(stored_checksum) : 0u);
     if (expected_file_size > (size_t)LONG_MAX || fseek(f, 0, SEEK_END) != 0) {
         result->status = CHECKPOINT_LOAD_FILE_SIZE_FAILED;
         gru_model_destroy(model);
@@ -315,8 +376,14 @@ GruModel* checkpoint_load_compatible(
         fclose(f);
         return NULL;
     }
-    if ((size_t)actual_file_size < expected_file_size) {
+    if ((size_t)actual_file_size < parameter_end_offset) {
         result->status = CHECKPOINT_LOAD_TRUNCATED_PARAMETERS;
+        gru_model_destroy(model);
+        fclose(f);
+        return NULL;
+    }
+    if ((size_t)actual_file_size < expected_file_size) {
+        result->status = CHECKPOINT_LOAD_TRUNCATED_CHECKSUM;
         gru_model_destroy(model);
         fclose(f);
         return NULL;
@@ -340,8 +407,34 @@ GruModel* checkpoint_load_compatible(
         fclose(f);
         return NULL;
     }
-    if (fread(params, sizeof(float), header.parameter_count, f) != header.parameter_count ||
-        !gru_model_import_parameters(model, params, header.parameter_count)) {
+    if (fread(params, sizeof(float), header.parameter_count, f) != header.parameter_count) {
+        result->status = CHECKPOINT_LOAD_PARAMETER_IMPORT_FAILED;
+        free(params);
+        gru_model_destroy(model);
+        fclose(f);
+        return NULL;
+    }
+    if (header.version >= 2u) {
+        if (fread(&stored_checksum, sizeof(stored_checksum), 1, f) != 1) {
+            result->status = CHECKPOINT_LOAD_TRUNCATED_CHECKSUM;
+            free(params);
+            gru_model_destroy(model);
+            fclose(f);
+            return NULL;
+        }
+        computed_checksum = checkpoint_checksum(&header, params, header.parameter_count);
+        result->stored_checksum = stored_checksum;
+        result->computed_checksum = computed_checksum;
+        if (stored_checksum != computed_checksum) {
+            result->status = CHECKPOINT_LOAD_CHECKSUM_MISMATCH;
+            free(params);
+            gru_model_destroy(model);
+            fclose(f);
+            return NULL;
+        }
+        result->checksum_verified = 1;
+    }
+    if (!gru_model_import_parameters(model, params, header.parameter_count)) {
         result->status = CHECKPOINT_LOAD_PARAMETER_IMPORT_FAILED;
         free(params);
         gru_model_destroy(model);

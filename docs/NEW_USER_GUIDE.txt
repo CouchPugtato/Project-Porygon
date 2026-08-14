@@ -358,9 +358,11 @@ A model checkpoint stores its expected input dimension. The runtime now logs:
 - `[runtime] no checkpoint provided, starting fresh model`
   - no checkpoint path was given
 
-The loader now validates format version, observation dimension, action count, supported parameter layout, and exact file length before model use. Errors identify the rejected field or file condition.
+The loader now validates format version, observation dimension, action count, supported parameter layout, exact file length, and v2 checkpoint checksum before model use. Errors identify the rejected field or file condition.
 
 Checkpoint saves are crash-safe: the runtime writes and flushes a same-directory `.tmp` file before atomically replacing the destination. A failed or interrupted save therefore leaves the previous completed checkpoint intact; the next save cleans up any stale temporary payload. Do not run multiple writers against the same checkpoint path.
+
+New saves use checkpoint format v2 with a CRC-32 checksum over trainer state, model metadata, and parameters. A v2 load reports `checksum=verified`; a compatible v1 checkpoint still loads but reports `checksum=unverified`. A checksum mismatch means the file contents changed or were corrupted and the runtime refuses to use it.
 
 Bottom line:
 

@@ -4,6 +4,7 @@
 #include "gru_model.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct {
     size_t step;
@@ -13,7 +14,8 @@ typedef struct {
     unsigned int seed;
 } TrainerCheckpointState;
 
-#define CHECKPOINT_FORMAT_VERSION 1u
+#define CHECKPOINT_MIN_SUPPORTED_VERSION 1u
+#define CHECKPOINT_FORMAT_VERSION 2u
 
 typedef enum {
     CHECKPOINT_LOAD_OK = 0,
@@ -29,7 +31,9 @@ typedef enum {
     CHECKPOINT_LOAD_MODEL_CREATE_FAILED,
     CHECKPOINT_LOAD_PARAMETER_LAYOUT_MISMATCH,
     CHECKPOINT_LOAD_TRUNCATED_PARAMETERS,
+    CHECKPOINT_LOAD_TRUNCATED_CHECKSUM,
     CHECKPOINT_LOAD_TRAILING_DATA,
+    CHECKPOINT_LOAD_CHECKSUM_MISMATCH,
     CHECKPOINT_LOAD_FILE_SIZE_FAILED,
     CHECKPOINT_LOAD_ALLOCATION_FAILED,
     CHECKPOINT_LOAD_PARAMETER_IMPORT_FAILED
@@ -52,6 +56,9 @@ typedef struct {
     size_t expected_num_actions;
     CheckpointParameterLayout parameter_layout;
     int migrated_legacy_heads;
+    int checksum_verified;
+    uint32_t stored_checksum;
+    uint32_t computed_checksum;
 } CheckpointLoadResult;
 
 int checkpoint_save(const char* path, const GruModel* model, const TrainerCheckpointState* state);

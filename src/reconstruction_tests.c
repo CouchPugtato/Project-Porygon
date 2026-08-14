@@ -2909,6 +2909,25 @@ static int write_test_checkpoint(
     return ok;
 }
 
+static int flip_test_checkpoint_byte(const char* path, long offset) {
+    FILE* file = fopen(path, "r+b");
+    int value;
+    int ok = 0;
+    if (!file || offset < 0 || fseek(file, offset, SEEK_SET) != 0) {
+        if (file) fclose(file);
+        return 0;
+    }
+    value = fgetc(file);
+    if (value != EOF && fseek(file, offset, SEEK_SET) == 0 &&
+            fputc(value ^ 0x01, file) != EOF) {
+        ok = 1;
+    }
+    if (fclose(file) != 0) {
+        ok = 0;
+    }
+    return ok;
+}
+
 static int test_checkpoint_compatibility_validation(void) {
     const char* current_path = "checkpoint_test_current.bin";
     const char* current_temporary_path = "checkpoint_test_current.bin.tmp";
@@ -2916,8 +2935,11 @@ static int test_checkpoint_compatibility_validation(void) {
     const char* replacement_failure_temporary_path = "checkpoint_test_replace_failure.tmp";
     const char* legacy_path = "checkpoint_test_legacy.bin";
     const char* version_path = "checkpoint_test_version.bin";
+    const char* header_corrupt_path = "checkpoint_test_header_corrupt.bin";
+    const char* parameter_corrupt_path = "checkpoint_test_parameter_corrupt.bin";
     const char* truncated_path = "checkpoint_test_truncated.bin";
     const char* truncated_parameters_path = "checkpoint_test_truncated_parameters.bin";
+    const char* truncated_checksum_path = "checkpoint_test_truncated_checksum.bin";
     const char* trailing_path = "checkpoint_test_trailing.bin";
     GruModel* model = NULL;
     GruModel* loaded = NULL;
@@ -2941,8 +2963,11 @@ static int test_checkpoint_compatibility_validation(void) {
     TEST_RMDIR(replacement_failure_path);
     remove(legacy_path);
     remove(version_path);
+    remove(header_corrupt_path);
+    remove(parameter_corrupt_path);
     remove(truncated_path);
     remove(truncated_parameters_path);
+    remove(truncated_checksum_path);
     remove(trailing_path);
     memset(&state, 0, sizeof(state));
     state.step = 42u;
@@ -2960,6 +2985,9 @@ static int test_checkpoint_compatibility_validation(void) {
     ok &= assert_true(loaded != NULL && result.status == CHECKPOINT_LOAD_OK, "current checkpoint loads successfully");
     ok &= assert_true(result.parameter_layout == CHECKPOINT_LAYOUT_FACTORIZED && !result.migrated_legacy_heads,
         "current checkpoint reports factorized layout");
+    ok &= assert_true(result.stored_version == CHECKPOINT_FORMAT_VERSION && result.checksum_verified &&
+            result.stored_checksum == result.computed_checksum,
+        "current checkpoint reports verified v2 checksum");
     ok &= assert_true(loaded_state.step == state.step, "current checkpoint restores trainer state");
     gru_model_destroy(loaded);
     loaded = NULL;
@@ -3027,7 +3055,7 @@ static int test_checkpoint_compatibility_validation(void) {
     memcpy(legacy_parameters + prefix_count, current_parameters + current_count - value_count, value_count * sizeof(float));
     memset(&header, 0, sizeof(header));
     memcpy(header.magic, "PORYCHK", 7);
-    header.version = CHECKPOINT_FORMAT_VERSION;
+    header.version = CHECKPOINT_MIN_SUPPORTED_VERSION;
     header.input_dim = gru_model_input_dim(model);
     header.hidden_dim = gru_model_hidden_dim(model);
     header.num_actions = gru_model_num_actions(model);
@@ -3040,6 +3068,8 @@ static int test_checkpoint_compatibility_validation(void) {
         "legacy flat checkpoint loads successfully");
     ok &= assert_true(result.parameter_layout == CHECKPOINT_LAYOUT_LEGACY_FLAT && result.migrated_legacy_heads,
         "legacy checkpoint reports factorized-head migration");
+    ok &= assert_true(result.stored_version == CHECKPOINT_MIN_SUPPORTED_VERSION && !result.checksum_verified,
+        "v1 checkpoint loads as checksum-unverified");
     gru_model_destroy(loaded);
     loaded = NULL;
 
@@ -3050,6 +3080,28 @@ static int test_checkpoint_compatibility_validation(void) {
     loaded = checkpoint_load_compatible(version_path, NULL, 8u, OBS_NUM_ACTIONS, &result);
     ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_UNSUPPORTED_VERSION,
         "checkpoint rejects unsupported format version");
+
+    ok &= assert_true(checkpoint_save(header_corrupt_path, model, &state),
+        "checkpoint test saves header corruption fixture");
+    ok &= assert_true(flip_test_checkpoint_byte(
+            header_corrupt_path,
+            (long)(offsetof(TestCheckpointHeader, trainer) + offsetof(TrainerCheckpointState, seed))),
+        "checkpoint test corrupts checksummed trainer state");
+    loaded = checkpoint_load_compatible(header_corrupt_path, NULL, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_CHECKSUM_MISMATCH &&
+            result.stored_checksum != result.computed_checksum,
+        "checkpoint rejects checksummed header corruption");
+
+    ok &= assert_true(checkpoint_save(parameter_corrupt_path, model, &state),
+        "checkpoint test saves parameter corruption fixture");
+    ok &= assert_true(flip_test_checkpoint_byte(
+            parameter_corrupt_path,
+            (long)sizeof(TestCheckpointHeader)),
+        "checkpoint test corrupts checksummed parameter payload");
+    loaded = checkpoint_load_compatible(parameter_corrupt_path, NULL, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_CHECKSUM_MISMATCH &&
+            result.stored_checksum != result.computed_checksum,
+        "checkpoint rejects checksummed parameter corruption");
 
     file = fopen(truncated_path, "wb");
     ok &= assert_true(file != NULL, "checkpoint test opens truncated fixture");
@@ -3075,8 +3127,14 @@ static int test_checkpoint_compatibility_validation(void) {
     ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_TRUNCATED_PARAMETERS,
         "checkpoint rejects truncated parameter payload");
 
-    ok &= assert_true(write_test_checkpoint(trailing_path, &header, current_parameters),
-        "checkpoint test writes trailing-data fixture");
+    ok &= assert_true(write_test_checkpoint(truncated_checksum_path, &header, current_parameters),
+        "checkpoint test writes missing-checksum fixture");
+    loaded = checkpoint_load_compatible(truncated_checksum_path, NULL, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_TRUNCATED_CHECKSUM,
+        "checkpoint rejects truncated checksum footer");
+
+    ok &= assert_true(checkpoint_save(trailing_path, model, &state),
+        "checkpoint test saves trailing-data fixture");
     file = fopen(trailing_path, "ab");
     ok &= assert_true(file != NULL, "checkpoint test opens trailing-data fixture");
     if (file) {
@@ -3100,8 +3158,11 @@ cleanup:
     TEST_RMDIR(replacement_failure_path);
     remove(legacy_path);
     remove(version_path);
+    remove(header_corrupt_path);
+    remove(parameter_corrupt_path);
     remove(truncated_path);
     remove(truncated_parameters_path);
+    remove(truncated_checksum_path);
     remove(trailing_path);
     return ok;
 }

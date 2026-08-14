@@ -17,6 +17,13 @@ Current checkpoints serialize:
   - tera choice
 - value head
 - basic trainer state
+- a CRC-32 integrity checksum
+
+## Format versions and integrity
+
+Version 2 appends a CRC-32 footer covering the complete serialized header and parameter payload. The loader computes the checksum before importing parameters and rejects any mismatch. This detects accidental byte corruption; it is not intended as protection against deliberate tampering.
+
+Version 1 checkpoints remain loadable for migration and are reported as `checksum=unverified` because they have no integrity footer. Every newly saved checkpoint uses version 2 and is reported as `checksum=verified` after a successful load.
 
 ## Crash-safe saving
 
@@ -45,12 +52,13 @@ This supports migration, but does not make every old checkpoint a valid baseline
 The loader validates:
 
 - magic header and complete header length
-- exact supported format version
+- supported format version (v1 or v2)
 - nonzero, bounded dimensions
 - observation dimension against `observation_flat_size()`
 - action count against `OBS_NUM_ACTIONS`
 - exact current-factorized or legacy-flat parameter count
 - exact file length, rejecting truncation and trailing data
+- complete and matching CRC-32 footer for v2 checkpoints
 - successful parameter import
 
-Failures report a specific reason plus stored and expected metadata. Successful legacy loads report `layout=legacy_flat migrated_factorized_heads=1`.
+Failures report a specific reason plus stored and expected metadata, including stored and computed checksums when integrity verification fails. Successful loads report their format version and `checksum=verified` or `checksum=unverified`; legacy parameter-layout loads also report `layout=legacy_flat migrated_factorized_heads=1`.

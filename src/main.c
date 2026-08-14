@@ -100,7 +100,7 @@ static void report_checkpoint_load_failure(
 ) {
     CheckpointLoadStatus status = result ? result->status : CHECKPOINT_LOAD_INVALID_ARGUMENT;
     fprintf(stderr,
-        "%s checkpoint='%s' reason='%s' stored_version=%u stored_input=%zu stored_hidden=%zu stored_actions=%zu stored_parameters=%zu expected_input=%zu expected_actions=%zu\n",
+        "%s checkpoint='%s' reason='%s' stored_version=%u stored_input=%zu stored_hidden=%zu stored_actions=%zu stored_parameters=%zu expected_input=%zu expected_actions=%zu stored_checksum=%08x computed_checksum=%08x\n",
         context ? context : "checkpoint load failed",
         path ? path : "",
         checkpoint_load_status_string(status),
@@ -110,7 +110,9 @@ static void report_checkpoint_load_failure(
         result ? result->stored_num_actions : 0u,
         result ? result->stored_parameter_count : 0u,
         result ? result->expected_input_dim : observation_flat_size(),
-        result ? result->expected_num_actions : OBS_NUM_ACTIONS);
+        result ? result->expected_num_actions : OBS_NUM_ACTIONS,
+        result ? (unsigned int)result->stored_checksum : 0u,
+        result ? (unsigned int)result->computed_checksum : 0u);
 }
 
 static void report_checkpoint_load_success(
@@ -119,10 +121,12 @@ static void report_checkpoint_load_success(
     const TrainerCheckpointState* state,
     const CheckpointLoadResult* result
 ) {
-    fprintf(stderr, "%s checkpoint='%s' step=%zu layout=%s%s\n",
+    fprintf(stderr, "%s checkpoint='%s' step=%zu version=%u checksum=%s layout=%s%s\n",
         context ? context : "loaded checkpoint",
         path ? path : "",
         state ? state->step : 0u,
+        result ? result->stored_version : 0u,
+        result && result->checksum_verified ? "verified" : "unverified",
         result && result->parameter_layout == CHECKPOINT_LAYOUT_LEGACY_FLAT ? "legacy_flat" : "factorized",
         result && result->migrated_legacy_heads ? " migrated_factorized_heads=1" : "");
 }
