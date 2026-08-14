@@ -92,6 +92,8 @@ typedef struct {
     float* slot1_tera_bias;
     float* slot1_target_head;
     float* slot1_target_bias;
+    float* joint_pair_head;
+    float* joint_pair_bias;
     float* value_head;
     float value_bias;
     size_t count;
@@ -140,6 +142,8 @@ typedef struct {
     float* slot1_tera_bias_m; float* slot1_tera_bias_v;
     float* slot1_target_head_m; float* slot1_target_head_v;
     float* slot1_target_bias_m; float* slot1_target_bias_v;
+    float* joint_pair_head_m; float* joint_pair_head_v;
+    float* joint_pair_bias_m; float* joint_pair_bias_v;
     float* value_head_m;
     float* value_head_v;
     float value_bias_m;
@@ -186,6 +190,8 @@ struct GruModel {
     float* slot1_tera_bias;
     Matrix slot1_target_head;
     float* slot1_target_bias;
+    Matrix joint_pair_head;
+    float* joint_pair_bias;
 
     float* value_head;
     float value_bias;
@@ -410,6 +416,7 @@ static void gru_gradient_accum_free(GruGradientAccum* accum) {
     free(accum->slot1_switch_head); free(accum->slot1_switch_bias);
     free(accum->slot1_tera_head); free(accum->slot1_tera_bias);
     free(accum->slot1_target_head); free(accum->slot1_target_bias);
+    free(accum->joint_pair_head); free(accum->joint_pair_bias);
     free(accum->value_head);
     memset(accum, 0, sizeof(*accum));
 }
@@ -449,6 +456,8 @@ static void gru_adam_state_free(GruAdamState* state) {
     free(state->slot1_tera_bias_m); free(state->slot1_tera_bias_v);
     free(state->slot1_target_head_m); free(state->slot1_target_head_v);
     free(state->slot1_target_bias_m); free(state->slot1_target_bias_v);
+    free(state->joint_pair_head_m); free(state->joint_pair_head_v);
+    free(state->joint_pair_bias_m); free(state->joint_pair_bias_v);
     free(state->value_head_m); free(state->value_head_v);
     memset(state, 0, sizeof(*state));
 }
@@ -473,6 +482,7 @@ static int gru_adam_state_ensure(GruModel* model) {
             state->slot1_switch_head_m && state->slot1_switch_head_v && state->slot1_switch_bias_m && state->slot1_switch_bias_v &&
             state->slot1_tera_head_m && state->slot1_tera_head_v && state->slot1_tera_bias_m && state->slot1_tera_bias_v &&
             state->slot1_target_head_m && state->slot1_target_head_v && state->slot1_target_bias_m && state->slot1_target_bias_v &&
+            state->joint_pair_head_m && state->joint_pair_head_v && state->joint_pair_bias_m && state->joint_pair_bias_v &&
             state->value_head_m && state->value_head_v) {
         return 1;
     }
@@ -539,6 +549,10 @@ static int gru_adam_state_ensure(GruModel* model) {
     state->slot1_target_head_v = (float*)calloc(model->slot1_target_head.rows * model->slot1_target_head.cols, sizeof(float));
     state->slot1_target_bias_m = (float*)calloc(FACTORIZED_TARGET_DIM, sizeof(float));
     state->slot1_target_bias_v = (float*)calloc(FACTORIZED_TARGET_DIM, sizeof(float));
+    state->joint_pair_head_m = (float*)calloc(model->joint_pair_head.rows * model->joint_pair_head.cols, sizeof(float));
+    state->joint_pair_head_v = (float*)calloc(model->joint_pair_head.rows * model->joint_pair_head.cols, sizeof(float));
+    state->joint_pair_bias_m = (float*)calloc(FACTORIZED_PAIR_DIM, sizeof(float));
+    state->joint_pair_bias_v = (float*)calloc(FACTORIZED_PAIR_DIM, sizeof(float));
     state->value_head_m = (float*)calloc(model->hidden_dim, sizeof(float));
     state->value_head_v = (float*)calloc(model->hidden_dim, sizeof(float));
     if (!state->wzx_m || !state->wzx_v || !state->wzh_m || !state->wzh_v || !state->bz_m || !state->bz_v ||
@@ -555,6 +569,7 @@ static int gru_adam_state_ensure(GruModel* model) {
             !state->slot1_switch_head_m || !state->slot1_switch_head_v || !state->slot1_switch_bias_m || !state->slot1_switch_bias_v ||
             !state->slot1_tera_head_m || !state->slot1_tera_head_v || !state->slot1_tera_bias_m || !state->slot1_tera_bias_v ||
             !state->slot1_target_head_m || !state->slot1_target_head_v || !state->slot1_target_bias_m || !state->slot1_target_bias_v ||
+            !state->joint_pair_head_m || !state->joint_pair_head_v || !state->joint_pair_bias_m || !state->joint_pair_bias_v ||
             !state->value_head_m || !state->value_head_v) {
         gru_adam_state_free(state);
         return 0;
@@ -576,6 +591,7 @@ static int gru_gradient_accum_ensure(GruModel* model) {
             accum->slot1_kind_head && accum->slot1_kind_bias && accum->slot1_move_head && accum->slot1_move_bias &&
             accum->slot1_switch_head && accum->slot1_switch_bias && accum->slot1_tera_head && accum->slot1_tera_bias &&
             accum->slot1_target_head && accum->slot1_target_bias &&
+            accum->joint_pair_head && accum->joint_pair_bias &&
             accum->value_head) {
         return 1;
     }
@@ -611,6 +627,8 @@ static int gru_gradient_accum_ensure(GruModel* model) {
     accum->slot1_tera_bias = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
     accum->slot1_target_head = (float*)calloc(model->slot1_target_head.rows * model->slot1_target_head.cols, sizeof(float));
     accum->slot1_target_bias = (float*)calloc(FACTORIZED_TARGET_DIM, sizeof(float));
+    accum->joint_pair_head = (float*)calloc(model->joint_pair_head.rows * model->joint_pair_head.cols, sizeof(float));
+    accum->joint_pair_bias = (float*)calloc(FACTORIZED_PAIR_DIM, sizeof(float));
     accum->value_head = (float*)calloc(model->hidden_dim, sizeof(float));
     if (!accum->wzx || !accum->wzh || !accum->bz || !accum->wrx || !accum->wrh || !accum->br ||
             !accum->wnx || !accum->wnh || !accum->bn || !accum->policy_head || !accum->policy_bias ||
@@ -620,6 +638,7 @@ static int gru_gradient_accum_ensure(GruModel* model) {
             !accum->slot1_kind_head || !accum->slot1_kind_bias || !accum->slot1_move_head || !accum->slot1_move_bias ||
             !accum->slot1_switch_head || !accum->slot1_switch_bias || !accum->slot1_tera_head || !accum->slot1_tera_bias ||
             !accum->slot1_target_head || !accum->slot1_target_bias ||
+            !accum->joint_pair_head || !accum->joint_pair_bias ||
             !accum->value_head) {
         gru_gradient_accum_free(accum);
         return 0;
@@ -664,6 +683,8 @@ void gru_model_clear_accumulated_supervised_updates(GruModel* model) {
     memset(accum->slot1_tera_bias, 0, FACTORIZED_TERA_DIM * sizeof(float));
     memset(accum->slot1_target_head, 0, model->slot1_target_head.rows * model->slot1_target_head.cols * sizeof(float));
     memset(accum->slot1_target_bias, 0, FACTORIZED_TARGET_DIM * sizeof(float));
+    memset(accum->joint_pair_head, 0, model->joint_pair_head.rows * model->joint_pair_head.cols * sizeof(float));
+    memset(accum->joint_pair_bias, 0, FACTORIZED_PAIR_DIM * sizeof(float));
     memset(accum->value_head, 0, model->hidden_dim * sizeof(float));
     accum->value_bias = 0.0f;
     accum->count = 0;
@@ -745,6 +766,8 @@ int gru_model_apply_accumulated_supervised_updates(GruModel* model, float learni
     for (i = 0; i < FACTORIZED_TERA_DIM; ++i) model->slot1_tera_bias[i] -= scale * accum->slot1_tera_bias[i];
     for (i = 0; i < model->slot1_target_head.rows * model->slot1_target_head.cols; ++i) model->slot1_target_head.data[i] -= scale * accum->slot1_target_head[i];
     for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) model->slot1_target_bias[i] -= scale * accum->slot1_target_bias[i];
+    for (i = 0; i < model->joint_pair_head.rows * model->joint_pair_head.cols; ++i) model->joint_pair_head.data[i] -= scale * accum->joint_pair_head[i];
+    for (i = 0; i < FACTORIZED_PAIR_DIM; ++i) model->joint_pair_bias[i] -= scale * accum->joint_pair_bias[i];
 #ifdef _OPENMP
     #pragma omp parallel for if(model->hidden_dim >= 64)
 #endif
@@ -825,6 +848,8 @@ int gru_model_apply_accumulated_adam_updates(
     for (i = 0; i < FACTORIZED_TERA_DIM; ++i) { float g = accum->slot1_tera_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
     for (i = 0; i < model->slot1_target_head.rows * model->slot1_target_head.cols; ++i) { float g = accum->slot1_target_head[i] * scale; global_sq_norm += (double)g * (double)g; }
     for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) { float g = accum->slot1_target_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->joint_pair_head.rows * model->joint_pair_head.cols; ++i) { float g = accum->joint_pair_head[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < FACTORIZED_PAIR_DIM; ++i) { float g = accum->joint_pair_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
     for (i = 0; i < model->hidden_dim; ++i) { float g = accum->value_head[i] * scale; global_sq_norm += (double)g * (double)g; }
     {
         float g = accum->value_bias * scale;
@@ -870,6 +895,8 @@ int gru_model_apply_accumulated_adam_updates(
     for (i = 0; i < FACTORIZED_TERA_DIM; ++i) accum->slot1_tera_bias[i] *= scale;
     for (i = 0; i < model->slot1_target_head.rows * model->slot1_target_head.cols; ++i) accum->slot1_target_head[i] *= scale;
     for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) accum->slot1_target_bias[i] *= scale;
+    for (i = 0; i < model->joint_pair_head.rows * model->joint_pair_head.cols; ++i) accum->joint_pair_head[i] *= scale;
+    for (i = 0; i < FACTORIZED_PAIR_DIM; ++i) accum->joint_pair_bias[i] *= scale;
     for (i = 0; i < model->hidden_dim; ++i) accum->value_head[i] *= scale;
     accum->value_bias *= scale;
     adam_apply_array(model->wzx.data, state->wzx_m, state->wzx_v, accum->wzx, model->wzx.rows * model->wzx.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
@@ -903,6 +930,8 @@ int gru_model_apply_accumulated_adam_updates(
     adam_apply_array(model->slot1_tera_bias, state->slot1_tera_bias_m, state->slot1_tera_bias_v, accum->slot1_tera_bias, FACTORIZED_TERA_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     adam_apply_array(model->slot1_target_head.data, state->slot1_target_head_m, state->slot1_target_head_v, accum->slot1_target_head, model->slot1_target_head.rows * model->slot1_target_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     adam_apply_array(model->slot1_target_bias, state->slot1_target_bias_m, state->slot1_target_bias_v, accum->slot1_target_bias, FACTORIZED_TARGET_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->joint_pair_head.data, state->joint_pair_head_m, state->joint_pair_head_v, accum->joint_pair_head, model->joint_pair_head.rows * model->joint_pair_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    adam_apply_array(model->joint_pair_bias, state->joint_pair_bias_m, state->joint_pair_bias_v, accum->joint_pair_bias, FACTORIZED_PAIR_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     adam_apply_array(model->value_head, state->value_head_m, state->value_head_v, accum->value_head, model->hidden_dim, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     state->value_bias_m = beta1 * state->value_bias_m + (1.0f - beta1) * accum->value_bias;
     state->value_bias_v = beta2 * state->value_bias_v + (1.0f - beta2) * accum->value_bias * accum->value_bias;
@@ -1082,6 +1111,51 @@ static void build_factorized_masks(const unsigned char* legal_mask, int slot, un
             kind_mask[1] = 1;
         }
     }
+}
+
+static size_t joint_pair_index(int action0, int action1) {
+    size_t lo = (size_t)(action0 < action1 ? action0 : action1);
+    size_t hi = (size_t)(action0 < action1 ? action1 : action0);
+    return lo * FACTORIZED_LOCAL_ACTION_DIM - (lo * (lo - 1u)) / 2u + (hi - lo);
+}
+
+static int joint_local_pair_legal(int action0, int action1) {
+    if (action0 >= 4 && action0 < 8 && action1 >= 4 && action1 < 8) {
+        return 0;
+    }
+    if (action0 >= 8 && action1 >= 8 && action0 == action1) {
+        return 0;
+    }
+    return 1;
+}
+
+static float linear_row_logit(const Matrix* head, const float* bias, size_t row, const float* hidden_state) {
+    float value = bias[row];
+    size_t h;
+    for (h = 0; h < head->cols; ++h) {
+        value += head->data[row * head->cols + h] * hidden_state[h];
+    }
+    return value;
+}
+
+static float factorized_local_action_logit(const GruModel* model, const float* hidden_state, int slot, int action) {
+    const Matrix* kind_head = slot == 0 ? &model->slot0_kind_head : &model->slot1_kind_head;
+    const float* kind_bias = slot == 0 ? model->slot0_kind_bias : model->slot1_kind_bias;
+    const Matrix* move_head = slot == 0 ? &model->slot0_move_head : &model->slot1_move_head;
+    const float* move_bias = slot == 0 ? model->slot0_move_bias : model->slot1_move_bias;
+    const Matrix* switch_head = slot == 0 ? &model->slot0_switch_head : &model->slot1_switch_head;
+    const float* switch_bias = slot == 0 ? model->slot0_switch_bias : model->slot1_switch_bias;
+    const Matrix* tera_head = slot == 0 ? &model->slot0_tera_head : &model->slot1_tera_head;
+    const float* tera_bias = slot == 0 ? model->slot0_tera_bias : model->slot1_tera_bias;
+    if (action < 8) {
+        int move = action & 3;
+        int tera = action >= 4 ? 1 : 0;
+        return linear_row_logit(kind_head, kind_bias, 0u, hidden_state) +
+            linear_row_logit(move_head, move_bias, (size_t)move, hidden_state) +
+            linear_row_logit(tera_head, tera_bias, (size_t)tera, hidden_state);
+    }
+    return linear_row_logit(kind_head, kind_bias, 1u, hidden_state) +
+        linear_row_logit(switch_head, switch_bias, (size_t)(action - 8), hidden_state);
 }
 
 static void sync_flat_heads_from_factorized(GruModel* model) {
@@ -1274,6 +1348,181 @@ static void factorized_slot_policy_gradients(
     *accuracy_sum += accuracy_ok ? 1.0f : 0.0f;
 }
 
+typedef struct {
+    float* slot0_kind_head; float* slot0_kind_bias;
+    float* slot0_move_head; float* slot0_move_bias;
+    float* slot0_switch_head; float* slot0_switch_bias;
+    float* slot0_tera_head; float* slot0_tera_bias;
+    float* slot1_kind_head; float* slot1_kind_bias;
+    float* slot1_move_head; float* slot1_move_bias;
+    float* slot1_switch_head; float* slot1_switch_bias;
+    float* slot1_tera_head; float* slot1_tera_bias;
+    float* pair_head; float* pair_bias;
+} JointHeadGradients;
+
+static void accumulate_linear_row_gradient(
+    const Matrix* head,
+    const float* hidden_state,
+    size_t row,
+    float gradient,
+    float* grad_head,
+    float* grad_bias,
+    float* grad_h
+) {
+    size_t h;
+    grad_bias[row] += gradient;
+    for (h = 0; h < head->cols; ++h) {
+        grad_head[row * head->cols + h] += gradient * hidden_state[h];
+        grad_h[h] += head->data[row * head->cols + h] * gradient;
+    }
+}
+
+static void accumulate_local_action_gradient(
+    const GruModel* model,
+    const float* hidden_state,
+    int slot,
+    int action,
+    float gradient,
+    JointHeadGradients* grads,
+    float* grad_h
+) {
+    const Matrix* kind_head = slot == 0 ? &model->slot0_kind_head : &model->slot1_kind_head;
+    const Matrix* move_head = slot == 0 ? &model->slot0_move_head : &model->slot1_move_head;
+    const Matrix* switch_head = slot == 0 ? &model->slot0_switch_head : &model->slot1_switch_head;
+    const Matrix* tera_head = slot == 0 ? &model->slot0_tera_head : &model->slot1_tera_head;
+    float* kind_grad_head = slot == 0 ? grads->slot0_kind_head : grads->slot1_kind_head;
+    float* kind_grad_bias = slot == 0 ? grads->slot0_kind_bias : grads->slot1_kind_bias;
+    float* move_grad_head = slot == 0 ? grads->slot0_move_head : grads->slot1_move_head;
+    float* move_grad_bias = slot == 0 ? grads->slot0_move_bias : grads->slot1_move_bias;
+    float* switch_grad_head = slot == 0 ? grads->slot0_switch_head : grads->slot1_switch_head;
+    float* switch_grad_bias = slot == 0 ? grads->slot0_switch_bias : grads->slot1_switch_bias;
+    float* tera_grad_head = slot == 0 ? grads->slot0_tera_head : grads->slot1_tera_head;
+    float* tera_grad_bias = slot == 0 ? grads->slot0_tera_bias : grads->slot1_tera_bias;
+    if (action < 8) {
+        accumulate_linear_row_gradient(kind_head, hidden_state, 0u, gradient, kind_grad_head, kind_grad_bias, grad_h);
+        accumulate_linear_row_gradient(move_head, hidden_state, (size_t)(action & 3), gradient, move_grad_head, move_grad_bias, grad_h);
+        accumulate_linear_row_gradient(tera_head, hidden_state, (size_t)(action >= 4 ? 1 : 0), gradient, tera_grad_head, tera_grad_bias, grad_h);
+    } else {
+        accumulate_linear_row_gradient(kind_head, hidden_state, 1u, gradient, kind_grad_head, kind_grad_bias, grad_h);
+        accumulate_linear_row_gradient(switch_head, hidden_state, (size_t)(action - 8), gradient, switch_grad_head, switch_grad_bias, grad_h);
+    }
+}
+
+static int joint_policy_gradients(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* choice,
+    float policy_scale,
+    float entropy_coef,
+    float* action_loss_sum,
+    float* accuracy_sum,
+    float* grad_h,
+    JointHeadGradients* grads
+) {
+    float joint_policy[FACTORIZED_JOINT_DIM];
+    float grad_joint[FACTORIZED_JOINT_DIM];
+    float local0_grad[FACTORIZED_LOCAL_ACTION_DIM] = {0};
+    float local1_grad[FACTORIZED_LOCAL_ACTION_DIM] = {0};
+    float pair_grad[FACTORIZED_PAIR_DIM] = {0};
+    float neg_entropy = 0.0f;
+    int flat0 = -1;
+    int flat1 = -1;
+    int selected;
+    int best = 0;
+    int i;
+    if (!factorized_action_choice_to_flat_actions(choice, &flat0, &flat1) || flat0 < 0 || flat1 < 14) {
+        return 0;
+    }
+    selected = flat0 * FACTORIZED_LOCAL_ACTION_DIM + (flat1 - 14);
+    if (!gru_model_evaluate_joint_hidden(model, hidden_state, legal_mask, joint_policy, NULL) ||
+            joint_policy[selected] <= 0.0f) {
+        return 0;
+    }
+    *action_loss_sum += -2.0f * logf(joint_policy[selected] > 1.0e-8f ? joint_policy[selected] : 1.0e-8f);
+    for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) {
+        float p = joint_policy[i] > 1.0e-8f ? joint_policy[i] : 1.0e-8f;
+        if (joint_policy[i] > joint_policy[best]) best = i;
+        if (joint_policy[i] > 0.0f) neg_entropy += p * logf(p);
+    }
+    *accuracy_sum += best == selected ? 2.0f : 0.0f;
+    for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) {
+        int action0 = i / FACTORIZED_LOCAL_ACTION_DIM;
+        int action1 = i % FACTORIZED_LOCAL_ACTION_DIM;
+        float p = joint_policy[i];
+        float gradient;
+        if (p <= 0.0f) {
+            grad_joint[i] = 0.0f;
+            continue;
+        }
+        gradient = (p - (i == selected ? 1.0f : 0.0f)) * policy_scale;
+        if (entropy_coef != 0.0f) {
+            float safe_p = p > 1.0e-8f ? p : 1.0e-8f;
+            gradient += entropy_coef * p * (logf(safe_p) - neg_entropy);
+        }
+        grad_joint[i] = gradient;
+        local0_grad[action0] += gradient;
+        local1_grad[action1] += gradient;
+        pair_grad[joint_pair_index(action0, action1)] += gradient;
+    }
+    for (i = 0; i < FACTORIZED_LOCAL_ACTION_DIM; ++i) {
+        accumulate_local_action_gradient(model, hidden_state, 0, i, local0_grad[i], grads, grad_h);
+        accumulate_local_action_gradient(model, hidden_state, 1, i, local1_grad[i], grads, grad_h);
+    }
+    for (i = 0; i < FACTORIZED_PAIR_DIM; ++i) {
+        accumulate_linear_row_gradient(&model->joint_pair_head, hidden_state, (size_t)i, pair_grad[i],
+            grads->pair_head, grads->pair_bias, grad_h);
+    }
+    return 1;
+}
+
+static void factorized_target_policy_gradients(
+    const GruModel* model,
+    const float* hidden_state,
+    int slot,
+    const FactorizedActionChoice* choice,
+    float policy_scale,
+    float entropy_coef,
+    float* action_loss_sum,
+    float* grad_h,
+    float* grad_target_head,
+    float* grad_target_bias
+) {
+    unsigned char target_bits = slot == 0 ? choice->slot0_target_mask : choice->slot1_target_mask;
+    int target_index = slot == 0 ? choice->slot0_target_index : choice->slot1_target_index;
+    unsigned char target_mask[FACTORIZED_TARGET_DIM];
+    float target_policy[FACTORIZED_TARGET_DIM];
+    float neg_entropy = 0.0f;
+    float grad_logits[FACTORIZED_TARGET_DIM];
+    const Matrix* head = slot == 0 ? &model->slot0_target_head : &model->slot1_target_head;
+    const float* bias = slot == 0 ? model->slot0_target_bias : model->slot1_target_bias;
+    int i;
+    if (target_bits == 0u || target_index < 0 || target_index >= FACTORIZED_TARGET_DIM ||
+            !(target_bits & FACTORIZED_TARGET_BIT(target_index))) {
+        return;
+    }
+    factorized_target_mask_to_array(target_bits, target_mask);
+    evaluate_small_head(head, bias, hidden_state, target_mask, FACTORIZED_TARGET_DIM, target_policy);
+    *action_loss_sum += -logf(target_policy[target_index] > 1.0e-8f ? target_policy[target_index] : 1.0e-8f);
+    for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) if (target_mask[i]) {
+        float p = target_policy[i] > 1.0e-8f ? target_policy[i] : 1.0e-8f;
+        neg_entropy += p * logf(p);
+    }
+    for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) {
+        if (!target_mask[i]) {
+            grad_logits[i] = 0.0f;
+            continue;
+        }
+        grad_logits[i] = (target_policy[i] - (i == target_index ? 1.0f : 0.0f)) * policy_scale;
+        if (entropy_coef != 0.0f) {
+            float p = target_policy[i] > 1.0e-8f ? target_policy[i] : 1.0e-8f;
+            grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy);
+        }
+        accumulate_linear_row_gradient(head, hidden_state, (size_t)i, grad_logits[i],
+            grad_target_head, grad_target_bias, grad_h);
+    }
+}
+
 static void evaluate_hidden_internal(
     const GruModel* model,
     const float* hidden_state,
@@ -1387,6 +1636,8 @@ GruModel* gru_model_create(size_t input_dim, size_t hidden_dim, size_t num_actio
     model->slot1_tera_bias = vector_make(FACTORIZED_TERA_DIM);
     model->slot1_target_head = matrix_make(FACTORIZED_TARGET_DIM, hidden_dim, p_scale);
     model->slot1_target_bias = vector_make(FACTORIZED_TARGET_DIM);
+    model->joint_pair_head = matrix_make(FACTORIZED_PAIR_DIM, hidden_dim, p_scale);
+    model->joint_pair_bias = vector_make(FACTORIZED_PAIR_DIM);
     model->value_head = (float*)malloc(hidden_dim * sizeof(float));
 
     if (!model->wzx.data || !model->wzh.data || !model->bz ||
@@ -1399,6 +1650,7 @@ GruModel* gru_model_create(size_t input_dim, size_t hidden_dim, size_t num_actio
         !model->slot1_kind_head.data || !model->slot1_kind_bias || !model->slot1_move_head.data || !model->slot1_move_bias ||
         !model->slot1_switch_head.data || !model->slot1_switch_bias || !model->slot1_tera_head.data || !model->slot1_tera_bias ||
         !model->slot1_target_head.data || !model->slot1_target_bias ||
+        !model->joint_pair_head.data || !model->joint_pair_bias ||
         !model->value_head) {
         gru_model_destroy(model);
         return NULL;
@@ -1439,6 +1691,7 @@ void gru_model_destroy(GruModel* model) {
     matrix_free(&model->slot1_switch_head); free(model->slot1_switch_bias);
     matrix_free(&model->slot1_tera_head); free(model->slot1_tera_bias);
     matrix_free(&model->slot1_target_head); free(model->slot1_target_bias);
+    matrix_free(&model->joint_pair_head); free(model->joint_pair_bias);
     free(model->value_head);
     gru_adam_state_free(&model->adam_state);
     gru_forward_scratch_free(&model->forward_scratch);
@@ -1765,6 +2018,51 @@ int gru_model_evaluate_factorized_hidden(
     return 1;
 }
 
+int gru_model_evaluate_joint_hidden(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    float* joint_policy,
+    float* value_out
+) {
+    float logits[FACTORIZED_JOINT_DIM];
+    int action0;
+    int action1;
+    int legal_count = 0;
+    if (!model || !hidden_state || !legal_mask || !joint_policy) {
+        return 0;
+    }
+    for (action0 = 0; action0 < FACTORIZED_LOCAL_ACTION_DIM; ++action0) {
+        for (action1 = 0; action1 < FACTORIZED_LOCAL_ACTION_DIM; ++action1) {
+            size_t index = (size_t)action0 * FACTORIZED_LOCAL_ACTION_DIM + (size_t)action1;
+            int legal = legal_mask[action0] && legal_mask[14 + action1] &&
+                joint_local_pair_legal(action0, action1);
+            if (legal) {
+                size_t pair = joint_pair_index(action0, action1);
+                logits[index] = factorized_local_action_logit(model, hidden_state, 0, action0) +
+                    factorized_local_action_logit(model, hidden_state, 1, action1) +
+                    linear_row_logit(&model->joint_pair_head, model->joint_pair_bias, pair, hidden_state);
+                ++legal_count;
+            } else {
+                logits[index] = -1.0e9f;
+            }
+        }
+    }
+    if (legal_count == 0) {
+        memset(joint_policy, 0, FACTORIZED_JOINT_DIM * sizeof(float));
+        return 0;
+    }
+    softmax(logits, FACTORIZED_JOINT_DIM, joint_policy);
+    if (value_out) {
+        size_t h;
+        *value_out = model->value_bias;
+        for (h = 0; h < model->hidden_dim; ++h) {
+            *value_out += model->value_head[h] * hidden_state[h];
+        }
+    }
+    return 1;
+}
+
 static int recurrent_update_sequence(
     GruModel* model,
     const float* sequence,
@@ -1823,6 +2121,7 @@ static int recurrent_update_sequence(
     float* grad_slot1_switch_head = NULL; float* grad_slot1_switch_bias = NULL;
     float* grad_slot1_tera_head = NULL; float* grad_slot1_tera_bias = NULL;
     float* grad_slot1_target_head = NULL; float* grad_slot1_target_bias = NULL;
+    float* grad_joint_pair_head = NULL; float* grad_joint_pair_bias = NULL;
     float grad_value_bias = 0.0f;
     float value = 0.0f;
     float dv;
@@ -1833,6 +2132,7 @@ static int recurrent_update_sequence(
     GruGradientAccum* accum = NULL;
     unsigned char combined_legal[OBS_NUM_ACTIONS];
     FactorizedActionChoice target_choice;
+    JointHeadGradients joint_grads;
 
     if (!model || !sequence || steps == 0 || target_action < 0 || (size_t)target_action >= model->num_actions) {
         return 0;
@@ -1925,12 +2225,26 @@ static int recurrent_update_sequence(
     grad_slot1_tera_bias = (float*)calloc(FACTORIZED_TERA_DIM, sizeof(float));
     grad_slot1_target_head = (float*)calloc(model->slot1_target_head.rows * model->slot1_target_head.cols, sizeof(float));
     grad_slot1_target_bias = (float*)calloc(FACTORIZED_TARGET_DIM, sizeof(float));
+    grad_joint_pair_head = (float*)calloc(model->joint_pair_head.rows * model->joint_pair_head.cols, sizeof(float));
+    grad_joint_pair_bias = (float*)calloc(FACTORIZED_PAIR_DIM, sizeof(float));
     if (!grad_slot0_kind_head || !grad_slot0_kind_bias || !grad_slot0_move_head || !grad_slot0_move_bias || !grad_slot0_switch_head || !grad_slot0_switch_bias || !grad_slot0_tera_head || !grad_slot0_tera_bias || !grad_slot0_target_head || !grad_slot0_target_bias ||
-            !grad_slot1_kind_head || !grad_slot1_kind_bias || !grad_slot1_move_head || !grad_slot1_move_bias || !grad_slot1_switch_head || !grad_slot1_switch_bias || !grad_slot1_tera_head || !grad_slot1_tera_bias || !grad_slot1_target_head || !grad_slot1_target_bias) {
+            !grad_slot1_kind_head || !grad_slot1_kind_bias || !grad_slot1_move_head || !grad_slot1_move_bias || !grad_slot1_switch_head || !grad_slot1_switch_bias || !grad_slot1_tera_head || !grad_slot1_tera_bias || !grad_slot1_target_head || !grad_slot1_target_bias ||
+            !grad_joint_pair_head || !grad_joint_pair_bias) {
         free(grad_slot0_kind_head); free(grad_slot0_kind_bias); free(grad_slot0_move_head); free(grad_slot0_move_bias); free(grad_slot0_switch_head); free(grad_slot0_switch_bias); free(grad_slot0_tera_head); free(grad_slot0_tera_bias); free(grad_slot0_target_head); free(grad_slot0_target_bias);
         free(grad_slot1_kind_head); free(grad_slot1_kind_bias); free(grad_slot1_move_head); free(grad_slot1_move_bias); free(grad_slot1_switch_head); free(grad_slot1_switch_bias); free(grad_slot1_tera_head); free(grad_slot1_tera_bias); free(grad_slot1_target_head); free(grad_slot1_target_bias);
+        free(grad_joint_pair_head); free(grad_joint_pair_bias);
         return 0;
     }
+    memset(&joint_grads, 0, sizeof(joint_grads));
+    joint_grads.slot0_kind_head = grad_slot0_kind_head; joint_grads.slot0_kind_bias = grad_slot0_kind_bias;
+    joint_grads.slot0_move_head = grad_slot0_move_head; joint_grads.slot0_move_bias = grad_slot0_move_bias;
+    joint_grads.slot0_switch_head = grad_slot0_switch_head; joint_grads.slot0_switch_bias = grad_slot0_switch_bias;
+    joint_grads.slot0_tera_head = grad_slot0_tera_head; joint_grads.slot0_tera_bias = grad_slot0_tera_bias;
+    joint_grads.slot1_kind_head = grad_slot1_kind_head; joint_grads.slot1_kind_bias = grad_slot1_kind_bias;
+    joint_grads.slot1_move_head = grad_slot1_move_head; joint_grads.slot1_move_bias = grad_slot1_move_bias;
+    joint_grads.slot1_switch_head = grad_slot1_switch_head; joint_grads.slot1_switch_bias = grad_slot1_switch_bias;
+    joint_grads.slot1_tera_head = grad_slot1_tera_head; joint_grads.slot1_tera_bias = grad_slot1_tera_bias;
+    joint_grads.pair_head = grad_joint_pair_head; joint_grads.pair_bias = grad_joint_pair_bias;
 
     start_hidden = initial_hidden_state ? initial_hidden_state : zero_hidden;
     if (target_action_secondary >= 0) {
@@ -1975,6 +2289,11 @@ static int recurrent_update_sequence(
             n_t[h] = tanhf(n_t[h]);
             h_t[h] = (1.0f - z_t[h]) * n_t[h] + z_t[h] * prev_h[h];
         }
+    }
+
+    value = model->value_bias;
+    for (h = 0; h < hdim; ++h) {
+        value += model->value_head[h] * h_states[(steps - 1) * hdim + h];
     }
 
     if (anchor_policy) {
@@ -2038,6 +2357,25 @@ static int recurrent_update_sequence(
             }
         }
             matrix_transpose_vec_mul_accum(&model->policy_head, grad_logits, grad_h);
+        }
+    } else if (target_choice.slot0_has_action && target_choice.slot1_has_action) {
+        if (!joint_policy_gradients(model, h_states + ((steps - 1) * hdim), combined_legal,
+                &target_choice, policy_scale, entropy_coef, &action_loss_sum, &accuracy_sum,
+                grad_h, &joint_grads)) {
+            free(grad_slot0_kind_head); free(grad_slot0_kind_bias); free(grad_slot0_move_head); free(grad_slot0_move_bias); free(grad_slot0_switch_head); free(grad_slot0_switch_bias); free(grad_slot0_tera_head); free(grad_slot0_tera_bias); free(grad_slot0_target_head); free(grad_slot0_target_bias);
+            free(grad_slot1_kind_head); free(grad_slot1_kind_bias); free(grad_slot1_move_head); free(grad_slot1_move_bias); free(grad_slot1_switch_head); free(grad_slot1_switch_bias); free(grad_slot1_tera_head); free(grad_slot1_tera_bias); free(grad_slot1_target_head); free(grad_slot1_target_bias);
+            free(grad_joint_pair_head); free(grad_joint_pair_bias);
+            return 0;
+        }
+        if (target_choice.slot0_kind == FACTORIZED_ACTION_MOVE) {
+            factorized_target_policy_gradients(model, h_states + ((steps - 1) * hdim), 0,
+                &target_choice, policy_scale, entropy_coef, &action_loss_sum, grad_h,
+                grad_slot0_target_head, grad_slot0_target_bias);
+        }
+        if (target_choice.slot1_kind == FACTORIZED_ACTION_MOVE) {
+            factorized_target_policy_gradients(model, h_states + ((steps - 1) * hdim), 1,
+                &target_choice, policy_scale, entropy_coef, &action_loss_sum, grad_h,
+                grad_slot1_target_head, grad_slot1_target_bias);
         }
     } else {
         if (target_choice.slot0_has_action) {
@@ -2181,6 +2519,8 @@ static int recurrent_update_sequence(
         for (a = 0; a < FACTORIZED_TERA_DIM; ++a) accum->slot1_tera_bias[a] += grad_slot1_tera_bias[a];
         for (a = 0; a < model->slot1_target_head.rows * model->slot1_target_head.cols; ++a) accum->slot1_target_head[a] += grad_slot1_target_head[a];
         for (a = 0; a < FACTORIZED_TARGET_DIM; ++a) accum->slot1_target_bias[a] += grad_slot1_target_bias[a];
+        for (a = 0; a < model->joint_pair_head.rows * model->joint_pair_head.cols; ++a) accum->joint_pair_head[a] += grad_joint_pair_head[a];
+        for (a = 0; a < FACTORIZED_PAIR_DIM; ++a) accum->joint_pair_bias[a] += grad_joint_pair_bias[a];
 #ifdef _OPENMP
         #pragma omp parallel for if(hdim >= 64)
 #endif
@@ -2252,6 +2592,8 @@ static int recurrent_update_sequence(
         for (a = 0; a < FACTORIZED_TERA_DIM; ++a) model->slot1_tera_bias[a] -= learning_rate * grad_slot1_tera_bias[a];
         for (a = 0; a < model->slot1_target_head.rows * model->slot1_target_head.cols; ++a) model->slot1_target_head.data[a] -= learning_rate * grad_slot1_target_head[a];
         for (a = 0; a < FACTORIZED_TARGET_DIM; ++a) model->slot1_target_bias[a] -= learning_rate * grad_slot1_target_bias[a];
+        for (a = 0; a < model->joint_pair_head.rows * model->joint_pair_head.cols; ++a) model->joint_pair_head.data[a] -= learning_rate * grad_joint_pair_head[a];
+        for (a = 0; a < FACTORIZED_PAIR_DIM; ++a) model->joint_pair_bias[a] -= learning_rate * grad_joint_pair_bias[a];
 #ifdef _OPENMP
         #pragma omp parallel for if(hdim >= 64)
 #endif
@@ -2264,6 +2606,7 @@ static int recurrent_update_sequence(
     free(grad_slot0_switch_head); free(grad_slot0_switch_bias); free(grad_slot0_tera_head); free(grad_slot0_tera_bias); free(grad_slot0_target_head); free(grad_slot0_target_bias);
     free(grad_slot1_kind_head); free(grad_slot1_kind_bias); free(grad_slot1_move_head); free(grad_slot1_move_bias);
     free(grad_slot1_switch_head); free(grad_slot1_switch_bias); free(grad_slot1_tera_head); free(grad_slot1_tera_bias); free(grad_slot1_target_head); free(grad_slot1_target_bias);
+    free(grad_joint_pair_head); free(grad_joint_pair_bias);
 
     return 1;
 }
@@ -2864,15 +3207,24 @@ size_t gru_model_parameter_count(const GruModel* model) {
         model->slot1_switch_head.rows * model->slot1_switch_head.cols + FACTORIZED_SWITCH_DIM +
         model->slot1_tera_head.rows * model->slot1_tera_head.cols + FACTORIZED_TERA_DIM +
         model->slot1_target_head.rows * model->slot1_target_head.cols + FACTORIZED_TARGET_DIM +
+        model->joint_pair_head.rows * model->joint_pair_head.cols + FACTORIZED_PAIR_DIM +
         model->hidden_dim +
         1;
+}
+
+size_t gru_model_pre_joint_parameter_count(const GruModel* model) {
+    if (!model) {
+        return 0;
+    }
+    return gru_model_parameter_count(model) -
+        (model->joint_pair_head.rows * model->joint_pair_head.cols + FACTORIZED_PAIR_DIM);
 }
 
 size_t gru_model_pre_target_parameter_count(const GruModel* model) {
     if (!model) {
         return 0;
     }
-    return gru_model_parameter_count(model) -
+    return gru_model_pre_joint_parameter_count(model) -
         (model->slot0_target_head.rows * model->slot0_target_head.cols + FACTORIZED_TARGET_DIM) -
         (model->slot1_target_head.rows * model->slot1_target_head.cols + FACTORIZED_TARGET_DIM);
 }
@@ -2938,6 +3290,8 @@ int gru_model_export_parameters(const GruModel* model, float* out, size_t count)
     copy_out(out, &idx, model->slot1_tera_bias, FACTORIZED_TERA_DIM);
     copy_out(out, &idx, model->slot1_target_head.data, model->slot1_target_head.rows * model->slot1_target_head.cols);
     copy_out(out, &idx, model->slot1_target_bias, FACTORIZED_TARGET_DIM);
+    copy_out(out, &idx, model->joint_pair_head.data, model->joint_pair_head.rows * model->joint_pair_head.cols);
+    copy_out(out, &idx, model->joint_pair_bias, FACTORIZED_PAIR_DIM);
     copy_out(out, &idx, model->value_head, model->hidden_dim);
     out[idx++] = model->value_bias;
     return idx == gru_model_parameter_count(model);
@@ -2947,12 +3301,15 @@ int gru_model_import_parameters(GruModel* model, const float* in, size_t count) 
     size_t idx = 0;
     size_t legacy_count;
     size_t pre_target_count;
+    size_t pre_joint_count;
+    int has_joint_head;
     int has_target_heads;
     int has_factorized_heads;
     if (!model || !in) {
         return 0;
     }
     legacy_count = gru_model_legacy_parameter_count(model);
+    pre_joint_count = gru_model_pre_joint_parameter_count(model);
     pre_target_count = gru_model_pre_target_parameter_count(model);
     if (count < legacy_count) {
         return 0;
@@ -2968,7 +3325,8 @@ int gru_model_import_parameters(GruModel* model, const float* in, size_t count) 
     copy_in(model->bn, in, &idx, model->hidden_dim);
     copy_in(model->policy_head.data, in, &idx, model->policy_head.rows * model->policy_head.cols);
     copy_in(model->policy_bias, in, &idx, model->num_actions);
-    has_target_heads = count == gru_model_parameter_count(model);
+    has_joint_head = count == gru_model_parameter_count(model);
+    has_target_heads = has_joint_head || count == pre_joint_count;
     has_factorized_heads = has_target_heads || count == pre_target_count;
     if (has_factorized_heads) {
         copy_in(model->slot0_kind_head.data, in, &idx, model->slot0_kind_head.rows * model->slot0_kind_head.cols);
@@ -3003,6 +3361,13 @@ int gru_model_import_parameters(GruModel* model, const float* in, size_t count) 
         memset(model->slot0_target_bias, 0, FACTORIZED_TARGET_DIM * sizeof(float));
         memset(model->slot1_target_head.data, 0, model->slot1_target_head.rows * model->slot1_target_head.cols * sizeof(float));
         memset(model->slot1_target_bias, 0, FACTORIZED_TARGET_DIM * sizeof(float));
+    }
+    if (has_joint_head) {
+        copy_in(model->joint_pair_head.data, in, &idx, model->joint_pair_head.rows * model->joint_pair_head.cols);
+        copy_in(model->joint_pair_bias, in, &idx, FACTORIZED_PAIR_DIM);
+    } else {
+        memset(model->joint_pair_head.data, 0, model->joint_pair_head.rows * model->joint_pair_head.cols * sizeof(float));
+        memset(model->joint_pair_bias, 0, FACTORIZED_PAIR_DIM * sizeof(float));
     }
     copy_in(model->value_head, in, &idx, model->hidden_dim);
     model->value_bias = in[idx++];

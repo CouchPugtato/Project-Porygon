@@ -324,6 +324,8 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     float slot1_switch_policy[FACTORIZED_SWITCH_DIM];
     float slot1_tera_policy[FACTORIZED_TERA_DIM];
     float slot1_target_policy[FACTORIZED_TARGET_DIM];
+    float joint_policy[FACTORIZED_JOINT_DIM];
+    unsigned char joint_mask[FACTORIZED_JOINT_DIM];
     float* pair_policy;
     float value;
     int action = -1;
@@ -331,6 +333,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     int legal_count = 0;
     int slot0_needs_action;
     int slot1_needs_action;
+    int use_joint_policy;
     unsigned char slot0_mask[OBS_NUM_ACTIONS];
     unsigned char slot1_mask[OBS_NUM_ACTIONS];
     unsigned char slot0_kind_mask[FACTORIZED_KIND_DIM];
@@ -367,6 +370,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     }
     slot0_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 0);
     slot1_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 1);
+    use_joint_policy = slot0_needs_action && slot1_needs_action;
     build_slot_legal_mask(session->observation.legal_mask, 0, slot0_mask);
     build_slot_legal_mask(session->observation.legal_mask, 1, slot1_mask);
     build_runtime_factor_masks(session->observation.legal_mask, 0, slot0_kind_mask, slot0_move_mask, slot0_switch_mask);
@@ -391,6 +395,16 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         free(pair_policy);
         return 0;
     }
+    if (use_joint_policy) {
+        if (!gru_model_evaluate_joint_hidden(runtime->model, session->hidden_state,
+                session->observation.legal_mask, joint_policy, NULL)) {
+            free(pair_policy);
+            return 0;
+        }
+        for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) {
+            joint_mask[i] = joint_policy[i] > 0.0f ? 1 : 0;
+        }
+    }
     for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
         pair_policy[i] = slot0_kind_policy[0] * slot0_move_policy[i] * (slot0_mask[i] ? slot0_tera_policy[0] : 0.0f);
         pair_policy[4 + i] = slot0_kind_policy[0] * slot0_move_policy[i] * (slot0_mask[4 + i] ? slot0_tera_policy[1] : 0.0f);
@@ -401,7 +415,32 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         pair_policy[8 + i] = slot0_kind_policy[1] * slot0_switch_policy[i];
         pair_policy[22 + i] = slot1_kind_policy[1] * slot1_switch_policy[i];
     }
-    if (slot0_needs_action) {
+    if (use_joint_policy) {
+        int pair = sample_small_masked(joint_policy, joint_mask, FACTORIZED_JOINT_DIM);
+        int local0 = pair / FACTORIZED_LOCAL_ACTION_DIM;
+        int local1 = pair % FACTORIZED_LOCAL_ACTION_DIM;
+        factorized_action_choice_from_flat_actions(&sampled_choice, local0, 14 + local1);
+        if (sampled_choice.slot0_kind == FACTORIZED_ACTION_MOVE) {
+            sampled_choice.slot0_target_mask = build_move_target_mask(
+                &session->parsed_request, 0, sampled_choice.slot0_move_index);
+            if (sampled_choice.slot0_target_mask != 0u) {
+                unsigned char target_mask[FACTORIZED_TARGET_DIM];
+                factorized_target_mask_to_array(sampled_choice.slot0_target_mask, target_mask);
+                sampled_choice.slot0_target_index = (unsigned char)sample_small_masked(
+                    slot0_target_policy, target_mask, FACTORIZED_TARGET_DIM);
+            }
+        }
+        if (sampled_choice.slot1_kind == FACTORIZED_ACTION_MOVE) {
+            sampled_choice.slot1_target_mask = build_move_target_mask(
+                &session->parsed_request, 1, sampled_choice.slot1_move_index);
+            if (sampled_choice.slot1_target_mask != 0u) {
+                unsigned char target_mask[FACTORIZED_TARGET_DIM];
+                factorized_target_mask_to_array(sampled_choice.slot1_target_mask, target_mask);
+                sampled_choice.slot1_target_index = (unsigned char)sample_small_masked(
+                    slot1_target_policy, target_mask, FACTORIZED_TARGET_DIM);
+            }
+        }
+    } else if (slot0_needs_action) {
         int kind = sample_small_masked(slot0_kind_policy, slot0_kind_mask, FACTORIZED_KIND_DIM);
         sampled_choice.slot0_has_action = 1;
         if (kind == 0) {
@@ -424,7 +463,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             sampled_choice.slot0_switch_index = (unsigned char)sw;
         }
     }
-    if (slot1_needs_action) {
+    if (!use_joint_policy && slot1_needs_action) {
         int kind = sample_small_masked(slot1_kind_policy, slot1_kind_mask, FACTORIZED_KIND_DIM);
         sampled_choice.slot1_has_action = 1;
         if (kind == 0) {
@@ -502,6 +541,31 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         }
     }
     session->pending_old_log_prob = 0.0f;
+    if (use_joint_policy) {
+        int joint_action0 = -1;
+        int joint_action1 = -1;
+        if (!factorized_action_choice_to_flat_actions(&session->pending_factorized_choice,
+                &joint_action0, &joint_action1) || joint_action0 < 0 || joint_action1 < 14) {
+            free(pair_policy);
+            return 0;
+        }
+        session->pending_old_log_prob += action_log_prob(joint_policy,
+            joint_action0 * FACTORIZED_LOCAL_ACTION_DIM + (joint_action1 - 14));
+        if (session->pending_factorized_choice.slot0_kind == FACTORIZED_ACTION_MOVE &&
+                session->pending_factorized_choice.slot0_target_mask != 0u) {
+            unsigned char target_mask[FACTORIZED_TARGET_DIM];
+            factorized_target_mask_to_array(session->pending_factorized_choice.slot0_target_mask, target_mask);
+            session->pending_old_log_prob += masked_small_log_prob(slot0_target_policy, target_mask,
+                FACTORIZED_TARGET_DIM, session->pending_factorized_choice.slot0_target_index);
+        }
+        if (session->pending_factorized_choice.slot1_kind == FACTORIZED_ACTION_MOVE &&
+                session->pending_factorized_choice.slot1_target_mask != 0u) {
+            unsigned char target_mask[FACTORIZED_TARGET_DIM];
+            factorized_target_mask_to_array(session->pending_factorized_choice.slot1_target_mask, target_mask);
+            session->pending_old_log_prob += masked_small_log_prob(slot1_target_policy, target_mask,
+                FACTORIZED_TARGET_DIM, session->pending_factorized_choice.slot1_target_index);
+        }
+    } else {
     if (session->pending_factorized_choice.slot0_has_action) {
         if (session->pending_factorized_choice.slot0_kind == FACTORIZED_ACTION_MOVE) {
             unsigned char tera_mask[FACTORIZED_TERA_DIM] = {
@@ -539,6 +603,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             session->pending_old_log_prob += action_log_prob(slot1_kind_policy, 1);
             session->pending_old_log_prob += action_log_prob(slot1_switch_policy, session->pending_factorized_choice.slot1_switch_index);
         }
+    }
     }
     session->pending_old_value = value;
     if (!factorized_choice_to_command(&session->parsed_request, &session->pending_factorized_choice, command, sizeof(command))) {

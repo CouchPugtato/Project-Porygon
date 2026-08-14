@@ -141,6 +141,7 @@ static int evaluate_joint_step(
     float slot1_switch_policy[FACTORIZED_SWITCH_DIM];
     float slot1_tera_policy[FACTORIZED_TERA_DIM];
     float slot1_target_policy[FACTORIZED_TARGET_DIM];
+    float joint_policy[FACTORIZED_JOINT_DIM];
     unsigned char target_mask[FACTORIZED_TARGET_DIM];
     float joint_log_prob = 0.0f;
     float entropy = 0.0f;
@@ -167,6 +168,38 @@ static int evaluate_joint_step(
         return 0;
     }
     choice = &episode->factorized_actions[step_index];
+    if (choice->slot0_has_action && choice->slot1_has_action) {
+        int flat0 = -1;
+        int flat1 = -1;
+        int selected;
+        int i;
+        if (!factorized_action_choice_to_flat_actions(choice, &flat0, &flat1) || flat0 < 0 || flat1 < 14 ||
+                !gru_model_evaluate_joint_hidden(model, hidden_state,
+                    episode->legal_masks + (step_index * OBS_NUM_ACTIONS), joint_policy, &value)) {
+            return 0;
+        }
+        selected = flat0 * FACTORIZED_LOCAL_ACTION_DIM + (flat1 - 14);
+        joint_log_prob += masked_action_log_prob(joint_policy, selected);
+        for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) {
+            if (joint_policy[i] > 0.0f) {
+                entropy -= joint_policy[i] * logf(joint_policy[i] > 1.0e-8f ? joint_policy[i] : 1.0e-8f);
+            }
+        }
+        if (choice->slot0_kind == FACTORIZED_ACTION_MOVE && choice->slot0_target_mask != 0u) {
+            factorized_target_mask_to_array(choice->slot0_target_mask, target_mask);
+            joint_log_prob += masked_small_log_prob(slot0_target_policy, target_mask, FACTORIZED_TARGET_DIM, choice->slot0_target_index);
+            entropy += masked_small_entropy(slot0_target_policy, target_mask, FACTORIZED_TARGET_DIM);
+        }
+        if (choice->slot1_kind == FACTORIZED_ACTION_MOVE && choice->slot1_target_mask != 0u) {
+            factorized_target_mask_to_array(choice->slot1_target_mask, target_mask);
+            joint_log_prob += masked_small_log_prob(slot1_target_policy, target_mask, FACTORIZED_TARGET_DIM, choice->slot1_target_index);
+            entropy += masked_small_entropy(slot1_target_policy, target_mask, FACTORIZED_TARGET_DIM);
+        }
+        if (joint_log_prob_out) *joint_log_prob_out = joint_log_prob;
+        if (value_out) *value_out = value;
+        if (entropy_out) *entropy_out = entropy;
+        return 1;
+    }
     if (choice->slot0_has_action) {
         build_factor_masks_from_episode(episode, step_index, 0, kind_mask, move_mask, switch_mask);
         if (choice->slot0_kind == FACTORIZED_ACTION_MOVE) {

@@ -9,6 +9,9 @@
 #define FACTORIZED_MOVE_DIM 4
 #define FACTORIZED_SWITCH_DIM 6
 #define FACTORIZED_TERA_DIM 2
+#define FACTORIZED_LOCAL_ACTION_DIM 14
+#define FACTORIZED_PAIR_DIM 105
+#define FACTORIZED_JOINT_DIM (FACTORIZED_LOCAL_ACTION_DIM * FACTORIZED_LOCAL_ACTION_DIM)
 
 typedef struct GruModel GruModel;
 
@@ -84,6 +87,13 @@ int gru_model_evaluate_factorized_hidden(
     float* slot1_switch_policy,
     float* slot1_tera_policy,
     float* slot1_target_policy,
+    float* value_out
+);
+int gru_model_evaluate_joint_hidden(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    float* joint_policy,
     float* value_out
 );
 int gru_model_supervised_update_heads(
@@ -314,6 +324,7 @@ int gru_model_policy_gradient_update_sequence_window_dual_anchored(
     float anchor_kl_coef
 );
 size_t gru_model_parameter_count(const GruModel* model);
+size_t gru_model_pre_joint_parameter_count(const GruModel* model);
 size_t gru_model_pre_target_parameter_count(const GruModel* model);
 size_t gru_model_legacy_parameter_count(const GruModel* model);
 int gru_model_export_parameters(const GruModel* model, float* out, size_t count);

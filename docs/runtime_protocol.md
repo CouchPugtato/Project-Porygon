@@ -17,7 +17,7 @@ Replay-only records may additionally contain:
 - `decision`
 - `episode_complete`
 
-Live `episode_complete` records contain the full observation sequence, legal masks, paired flat actions, factorized action choices, per-slot move-target indices and masks, rewards/dones, rollout-time log probabilities and values, plus the frozen actor checkpoint in `policy_tag`. Target indices represent self, ally, left foe, or right foe and are trained only when the selected move exposes a legal target choice. `--train-live-ppo` validates the policy tag before accepting the batch.
+Live `episode_complete` records contain the full observation sequence, legal masks, paired flat actions, factorized action choices, per-slot move-target indices and masks, rewards/dones, rollout-time log probabilities and values, plus the frozen actor checkpoint in `policy_tag`. On two-action turns, the stored log probability includes one normalized joint-action probability plus any selectable target probabilities; one-action turns retain the per-slot factorized probability. Target indices represent self, ally, left foe, or right foe and are trained only when the selected move exposes a legal target choice. `--train-live-ppo` validates the policy tag before accepting the batch.
 
 Canonical messages:
 

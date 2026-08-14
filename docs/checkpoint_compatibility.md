@@ -4,7 +4,7 @@ Checkpoint compatibility has three independent requirements:
 
 1. The stored observation input dimension must match `observation_flat_size()` in the current runtime.
 2. The stored action count and flat action layout must match `OBS_NUM_ACTIONS` and `enum ObsAction`.
-3. The serialized parameter count must match the current model layout, the previous factorized layout without move-target heads, or the supported legacy flat-head layout.
+3. The serialized parameter count must match the current model layout, the pre-joint factorized layout, the earlier factorized layout without move-target heads, or the supported legacy flat-head layout.
 
 Current checkpoints serialize:
 
@@ -16,6 +16,7 @@ Current checkpoints serialize:
   - switch target
   - tera choice
   - move target
+- a symmetric joint-action compatibility head used when both active slots act
 - value head
 - basic trainer state
 - a CRC-32 integrity checksum
@@ -40,6 +41,8 @@ Only one process should write a given checkpoint path at a time. Different train
 
 Checkpoints from the factorized architecture before explicit move targeting also remain loadable. Their existing heads are restored unchanged and the new move-target heads are initialized neutrally, so every legal target starts with equal probability before further training.
 
+Factorized checkpoints created before joint-action scoring also remain loadable. The compatibility head is initialized to zero, so the initial joint policy reduces to the existing slot-specific action scores until the new head is trained.
+
 This supports migration, but does not make every old checkpoint a valid baseline. Reconstruction semantics and observation contents may have changed even when the numeric input dimension happens to match.
 
 ## Operational rules
@@ -59,7 +62,7 @@ The loader validates:
 - nonzero, bounded dimensions
 - observation dimension against `observation_flat_size()`
 - action count against `OBS_NUM_ACTIONS`
-- exact current-factorized, pre-target-factorized, or legacy-flat parameter count
+- exact current-factorized, pre-joint-factorized, pre-target-factorized, or legacy-flat parameter count
 - exact file length, rejecting truncation and trailing data
 - complete and matching CRC-32 footer for v2 checkpoints
 - successful parameter import

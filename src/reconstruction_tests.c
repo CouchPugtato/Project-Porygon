@@ -3014,12 +3014,82 @@ static int test_factorized_target_head_training(void) {
     return ok;
 }
 
+static int test_symmetric_joint_action_training(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    float sequence[4] = {0};
+    float hidden[8] = {0};
+    unsigned char legal0[OBS_NUM_ACTIONS] = {0};
+    unsigned char legal1[OBS_NUM_ACTIONS] = {0};
+    unsigned char combined[OBS_NUM_ACTIONS] = {0};
+    float before[FACTORIZED_JOINT_DIM] = {0};
+    float after[FACTORIZED_JOINT_DIM] = {0};
+    float* parameters = NULL;
+    size_t parameter_count;
+    FactorizedActionChoice choice;
+    float value = 0.0f;
+    float probability_sum = 0.0f;
+    int selected = 1;
+    int i;
+    int ok = 1;
+    ok &= assert_true(model != NULL, "joint scorer test creates model");
+    if (!model) return 0;
+    parameter_count = gru_model_parameter_count(model);
+    parameters = (float*)calloc(parameter_count, sizeof(float));
+    ok &= assert_true(parameters != NULL && gru_model_import_parameters(model, parameters, parameter_count),
+        "joint scorer test starts from neutral parameters");
+    if (!parameters) {
+        gru_model_destroy(model);
+        return 0;
+    }
+    legal0[OBS_A1_MOVE1] = 1;
+    legal0[OBS_A1_MOVE2] = 1;
+    legal1[OBS_A2_MOVE1] = 1;
+    legal1[OBS_A2_MOVE2] = 1;
+    memcpy(combined, legal0, sizeof(combined));
+    combined[OBS_A2_MOVE1] = 1;
+    combined[OBS_A2_MOVE2] = 1;
+    factorized_action_choice_from_flat_actions(&choice, OBS_A1_MOVE1, OBS_A2_MOVE2);
+    ok &= assert_true(gru_model_evaluate_joint_hidden(model, hidden, combined, before, &value),
+        "joint scorer evaluates legal action pairs");
+    gru_model_clear_accumulated_supervised_updates(model);
+    ok &= assert_true(gru_model_supervised_accumulate_sequence_window_factorized(
+        model, sequence, 1u, NULL, legal0, legal1, &choice, 0.0f,
+        NULL, NULL, NULL), "joint scorer accumulates supervised pair update");
+    ok &= assert_true(gru_model_apply_accumulated_supervised_updates(model, 0.1f),
+        "joint scorer applies supervised pair update");
+    ok &= assert_true(gru_model_evaluate_joint_hidden(model, hidden, combined, after, &value),
+        "joint scorer evaluates after training");
+    ok &= assert_true(after[selected] > before[selected],
+        "joint scorer raises the labeled action-pair probability");
+    for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) probability_sum += after[i];
+    ok &= assert_true(fabsf(probability_sum - 1.0f) < 1.0e-5f,
+        "joint scorer normalizes over legal pairs");
+
+    memset(combined, 0, sizeof(combined));
+    combined[OBS_A1_MOVE1] = 1;
+    combined[OBS_A1_MOVE1_TERA] = 1;
+    combined[OBS_A1_SWITCH1] = 1;
+    combined[OBS_A2_MOVE1] = 1;
+    combined[OBS_A2_MOVE1_TERA] = 1;
+    combined[OBS_A2_SWITCH1] = 1;
+    ok &= assert_true(gru_model_evaluate_joint_hidden(model, hidden, combined, after, &value),
+        "joint scorer evaluates constrained pairs");
+    ok &= assert_true(after[4 * FACTORIZED_LOCAL_ACTION_DIM + 4] == 0.0f,
+        "joint scorer masks two simultaneous Terastallizations");
+    ok &= assert_true(after[8 * FACTORIZED_LOCAL_ACTION_DIM + 8] == 0.0f,
+        "joint scorer masks duplicate switch destinations");
+    free(parameters);
+    gru_model_destroy(model);
+    return ok;
+}
+
 static int test_checkpoint_compatibility_validation(void) {
     const char* current_path = "checkpoint_test_current.bin";
     const char* current_temporary_path = "checkpoint_test_current.bin.tmp";
     const char* replacement_failure_path = "checkpoint_test_replace_failure";
     const char* replacement_failure_temporary_path = "checkpoint_test_replace_failure.tmp";
     const char* legacy_path = "checkpoint_test_legacy.bin";
+    const char* pre_joint_path = "checkpoint_test_pre_joint.bin";
     const char* pre_target_path = "checkpoint_test_pre_target.bin";
     const char* version_path = "checkpoint_test_version.bin";
     const char* header_corrupt_path = "checkpoint_test_header_corrupt.bin";
@@ -3037,8 +3107,10 @@ static int test_checkpoint_compatibility_validation(void) {
     TestCheckpointHeader header;
     float* current_parameters = NULL;
     float* legacy_parameters = NULL;
+    float* pre_joint_parameters = NULL;
     float* pre_target_parameters = NULL;
     size_t current_count;
+    size_t pre_joint_count;
     size_t pre_target_count;
     size_t legacy_count;
     size_t value_count;
@@ -3051,6 +3123,7 @@ static int test_checkpoint_compatibility_validation(void) {
     remove(replacement_failure_temporary_path);
     TEST_RMDIR(replacement_failure_path);
     remove(legacy_path);
+    remove(pre_joint_path);
     remove(pre_target_path);
     remove(version_path);
     remove(header_corrupt_path);
@@ -3131,18 +3204,45 @@ static int test_checkpoint_compatibility_validation(void) {
         "checkpoint rejects action count mismatch");
 
     current_count = gru_model_parameter_count(model);
+    pre_joint_count = gru_model_pre_joint_parameter_count(model);
     pre_target_count = gru_model_pre_target_parameter_count(model);
     legacy_count = gru_model_legacy_parameter_count(model);
     value_count = gru_model_hidden_dim(model) + 1u;
     prefix_count = legacy_count - value_count;
     current_parameters = (float*)malloc(current_count * sizeof(float));
     legacy_parameters = (float*)malloc(legacy_count * sizeof(float));
+    pre_joint_parameters = (float*)malloc(pre_joint_count * sizeof(float));
     pre_target_parameters = (float*)malloc(pre_target_count * sizeof(float));
-    ok &= assert_true(current_parameters != NULL && legacy_parameters != NULL && pre_target_parameters != NULL,
+    ok &= assert_true(current_parameters != NULL && legacy_parameters != NULL && pre_joint_parameters != NULL && pre_target_parameters != NULL,
         "checkpoint test allocates legacy fixture parameters");
-    if (!current_parameters || !legacy_parameters || !pre_target_parameters) goto cleanup;
+    if (!current_parameters || !legacy_parameters || !pre_joint_parameters || !pre_target_parameters) goto cleanup;
     ok &= assert_true(gru_model_export_parameters(model, current_parameters, current_count),
         "checkpoint test exports current parameters");
+    {
+        size_t joint_chunk = (gru_model_hidden_dim(model) * FACTORIZED_PAIR_DIM) + FACTORIZED_PAIR_DIM;
+        size_t joint_offset = current_count - value_count - joint_chunk;
+        memcpy(pre_joint_parameters, current_parameters, joint_offset * sizeof(float));
+        memcpy(pre_joint_parameters + joint_offset,
+            current_parameters + joint_offset + joint_chunk, value_count * sizeof(float));
+        ok &= assert_true(joint_offset + value_count == pre_joint_count,
+            "checkpoint test builds pre-joint fixture layout");
+    }
+    memset(&header, 0, sizeof(header));
+    memcpy(header.magic, "PORYCHK", 7);
+    header.version = CHECKPOINT_MIN_SUPPORTED_VERSION;
+    header.input_dim = gru_model_input_dim(model);
+    header.hidden_dim = gru_model_hidden_dim(model);
+    header.num_actions = gru_model_num_actions(model);
+    header.parameter_count = pre_joint_count;
+    header.trainer = state;
+    ok &= assert_true(write_test_checkpoint(pre_joint_path, &header, pre_joint_parameters),
+        "checkpoint test writes pre-joint factorized layout");
+    loaded = checkpoint_load_compatible(pre_joint_path, &loaded_state, 8u, OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded != NULL && result.status == CHECKPOINT_LOAD_OK &&
+            result.parameter_layout == CHECKPOINT_LAYOUT_FACTORIZED,
+        "pre-joint checkpoint loads with a neutral compatibility scorer");
+    gru_model_destroy(loaded);
+    loaded = NULL;
     {
         size_t target_chunk = (gru_model_hidden_dim(model) * FACTORIZED_TARGET_DIM) + FACTORIZED_TARGET_DIM;
         size_t slot1_factorized_chunk =
@@ -3150,17 +3250,17 @@ static int test_checkpoint_compatibility_validation(void) {
             (gru_model_hidden_dim(model) * FACTORIZED_MOVE_DIM) + FACTORIZED_MOVE_DIM +
             (gru_model_hidden_dim(model) * FACTORIZED_SWITCH_DIM) + FACTORIZED_SWITCH_DIM +
             (gru_model_hidden_dim(model) * FACTORIZED_TERA_DIM) + FACTORIZED_TERA_DIM;
-        size_t target1_offset = current_count - value_count - target_chunk;
+        size_t target1_offset = pre_joint_count - value_count - target_chunk;
         size_t target0_offset = target1_offset - slot1_factorized_chunk - target_chunk;
         size_t out_index = 0;
-        memcpy(pre_target_parameters, current_parameters, target0_offset * sizeof(float));
+        memcpy(pre_target_parameters, pre_joint_parameters, target0_offset * sizeof(float));
         out_index += target0_offset;
         memcpy(pre_target_parameters + out_index,
-            current_parameters + target0_offset + target_chunk,
+            pre_joint_parameters + target0_offset + target_chunk,
             slot1_factorized_chunk * sizeof(float));
         out_index += slot1_factorized_chunk;
         memcpy(pre_target_parameters + out_index,
-            current_parameters + target1_offset + target_chunk,
+            pre_joint_parameters + target1_offset + target_chunk,
             value_count * sizeof(float));
         out_index += value_count;
         ok &= assert_true(out_index == pre_target_count, "checkpoint test builds pre-target fixture layout");
@@ -3283,12 +3383,14 @@ cleanup:
     gru_model_destroy(model);
     free(current_parameters);
     free(legacy_parameters);
+    free(pre_joint_parameters);
     free(pre_target_parameters);
     remove(current_path);
     remove(current_temporary_path);
     remove(replacement_failure_temporary_path);
     TEST_RMDIR(replacement_failure_path);
     remove(legacy_path);
+    remove(pre_joint_path);
     remove(pre_target_path);
     remove(version_path);
     remove(header_corrupt_path);
@@ -3317,6 +3419,7 @@ int main(int argc, char** argv) {
     }
     if (!test_episode_target_roundtrip()) return 1;
     if (!test_factorized_target_head_training()) return 1;
+    if (!test_symmetric_joint_action_training()) return 1;
     if (!test_checkpoint_compatibility_validation()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;
