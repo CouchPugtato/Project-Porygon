@@ -273,6 +273,7 @@ GruModel* checkpoint_load_compatible(
     GruModel* model = NULL;
     float* params = NULL;
     size_t current_parameter_count;
+    size_t pre_entity_parameter_count;
     size_t pre_joint_parameter_count;
     size_t pre_target_parameter_count;
     size_t legacy_parameter_count;
@@ -339,10 +340,13 @@ GruModel* checkpoint_load_compatible(
         return NULL;
     }
     current_parameter_count = gru_model_parameter_count(model);
+    pre_entity_parameter_count = gru_model_pre_entity_parameter_count(model);
     pre_joint_parameter_count = gru_model_pre_joint_parameter_count(model);
     pre_target_parameter_count = gru_model_pre_target_parameter_count(model);
     legacy_parameter_count = gru_model_legacy_parameter_count(model);
     if (header.parameter_count == current_parameter_count) {
+        result->parameter_layout = CHECKPOINT_LAYOUT_FACTORIZED;
+    } else if (header.parameter_count == pre_entity_parameter_count) {
         result->parameter_layout = CHECKPOINT_LAYOUT_FACTORIZED;
     } else if (header.parameter_count == pre_joint_parameter_count) {
         result->parameter_layout = CHECKPOINT_LAYOUT_FACTORIZED;

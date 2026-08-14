@@ -12,6 +12,7 @@
 #define FACTORIZED_LOCAL_ACTION_DIM 14
 #define FACTORIZED_PAIR_DIM 105
 #define FACTORIZED_JOINT_DIM (FACTORIZED_LOCAL_ACTION_DIM * FACTORIZED_LOCAL_ACTION_DIM)
+#define GRU_ENTITY_EMBED_DIM 32
 
 typedef struct GruModel GruModel;
 
@@ -324,6 +325,7 @@ int gru_model_policy_gradient_update_sequence_window_dual_anchored(
     float anchor_kl_coef
 );
 size_t gru_model_parameter_count(const GruModel* model);
+size_t gru_model_pre_entity_parameter_count(const GruModel* model);
 size_t gru_model_pre_joint_parameter_count(const GruModel* model);
 size_t gru_model_pre_target_parameter_count(const GruModel* model);
 size_t gru_model_legacy_parameter_count(const GruModel* model);

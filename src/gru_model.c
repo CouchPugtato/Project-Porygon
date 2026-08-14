@@ -1,5 +1,6 @@
 #include "gru_model.h"
 #include "action_mapper.h"
+#include "observation.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -24,6 +25,8 @@ typedef struct {
     float* gated_hidden;
     float* logits;
     float* next_hidden;
+    float* transformed_input;
+    float* entity_hidden;
 } GruForwardScratch;
 
 typedef struct {
@@ -58,6 +61,12 @@ typedef struct {
     float* grad_policy_head;
     float* grad_policy_bias;
     float* grad_value_head;
+    float* transformed_inputs;
+    float* entity_hidden;
+    float* grad_input;
+    float* grad_entity_encoder;
+    float* grad_entity_bias;
+    float* grad_entity_decoder;
 } GruRecurrentScratch;
 
 typedef struct {
@@ -94,6 +103,9 @@ typedef struct {
     float* slot1_target_bias;
     float* joint_pair_head;
     float* joint_pair_bias;
+    float* entity_encoder;
+    float* entity_bias;
+    float* entity_decoder;
     float* value_head;
     float value_bias;
     size_t count;
@@ -144,6 +156,9 @@ typedef struct {
     float* slot1_target_bias_m; float* slot1_target_bias_v;
     float* joint_pair_head_m; float* joint_pair_head_v;
     float* joint_pair_bias_m; float* joint_pair_bias_v;
+    float* entity_encoder_m; float* entity_encoder_v;
+    float* entity_bias_m; float* entity_bias_v;
+    float* entity_decoder_m; float* entity_decoder_v;
     float* value_head_m;
     float* value_head_v;
     float value_bias_m;
@@ -192,6 +207,10 @@ struct GruModel {
     float* slot1_target_bias;
     Matrix joint_pair_head;
     float* joint_pair_bias;
+    Matrix entity_encoder;
+    float* entity_bias;
+    Matrix entity_decoder;
+    int entity_encoder_enabled;
 
     float* value_head;
     float value_bias;
@@ -265,6 +284,8 @@ static void gru_forward_scratch_free(GruForwardScratch* scratch) {
     free(scratch->gated_hidden);
     free(scratch->logits);
     free(scratch->next_hidden);
+    free(scratch->transformed_input);
+    free(scratch->entity_hidden);
     memset(scratch, 0, sizeof(*scratch));
 }
 
@@ -275,7 +296,8 @@ static int gru_forward_scratch_ensure(GruModel* model) {
     }
     scratch = &model->forward_scratch;
     if (scratch->hidden_capacity == model->hidden_dim && scratch->action_capacity == model->num_actions &&
-            scratch->z && scratch->r && scratch->n && scratch->gated_hidden && scratch->logits && scratch->next_hidden) {
+            scratch->z && scratch->r && scratch->n && scratch->gated_hidden && scratch->logits && scratch->next_hidden &&
+            scratch->transformed_input && scratch->entity_hidden) {
         return 1;
     }
     gru_forward_scratch_free(scratch);
@@ -285,7 +307,10 @@ static int gru_forward_scratch_ensure(GruModel* model) {
     scratch->gated_hidden = (float*)calloc(model->hidden_dim, sizeof(float));
     scratch->logits = (float*)calloc(model->num_actions, sizeof(float));
     scratch->next_hidden = (float*)calloc(model->hidden_dim, sizeof(float));
-    if (!scratch->z || !scratch->r || !scratch->n || !scratch->gated_hidden || !scratch->logits || !scratch->next_hidden) {
+    scratch->transformed_input = (float*)calloc(model->input_dim, sizeof(float));
+    scratch->entity_hidden = (float*)calloc(2u * OBS_TEAM_SIZE * GRU_ENTITY_EMBED_DIM, sizeof(float));
+    if (!scratch->z || !scratch->r || !scratch->n || !scratch->gated_hidden || !scratch->logits || !scratch->next_hidden ||
+            !scratch->transformed_input || !scratch->entity_hidden) {
         gru_forward_scratch_free(scratch);
         return 0;
     }
@@ -325,6 +350,12 @@ static void gru_recurrent_scratch_free(GruRecurrentScratch* scratch) {
     free(scratch->grad_policy_head);
     free(scratch->grad_policy_bias);
     free(scratch->grad_value_head);
+    free(scratch->transformed_inputs);
+    free(scratch->entity_hidden);
+    free(scratch->grad_input);
+    free(scratch->grad_entity_encoder);
+    free(scratch->grad_entity_bias);
+    free(scratch->grad_entity_decoder);
     memset(scratch, 0, sizeof(*scratch));
 }
 
@@ -343,7 +374,9 @@ static int gru_recurrent_scratch_ensure(GruModel* model, size_t steps) {
             scratch->grad_logits && scratch->d_gated && scratch->d_pre_z && scratch->d_pre_r && scratch->d_pre_n &&
             scratch->grad_wzx && scratch->grad_wzh && scratch->grad_bz && scratch->grad_wrx && scratch->grad_wrh &&
             scratch->grad_br && scratch->grad_wnx && scratch->grad_wnh && scratch->grad_bn &&
-            scratch->grad_policy_head && scratch->grad_policy_bias && scratch->grad_value_head) {
+            scratch->grad_policy_head && scratch->grad_policy_bias && scratch->grad_value_head &&
+            scratch->transformed_inputs && scratch->entity_hidden && scratch->grad_input &&
+            scratch->grad_entity_encoder && scratch->grad_entity_bias && scratch->grad_entity_decoder) {
         return 1;
     }
     gru_recurrent_scratch_free(scratch);
@@ -374,13 +407,21 @@ static int gru_recurrent_scratch_ensure(GruModel* model, size_t steps) {
     scratch->grad_policy_head = (float*)calloc(model->policy_head.rows * model->policy_head.cols, sizeof(float));
     scratch->grad_policy_bias = (float*)calloc(model->num_actions, sizeof(float));
     scratch->grad_value_head = (float*)calloc(model->hidden_dim, sizeof(float));
+    scratch->transformed_inputs = (float*)calloc(steps * model->input_dim, sizeof(float));
+    scratch->entity_hidden = (float*)calloc(steps * 2u * OBS_TEAM_SIZE * GRU_ENTITY_EMBED_DIM, sizeof(float));
+    scratch->grad_input = (float*)calloc(model->input_dim, sizeof(float));
+    scratch->grad_entity_encoder = (float*)calloc(model->entity_encoder_enabled ? model->entity_encoder.rows * model->entity_encoder.cols : 1u, sizeof(float));
+    scratch->grad_entity_bias = (float*)calloc(model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 1u, sizeof(float));
+    scratch->grad_entity_decoder = (float*)calloc(model->entity_encoder_enabled ? model->entity_decoder.rows * model->entity_decoder.cols : 1u, sizeof(float));
     if (!scratch->h_states || !scratch->z_cache || !scratch->r_cache || !scratch->n_cache || !scratch->gated_cache ||
             !scratch->zero_hidden || !scratch->logits || !scratch->policy || !scratch->grad_h ||
             !scratch->next_grad_h || !scratch->grad_logits || !scratch->d_gated || !scratch->d_pre_z ||
             !scratch->d_pre_r || !scratch->d_pre_n || !scratch->grad_wzx || !scratch->grad_wzh ||
             !scratch->grad_bz || !scratch->grad_wrx || !scratch->grad_wrh || !scratch->grad_br ||
             !scratch->grad_wnx || !scratch->grad_wnh || !scratch->grad_bn || !scratch->grad_policy_head ||
-            !scratch->grad_policy_bias || !scratch->grad_value_head) {
+            !scratch->grad_policy_bias || !scratch->grad_value_head || !scratch->transformed_inputs ||
+            !scratch->entity_hidden || !scratch->grad_input || !scratch->grad_entity_encoder ||
+            !scratch->grad_entity_bias || !scratch->grad_entity_decoder) {
         gru_recurrent_scratch_free(scratch);
         return 0;
     }
@@ -417,6 +458,7 @@ static void gru_gradient_accum_free(GruGradientAccum* accum) {
     free(accum->slot1_tera_head); free(accum->slot1_tera_bias);
     free(accum->slot1_target_head); free(accum->slot1_target_bias);
     free(accum->joint_pair_head); free(accum->joint_pair_bias);
+    free(accum->entity_encoder); free(accum->entity_bias); free(accum->entity_decoder);
     free(accum->value_head);
     memset(accum, 0, sizeof(*accum));
 }
@@ -458,6 +500,9 @@ static void gru_adam_state_free(GruAdamState* state) {
     free(state->slot1_target_bias_m); free(state->slot1_target_bias_v);
     free(state->joint_pair_head_m); free(state->joint_pair_head_v);
     free(state->joint_pair_bias_m); free(state->joint_pair_bias_v);
+    free(state->entity_encoder_m); free(state->entity_encoder_v);
+    free(state->entity_bias_m); free(state->entity_bias_v);
+    free(state->entity_decoder_m); free(state->entity_decoder_v);
     free(state->value_head_m); free(state->value_head_v);
     memset(state, 0, sizeof(*state));
 }
@@ -483,6 +528,8 @@ static int gru_adam_state_ensure(GruModel* model) {
             state->slot1_tera_head_m && state->slot1_tera_head_v && state->slot1_tera_bias_m && state->slot1_tera_bias_v &&
             state->slot1_target_head_m && state->slot1_target_head_v && state->slot1_target_bias_m && state->slot1_target_bias_v &&
             state->joint_pair_head_m && state->joint_pair_head_v && state->joint_pair_bias_m && state->joint_pair_bias_v &&
+            state->entity_encoder_m && state->entity_encoder_v && state->entity_bias_m && state->entity_bias_v &&
+            state->entity_decoder_m && state->entity_decoder_v &&
             state->value_head_m && state->value_head_v) {
         return 1;
     }
@@ -553,6 +600,12 @@ static int gru_adam_state_ensure(GruModel* model) {
     state->joint_pair_head_v = (float*)calloc(model->joint_pair_head.rows * model->joint_pair_head.cols, sizeof(float));
     state->joint_pair_bias_m = (float*)calloc(FACTORIZED_PAIR_DIM, sizeof(float));
     state->joint_pair_bias_v = (float*)calloc(FACTORIZED_PAIR_DIM, sizeof(float));
+    state->entity_encoder_m = (float*)calloc(model->entity_encoder_enabled ? model->entity_encoder.rows * model->entity_encoder.cols : 1u, sizeof(float));
+    state->entity_encoder_v = (float*)calloc(model->entity_encoder_enabled ? model->entity_encoder.rows * model->entity_encoder.cols : 1u, sizeof(float));
+    state->entity_bias_m = (float*)calloc(model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 1u, sizeof(float));
+    state->entity_bias_v = (float*)calloc(model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 1u, sizeof(float));
+    state->entity_decoder_m = (float*)calloc(model->entity_encoder_enabled ? model->entity_decoder.rows * model->entity_decoder.cols : 1u, sizeof(float));
+    state->entity_decoder_v = (float*)calloc(model->entity_encoder_enabled ? model->entity_decoder.rows * model->entity_decoder.cols : 1u, sizeof(float));
     state->value_head_m = (float*)calloc(model->hidden_dim, sizeof(float));
     state->value_head_v = (float*)calloc(model->hidden_dim, sizeof(float));
     if (!state->wzx_m || !state->wzx_v || !state->wzh_m || !state->wzh_v || !state->bz_m || !state->bz_v ||
@@ -570,6 +623,8 @@ static int gru_adam_state_ensure(GruModel* model) {
             !state->slot1_tera_head_m || !state->slot1_tera_head_v || !state->slot1_tera_bias_m || !state->slot1_tera_bias_v ||
             !state->slot1_target_head_m || !state->slot1_target_head_v || !state->slot1_target_bias_m || !state->slot1_target_bias_v ||
             !state->joint_pair_head_m || !state->joint_pair_head_v || !state->joint_pair_bias_m || !state->joint_pair_bias_v ||
+            !state->entity_encoder_m || !state->entity_encoder_v || !state->entity_bias_m || !state->entity_bias_v ||
+            !state->entity_decoder_m || !state->entity_decoder_v ||
             !state->value_head_m || !state->value_head_v) {
         gru_adam_state_free(state);
         return 0;
@@ -592,6 +647,7 @@ static int gru_gradient_accum_ensure(GruModel* model) {
             accum->slot1_switch_head && accum->slot1_switch_bias && accum->slot1_tera_head && accum->slot1_tera_bias &&
             accum->slot1_target_head && accum->slot1_target_bias &&
             accum->joint_pair_head && accum->joint_pair_bias &&
+            accum->entity_encoder && accum->entity_bias && accum->entity_decoder &&
             accum->value_head) {
         return 1;
     }
@@ -629,6 +685,9 @@ static int gru_gradient_accum_ensure(GruModel* model) {
     accum->slot1_target_bias = (float*)calloc(FACTORIZED_TARGET_DIM, sizeof(float));
     accum->joint_pair_head = (float*)calloc(model->joint_pair_head.rows * model->joint_pair_head.cols, sizeof(float));
     accum->joint_pair_bias = (float*)calloc(FACTORIZED_PAIR_DIM, sizeof(float));
+    accum->entity_encoder = (float*)calloc(model->entity_encoder_enabled ? model->entity_encoder.rows * model->entity_encoder.cols : 1u, sizeof(float));
+    accum->entity_bias = (float*)calloc(model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 1u, sizeof(float));
+    accum->entity_decoder = (float*)calloc(model->entity_encoder_enabled ? model->entity_decoder.rows * model->entity_decoder.cols : 1u, sizeof(float));
     accum->value_head = (float*)calloc(model->hidden_dim, sizeof(float));
     if (!accum->wzx || !accum->wzh || !accum->bz || !accum->wrx || !accum->wrh || !accum->br ||
             !accum->wnx || !accum->wnh || !accum->bn || !accum->policy_head || !accum->policy_bias ||
@@ -639,6 +698,7 @@ static int gru_gradient_accum_ensure(GruModel* model) {
             !accum->slot1_switch_head || !accum->slot1_switch_bias || !accum->slot1_tera_head || !accum->slot1_tera_bias ||
             !accum->slot1_target_head || !accum->slot1_target_bias ||
             !accum->joint_pair_head || !accum->joint_pair_bias ||
+            !accum->entity_encoder || !accum->entity_bias || !accum->entity_decoder ||
             !accum->value_head) {
         gru_gradient_accum_free(accum);
         return 0;
@@ -685,6 +745,11 @@ void gru_model_clear_accumulated_supervised_updates(GruModel* model) {
     memset(accum->slot1_target_bias, 0, FACTORIZED_TARGET_DIM * sizeof(float));
     memset(accum->joint_pair_head, 0, model->joint_pair_head.rows * model->joint_pair_head.cols * sizeof(float));
     memset(accum->joint_pair_bias, 0, FACTORIZED_PAIR_DIM * sizeof(float));
+    if (model->entity_encoder_enabled) {
+        memset(accum->entity_encoder, 0, model->entity_encoder.rows * model->entity_encoder.cols * sizeof(float));
+        memset(accum->entity_bias, 0, GRU_ENTITY_EMBED_DIM * sizeof(float));
+        memset(accum->entity_decoder, 0, model->entity_decoder.rows * model->entity_decoder.cols * sizeof(float));
+    }
     memset(accum->value_head, 0, model->hidden_dim * sizeof(float));
     accum->value_bias = 0.0f;
     accum->count = 0;
@@ -768,6 +833,9 @@ int gru_model_apply_accumulated_supervised_updates(GruModel* model, float learni
     for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) model->slot1_target_bias[i] -= scale * accum->slot1_target_bias[i];
     for (i = 0; i < model->joint_pair_head.rows * model->joint_pair_head.cols; ++i) model->joint_pair_head.data[i] -= scale * accum->joint_pair_head[i];
     for (i = 0; i < FACTORIZED_PAIR_DIM; ++i) model->joint_pair_bias[i] -= scale * accum->joint_pair_bias[i];
+    for (i = 0; i < model->entity_encoder.rows * model->entity_encoder.cols; ++i) model->entity_encoder.data[i] -= scale * accum->entity_encoder[i];
+    for (i = 0; i < (model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 0u); ++i) model->entity_bias[i] -= scale * accum->entity_bias[i];
+    for (i = 0; i < model->entity_decoder.rows * model->entity_decoder.cols; ++i) model->entity_decoder.data[i] -= scale * accum->entity_decoder[i];
 #ifdef _OPENMP
     #pragma omp parallel for if(model->hidden_dim >= 64)
 #endif
@@ -850,6 +918,9 @@ int gru_model_apply_accumulated_adam_updates(
     for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) { float g = accum->slot1_target_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
     for (i = 0; i < model->joint_pair_head.rows * model->joint_pair_head.cols; ++i) { float g = accum->joint_pair_head[i] * scale; global_sq_norm += (double)g * (double)g; }
     for (i = 0; i < FACTORIZED_PAIR_DIM; ++i) { float g = accum->joint_pair_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->entity_encoder.rows * model->entity_encoder.cols; ++i) { float g = accum->entity_encoder[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < (model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 0u); ++i) { float g = accum->entity_bias[i] * scale; global_sq_norm += (double)g * (double)g; }
+    for (i = 0; i < model->entity_decoder.rows * model->entity_decoder.cols; ++i) { float g = accum->entity_decoder[i] * scale; global_sq_norm += (double)g * (double)g; }
     for (i = 0; i < model->hidden_dim; ++i) { float g = accum->value_head[i] * scale; global_sq_norm += (double)g * (double)g; }
     {
         float g = accum->value_bias * scale;
@@ -897,6 +968,9 @@ int gru_model_apply_accumulated_adam_updates(
     for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) accum->slot1_target_bias[i] *= scale;
     for (i = 0; i < model->joint_pair_head.rows * model->joint_pair_head.cols; ++i) accum->joint_pair_head[i] *= scale;
     for (i = 0; i < FACTORIZED_PAIR_DIM; ++i) accum->joint_pair_bias[i] *= scale;
+    for (i = 0; i < model->entity_encoder.rows * model->entity_encoder.cols; ++i) accum->entity_encoder[i] *= scale;
+    for (i = 0; i < (model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 0u); ++i) accum->entity_bias[i] *= scale;
+    for (i = 0; i < model->entity_decoder.rows * model->entity_decoder.cols; ++i) accum->entity_decoder[i] *= scale;
     for (i = 0; i < model->hidden_dim; ++i) accum->value_head[i] *= scale;
     accum->value_bias *= scale;
     adam_apply_array(model->wzx.data, state->wzx_m, state->wzx_v, accum->wzx, model->wzx.rows * model->wzx.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
@@ -932,6 +1006,11 @@ int gru_model_apply_accumulated_adam_updates(
     adam_apply_array(model->slot1_target_bias, state->slot1_target_bias_m, state->slot1_target_bias_v, accum->slot1_target_bias, FACTORIZED_TARGET_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     adam_apply_array(model->joint_pair_head.data, state->joint_pair_head_m, state->joint_pair_head_v, accum->joint_pair_head, model->joint_pair_head.rows * model->joint_pair_head.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     adam_apply_array(model->joint_pair_bias, state->joint_pair_bias_m, state->joint_pair_bias_v, accum->joint_pair_bias, FACTORIZED_PAIR_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    if (model->entity_encoder_enabled) {
+        adam_apply_array(model->entity_encoder.data, state->entity_encoder_m, state->entity_encoder_v, accum->entity_encoder, model->entity_encoder.rows * model->entity_encoder.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+        adam_apply_array(model->entity_bias, state->entity_bias_m, state->entity_bias_v, accum->entity_bias, GRU_ENTITY_EMBED_DIM, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+        adam_apply_array(model->entity_decoder.data, state->entity_decoder_m, state->entity_decoder_v, accum->entity_decoder, model->entity_decoder.rows * model->entity_decoder.cols, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    }
     adam_apply_array(model->value_head, state->value_head_m, state->value_head_v, accum->value_head, model->hidden_dim, learning_rate, beta1, beta2, epsilon, bias_correction1, bias_correction2);
     state->value_bias_m = beta1 * state->value_bias_m + (1.0f - beta1) * accum->value_bias;
     state->value_bias_v = beta2 * state->value_bias_v + (1.0f - beta2) * accum->value_bias * accum->value_bias;
@@ -1012,6 +1091,87 @@ static void outer_product_accum(float* dst, size_t rows, size_t cols, const floa
         float lhs_r = lhs[r];
         for (c = 0; c < cols; ++c) {
             dst_row[c] += lhs_r * rhs[c];
+        }
+    }
+}
+
+static void transform_observation_input(
+    const GruModel* model,
+    const float* input,
+    float* transformed,
+    float* entity_hidden
+) {
+    const size_t entity_offset = OBS_GLOBAL_FEATURES + 2u * OBS_SIDE_FEATURES;
+    size_t entity;
+    memcpy(transformed, input, model->input_dim * sizeof(float));
+    memset(entity_hidden, 0, 2u * OBS_TEAM_SIZE * GRU_ENTITY_EMBED_DIM * sizeof(float));
+    if (!model->entity_encoder_enabled) {
+        return;
+    }
+    for (entity = 0; entity < 2u * OBS_TEAM_SIZE; ++entity) {
+        const float* features = input + entity_offset + entity * OBS_POKEMON_FEATURES;
+        float* output_features = transformed + entity_offset + entity * OBS_POKEMON_FEATURES;
+        float* embedding = entity_hidden + entity * GRU_ENTITY_EMBED_DIM;
+        float present = features[0];
+        size_t e;
+        size_t f;
+        if (present <= 0.0f) {
+            continue;
+        }
+        memcpy(embedding, model->entity_bias, GRU_ENTITY_EMBED_DIM * sizeof(float));
+        matrix_vec_mul_accum(&model->entity_encoder, features, embedding);
+        for (e = 0; e < GRU_ENTITY_EMBED_DIM; ++e) {
+            embedding[e] = tanhf(embedding[e]);
+        }
+        for (f = 0; f < OBS_POKEMON_FEATURES; ++f) {
+            const float* decoder_row = model->entity_decoder.data + f * GRU_ENTITY_EMBED_DIM;
+            float residual = 0.0f;
+            for (e = 0; e < GRU_ENTITY_EMBED_DIM; ++e) {
+                residual += decoder_row[e] * embedding[e];
+            }
+            output_features[f] += present * residual;
+        }
+    }
+}
+
+static void backprop_entity_encoder(
+    const GruModel* model,
+    const float* raw_input,
+    const float* entity_hidden,
+    const float* grad_input,
+    float* grad_encoder,
+    float* grad_bias,
+    float* grad_decoder
+) {
+    const size_t entity_offset = OBS_GLOBAL_FEATURES + 2u * OBS_SIDE_FEATURES;
+    size_t entity;
+    if (!model->entity_encoder_enabled) {
+        return;
+    }
+    for (entity = 0; entity < 2u * OBS_TEAM_SIZE; ++entity) {
+        const float* features = raw_input + entity_offset + entity * OBS_POKEMON_FEATURES;
+        const float* embedding = entity_hidden + entity * GRU_ENTITY_EMBED_DIM;
+        const float* entity_grad = grad_input + entity_offset + entity * OBS_POKEMON_FEATURES;
+        float grad_embedding[GRU_ENTITY_EMBED_DIM] = {0};
+        float present = features[0];
+        size_t e;
+        size_t f;
+        if (present <= 0.0f) {
+            continue;
+        }
+        for (f = 0; f < OBS_POKEMON_FEATURES; ++f) {
+            float feature_gradient = entity_grad[f] * present;
+            for (e = 0; e < GRU_ENTITY_EMBED_DIM; ++e) {
+                grad_decoder[f * GRU_ENTITY_EMBED_DIM + e] += feature_gradient * embedding[e];
+                grad_embedding[e] += model->entity_decoder.data[f * GRU_ENTITY_EMBED_DIM + e] * feature_gradient;
+            }
+        }
+        for (e = 0; e < GRU_ENTITY_EMBED_DIM; ++e) {
+            float grad_pre = grad_embedding[e] * (1.0f - embedding[e] * embedding[e]);
+            grad_bias[e] += grad_pre;
+            for (f = 0; f < OBS_POKEMON_FEATURES; ++f) {
+                grad_encoder[e * OBS_POKEMON_FEATURES + f] += grad_pre * features[f];
+            }
         }
     }
 }
@@ -1532,19 +1692,23 @@ static void evaluate_hidden_internal(
     float* value_out
 ) {
     size_t i;
-    memcpy(logits, model->policy_bias, model->num_actions * sizeof(float));
-    matrix_vec_mul_accum(&model->policy_head, hidden_state, logits);
-    if (legal_mask) {
-        for (i = 0; i < model->num_actions; ++i) {
-            if (!legal_mask[i]) {
-                logits[i] = -1.0e9f;
+    if (policy_out) {
+        memcpy(logits, model->policy_bias, model->num_actions * sizeof(float));
+        matrix_vec_mul_accum(&model->policy_head, hidden_state, logits);
+        if (legal_mask) {
+            for (i = 0; i < model->num_actions; ++i) {
+                if (!legal_mask[i]) {
+                    logits[i] = -1.0e9f;
+                }
             }
         }
+        softmax(logits, model->num_actions, policy_out);
     }
-    softmax(logits, model->num_actions, policy_out);
-    *value_out = model->value_bias;
-    for (i = 0; i < model->hidden_dim; ++i) {
-        *value_out += model->value_head[i] * hidden_state[i];
+    if (value_out) {
+        *value_out = model->value_bias;
+        for (i = 0; i < model->hidden_dim; ++i) {
+            *value_out += model->value_head[i] * hidden_state[i];
+        }
     }
 }
 
@@ -1600,6 +1764,7 @@ GruModel* gru_model_create(size_t input_dim, size_t hidden_dim, size_t num_actio
     model->input_dim = input_dim;
     model->hidden_dim = hidden_dim;
     model->num_actions = num_actions;
+    model->entity_encoder_enabled = input_dim == OBSERVATION_FLAT_SIZE ? 1 : 0;
 
     x_scale = 1.0f / sqrtf((float)input_dim);
     h_scale = 1.0f / sqrtf((float)hidden_dim);
@@ -1638,6 +1803,13 @@ GruModel* gru_model_create(size_t input_dim, size_t hidden_dim, size_t num_actio
     model->slot1_target_bias = vector_make(FACTORIZED_TARGET_DIM);
     model->joint_pair_head = matrix_make(FACTORIZED_PAIR_DIM, hidden_dim, p_scale);
     model->joint_pair_bias = vector_make(FACTORIZED_PAIR_DIM);
+    if (model->entity_encoder_enabled) {
+        model->entity_encoder = matrix_make(GRU_ENTITY_EMBED_DIM, OBS_POKEMON_FEATURES,
+            1.0f / sqrtf((float)OBS_POKEMON_FEATURES));
+        model->entity_bias = vector_make(GRU_ENTITY_EMBED_DIM);
+        model->entity_decoder = matrix_make(OBS_POKEMON_FEATURES, GRU_ENTITY_EMBED_DIM,
+            0.05f / sqrtf((float)GRU_ENTITY_EMBED_DIM));
+    }
     model->value_head = (float*)malloc(hidden_dim * sizeof(float));
 
     if (!model->wzx.data || !model->wzh.data || !model->bz ||
@@ -1651,6 +1823,7 @@ GruModel* gru_model_create(size_t input_dim, size_t hidden_dim, size_t num_actio
         !model->slot1_switch_head.data || !model->slot1_switch_bias || !model->slot1_tera_head.data || !model->slot1_tera_bias ||
         !model->slot1_target_head.data || !model->slot1_target_bias ||
         !model->joint_pair_head.data || !model->joint_pair_bias ||
+        (model->entity_encoder_enabled && (!model->entity_encoder.data || !model->entity_bias || !model->entity_decoder.data)) ||
         !model->value_head) {
         gru_model_destroy(model);
         return NULL;
@@ -1692,7 +1865,9 @@ void gru_model_destroy(GruModel* model) {
     matrix_free(&model->slot1_tera_head); free(model->slot1_tera_bias);
     matrix_free(&model->slot1_target_head); free(model->slot1_target_bias);
     matrix_free(&model->joint_pair_head); free(model->joint_pair_bias);
+    matrix_free(&model->entity_encoder); free(model->entity_bias); matrix_free(&model->entity_decoder);
     free(model->value_head);
+    gru_gradient_accum_free(&model->grad_accum);
     gru_adam_state_free(&model->adam_state);
     gru_forward_scratch_free(&model->forward_scratch);
     gru_recurrent_scratch_free(&model->recurrent_scratch);
@@ -1733,7 +1908,7 @@ static int gru_model_forward_step_with_buffers(
 ) {
     size_t h;
 
-    if (!model || !input || !hidden_state_in || !hidden_state_out || !policy_out || !value_out ||
+    if (!model || !input || !hidden_state_in || !hidden_state_out ||
         !z || !r || !n || !gated_hidden || !logits) {
         return 0;
     }
@@ -1773,14 +1948,15 @@ void gru_model_forward_step(
 ) {
     GruForwardScratch* scratch;
 
-    if (!model || !input || !hidden_state_in || !hidden_state_out || !policy_out || !value_out) {
+    if (!model || !input || !hidden_state_in || !hidden_state_out) {
         return;
     }
     if (!gru_forward_scratch_ensure((GruModel*)model)) {
         return;
     }
     scratch = &((GruModel*)model)->forward_scratch;
-    gru_model_forward_step_with_buffers(model, input, hidden_state_in, hidden_state_out, policy_out, value_out,
+    transform_observation_input(model, input, scratch->transformed_input, scratch->entity_hidden);
+    gru_model_forward_step_with_buffers(model, scratch->transformed_input, hidden_state_in, hidden_state_out, policy_out, value_out,
         scratch->z, scratch->r, scratch->n, scratch->gated_hidden, scratch->logits);
 }
 
@@ -1795,7 +1971,7 @@ void gru_model_forward_sequence(
     size_t t;
     GruForwardScratch* scratch;
 
-    if (!model || !sequence || !hidden_state_io || !policy_out || !value_out) {
+    if (!model || !sequence || !hidden_state_io) {
         return;
     }
     if (!gru_forward_scratch_ensure((GruModel*)model)) {
@@ -1805,7 +1981,8 @@ void gru_model_forward_sequence(
 
     for (t = 0; t < steps; ++t) {
         const float* input = sequence + (t * model->input_dim);
-        if (!gru_model_forward_step_with_buffers(model, input, hidden_state_io, scratch->next_hidden, policy_out, value_out,
+        transform_observation_input(model, input, scratch->transformed_input, scratch->entity_hidden);
+        if (!gru_model_forward_step_with_buffers(model, scratch->transformed_input, hidden_state_io, scratch->next_hidden, policy_out, value_out,
                 scratch->z, scratch->r, scratch->n, scratch->gated_hidden, scratch->logits)) {
             return;
         }
@@ -2111,6 +2288,12 @@ static int recurrent_update_sequence(
     float* grad_wnx = NULL; float* grad_wnh = NULL; float* grad_bn = NULL;
     float* grad_policy_head = NULL; float* grad_policy_bias = NULL;
     float* grad_value_head = NULL;
+    float* transformed_inputs = NULL;
+    float* entity_hidden_cache = NULL;
+    float* grad_input = NULL;
+    float* grad_entity_encoder = NULL;
+    float* grad_entity_bias = NULL;
+    float* grad_entity_decoder = NULL;
     float* grad_slot0_kind_head = NULL; float* grad_slot0_kind_bias = NULL;
     float* grad_slot0_move_head = NULL; float* grad_slot0_move_bias = NULL;
     float* grad_slot0_switch_head = NULL; float* grad_slot0_switch_bias = NULL;
@@ -2178,6 +2361,12 @@ static int recurrent_update_sequence(
     grad_policy_head = scratch->grad_policy_head;
     grad_policy_bias = scratch->grad_policy_bias;
     grad_value_head = scratch->grad_value_head;
+    transformed_inputs = scratch->transformed_inputs;
+    entity_hidden_cache = scratch->entity_hidden;
+    grad_input = scratch->grad_input;
+    grad_entity_encoder = scratch->grad_entity_encoder;
+    grad_entity_bias = scratch->grad_entity_bias;
+    grad_entity_decoder = scratch->grad_entity_decoder;
     memset(h_states, 0, steps * hdim * sizeof(float));
     memset(z_cache, 0, steps * hdim * sizeof(float));
     memset(r_cache, 0, steps * hdim * sizeof(float));
@@ -2205,6 +2394,14 @@ static int recurrent_update_sequence(
     memset(grad_policy_head, 0, model->policy_head.rows * model->policy_head.cols * sizeof(float));
     memset(grad_policy_bias, 0, adim * sizeof(float));
     memset(grad_value_head, 0, hdim * sizeof(float));
+    memset(transformed_inputs, 0, steps * xdim * sizeof(float));
+    memset(entity_hidden_cache, 0, steps * 2u * OBS_TEAM_SIZE * GRU_ENTITY_EMBED_DIM * sizeof(float));
+    memset(grad_input, 0, xdim * sizeof(float));
+    if (model->entity_encoder_enabled) {
+        memset(grad_entity_encoder, 0, model->entity_encoder.rows * model->entity_encoder.cols * sizeof(float));
+        memset(grad_entity_bias, 0, GRU_ENTITY_EMBED_DIM * sizeof(float));
+        memset(grad_entity_decoder, 0, model->entity_decoder.rows * model->entity_decoder.cols * sizeof(float));
+    }
     grad_slot0_kind_head = (float*)calloc(model->slot0_kind_head.rows * model->slot0_kind_head.cols, sizeof(float));
     grad_slot0_kind_bias = (float*)calloc(FACTORIZED_KIND_DIM, sizeof(float));
     grad_slot0_move_head = (float*)calloc(model->slot0_move_head.rows * model->slot0_move_head.cols, sizeof(float));
@@ -2264,13 +2461,16 @@ static int recurrent_update_sequence(
     }
 
     for (t = 0; t < steps; ++t) {
-        const float* input = sequence + (t * xdim);
+        const float* raw_input = sequence + (t * xdim);
+        float* input = transformed_inputs + (t * xdim);
         const float* prev_h = (t > 0) ? (h_states + ((t - 1) * hdim)) : start_hidden;
         float* z_t = z_cache + (t * hdim);
         float* r_t = r_cache + (t * hdim);
         float* n_t = n_cache + (t * hdim);
         float* g_t = gated_cache + (t * hdim);
         float* h_t = h_states + (t * hdim);
+        transform_observation_input(model, raw_input, input,
+            entity_hidden_cache + t * 2u * OBS_TEAM_SIZE * GRU_ENTITY_EMBED_DIM);
         memcpy(z_t, model->bz, hdim * sizeof(float));
         memcpy(r_t, model->br, hdim * sizeof(float));
         matrix_vec_mul_accum(&model->wzx, input, z_t);
@@ -2415,7 +2615,8 @@ static int recurrent_update_sequence(
     }
 
     for (t = steps; t-- > 0;) {
-        const float* input = sequence + (t * xdim);
+        const float* raw_input = sequence + (t * xdim);
+        const float* input = transformed_inputs + (t * xdim);
         const float* prev_h = (t > 0) ? (h_states + ((t - 1) * hdim)) : start_hidden;
         const float* z_t = z_cache + (t * hdim);
         const float* r_t = r_cache + (t * hdim);
@@ -2451,6 +2652,15 @@ static int recurrent_update_sequence(
         outer_product_accum(grad_wzh, hdim, hdim, d_pre_z, prev_h);
         matrix_transpose_vec_mul_accum(&model->wrh, d_pre_r, next_grad_h);
         matrix_transpose_vec_mul_accum(&model->wzh, d_pre_z, next_grad_h);
+        if (model->entity_encoder_enabled) {
+            memset(grad_input, 0, xdim * sizeof(float));
+            matrix_transpose_vec_mul_accum(&model->wzx, d_pre_z, grad_input);
+            matrix_transpose_vec_mul_accum(&model->wrx, d_pre_r, grad_input);
+            matrix_transpose_vec_mul_accum(&model->wnx, d_pre_n, grad_input);
+            backprop_entity_encoder(model, raw_input,
+                entity_hidden_cache + t * 2u * OBS_TEAM_SIZE * GRU_ENTITY_EMBED_DIM,
+                grad_input, grad_entity_encoder, grad_entity_bias, grad_entity_decoder);
+        }
         memcpy(grad_h, next_grad_h, hdim * sizeof(float));
     }
 
@@ -2521,6 +2731,9 @@ static int recurrent_update_sequence(
         for (a = 0; a < FACTORIZED_TARGET_DIM; ++a) accum->slot1_target_bias[a] += grad_slot1_target_bias[a];
         for (a = 0; a < model->joint_pair_head.rows * model->joint_pair_head.cols; ++a) accum->joint_pair_head[a] += grad_joint_pair_head[a];
         for (a = 0; a < FACTORIZED_PAIR_DIM; ++a) accum->joint_pair_bias[a] += grad_joint_pair_bias[a];
+        for (a = 0; a < model->entity_encoder.rows * model->entity_encoder.cols; ++a) accum->entity_encoder[a] += grad_entity_encoder[a];
+        for (a = 0; a < (model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 0u); ++a) accum->entity_bias[a] += grad_entity_bias[a];
+        for (a = 0; a < model->entity_decoder.rows * model->entity_decoder.cols; ++a) accum->entity_decoder[a] += grad_entity_decoder[a];
 #ifdef _OPENMP
         #pragma omp parallel for if(hdim >= 64)
 #endif
@@ -2594,6 +2807,9 @@ static int recurrent_update_sequence(
         for (a = 0; a < FACTORIZED_TARGET_DIM; ++a) model->slot1_target_bias[a] -= learning_rate * grad_slot1_target_bias[a];
         for (a = 0; a < model->joint_pair_head.rows * model->joint_pair_head.cols; ++a) model->joint_pair_head.data[a] -= learning_rate * grad_joint_pair_head[a];
         for (a = 0; a < FACTORIZED_PAIR_DIM; ++a) model->joint_pair_bias[a] -= learning_rate * grad_joint_pair_bias[a];
+        for (a = 0; a < model->entity_encoder.rows * model->entity_encoder.cols; ++a) model->entity_encoder.data[a] -= learning_rate * grad_entity_encoder[a];
+        for (a = 0; a < (model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 0u); ++a) model->entity_bias[a] -= learning_rate * grad_entity_bias[a];
+        for (a = 0; a < model->entity_decoder.rows * model->entity_decoder.cols; ++a) model->entity_decoder.data[a] -= learning_rate * grad_entity_decoder[a];
 #ifdef _OPENMP
         #pragma omp parallel for if(hdim >= 64)
 #endif
@@ -3208,15 +3424,28 @@ size_t gru_model_parameter_count(const GruModel* model) {
         model->slot1_tera_head.rows * model->slot1_tera_head.cols + FACTORIZED_TERA_DIM +
         model->slot1_target_head.rows * model->slot1_target_head.cols + FACTORIZED_TARGET_DIM +
         model->joint_pair_head.rows * model->joint_pair_head.cols + FACTORIZED_PAIR_DIM +
+        model->entity_encoder.rows * model->entity_encoder.cols +
+        (model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 0u) +
+        model->entity_decoder.rows * model->entity_decoder.cols +
         model->hidden_dim +
         1;
+}
+
+size_t gru_model_pre_entity_parameter_count(const GruModel* model) {
+    if (!model) {
+        return 0;
+    }
+    return gru_model_parameter_count(model) -
+        model->entity_encoder.rows * model->entity_encoder.cols -
+        (model->entity_encoder_enabled ? GRU_ENTITY_EMBED_DIM : 0u) -
+        model->entity_decoder.rows * model->entity_decoder.cols;
 }
 
 size_t gru_model_pre_joint_parameter_count(const GruModel* model) {
     if (!model) {
         return 0;
     }
-    return gru_model_parameter_count(model) -
+    return gru_model_pre_entity_parameter_count(model) -
         (model->joint_pair_head.rows * model->joint_pair_head.cols + FACTORIZED_PAIR_DIM);
 }
 
@@ -3292,6 +3521,11 @@ int gru_model_export_parameters(const GruModel* model, float* out, size_t count)
     copy_out(out, &idx, model->slot1_target_bias, FACTORIZED_TARGET_DIM);
     copy_out(out, &idx, model->joint_pair_head.data, model->joint_pair_head.rows * model->joint_pair_head.cols);
     copy_out(out, &idx, model->joint_pair_bias, FACTORIZED_PAIR_DIM);
+    if (model->entity_encoder_enabled) {
+        copy_out(out, &idx, model->entity_encoder.data, model->entity_encoder.rows * model->entity_encoder.cols);
+        copy_out(out, &idx, model->entity_bias, GRU_ENTITY_EMBED_DIM);
+        copy_out(out, &idx, model->entity_decoder.data, model->entity_decoder.rows * model->entity_decoder.cols);
+    }
     copy_out(out, &idx, model->value_head, model->hidden_dim);
     out[idx++] = model->value_bias;
     return idx == gru_model_parameter_count(model);
@@ -3302,6 +3536,8 @@ int gru_model_import_parameters(GruModel* model, const float* in, size_t count) 
     size_t legacy_count;
     size_t pre_target_count;
     size_t pre_joint_count;
+    size_t pre_entity_count;
+    int has_entity_encoder;
     int has_joint_head;
     int has_target_heads;
     int has_factorized_heads;
@@ -3309,6 +3545,7 @@ int gru_model_import_parameters(GruModel* model, const float* in, size_t count) 
         return 0;
     }
     legacy_count = gru_model_legacy_parameter_count(model);
+    pre_entity_count = gru_model_pre_entity_parameter_count(model);
     pre_joint_count = gru_model_pre_joint_parameter_count(model);
     pre_target_count = gru_model_pre_target_parameter_count(model);
     if (count < legacy_count) {
@@ -3325,7 +3562,8 @@ int gru_model_import_parameters(GruModel* model, const float* in, size_t count) 
     copy_in(model->bn, in, &idx, model->hidden_dim);
     copy_in(model->policy_head.data, in, &idx, model->policy_head.rows * model->policy_head.cols);
     copy_in(model->policy_bias, in, &idx, model->num_actions);
-    has_joint_head = count == gru_model_parameter_count(model);
+    has_entity_encoder = model->entity_encoder_enabled && count == gru_model_parameter_count(model);
+    has_joint_head = has_entity_encoder || count == pre_entity_count;
     has_target_heads = has_joint_head || count == pre_joint_count;
     has_factorized_heads = has_target_heads || count == pre_target_count;
     if (has_factorized_heads) {
@@ -3368,6 +3606,15 @@ int gru_model_import_parameters(GruModel* model, const float* in, size_t count) 
     } else {
         memset(model->joint_pair_head.data, 0, model->joint_pair_head.rows * model->joint_pair_head.cols * sizeof(float));
         memset(model->joint_pair_bias, 0, FACTORIZED_PAIR_DIM * sizeof(float));
+    }
+    if (has_entity_encoder) {
+        copy_in(model->entity_encoder.data, in, &idx, model->entity_encoder.rows * model->entity_encoder.cols);
+        copy_in(model->entity_bias, in, &idx, GRU_ENTITY_EMBED_DIM);
+        copy_in(model->entity_decoder.data, in, &idx, model->entity_decoder.rows * model->entity_decoder.cols);
+    } else if (model->entity_encoder_enabled) {
+        memset(model->entity_encoder.data, 0, model->entity_encoder.rows * model->entity_encoder.cols * sizeof(float));
+        memset(model->entity_bias, 0, GRU_ENTITY_EMBED_DIM * sizeof(float));
+        memset(model->entity_decoder.data, 0, model->entity_decoder.rows * model->entity_decoder.cols * sizeof(float));
     }
     copy_in(model->value_head, in, &idx, model->hidden_dim);
     model->value_bias = in[idx++];

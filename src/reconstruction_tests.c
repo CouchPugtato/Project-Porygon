@@ -3083,6 +3083,150 @@ static int test_symmetric_joint_action_training(void) {
     return ok;
 }
 
+static int test_shared_entity_encoder_training_and_migration(void) {
+    const char* pre_entity_path = "checkpoint_test_pre_entity.bin";
+    GruModel* model = gru_model_create(observation_flat_size(), 4u, OBS_NUM_ACTIONS);
+    GruModel* migrated = NULL;
+    GruModel* loaded = NULL;
+    Observation observation;
+    FactorizedActionChoice choice;
+    float* sequence = NULL;
+    float* before = NULL;
+    float* after = NULL;
+    float* pre_entity = NULL;
+    float* migrated_parameters = NULL;
+    float hidden_state[4] = {0};
+    float forward_value = 0.0f;
+    unsigned char legal_mask[OBS_NUM_ACTIONS] = {0};
+    size_t current_count;
+    size_t pre_entity_count;
+    size_t value_count = 5u;
+    size_t entity_chunk =
+        (size_t)GRU_ENTITY_EMBED_DIM * OBS_POKEMON_FEATURES +
+        GRU_ENTITY_EMBED_DIM +
+        (size_t)OBS_POKEMON_FEATURES * GRU_ENTITY_EMBED_DIM;
+    size_t entity_offset;
+    size_t i;
+    TestCheckpointHeader header;
+    TrainerCheckpointState state;
+    CheckpointLoadResult result;
+    int encoder_changed = 0;
+    int adam_changed = 0;
+    int ok = 1;
+    ok &= assert_true(model != NULL, "shared entity encoder test creates observation-sized model");
+    if (!model) return 0;
+    current_count = gru_model_parameter_count(model);
+    pre_entity_count = gru_model_pre_entity_parameter_count(model);
+    ok &= assert_true(current_count - pre_entity_count == entity_chunk,
+        "shared entity encoder is serialized once for all Pokemon slots");
+    sequence = (float*)calloc(observation_flat_size(), sizeof(float));
+    before = (float*)malloc(current_count * sizeof(float));
+    after = (float*)malloc(current_count * sizeof(float));
+    pre_entity = (float*)malloc(pre_entity_count * sizeof(float));
+    migrated_parameters = (float*)malloc(current_count * sizeof(float));
+    ok &= assert_true(sequence && before && after && pre_entity && migrated_parameters,
+        "shared entity encoder test allocates buffers");
+    if (!sequence || !before || !after || !pre_entity || !migrated_parameters) goto cleanup;
+    observation_init(&observation);
+    observation.self_team[0].known = 1;
+    observation.self_team[0].revealed = 1;
+    observation.self_team[0].active = 1;
+    observation.self_team[0].hp_frac = 1.0f;
+    observation.self_team[0].species_id = 25;
+    observation.self_team[0].species_known_mode = 2;
+    observation.legal_mask[OBS_A1_MOVE1] = 1;
+    ok &= assert_true(observation_flatten(sequence, observation_flat_size(), &observation) == observation_flat_size(),
+        "shared entity encoder test flattens observation");
+    gru_model_forward_step(model, sequence, hidden_state, hidden_state, NULL, &forward_value);
+    ok &= assert_true(hidden_state[0] != 0.0f || hidden_state[1] != 0.0f ||
+            hidden_state[2] != 0.0f || hidden_state[3] != 0.0f,
+        "value-only runtime forward call advances recurrent state");
+    legal_mask[OBS_A1_MOVE1] = 1;
+    factorized_action_choice_from_flat_actions(&choice, OBS_A1_MOVE1, -1);
+    ok &= assert_true(gru_model_export_parameters(model, before, current_count),
+        "shared entity encoder test exports initial parameters");
+    gru_model_clear_accumulated_supervised_updates(model);
+    ok &= assert_true(gru_model_supervised_accumulate_sequence_window_factorized(
+        model, sequence, 1u, NULL, legal_mask, NULL, &choice, 0.0f,
+        NULL, NULL, NULL), "shared entity encoder receives recurrent gradients");
+    ok &= assert_true(gru_model_apply_accumulated_supervised_updates(model, 0.05f),
+        "shared entity encoder applies recurrent update");
+    ok &= assert_true(gru_model_export_parameters(model, after, current_count),
+        "shared entity encoder test exports updated parameters");
+    entity_offset = current_count - value_count - entity_chunk;
+    for (i = 0; i < entity_chunk; ++i) {
+        if (before[entity_offset + i] != after[entity_offset + i]) {
+            encoder_changed = 1;
+            break;
+        }
+    }
+    ok &= assert_true(encoder_changed, "shared entity encoder learns from a Pokemon in any team slot");
+    memcpy(before, after, current_count * sizeof(float));
+    gru_model_clear_accumulated_supervised_updates(model);
+    ok &= assert_true(gru_model_supervised_accumulate_sequence_window_factorized(
+        model, sequence, 1u, NULL, legal_mask, NULL, &choice, 0.0f,
+        NULL, NULL, NULL), "shared entity encoder accumulates an Adam update");
+    ok &= assert_true(gru_model_apply_accumulated_adam_updates(
+        model, 0.001f, 0.9f, 0.999f, 1.0e-8f, 1.0f),
+        "shared entity encoder participates in Adam optimization");
+    ok &= assert_true(gru_model_export_parameters(model, after, current_count),
+        "shared entity encoder exports after Adam optimization");
+    for (i = 0; i < entity_chunk; ++i) {
+        if (before[entity_offset + i] != after[entity_offset + i]) {
+            adam_changed = 1;
+            break;
+        }
+    }
+    ok &= assert_true(adam_changed, "Adam updates the shared entity encoder parameters");
+
+    memcpy(pre_entity, after, entity_offset * sizeof(float));
+    memcpy(pre_entity + entity_offset, after + entity_offset + entity_chunk, value_count * sizeof(float));
+    memset(&header, 0, sizeof(header));
+    memset(&state, 0, sizeof(state));
+    memcpy(header.magic, "PORYCHK", 7);
+    header.version = CHECKPOINT_MIN_SUPPORTED_VERSION;
+    header.input_dim = observation_flat_size();
+    header.hidden_dim = 4u;
+    header.num_actions = OBS_NUM_ACTIONS;
+    header.parameter_count = pre_entity_count;
+    header.trainer = state;
+    remove(pre_entity_path);
+    ok &= assert_true(write_test_checkpoint(pre_entity_path, &header, pre_entity),
+        "shared entity encoder test writes pre-entity checkpoint fixture");
+    loaded = checkpoint_load_compatible(pre_entity_path, NULL,
+        observation_flat_size(), OBS_NUM_ACTIONS, &result);
+    ok &= assert_true(loaded != NULL && result.status == CHECKPOINT_LOAD_OK &&
+            result.parameter_layout == CHECKPOINT_LAYOUT_FACTORIZED,
+        "checkpoint loader accepts pre-entity factorized layout");
+    migrated = gru_model_create(observation_flat_size(), 4u, OBS_NUM_ACTIONS);
+    ok &= assert_true(migrated != NULL &&
+            gru_model_import_parameters(migrated, pre_entity, pre_entity_count) &&
+            gru_model_export_parameters(migrated, migrated_parameters, current_count),
+        "pre-entity checkpoint parameters migrate successfully");
+    if (migrated) {
+        int neutral = 1;
+        for (i = 0; i < entity_chunk; ++i) {
+            if (migrated_parameters[entity_offset + i] != 0.0f) {
+                neutral = 0;
+                break;
+            }
+        }
+        ok &= assert_true(neutral, "pre-entity migration initializes the shared residual path neutrally");
+    }
+
+cleanup:
+    remove(pre_entity_path);
+    gru_model_destroy(loaded);
+    gru_model_destroy(migrated);
+    gru_model_destroy(model);
+    free(sequence);
+    free(before);
+    free(after);
+    free(pre_entity);
+    free(migrated_parameters);
+    return ok;
+}
+
 static int test_checkpoint_compatibility_validation(void) {
     const char* current_path = "checkpoint_test_current.bin";
     const char* current_temporary_path = "checkpoint_test_current.bin.tmp";
@@ -3420,6 +3564,7 @@ int main(int argc, char** argv) {
     if (!test_episode_target_roundtrip()) return 1;
     if (!test_factorized_target_head_training()) return 1;
     if (!test_symmetric_joint_action_training()) return 1;
+    if (!test_shared_entity_encoder_training_and_migration()) return 1;
     if (!test_checkpoint_compatibility_validation()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;
