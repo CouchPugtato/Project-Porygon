@@ -110,6 +110,12 @@ Metric units:
 - training summaries use `tera_action_rate`: tera move actions divided by all move actions
 - evaluation summaries use `tera_battle_rate`: battles containing a tera divided by matches played
 - `tera_rate` remains in both formats as a backward-compatible alias; do not compare the aliases across artifact types without checking the unit
+- `baseline_tera_action_rate` is also action-level; the shared default is `0.03`, measured from the current pre-PPO actor, and must not be populated from a battle-level evaluation rate
+
+PPO safety behavior:
+
+- `--anchor-checkpoint` and `--anchor-kl-coef` apply to PPO as well as ordinary policy-gradient training
+- `--target-kl` stops the current PPO epoch immediately after the first completed episode update that exceeds the threshold; the triggering value and stop state are written to the training summary
 
 Stable algorithm and guardrail defaults are centralized in `config/rl_defaults.toml`. Reward weights remain in `config/reward_weights.toml` because both the C runtime and Python communicator consume them.
 

@@ -70,6 +70,8 @@ typedef struct {
     double approx_kl_sum;
     double clip_fraction_sum;
     float anchor_kl_max;
+    float target_kl_trigger;
+    int target_kl_exceeded;
     double value_mean_sum;
     double advantage_mean_sum;
     double abs_advantage_mean_sum;
@@ -1495,6 +1497,9 @@ static int write_rl_training_summary_json(
     fprintf(out, "  \"approx_kl\": %.6f,\n", summary->label_weight_sum > 0 ? summary->approx_kl_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"clip_fraction\": %.6f,\n", summary->label_weight_sum > 0 ? summary->clip_fraction_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"anchor_kl_max\": %.6f,\n", summary->anchor_kl_max);
+    fprintf(out, "  \"target_kl\": %.6f,\n", trainer->target_kl);
+    fprintf(out, "  \"target_kl_exceeded\": %s,\n", summary->target_kl_exceeded ? "true" : "false");
+    fprintf(out, "  \"target_kl_trigger\": %.6f,\n", summary->target_kl_trigger);
     fprintf(out, "  \"labels\": %zu\n", summary->label_weight_sum);
     fputs("}\n", out);
     fclose(out);
@@ -2528,6 +2533,8 @@ static int train_from_input_file(
                 rl_training_summary_record_trainer(&rl_summary, &trainer);
                 if (ppo_mode && trainer.target_kl > 0.0f && trainer.last_approx_kl > trainer.target_kl) {
                     ppo_early_stop = 1;
+                    rl_summary.target_kl_exceeded = 1;
+                    rl_summary.target_kl_trigger = trainer.last_approx_kl;
                 }
             } else {
                 if (!gru_trainer_supervised_episode(&trainer, model, &runtime.sessions[session_index].episode)) {
@@ -2612,11 +2619,16 @@ static int train_from_input_file(
                     free(periodic_path);
                 }
             }
+            if (ppo_early_stop) {
+                break;
+            }
         }
 
         if (ppo_early_stop) {
-            printf("[train-ppo] early stop after epoch=%d reason=target_kl_exceeded approx_kl=%.4f target_kl=%.4f\n",
+            printf("[train-ppo] early stop after epoch=%d episodes=%zu/%zu reason=target_kl_exceeded approx_kl=%.4f target_kl=%.4f\n",
                 epoch,
+                trained_in_epoch,
+                train_sessions,
                 trainer.last_approx_kl,
                 trainer.target_kl);
         }
@@ -3004,8 +3016,8 @@ static int showdown_client_main(int argc, char** argv) {
             &reward_config,
             expected_policy_tag,
             training_summary_path,
-            "",
-            0.0f);
+            anchor_checkpoint_path,
+            anchor_kl_coef);
     }
     if (argc >= 4 && strcmp(argv[1], "--eval-supervised") == 0) {
         return evaluate_checkpoint_on_replay_file(argv[2], argv[3], &reward_config);

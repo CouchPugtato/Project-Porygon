@@ -9,8 +9,9 @@ from types import SimpleNamespace
 
 from league_manage import LeagueEval, LeagueMember, LeagueRegistry, OpponentStats, build_pool_payload, league_member_from_json, member_to_json_dict
 from league_rl_orchestrator import build_weighted_pool, collect_recent_opponent_stats, matchup_difficulty_weight, maybe_promote_candidate
-from live_rl_orchestrator import build_selfplay_command, collapse_flags_from_training_summary, round_manifest_completed
+from live_rl_orchestrator import build_selfplay_command, build_train_command, collapse_flags_from_training_summary, round_manifest_completed
 from opponent_sampling import refresh_adaptive_pool
+from rl_defaults import float_default
 from selfplay_server import load_model_pool, pool_coverage_summary, sample_pool_member, validate_pool_member
 
 
@@ -355,6 +356,35 @@ class ResumeAndCollapseTests(unittest.TestCase):
             next_pool.unlink()
             self.assertFalse(round_manifest_completed(manifest))
 
+    def test_ppo_train_command_preserves_anchor_and_target_kl(self) -> None:
+        args = SimpleNamespace(
+            training_mode="ppo",
+            current_policy_tag="parent.chk",
+            epochs=1,
+            learning_rate=0.001,
+            gamma=0.99,
+            entropy_coef=0.001,
+            advantage_norm=True,
+            gae_lambda=0.95,
+            ppo_clip_epsilon=0.2,
+            ppo_value_clip_epsilon=0.2,
+            target_kl=0.02,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_epsilon=1e-8,
+            reward_mode="terminal",
+            training_summary_path=Path("summary.json"),
+            anchor_checkpoint="anchor.chk",
+            anchor_kl_coef=0.01,
+            dense_additive_hp_swing_weight=0.1,
+            dense_additive_faint_swing_weight=0.25,
+            dense_additive_reward_clip=0.4,
+        )
+        command = build_train_command(args, Path("trainer.exe"), Path("episodes.jsonl"), Path("candidate.chk"))
+        self.assertEqual(command[command.index("--anchor-checkpoint") + 1], "anchor.chk")
+        self.assertEqual(command[command.index("--anchor-kl-coef") + 1], "0.01")
+        self.assertEqual(command[command.index("--target-kl") + 1], "0.02")
+
     def test_training_collapse_uses_action_level_tera_metric(self) -> None:
         flags = collapse_flags_from_training_summary(
             {
@@ -364,13 +394,29 @@ class ResumeAndCollapseTests(unittest.TestCase):
                 "move_slot_rates": {"slot_1": 0.71},
                 "anchor_kl_mean": 0.11,
             },
-            baseline_tera_rate=0.50,
+            baseline_tera_action_rate=0.50,
             min_episodes_warn=100,
             anchor_kl_warn_threshold=0.10,
         )
-        self.assertTrue(any(flag.startswith("warn_tera_rate_low") for flag in flags))
+        self.assertTrue(any(flag.startswith("warn_tera_action_rate_low") for flag in flags))
         self.assertTrue(any(flag.startswith("hard_move_slot_collapse") for flag in flags))
         self.assertTrue(any(flag.startswith("warn_anchor_kl_high") for flag in flags))
+
+    def test_default_tera_guardrail_uses_action_level_units(self) -> None:
+        baseline = float_default("baseline_tera_action_rate")
+        self.assertGreater(baseline, 0.0)
+        self.assertLess(baseline, 0.10)
+        flags = collapse_flags_from_training_summary(
+            {
+                "episode_count": 200,
+                "tera_action_rate": baseline,
+                "move_slot_rates": {},
+            },
+            baseline_tera_action_rate=baseline,
+            min_episodes_warn=100,
+            anchor_kl_warn_threshold=0.10,
+        )
+        self.assertFalse(any(flag.startswith("warn_tera_action_rate_low") for flag in flags))
 
 
 if __name__ == "__main__":

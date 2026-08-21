@@ -273,7 +273,7 @@ def trainer_env(args: argparse.Namespace) -> dict[str, str] | None:
     return {"PORYGON_OMP_THREADS": str(args.omp_threads)}
 
 
-def collapse_flags_from_training_summary(summary: dict[str, object], baseline_tera_rate: float, min_episodes_warn: int, anchor_kl_warn_threshold: float) -> list[str]:
+def collapse_flags_from_training_summary(summary: dict[str, object], baseline_tera_action_rate: float, min_episodes_warn: int, anchor_kl_warn_threshold: float) -> list[str]:
     flags: list[str] = []
     episode_count = int(summary.get("episode_count", 0) or 0)
     tera_rate = float(summary.get("tera_action_rate", summary.get("tera_rate", 0.0)) or 0.0)
@@ -281,8 +281,8 @@ def collapse_flags_from_training_summary(summary: dict[str, object], baseline_te
     anchor_kl_mean = float(summary.get("anchor_kl_mean", 0.0) or 0.0)
     if episode_count < min_episodes_warn:
         flags.append(f"warn_low_episode_count:{episode_count}")
-    if baseline_tera_rate > 0.0 and tera_rate < (float_default("warn_tera_baseline_ratio") * baseline_tera_rate):
-        flags.append(f"warn_tera_rate_low:{tera_rate:.3f}:{baseline_tera_rate:.3f}")
+    if baseline_tera_action_rate > 0.0 and tera_rate < (float_default("warn_tera_baseline_ratio") * baseline_tera_action_rate):
+        flags.append(f"warn_tera_action_rate_low:{tera_rate:.3f}:{baseline_tera_action_rate:.3f}")
     for key, value in move_slot_rates.items():
         rate = float(value or 0.0)
         if rate > 0.70:

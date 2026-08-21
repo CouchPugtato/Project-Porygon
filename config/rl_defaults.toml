@@ -24,7 +24,9 @@ adam_epsilon = 0.00000001
 
 anchor_kl_coef = 0.01
 anchor_kl_warn_threshold = 0.10
-baseline_tera_action_rate = 0.8562992125984252
+# Current pre-PPO actor baseline, measured as tera move actions / move actions.
+# Do not substitute the roughly 0.86 battle-level Tera usage rate here.
+baseline_tera_action_rate = 0.03
 min_training_episodes_warn = 100
 
 warn_move_slot_concentration = 0.55
