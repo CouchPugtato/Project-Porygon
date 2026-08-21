@@ -115,11 +115,36 @@ Metric units:
 PPO safety behavior:
 
 - `--anchor-checkpoint` and `--anchor-kl-coef` apply to PPO as well as ordinary policy-gradient training
-- `--target-kl` stops the current PPO epoch immediately after the first completed episode update that exceeds the threshold; the triggering value and stop state are written to the training summary
+- PPO accumulates a configurable number of episodes before each Adam update (`--ppo-minibatch-episodes`, default `8`), reducing sensitivity to one unusually short or unusual battle
+- `--shuffle-seed` makes the episode order reproducible across candidates trained from the same batch
+- `--target-kl` uses the label-weighted running mean and does not stop until both `--target-kl-min-episodes` and `--target-kl-min-labels` have been processed
+- `--target-kl-hard-multiplier` remains an emergency stop for an update whose KL is far beyond the target
+- the training summary records the input parent, output checkpoint, anchor, shuffle seed, minibatch size, available/processed episode counts, and whether the ordinary or emergency KL stop fired
 
 Stable algorithm and guardrail defaults are centralized in `config/rl_defaults.toml`. Reward weights remain in `config/reward_weights.toml` because both the C runtime and Python communicator consume them.
 
 Use `py/tools/eval_collapse_check.py` to re-run those checks from an existing summary JSON.
+
+## Controlled PPO hyperparameter search
+
+`py/tools/ppo_search.py` compares candidates without mixing data quality into the result. Every trial starts from the same `--init-checkpoint`, trains on the same required `--episode-batch`, and uses the same anchor and parent opponent. It searches learning rate, entropy coefficient, anchor strength, PPO clip, and deterministic shuffle seed.
+
+The search is staged:
+
+1. Train all sampled combinations and reject candidates that trip KL, anchor, or clipping safety checks.
+2. Evaluate the safest candidates against the parent with the candidate on both sides of the matchup; these live games provide the candidate-specific Tera and move-slot collapse checks.
+3. Give only the leading candidates a larger final evaluation.
+4. Rank results by the lower bound of the 95% Wilson interval, with collapse-free candidates first.
+
+Screening defaults to 250 games per side and final evaluation defaults to 1,000 games per side. These values are intentionally much larger than a smoke test; reduce them only when validating that the workflow itself runs. Existing candidate and evaluation artifacts are reused by default, so rerunning the same command resumes interrupted work.
+
+Example shape (run this only after building and copying the current client):
+
+```powershell
+python .\py\tools\ppo_search.py --run-prefix search_replace_me --init-checkpoint .\models\runs\parent\parent.chk --episode-batch .\matches\runs\collection\collection_episodes_a.jsonl --anchor-checkpoint .\models\runs\parent\parent.chk --eval-model-b .\models\runs\parent\parent.chk
+```
+
+For a robustness check, pass multiple deterministic orders such as `--shuffle-seeds 101,202,303`. The manifest under `models/search/<run-prefix>/` contains all training diagnostics, balanced evaluation results, confidence intervals, and the selected result. A search result is evidence for the tested parent, batch, opponent, and parameter ranges—not a universally optimal PPO setting.
 
 ## Collection provenance
 

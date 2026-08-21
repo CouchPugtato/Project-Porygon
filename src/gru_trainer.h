@@ -52,5 +52,10 @@ TrainerCheckpointState gru_trainer_checkpoint_state(const GruTrainer* trainer);
 int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const Episode* episode);
 int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, const Episode* episode);
 int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode* episode);
+int gru_trainer_ppo_minibatch(
+    GruTrainer* trainer,
+    GruModel* model,
+    const Episode* const* episodes,
+    size_t episode_count);
 
 #endif

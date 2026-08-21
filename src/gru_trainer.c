@@ -1086,7 +1086,13 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     return 1;
 }
 
-int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode* episode) {
+static int gru_trainer_ppo_episode_accumulate(
+    GruTrainer* trainer,
+    GruModel* model,
+    const Episode* episode,
+    int clear_before,
+    int apply_after
+) {
     size_t t;
     size_t hidden_dim;
     size_t labeled_steps = 0;
@@ -1174,7 +1180,9 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         return 0;
     }
 
-    gru_model_clear_accumulated_supervised_updates(model);
+    if (clear_before) {
+        gru_model_clear_accumulated_supervised_updates(model);
+    }
 
     gru_model_zero_state(model, hidden);
     if (anchor_enabled) {
@@ -1377,7 +1385,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         ++trainer->step;
     }
 
-    if (!gru_model_apply_accumulated_adam_updates(
+    if (apply_after && !gru_model_apply_accumulated_adam_updates(
             model,
             trainer->learning_rate,
             trainer->adam_beta1,
@@ -1419,5 +1427,83 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
     free(anchor_hidden);
     free(anchor_next_hidden);
     free(anchor_hidden_after);
+    return 1;
+}
+
+int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode* episode) {
+    return gru_trainer_ppo_episode_accumulate(trainer, model, episode, 1, 1);
+}
+
+int gru_trainer_ppo_minibatch(
+    GruTrainer* trainer,
+    GruModel* model,
+    const Episode* const* episodes,
+    size_t episode_count
+) {
+    size_t i;
+    size_t labels = 0;
+    double policy_loss_sum = 0.0;
+    double value_loss_sum = 0.0;
+    double mean_return_sum = 0.0;
+    double mean_advantage_sum = 0.0;
+    double mean_abs_advantage_sum = 0.0;
+    double mean_value_sum = 0.0;
+    double entropy_sum = 0.0;
+    double approx_kl_sum = 0.0;
+    double clip_fraction_sum = 0.0;
+    double anchor_kl_sum = 0.0;
+    double anchor_loss_sum = 0.0;
+    float anchor_kl_max = 0.0f;
+
+    if (!trainer || !model || !episodes || episode_count == 0) {
+        return 0;
+    }
+    gru_model_clear_accumulated_supervised_updates(model);
+    for (i = 0; i < episode_count; ++i) {
+        size_t episode_labels;
+        if (!episodes[i] || !gru_trainer_ppo_episode_accumulate(trainer, model, episodes[i], 0, 0)) {
+            gru_model_clear_accumulated_supervised_updates(model);
+            return 0;
+        }
+        episode_labels = trainer->last_rl_labels;
+        labels += episode_labels;
+        policy_loss_sum += (double)trainer->last_policy_loss * episode_labels;
+        value_loss_sum += (double)trainer->last_value_loss * episode_labels;
+        mean_return_sum += (double)trainer->last_mean_return * episode_labels;
+        mean_advantage_sum += (double)trainer->last_mean_advantage * episode_labels;
+        mean_abs_advantage_sum += (double)trainer->last_mean_abs_advantage * episode_labels;
+        mean_value_sum += (double)trainer->last_mean_value * episode_labels;
+        entropy_sum += (double)trainer->last_entropy * episode_labels;
+        approx_kl_sum += (double)trainer->last_approx_kl * episode_labels;
+        clip_fraction_sum += (double)trainer->last_clip_fraction * episode_labels;
+        anchor_kl_sum += (double)trainer->last_anchor_kl_mean * episode_labels;
+        anchor_loss_sum += (double)trainer->last_anchor_loss * episode_labels;
+        if (trainer->last_anchor_kl_max > anchor_kl_max) {
+            anchor_kl_max = trainer->last_anchor_kl_max;
+        }
+    }
+    if (!gru_model_apply_accumulated_adam_updates(
+            model,
+            trainer->learning_rate,
+            trainer->adam_beta1,
+            trainer->adam_beta2,
+            trainer->adam_epsilon,
+            trainer->gradient_clip)) {
+        gru_model_clear_accumulated_supervised_updates(model);
+        return 0;
+    }
+    trainer->last_policy_loss = labels > 0 ? (float)(policy_loss_sum / labels) : 0.0f;
+    trainer->last_value_loss = labels > 0 ? (float)(value_loss_sum / labels) : 0.0f;
+    trainer->last_mean_return = labels > 0 ? (float)(mean_return_sum / labels) : 0.0f;
+    trainer->last_mean_advantage = labels > 0 ? (float)(mean_advantage_sum / labels) : 0.0f;
+    trainer->last_mean_abs_advantage = labels > 0 ? (float)(mean_abs_advantage_sum / labels) : 0.0f;
+    trainer->last_mean_value = labels > 0 ? (float)(mean_value_sum / labels) : 0.0f;
+    trainer->last_entropy = labels > 0 ? (float)(entropy_sum / labels) : 0.0f;
+    trainer->last_approx_kl = labels > 0 ? (float)(approx_kl_sum / labels) : 0.0f;
+    trainer->last_clip_fraction = labels > 0 ? (float)(clip_fraction_sum / labels) : 0.0f;
+    trainer->last_anchor_kl_mean = labels > 0 ? (float)(anchor_kl_sum / labels) : 0.0f;
+    trainer->last_anchor_kl_max = anchor_kl_max;
+    trainer->last_anchor_loss = labels > 0 ? (float)(anchor_loss_sum / labels) : 0.0f;
+    trainer->last_rl_labels = labels;
     return 1;
 }

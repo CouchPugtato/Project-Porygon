@@ -3106,6 +3106,7 @@ static int test_factorized_ppo_anchor_regularization(void) {
     float before_distance;
     float after_distance = 0.0f;
     int legal_joint_indices[4] = {0, 1, FACTORIZED_LOCAL_ACTION_DIM, FACTORIZED_LOCAL_ACTION_DIM + 1};
+    const Episode* minibatch[2];
     int i;
     int ok = 1;
     memset(&episode, 0, sizeof(episode));
@@ -3174,8 +3175,12 @@ static int test_factorized_ppo_anchor_regularization(void) {
     trainer.entropy_coef = 0.0f;
     trainer.anchor_model = anchor;
     trainer.anchor_kl_coef = 0.1f;
-    ok &= assert_true(gru_trainer_ppo_episode(&trainer, model, &episode),
-        "factorized PPO applies anchored update");
+    minibatch[0] = &episode;
+    minibatch[1] = &episode;
+    ok &= assert_true(gru_trainer_ppo_minibatch(&trainer, model, minibatch, 2u),
+        "factorized PPO applies anchored minibatch update");
+    ok &= assert_true(trainer.last_rl_labels == 2u,
+        "factorized PPO minibatch reports all labels");
     ok &= assert_true(trainer.last_anchor_kl_mean > 1.0e-5f &&
         trainer.last_anchor_kl_max >= trainer.last_anchor_kl_mean &&
         trainer.last_anchor_loss > 0.0f,

@@ -202,6 +202,8 @@ def build_train_command(args: argparse.Namespace, trainer_exe: Path, episode_bat
         str(output_checkpoint),
         "--policy-tag-expected",
         str(args.current_policy_tag),
+        "--parent-checkpoint",
+        str(args.current_policy_tag),
         "--epochs",
         str(args.epochs),
         "--learning-rate",
@@ -220,6 +222,16 @@ def build_train_command(args: argparse.Namespace, trainer_exe: Path, episode_bat
         str(args.ppo_value_clip_epsilon),
         "--target-kl",
         str(args.target_kl),
+        "--target-kl-min-episodes",
+        str(args.target_kl_min_episodes),
+        "--target-kl-min-labels",
+        str(args.target_kl_min_labels),
+        "--target-kl-hard-multiplier",
+        str(args.target_kl_hard_multiplier),
+        "--shuffle-seed",
+        str(args.shuffle_seed),
+        "--ppo-minibatch-episodes",
+        str(args.ppo_minibatch_episodes),
         "--adam-beta1",
         str(args.adam_beta1),
         "--adam-beta2",
@@ -333,6 +345,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ppo-clip-epsilon", type=float, default=float_default("ppo_clip_epsilon"))
     parser.add_argument("--ppo-value-clip-epsilon", type=float, default=float_default("ppo_value_clip_epsilon"))
     parser.add_argument("--target-kl", type=float, default=float_default("ppo_target_kl"))
+    parser.add_argument("--target-kl-min-episodes", type=int, default=int_default("ppo_target_kl_min_episodes"))
+    parser.add_argument("--target-kl-min-labels", type=int, default=int_default("ppo_target_kl_min_labels"))
+    parser.add_argument("--target-kl-hard-multiplier", type=float, default=float_default("ppo_target_kl_hard_multiplier"))
+    parser.add_argument("--shuffle-seed", type=int, default=int_default("ppo_shuffle_seed"))
+    parser.add_argument("--ppo-minibatch-episodes", type=int, default=int_default("ppo_minibatch_episodes"))
     parser.add_argument("--adam-beta1", type=float, default=float_default("adam_beta1"))
     parser.add_argument("--adam-beta2", type=float, default=float_default("adam_beta2"))
     parser.add_argument("--adam-epsilon", type=float, default=float_default("adam_epsilon"))

@@ -369,6 +369,11 @@ class ResumeAndCollapseTests(unittest.TestCase):
             ppo_clip_epsilon=0.2,
             ppo_value_clip_epsilon=0.2,
             target_kl=0.02,
+            target_kl_min_episodes=20,
+            target_kl_min_labels=500,
+            target_kl_hard_multiplier=4.0,
+            shuffle_seed=1337,
+            ppo_minibatch_episodes=8,
             adam_beta1=0.9,
             adam_beta2=0.999,
             adam_epsilon=1e-8,
@@ -384,6 +389,11 @@ class ResumeAndCollapseTests(unittest.TestCase):
         self.assertEqual(command[command.index("--anchor-checkpoint") + 1], "anchor.chk")
         self.assertEqual(command[command.index("--anchor-kl-coef") + 1], "0.01")
         self.assertEqual(command[command.index("--target-kl") + 1], "0.02")
+        self.assertEqual(command[command.index("--target-kl-min-episodes") + 1], "20")
+        self.assertEqual(command[command.index("--target-kl-min-labels") + 1], "500")
+        self.assertEqual(command[command.index("--shuffle-seed") + 1], "1337")
+        self.assertEqual(command[command.index("--ppo-minibatch-episodes") + 1], "8")
+        self.assertEqual(command[command.index("--parent-checkpoint") + 1], "parent.chk")
 
     def test_training_collapse_uses_action_level_tera_metric(self) -> None:
         flags = collapse_flags_from_training_summary(

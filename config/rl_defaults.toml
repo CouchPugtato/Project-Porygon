@@ -18,6 +18,14 @@ gae_lambda = 0.95
 ppo_clip_epsilon = 0.20
 ppo_value_clip_epsilon = 0.20
 ppo_target_kl = 0.02
+# Require a representative amount of data before the running-mean KL stop fires.
+ppo_target_kl_min_episodes = 20
+ppo_target_kl_min_labels = 500
+# A single episode may still stop immediately when it exceeds this multiple.
+ppo_target_kl_hard_multiplier = 4.0
+ppo_shuffle_seed = 1337
+# Accumulate this many episodes before each PPO Adam update.
+ppo_minibatch_episodes = 8
 adam_beta1 = 0.90
 adam_beta2 = 0.999
 adam_epsilon = 0.00000001
@@ -37,5 +45,7 @@ fail_fast_earned_win_rate = 0.40
 fail_fast_min_games = 150
 promotion_earned_win_rate = 0.52
 promotion_min_tera_baseline_ratio = 0.60
-ppo_search_prune_approx_kl = 0.12
+# Slightly above the 0.02 training target so a normal boundary crossing is not
+# confused with an unsafe update; the 4x emergency stop is still rejected.
+ppo_search_prune_approx_kl = 0.03
 ppo_search_prune_tera_action_rate = 0.02

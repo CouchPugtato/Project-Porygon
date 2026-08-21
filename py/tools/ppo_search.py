@@ -3,17 +3,23 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
+import os
+import random
+import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from rl_defaults import bool_default, float_default
+from rl_defaults import bool_default, float_default, int_default
 
 
 DEFAULT_RUNS_ROOT = Path("models") / "runs"
 DEFAULT_MATCH_RUNS_ROOT = Path("matches") / "runs"
+DEFAULT_SEARCH_ROOT = Path("models") / "search"
+DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
 
 
 def parse_bool(value: str) -> bool:
@@ -32,6 +38,13 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
 def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0.0:
@@ -40,7 +53,17 @@ def positive_float(value: str) -> float:
 
 
 def csv_floats(value: str) -> list[float]:
-    return [float(part.strip()) for part in value.split(",") if part.strip()]
+    values = [float(part.strip()) for part in value.split(",") if part.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("provide at least one float")
+    return values
+
+
+def csv_ints(value: str) -> list[int]:
+    values = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("provide at least one integer")
+    return values
 
 
 def resolve_repo_root() -> Path:
@@ -58,11 +81,14 @@ def log(message: str) -> None:
     print(f"[ppo-search] {message}", flush=True)
 
 
-def run_command(command: list[str], cwd: Path) -> None:
+def run_command(command: list[str], cwd: Path, env_updates: dict[str, str] | None = None) -> None:
     log("exec: " + " ".join(f'"{part}"' if " " in part else part for part in command))
-    completed = subprocess.run(command, cwd=str(cwd))
+    env = os.environ.copy()
+    if env_updates:
+        env.update(env_updates)
+    completed = subprocess.run(command, cwd=str(cwd), env=env)
     if completed.returncode != 0:
-        raise SystemExit(completed.returncode)
+        raise RuntimeError(f"command failed with exit code {completed.returncode}")
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -74,226 +100,531 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def wilson_interval(wins: int, games: int, z: float = 1.959963984540054) -> tuple[float, float]:
+    if games <= 0:
+        return (0.0, 1.0)
+    p = wins / games
+    denominator = 1.0 + (z * z / games)
+    center = (p + z * z / (2.0 * games)) / denominator
+    margin = z * math.sqrt((p * (1.0 - p) / games) + (z * z / (4.0 * games * games))) / denominator
+    return (max(0.0, center - margin), min(1.0, center + margin))
+
+
+@dataclass(frozen=True)
+class Hyperparameters:
+    learning_rate: float
+    entropy_coef: float
+    anchor_kl_coef: float
+    ppo_clip_epsilon: float
+    shuffle_seed: int
+
+
+@dataclass
+class EvaluationResult:
+    stage: str
+    games: int
+    wins: int
+    earned_wins: int
+    win_rate: float
+    earned_win_rate: float
+    confidence_low: float
+    confidence_high: float
+    collapse_flags: list[str]
+    run_names: list[str]
+
+
 @dataclass
 class TrialResult:
     run_name: str
-    learning_rate: float
-    entropy_coef: float
+    hyperparameters: Hyperparameters
+    checkpoint_path: str
+    training_summary_path: str
+    safety_flags: list[str]
     approx_kl: float
+    target_kl_trigger: float
+    target_kl_exceeded: bool
+    target_kl_hard_stop: bool
+    anchor_kl_mean: float
+    anchor_kl_max: float
     clip_fraction: float
-    tera_rate_train: float
     labels: int
-    earned_win_rate: float
-    completed_games: int
-    collapse_flags: list[str]
+    episode_count: int
+    available_episode_count: int
+    training_reused: bool
+    screen_evaluation: EvaluationResult | None = None
+    final_evaluation: EvaluationResult | None = None
 
 
-def build_train_command(args: argparse.Namespace, repo_root: Path, run_name: str, learning_rate: float, entropy_coef: float, pool_seed: int) -> list[str]:
-    return [
-        sys.executable,
-        str((repo_root / "py" / "tools" / "live_rl_orchestrator.py").resolve()),
-        "--run-name",
-        run_name,
-        "--training-mode",
-        "ppo",
-        "--init-checkpoint",
-        str(resolve_path(repo_root, args.init_checkpoint)),
-        "--rounds",
-        "1",
-        "--games",
-        str(args.games),
-        "--concurrent-games",
-        str(args.concurrent_games),
-        "--worker-pairs",
-        str(args.worker_pairs),
-        "--ensure-shard-count",
-        "true" if args.ensure_shard_count else "false",
-        "--model-b",
-        args.model_b,
-        "--pool-seed",
-        str(pool_seed),
-        "--learning-rate",
-        str(learning_rate),
-        "--gamma",
-        str(args.gamma),
-        "--entropy-coef",
-        str(entropy_coef),
-        "--advantage-norm",
-        "true" if args.advantage_norm else "false",
-        "--reward-mode",
-        args.reward_mode,
-        "--launch-stagger-seconds",
-        str(args.launch_stagger_seconds),
-        "--resource-check-seconds",
-        str(args.resource_check_seconds),
-        "--min-available-memory-gb",
-        str(args.min_available_memory_gb),
-        "--min-available-pagefile-gb",
-        str(args.min_available_pagefile_gb),
-        "--stop-on-collapse",
-        "true",
-        "--omp-threads",
-        str(args.omp_threads),
-        "--resume",
-        "true",
-    ]
+def safe_float_token(value: float) -> str:
+    return f"{value:g}".replace("-", "m").replace(".", "p")
 
 
-def build_eval_command(args: argparse.Namespace, repo_root: Path, run_name: str) -> list[str]:
-    return [
-        sys.executable,
-        str((repo_root / "py" / "tools" / "selfplay_server.py").resolve()),
-        "--run-name",
-        f"{run_name}_vs_g4_{args.eval_games}",
-        "--games",
-        str(args.eval_games),
-        "--concurrent-games",
-        str(args.eval_concurrent_games),
-        "--worker-pairs",
-        str(args.eval_worker_pairs),
-        "--ensure-shard-count",
-        "false",
-        "--model-a-pool",
-        "",
-        "--model-a",
-        str((repo_root / DEFAULT_RUNS_ROOT / run_name / "round01" / "live_rl_round01.chk").resolve()),
-        "--model-b",
-        str(resolve_path(repo_root, args.eval_model_b)),
-        "--launch-stagger-seconds",
-        str(args.launch_stagger_seconds),
-        "--resource-check-seconds",
-        str(args.resource_check_seconds),
-        "--min-available-memory-gb",
-        str(args.min_available_memory_gb),
-        "--min-available-pagefile-gb",
-        str(args.min_available_pagefile_gb),
-        "--startup-timeout-seconds",
-        str(args.startup_timeout_seconds),
-    ]
-
-
-def collect_trial_result(repo_root: Path, run_name: str, learning_rate: float, entropy_coef: float, eval_games: int) -> TrialResult:
-    training_summary = load_json((repo_root / DEFAULT_RUNS_ROOT / run_name / "round01" / f"{run_name}_round01_training_summary.json").resolve())
-    eval_summary = load_json((repo_root / DEFAULT_MATCH_RUNS_ROOT / f"{run_name}_vs_g4_{eval_games}" / f"{run_name}_vs_g4_{eval_games}_summary.json").resolve())
-    group_stats = eval_summary.get("group_stats", {}) or {}
-    side_a = group_stats.get("a", {}) or {}
-    collapse = ((eval_summary.get("group_collapse_flags", {}) or {}).get("a", []) or [])
-    return TrialResult(
-        run_name=run_name,
-        learning_rate=learning_rate,
-        entropy_coef=entropy_coef,
-        approx_kl=float(training_summary.get("approx_kl", 0.0) or 0.0),
-        clip_fraction=float(training_summary.get("clip_fraction", 0.0) or 0.0),
-        tera_rate_train=float(training_summary.get("tera_action_rate", training_summary.get("tera_rate", 0.0)) or 0.0),
-        labels=int(training_summary.get("labels", 0) or 0),
-        earned_win_rate=float(side_a.get("earned_win_rate", 0.0) or 0.0),
-        completed_games=int(eval_summary.get("completed_games", 0) or 0),
-        collapse_flags=[str(flag) for flag in collapse],
+def trial_run_name(prefix: str, index: int, params: Hyperparameters) -> str:
+    return (
+        f"{prefix}_{index:02d}_lr{safe_float_token(params.learning_rate)}"
+        f"_ent{safe_float_token(params.entropy_coef)}"
+        f"_anchor{safe_float_token(params.anchor_kl_coef)}"
+        f"_clip{safe_float_token(params.ppo_clip_epsilon)}"
+        f"_seed{params.shuffle_seed}"
     )
 
 
-def rank_key(result: TrialResult) -> tuple[float, float, float]:
-    collapse_penalty = 0.0 if not result.collapse_flags else -1.0
-    return (collapse_penalty, result.earned_win_rate, -result.approx_kl)
+def build_train_command(
+    args: argparse.Namespace,
+    trainer_exe: Path,
+    episode_batch: Path,
+    init_checkpoint: Path,
+    anchor_checkpoint: Path,
+    output_checkpoint: Path,
+    summary_path: Path,
+    params: Hyperparameters,
+) -> list[str]:
+    expected_tag = args.policy_tag_expected or str(init_checkpoint)
+    return [
+        str(trainer_exe), "--train-live-ppo", str(episode_batch), str(output_checkpoint),
+        "--policy-tag-expected", expected_tag,
+        "--parent-checkpoint", str(init_checkpoint),
+        "--epochs", str(args.epochs),
+        "--learning-rate", str(params.learning_rate),
+        "--gamma", str(args.gamma),
+        "--entropy-coef", str(params.entropy_coef),
+        "--advantage-norm", "1" if args.advantage_norm else "0",
+        "--gae-lambda", str(args.gae_lambda),
+        "--ppo-clip-epsilon", str(params.ppo_clip_epsilon),
+        "--ppo-value-clip-epsilon", str(args.ppo_value_clip_epsilon),
+        "--target-kl", str(args.target_kl),
+        "--target-kl-min-episodes", str(args.target_kl_min_episodes),
+        "--target-kl-min-labels", str(args.target_kl_min_labels),
+        "--target-kl-hard-multiplier", str(args.target_kl_hard_multiplier),
+        "--shuffle-seed", str(params.shuffle_seed),
+        "--ppo-minibatch-episodes", str(args.ppo_minibatch_episodes),
+        "--adam-beta1", str(args.adam_beta1),
+        "--adam-beta2", str(args.adam_beta2),
+        "--adam-epsilon", str(args.adam_epsilon),
+        "--reward-mode", args.reward_mode,
+        "--training-summary-path", str(summary_path),
+        "--anchor-checkpoint", str(anchor_checkpoint),
+        "--anchor-kl-coef", str(params.anchor_kl_coef),
+        "--dense-additive-hp-swing-weight", str(args.dense_additive_hp_swing_weight),
+        "--dense-additive-faint-swing-weight", str(args.dense_additive_faint_swing_weight),
+        "--dense-additive-reward-clip", str(args.dense_additive_reward_clip),
+    ]
+
+
+def build_eval_command(
+    args: argparse.Namespace,
+    repo_root: Path,
+    run_name: str,
+    candidate_checkpoint: Path,
+    parent_checkpoint: Path,
+    candidate_side: str,
+    games: int,
+    pool_seed: int,
+) -> list[str]:
+    model_a = candidate_checkpoint if candidate_side == "a" else parent_checkpoint
+    model_b = parent_checkpoint if candidate_side == "a" else candidate_checkpoint
+    return [
+        sys.executable, str((repo_root / "py" / "tools" / "selfplay_server.py").resolve()),
+        "--run-name", run_name,
+        "--games", str(games),
+        "--concurrent-games", str(args.eval_concurrent_games),
+        "--worker-pairs", str(args.eval_worker_pairs),
+        "--worker-games", "0",
+        "--ensure-shard-count", "true",
+        "--model-a-pool", "",
+        "--model-a", str(model_a),
+        "--model-b-pool", "",
+        "--model-b", str(model_b),
+        "--pool-seed", str(pool_seed),
+        "--format", args.format,
+        "--worker-think-mode", "live",
+        "--serve-client", "1",
+        "--worker-log-stdout", "0",
+        "--launch-stagger-seconds", str(args.launch_stagger_seconds),
+        "--resource-check-seconds", str(args.resource_check_seconds),
+        "--min-available-memory-gb", str(args.min_available_memory_gb),
+        "--min-available-pagefile-gb", str(args.min_available_pagefile_gb),
+        "--startup-timeout-seconds", str(args.startup_timeout_seconds),
+    ]
+
+
+def training_safety_flags(summary: dict[str, object], args: argparse.Namespace, anchor_coef: float) -> list[str]:
+    flags: list[str] = []
+    episodes = int(summary.get("episode_count", 0) or 0)
+    labels = int(summary.get("labels", 0) or 0)
+    approx_kl = float(summary.get("approx_kl", 0.0) or 0.0)
+    anchor_mean = float(summary.get("anchor_kl_mean", 0.0) or 0.0)
+    anchor_max = float(summary.get("anchor_kl_max", 0.0) or 0.0)
+    clip_fraction = float(summary.get("clip_fraction", 0.0) or 0.0)
+    target_exceeded = bool(summary.get("target_kl_exceeded", False))
+    if labels <= 0 or episodes <= 0:
+        flags.append("no_training_data")
+    if bool(summary.get("target_kl_hard_stop", False)):
+        flags.append("target_kl_hard_stop")
+    if target_exceeded and episodes < args.target_kl_min_episodes:
+        flags.append(f"target_kl_before_min_episodes:{episodes}")
+    if target_exceeded and labels < args.target_kl_min_labels:
+        flags.append(f"target_kl_before_min_labels:{labels}")
+    if approx_kl > args.max_approx_kl:
+        flags.append(f"approx_kl_high:{approx_kl:.6f}")
+    if anchor_mean > args.max_anchor_kl_mean:
+        flags.append(f"anchor_kl_mean_high:{anchor_mean:.6f}")
+    if anchor_max > args.max_anchor_kl_max:
+        flags.append(f"anchor_kl_max_high:{anchor_max:.6f}")
+    if anchor_coef > 0.0 and episodes > 1 and anchor_mean <= 0.0:
+        flags.append("anchor_inactive")
+    if clip_fraction > args.max_clip_fraction:
+        flags.append(f"clip_fraction_high:{clip_fraction:.6f}")
+    return flags
+
+
+def collect_training_result(
+    run_name: str,
+    params: Hyperparameters,
+    checkpoint_path: Path,
+    summary_path: Path,
+    args: argparse.Namespace,
+    training_reused: bool = False,
+) -> TrialResult:
+    summary = load_json(summary_path)
+    return TrialResult(
+        run_name=run_name,
+        hyperparameters=params,
+        checkpoint_path=str(checkpoint_path),
+        training_summary_path=str(summary_path),
+        safety_flags=training_safety_flags(summary, args, params.anchor_kl_coef),
+        approx_kl=float(summary.get("approx_kl", 0.0) or 0.0),
+        target_kl_trigger=float(summary.get("target_kl_trigger", 0.0) or 0.0),
+        target_kl_exceeded=bool(summary.get("target_kl_exceeded", False)),
+        target_kl_hard_stop=bool(summary.get("target_kl_hard_stop", False)),
+        anchor_kl_mean=float(summary.get("anchor_kl_mean", 0.0) or 0.0),
+        anchor_kl_max=float(summary.get("anchor_kl_max", 0.0) or 0.0),
+        clip_fraction=float(summary.get("clip_fraction", 0.0) or 0.0),
+        labels=int(summary.get("labels", 0) or 0),
+        episode_count=int(summary.get("episode_count", 0) or 0),
+        available_episode_count=int(summary.get("available_episode_count", 0) or 0),
+        training_reused=training_reused,
+    )
+
+
+def training_artifacts_match(
+    summary_path: Path,
+    episode_batch: Path,
+    init_checkpoint: Path,
+    anchor_checkpoint: Path,
+    output_checkpoint: Path,
+    params: Hyperparameters,
+    args: argparse.Namespace,
+) -> bool:
+    try:
+        summary = load_json(summary_path)
+        expected_paths = {
+            "input_episode_batch": episode_batch,
+            "parent_checkpoint": init_checkpoint,
+            "anchor_checkpoint": anchor_checkpoint,
+            "output_checkpoint": output_checkpoint,
+        }
+        for key, expected in expected_paths.items():
+            recorded = str(summary.get(key, "")).strip()
+            if not recorded or resolve_path(resolve_repo_root(), recorded) != expected.resolve():
+                return False
+        expected_numbers = {
+            "learning_rate": params.learning_rate,
+            "entropy_coef": params.entropy_coef,
+            "anchor_kl_coef": params.anchor_kl_coef,
+            "ppo_clip_epsilon": params.ppo_clip_epsilon,
+        }
+        for key, expected in expected_numbers.items():
+            if not math.isclose(float(summary.get(key, math.nan)), expected, rel_tol=1e-6, abs_tol=1e-12):
+                return False
+        return (
+            int(summary.get("shuffle_seed", -1)) == params.shuffle_seed
+            and int(summary.get("minibatch_episodes", -1)) == args.ppo_minibatch_episodes
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def training_screen_key(trial: TrialResult, target_kl: float) -> tuple[int, float, int, float]:
+    safe = 1 if not trial.safety_flags else 0
+    return (safe, -abs(trial.approx_kl - target_kl * 0.5), trial.labels, -trial.anchor_kl_mean)
+
+
+def evaluation_summary_path(repo_root: Path, run_name: str) -> Path:
+    return repo_root / DEFAULT_MATCH_RUNS_ROOT / run_name / f"{run_name}_summary.json"
+
+
+def evaluation_artifacts_match(
+    summary_path: Path,
+    model_a: Path,
+    model_b: Path,
+    requested_games: int,
+) -> bool:
+    try:
+        summary = load_json(summary_path)
+        specs = summary.get("model_specs", {}) or {}
+        recorded_a = str((specs.get("a", {}) or {}).get("path", "")).strip()
+        recorded_b = str((specs.get("b", {}) or {}).get("path", "")).strip()
+        return (
+            summary.get("status") == "completed"
+            and int(summary.get("target_games", 0) or 0) == requested_games
+            and bool(recorded_a)
+            and bool(recorded_b)
+            and resolve_path(resolve_repo_root(), recorded_a) == model_a.resolve()
+            and resolve_path(resolve_repo_root(), recorded_b) == model_b.resolve()
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def run_balanced_evaluation(
+    args: argparse.Namespace,
+    repo_root: Path,
+    trial: TrialResult,
+    parent_checkpoint: Path,
+    stage: str,
+    games_per_side: int,
+    seed_base: int,
+) -> EvaluationResult:
+    total_games = 0
+    total_wins = 0
+    total_earned_wins = 0
+    collapse_flags: list[str] = []
+    run_names: list[str] = []
+    candidate_checkpoint = Path(trial.checkpoint_path)
+    for side_index, side in enumerate(("a", "b")):
+        run_name = f"{trial.run_name}_{stage}_side_{side}_{games_per_side}"
+        summary_path = evaluation_summary_path(repo_root, run_name)
+        run_names.append(run_name)
+        model_a = candidate_checkpoint if side == "a" else parent_checkpoint
+        model_b = parent_checkpoint if side == "a" else candidate_checkpoint
+        can_resume = (
+            args.resume
+            and trial.training_reused
+            and summary_path.exists()
+            and evaluation_artifacts_match(summary_path, model_a, model_b, games_per_side)
+        )
+        if not can_resume:
+            run_command(build_eval_command(
+                args, repo_root, run_name, candidate_checkpoint, parent_checkpoint,
+                side, games_per_side, seed_base + side_index,
+            ), repo_root)
+        summary = load_json(summary_path)
+        if summary.get("status") != "completed":
+            raise RuntimeError(f"evaluation did not complete: {run_name}")
+        group = ((summary.get("group_stats", {}) or {}).get(side, {}) or {})
+        games = int(group.get("matches_played", 0) or 0)
+        total_games += games
+        total_wins += int(group.get("wins", 0) or 0)
+        total_earned_wins += int(group.get("earned_wins", 0) or 0)
+        side_flags = ((summary.get("group_collapse_flags", {}) or {}).get(side, []) or [])
+        collapse_flags.extend(str(flag) for flag in side_flags)
+    low, high = wilson_interval(total_wins, total_games)
+    return EvaluationResult(
+        stage=stage,
+        games=total_games,
+        wins=total_wins,
+        earned_wins=total_earned_wins,
+        win_rate=(total_wins / total_games) if total_games else 0.0,
+        earned_win_rate=(total_earned_wins / total_games) if total_games else 0.0,
+        confidence_low=low,
+        confidence_high=high,
+        collapse_flags=sorted(set(collapse_flags)),
+        run_names=run_names,
+    )
+
+
+def evaluation_rank_key(trial: TrialResult, final: bool = False) -> tuple[int, float, float, float]:
+    result = trial.final_evaluation if final else trial.screen_evaluation
+    if result is None:
+        return (0, 0.0, 0.0, 0.0)
+    return (1 if not result.collapse_flags else 0, result.confidence_low, result.win_rate, -trial.anchor_kl_mean)
+
+
+def trial_payload(trial: TrialResult) -> dict[str, object]:
+    return asdict(trial)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Controlled anchored PPO hyperparameter search")
     parser.add_argument("--run-prefix", required=True)
     parser.add_argument("--init-checkpoint", required=True)
-    parser.add_argument("--eval-model-b", required=True)
-    parser.add_argument("--games", type=positive_int, default=300)
-    parser.add_argument("--concurrent-games", type=positive_int, default=60)
-    parser.add_argument("--worker-pairs", type=positive_int, default=60)
-    parser.add_argument("--ensure-shard-count", type=parse_bool, default=True)
-    parser.add_argument("--model-b", default="random")
+    parser.add_argument("--episode-batch", required=True)
+    parser.add_argument("--anchor-checkpoint", default="")
+    parser.add_argument("--eval-model-b", default="")
+    parser.add_argument("--policy-tag-expected", default="")
+    parser.add_argument("--trainer-exe", default=str(DEFAULT_TRAINER_EXE))
+    parser.add_argument("--learning-rates", type=csv_floats, default=[5e-6, 1e-5, 2.5e-5, 5e-5])
+    parser.add_argument("--entropy-coefs", type=csv_floats, default=[1e-4, 3e-4, 1e-3])
+    parser.add_argument("--anchor-kl-coefs", type=csv_floats, default=[0.003, 0.01, 0.03])
+    parser.add_argument("--ppo-clip-epsilons", type=csv_floats, default=[0.2])
+    parser.add_argument("--shuffle-seeds", type=csv_ints, default=[101])
+    parser.add_argument("--ppo-minibatch-episodes", type=positive_int, default=int_default("ppo_minibatch_episodes"))
+    parser.add_argument("--max-trials", type=positive_int, default=18)
+    parser.add_argument("--screen-candidates", type=positive_int, default=8)
+    parser.add_argument("--finalists", type=positive_int, default=3)
+    parser.add_argument("--search-seed", type=int, default=2026)
+    parser.add_argument("--epochs", type=positive_int, default=1)
     parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
     parser.add_argument("--advantage-norm", type=parse_bool, default=bool_default("advantage_norm"))
+    parser.add_argument("--gae-lambda", type=float, default=float_default("gae_lambda"))
+    parser.add_argument("--ppo-value-clip-epsilon", type=float, default=float_default("ppo_value_clip_epsilon"))
+    parser.add_argument("--target-kl", type=float, default=float_default("ppo_target_kl"))
+    parser.add_argument("--target-kl-min-episodes", type=positive_int, default=int_default("ppo_target_kl_min_episodes"))
+    parser.add_argument("--target-kl-min-labels", type=positive_int, default=int_default("ppo_target_kl_min_labels"))
+    parser.add_argument("--target-kl-hard-multiplier", type=positive_float, default=float_default("ppo_target_kl_hard_multiplier"))
+    parser.add_argument("--adam-beta1", type=float, default=float_default("adam_beta1"))
+    parser.add_argument("--adam-beta2", type=float, default=float_default("adam_beta2"))
+    parser.add_argument("--adam-epsilon", type=float, default=float_default("adam_epsilon"))
     parser.add_argument("--reward-mode", choices=["terminal", "dense_additive"], default="terminal")
-    parser.add_argument("--learning-rates", type=csv_floats, default=[5e-5, 1e-4, 2e-4])
-    parser.add_argument("--entropy-coefs", type=csv_floats, default=[1e-4, 3e-4, 5e-4])
-    parser.add_argument("--max-trials", type=positive_int, default=9)
-    parser.add_argument("--eval-games", type=positive_int, default=500)
-    parser.add_argument("--eval-concurrent-games", type=positive_int, default=60)
-    parser.add_argument("--eval-worker-pairs", type=positive_int, default=120)
-    parser.add_argument("--launch-stagger-seconds", type=float, default=0.35)
+    parser.add_argument("--dense-additive-hp-swing-weight", type=float, default=0.1)
+    parser.add_argument("--dense-additive-faint-swing-weight", type=float, default=0.25)
+    parser.add_argument("--dense-additive-reward-clip", type=float, default=0.4)
+    parser.add_argument("--max-approx-kl", type=float, default=float_default("ppo_search_prune_approx_kl"))
+    parser.add_argument("--max-anchor-kl-mean", type=float, default=0.05)
+    parser.add_argument("--max-anchor-kl-max", type=float, default=0.20)
+    parser.add_argument("--max-clip-fraction", type=float, default=0.25)
+    parser.add_argument("--screen-games-per-side", type=positive_int, default=250)
+    parser.add_argument("--final-games-per-side", type=positive_int, default=1000)
+    parser.add_argument("--eval-concurrent-games", type=positive_int, default=70)
+    parser.add_argument("--eval-worker-pairs", type=positive_int, default=125)
+    parser.add_argument("--format", default="gen9randomdoublesbattle")
+    parser.add_argument("--launch-stagger-seconds", type=float, default=0.25)
     parser.add_argument("--resource-check-seconds", type=float, default=2.0)
-    parser.add_argument("--min-available-memory-gb", type=float, default=3.0)
-    parser.add_argument("--min-available-pagefile-gb", type=float, default=6.0)
+    parser.add_argument("--min-available-memory-gb", type=float, default=2.0)
+    parser.add_argument("--min-available-pagefile-gb", type=float, default=4.0)
     parser.add_argument("--startup-timeout-seconds", type=positive_int, default=120)
-    parser.add_argument("--omp-threads", type=int, default=8)
-    parser.add_argument("--prune-approx-kl", type=float, default=float_default("ppo_search_prune_approx_kl"))
-    parser.add_argument(
-        "--prune-train-tera-action-rate-below",
-        "--prune-train-tera-rate-below",
-        dest="prune_train_tera_action_rate_below",
-        type=float,
-        default=float_default("ppo_search_prune_tera_action_rate"),
-    )
+    parser.add_argument("--omp-threads", type=nonnegative_int, default=8)
+    parser.add_argument("--resume", type=parse_bool, default=True)
     return parser
 
 
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     repo_root = resolve_repo_root()
-    search_dir = (repo_root / "models" / "search" / args.run_prefix).resolve()
+    trainer_exe = resolve_path(repo_root, args.trainer_exe)
+    init_checkpoint = resolve_path(repo_root, args.init_checkpoint)
+    episode_batch = resolve_path(repo_root, args.episode_batch)
+    anchor_checkpoint = resolve_path(repo_root, args.anchor_checkpoint) if args.anchor_checkpoint else init_checkpoint
+    parent_checkpoint = resolve_path(repo_root, args.eval_model_b) if args.eval_model_b else init_checkpoint
+    for label, path in (
+        ("trainer executable", trainer_exe),
+        ("initial checkpoint", init_checkpoint),
+        ("episode batch", episode_batch),
+        ("anchor checkpoint", anchor_checkpoint),
+        ("evaluation parent", parent_checkpoint),
+    ):
+        if not path.exists():
+            raise SystemExit(f"{label} not found: {path}")
+
+    search_dir = (repo_root / DEFAULT_SEARCH_ROOT / args.run_prefix).resolve()
     search_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = search_dir / f"{args.run_prefix}_search_manifest.json"
-
-    trials: list[TrialResult] = []
-    grid = list(itertools.product(args.learning_rates, args.entropy_coefs))[: args.max_trials]
+    combinations = [
+        Hyperparameters(lr, entropy, anchor, clip, shuffle_seed)
+        for lr, entropy, anchor, clip, shuffle_seed in itertools.product(
+            args.learning_rates, args.entropy_coefs, args.anchor_kl_coefs,
+            args.ppo_clip_epsilons, args.shuffle_seeds,
+        )
+    ]
+    random.Random(args.search_seed).shuffle(combinations)
+    combinations = combinations[: args.max_trials]
     manifest: dict[str, object] = {
+        "status": "running",
         "run_prefix": args.run_prefix,
         "started_at_unix": time.time(),
-        "grid": [{"learning_rate": lr, "entropy_coef": ent} for lr, ent in grid],
+        "fixed_inputs": {
+            "init_checkpoint": str(init_checkpoint),
+            "episode_batch": str(episode_batch),
+            "anchor_checkpoint": str(anchor_checkpoint),
+            "evaluation_parent": str(parent_checkpoint),
+        },
+        "search_seed": args.search_seed,
         "trials": [],
     }
     write_json(manifest_path, manifest)
 
-    for index, (learning_rate, entropy_coef) in enumerate(grid, start=1):
-        run_name = f"{args.run_prefix}_{index:02d}_lr{learning_rate:g}_ent{entropy_coef:g}".replace(".", "p")
-        run_command(build_train_command(args, repo_root, run_name, learning_rate, entropy_coef, 100 + index), repo_root)
-        training_summary = load_json((repo_root / DEFAULT_RUNS_ROOT / run_name / "round01" / f"{run_name}_round01_training_summary.json").resolve())
-        approx_kl = float(training_summary.get("approx_kl", 0.0) or 0.0)
-        tera_rate_train = float(training_summary.get("tera_action_rate", training_summary.get("tera_rate", 0.0)) or 0.0)
-        pruned = approx_kl > args.prune_approx_kl or tera_rate_train < args.prune_train_tera_action_rate_below
-        trial_payload: dict[str, object] = {
-            "run_name": run_name,
-            "learning_rate": learning_rate,
-            "entropy_coef": entropy_coef,
-            "approx_kl": approx_kl,
-            "tera_rate_train": tera_rate_train,
-            "tera_action_rate_train": tera_rate_train,
-            "pruned": pruned,
-        }
-        if not pruned:
-            run_command(build_eval_command(args, repo_root, run_name), repo_root)
-            result = collect_trial_result(repo_root, run_name, learning_rate, entropy_coef, args.eval_games)
-            trials.append(result)
-            trial_payload.update({
-                "earned_win_rate": result.earned_win_rate,
-                "completed_games": result.completed_games,
-                "clip_fraction": result.clip_fraction,
-                "collapse_flags": result.collapse_flags,
-            })
-        manifest["trials"].append(trial_payload)
+    trials: list[TrialResult] = []
+    trainer_env = {"PORYGON_OMP_THREADS": str(args.omp_threads)} if args.omp_threads > 0 else None
+    for index, params in enumerate(combinations, start=1):
+        run_name = trial_run_name(args.run_prefix, index, params)
+        run_dir = (repo_root / DEFAULT_RUNS_ROOT / run_name).resolve()
+        checkpoint_path = run_dir / "candidate.chk"
+        summary_path = run_dir / "training_summary.json"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        can_resume = (
+            args.resume
+            and checkpoint_path.exists()
+            and summary_path.exists()
+            and training_artifacts_match(
+                summary_path, episode_batch, init_checkpoint, anchor_checkpoint,
+                checkpoint_path, params, args,
+            )
+        )
+        if not can_resume:
+            shutil.copy2(init_checkpoint, checkpoint_path)
+            run_command(build_train_command(
+                args, trainer_exe, episode_batch, init_checkpoint, anchor_checkpoint,
+                checkpoint_path, summary_path, params,
+            ), repo_root, trainer_env)
+        trial = collect_training_result(
+            run_name, params, checkpoint_path, summary_path, args,
+            training_reused=can_resume,
+        )
+        trials.append(trial)
+        manifest["trials"] = [trial_payload(item) for item in trials]
         write_json(manifest_path, manifest)
+        log(f"trained {run_name} safe={not trial.safety_flags} labels={trial.labels} approx_kl={trial.approx_kl:.6f}")
 
-    ranked = sorted(trials, key=rank_key, reverse=True)
-    manifest["completed_at_unix"] = time.time()
-    manifest["ranked_results"] = [result.__dict__ for result in ranked]
-    manifest["best_result"] = ranked[0].__dict__ if ranked else None
-    write_json(manifest_path, manifest)
-
-    if ranked:
-        best = ranked[0]
+    safe_trials = [trial for trial in trials if not trial.safety_flags]
+    safe_trials.sort(key=lambda trial: training_screen_key(trial, args.target_kl), reverse=True)
+    screen_trials = safe_trials[: args.screen_candidates]
+    for index, trial in enumerate(screen_trials, start=1):
+        trial.screen_evaluation = run_balanced_evaluation(
+            args, repo_root, trial, parent_checkpoint, "screen",
+            args.screen_games_per_side, args.search_seed * 1000 + index * 10,
+        )
+        manifest["trials"] = [trial_payload(item) for item in trials]
+        write_json(manifest_path, manifest)
         log(
-            f"best run={best.run_name} lr={best.learning_rate:g} entropy={best.entropy_coef:g} "
-            f"earned_win_rate={best.earned_win_rate:.4f} approx_kl={best.approx_kl:.4f}"
+            f"screened {trial.run_name} win_rate={trial.screen_evaluation.win_rate:.4f} "
+            f"lower95={trial.screen_evaluation.confidence_low:.4f}"
+        )
+
+    ranked_screen = sorted(screen_trials, key=evaluation_rank_key, reverse=True)
+    finalists = [
+        trial for trial in ranked_screen
+        if trial.screen_evaluation and not trial.screen_evaluation.collapse_flags
+    ][: args.finalists]
+    for index, trial in enumerate(finalists, start=1):
+        trial.final_evaluation = run_balanced_evaluation(
+            args, repo_root, trial, parent_checkpoint, "final",
+            args.final_games_per_side, args.search_seed * 100000 + index * 10,
+        )
+        manifest["trials"] = [trial_payload(item) for item in trials]
+        write_json(manifest_path, manifest)
+        log(
+            f"finalized {trial.run_name} win_rate={trial.final_evaluation.win_rate:.4f} "
+            f"lower95={trial.final_evaluation.confidence_low:.4f}"
+        )
+
+    ranked_final = sorted(finalists, key=lambda trial: evaluation_rank_key(trial, final=True), reverse=True)
+    manifest["status"] = "completed"
+    manifest["completed_at_unix"] = time.time()
+    manifest["ranked_screen_results"] = [trial_payload(trial) for trial in ranked_screen]
+    manifest["ranked_final_results"] = [trial_payload(trial) for trial in ranked_final]
+    manifest["best_result"] = trial_payload(ranked_final[0]) if ranked_final else None
+    write_json(manifest_path, manifest)
+    if ranked_final:
+        best = ranked_final[0]
+        assert best.final_evaluation is not None
+        log(
+            f"best run={best.run_name} lr={best.hyperparameters.learning_rate:g} "
+            f"entropy={best.hyperparameters.entropy_coef:g} anchor={best.hyperparameters.anchor_kl_coef:g} "
+            f"win_rate={best.final_evaluation.win_rate:.4f} lower95={best.final_evaluation.confidence_low:.4f}"
         )
     else:
-        log("no unpruned trials completed")
+        log("no safe finalist completed")
 
 
 if __name__ == "__main__":
