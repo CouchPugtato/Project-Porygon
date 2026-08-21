@@ -1372,6 +1372,8 @@ static void factorized_slot_policy_gradients(
     const FactorizedActionChoice* choice,
     float policy_scale,
     float entropy_coef,
+    const FactorizedPolicySnapshot* anchor_policy,
+    float anchor_kl_coef,
     float* action_loss_sum,
     float* accuracy_sum,
     float* grad_h,
@@ -1407,6 +1409,16 @@ static void factorized_slot_policy_gradients(
     const float* tera_bias = slot == 0 ? model->slot0_tera_bias : model->slot1_tera_bias;
     const Matrix* target_head = slot == 0 ? &model->slot0_target_head : &model->slot1_target_head;
     const float* target_bias = slot == 0 ? model->slot0_target_bias : model->slot1_target_bias;
+    const float* anchor_kind_policy = !anchor_policy ? NULL :
+        (slot == 0 ? anchor_policy->slot0_kind_policy : anchor_policy->slot1_kind_policy);
+    const float* anchor_move_policy = !anchor_policy ? NULL :
+        (slot == 0 ? anchor_policy->slot0_move_policy : anchor_policy->slot1_move_policy);
+    const float* anchor_switch_policy = !anchor_policy ? NULL :
+        (slot == 0 ? anchor_policy->slot0_switch_policy : anchor_policy->slot1_switch_policy);
+    const float* anchor_tera_policy = !anchor_policy ? NULL :
+        (slot == 0 ? anchor_policy->slot0_tera_policy : anchor_policy->slot1_tera_policy);
+    const float* anchor_target_policy = !anchor_policy ? NULL :
+        (slot == 0 ? anchor_policy->slot0_target_policy : anchor_policy->slot1_target_policy);
     int target_kind;
     int accuracy_ok = 1;
     int i;
@@ -1425,6 +1437,7 @@ static void factorized_slot_policy_gradients(
             if (!kind_mask[i]) { grad_logits[i] = 0.0f; continue; }
             grad_logits[i] = (kind_policy[i] - (i == target_kind ? 1.0f : 0.0f)) * policy_scale;
             if (entropy_coef != 0.0f) { float p = kind_policy[i] > 1.0e-8f ? kind_policy[i] : 1.0e-8f; grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy); }
+            if (anchor_kind_policy && anchor_kl_coef > 0.0f) grad_logits[i] += anchor_kl_coef * (kind_policy[i] - anchor_kind_policy[i]);
             grad_kind_bias[i] += grad_logits[i];
             for (h = 0; h < (int)model->hidden_dim; ++h) grad_kind_head[i * model->hidden_dim + h] += grad_logits[i] * hidden_state[h];
         }
@@ -1453,6 +1466,7 @@ static void factorized_slot_policy_gradients(
                 if (!move_mask[i]) { grad_logits[i] = 0.0f; continue; }
                 grad_logits[i] = (move_policy[i] - (i == move_index ? 1.0f : 0.0f)) * policy_scale;
                 if (entropy_coef != 0.0f) { float p = move_policy[i] > 1.0e-8f ? move_policy[i] : 1.0e-8f; grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy); }
+                if (anchor_move_policy && anchor_kl_coef > 0.0f) grad_logits[i] += anchor_kl_coef * (move_policy[i] - anchor_move_policy[i]);
                 grad_move_bias[i] += grad_logits[i];
                 for (h = 0; h < (int)model->hidden_dim; ++h) grad_move_head[i * model->hidden_dim + h] += grad_logits[i] * hidden_state[h];
             }
@@ -1465,6 +1479,12 @@ static void factorized_slot_policy_gradients(
                 if (!tera_mask[i]) { grad_logits[i] = 0.0f; continue; }
                 grad_logits[i] = (tera_policy[i] - (i == tera_index ? 1.0f : 0.0f)) * policy_scale;
                 if (entropy_coef != 0.0f) { float p = tera_policy[i] > 1.0e-8f ? tera_policy[i] : 1.0e-8f; grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy); }
+                if (anchor_tera_policy && anchor_kl_coef > 0.0f) {
+                    float anchor_sum = 0.0f;
+                    int j;
+                    for (j = 0; j < FACTORIZED_TERA_DIM; ++j) if (tera_mask[j]) anchor_sum += anchor_tera_policy[j];
+                    if (anchor_sum > 1.0e-8f) grad_logits[i] += anchor_kl_coef * (tera_policy[i] - anchor_tera_policy[i] / anchor_sum);
+                }
                 grad_tera_bias[i] += grad_logits[i];
                 for (h = 0; h < (int)model->hidden_dim; ++h) grad_tera_head[i * model->hidden_dim + h] += grad_logits[i] * hidden_state[h];
             }
@@ -1482,6 +1502,12 @@ static void factorized_slot_policy_gradients(
                     if (!target_mask[i]) { grad_logits[i] = 0.0f; continue; }
                     grad_logits[i] = (target_policy[i] - (i == target_index ? 1.0f : 0.0f)) * policy_scale;
                     if (entropy_coef != 0.0f) { float p = target_policy[i] > 1.0e-8f ? target_policy[i] : 1.0e-8f; grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy); }
+                    if (anchor_target_policy && anchor_kl_coef > 0.0f) {
+                        float anchor_sum = 0.0f;
+                        int j;
+                        for (j = 0; j < FACTORIZED_TARGET_DIM; ++j) if (target_mask[j]) anchor_sum += anchor_target_policy[j];
+                        if (anchor_sum > 1.0e-8f) grad_logits[i] += anchor_kl_coef * (target_policy[i] - anchor_target_policy[i] / anchor_sum);
+                    }
                     grad_target_bias[i] += grad_logits[i];
                     for (h = 0; h < (int)model->hidden_dim; ++h) grad_target_head[i * model->hidden_dim + h] += grad_logits[i] * hidden_state[h];
                 }
@@ -1499,6 +1525,7 @@ static void factorized_slot_policy_gradients(
                 if (!switch_mask[i]) { grad_logits[i] = 0.0f; continue; }
                 grad_logits[i] = (switch_policy[i] - (i == switch_index ? 1.0f : 0.0f)) * policy_scale;
                 if (entropy_coef != 0.0f) { float p = switch_policy[i] > 1.0e-8f ? switch_policy[i] : 1.0e-8f; grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy); }
+                if (anchor_switch_policy && anchor_kl_coef > 0.0f) grad_logits[i] += anchor_kl_coef * (switch_policy[i] - anchor_switch_policy[i]);
                 grad_switch_bias[i] += grad_logits[i];
                 for (h = 0; h < (int)model->hidden_dim; ++h) grad_switch_head[i * model->hidden_dim + h] += grad_logits[i] * hidden_state[h];
             }
@@ -1575,6 +1602,8 @@ static int joint_policy_gradients(
     const FactorizedActionChoice* choice,
     float policy_scale,
     float entropy_coef,
+    const FactorizedPolicySnapshot* anchor_policy,
+    float anchor_kl_coef,
     float* action_loss_sum,
     float* accuracy_sum,
     float* grad_h,
@@ -1620,6 +1649,9 @@ static int joint_policy_gradients(
             float safe_p = p > 1.0e-8f ? p : 1.0e-8f;
             gradient += entropy_coef * p * (logf(safe_p) - neg_entropy);
         }
+        if (anchor_policy && anchor_policy->has_joint_policy && anchor_kl_coef > 0.0f) {
+            gradient += anchor_kl_coef * (p - anchor_policy->joint_policy[i]);
+        }
         grad_joint[i] = gradient;
         local0_grad[action0] += gradient;
         local1_grad[action1] += gradient;
@@ -1643,6 +1675,8 @@ static void factorized_target_policy_gradients(
     const FactorizedActionChoice* choice,
     float policy_scale,
     float entropy_coef,
+    const FactorizedPolicySnapshot* anchor_policy,
+    float anchor_kl_coef,
     float* action_loss_sum,
     float* grad_h,
     float* grad_target_head,
@@ -1656,6 +1690,8 @@ static void factorized_target_policy_gradients(
     float grad_logits[FACTORIZED_TARGET_DIM];
     const Matrix* head = slot == 0 ? &model->slot0_target_head : &model->slot1_target_head;
     const float* bias = slot == 0 ? model->slot0_target_bias : model->slot1_target_bias;
+    const float* anchor_target_policy = !anchor_policy ? NULL :
+        (slot == 0 ? anchor_policy->slot0_target_policy : anchor_policy->slot1_target_policy);
     int i;
     if (target_bits == 0u || target_index < 0 || target_index >= FACTORIZED_TARGET_DIM ||
             !(target_bits & FACTORIZED_TARGET_BIT(target_index))) {
@@ -1677,6 +1713,12 @@ static void factorized_target_policy_gradients(
         if (entropy_coef != 0.0f) {
             float p = target_policy[i] > 1.0e-8f ? target_policy[i] : 1.0e-8f;
             grad_logits[i] += entropy_coef * p * (logf(p) - neg_entropy);
+        }
+        if (anchor_target_policy && anchor_kl_coef > 0.0f) {
+            float anchor_sum = 0.0f;
+            int j;
+            for (j = 0; j < FACTORIZED_TARGET_DIM; ++j) if (target_mask[j]) anchor_sum += anchor_target_policy[j];
+            if (anchor_sum > 1.0e-8f) grad_logits[i] += anchor_kl_coef * (target_policy[i] - anchor_target_policy[i] / anchor_sum);
         }
         accumulate_linear_row_gradient(head, hidden_state, (size_t)i, grad_logits[i],
             grad_target_head, grad_target_bias, grad_h);
@@ -2259,7 +2301,9 @@ static int recurrent_update_sequence(
     float* action_loss_out,
     float* value_loss_out,
     float* accuracy_out,
-    const FactorizedActionChoice* factorized_choice
+    const FactorizedActionChoice* factorized_choice,
+    const FactorizedPolicySnapshot* factorized_anchor_policy,
+    float factorized_anchor_kl_coef
 ) {
     size_t hdim;
     size_t xdim;
@@ -2560,7 +2604,8 @@ static int recurrent_update_sequence(
         }
     } else if (target_choice.slot0_has_action && target_choice.slot1_has_action) {
         if (!joint_policy_gradients(model, h_states + ((steps - 1) * hdim), combined_legal,
-                &target_choice, policy_scale, entropy_coef, &action_loss_sum, &accuracy_sum,
+                &target_choice, policy_scale, entropy_coef, factorized_anchor_policy,
+                factorized_anchor_kl_coef, &action_loss_sum, &accuracy_sum,
                 grad_h, &joint_grads)) {
             free(grad_slot0_kind_head); free(grad_slot0_kind_bias); free(grad_slot0_move_head); free(grad_slot0_move_bias); free(grad_slot0_switch_head); free(grad_slot0_switch_bias); free(grad_slot0_tera_head); free(grad_slot0_tera_bias); free(grad_slot0_target_head); free(grad_slot0_target_bias);
             free(grad_slot1_kind_head); free(grad_slot1_kind_bias); free(grad_slot1_move_head); free(grad_slot1_move_bias); free(grad_slot1_switch_head); free(grad_slot1_switch_bias); free(grad_slot1_tera_head); free(grad_slot1_tera_bias); free(grad_slot1_target_head); free(grad_slot1_target_bias);
@@ -2569,17 +2614,20 @@ static int recurrent_update_sequence(
         }
         if (target_choice.slot0_kind == FACTORIZED_ACTION_MOVE) {
             factorized_target_policy_gradients(model, h_states + ((steps - 1) * hdim), 0,
-                &target_choice, policy_scale, entropy_coef, &action_loss_sum, grad_h,
+                &target_choice, policy_scale, entropy_coef, factorized_anchor_policy,
+                factorized_anchor_kl_coef, &action_loss_sum, grad_h,
                 grad_slot0_target_head, grad_slot0_target_bias);
         }
         if (target_choice.slot1_kind == FACTORIZED_ACTION_MOVE) {
             factorized_target_policy_gradients(model, h_states + ((steps - 1) * hdim), 1,
-                &target_choice, policy_scale, entropy_coef, &action_loss_sum, grad_h,
+                &target_choice, policy_scale, entropy_coef, factorized_anchor_policy,
+                factorized_anchor_kl_coef, &action_loss_sum, grad_h,
                 grad_slot1_target_head, grad_slot1_target_bias);
         }
     } else {
         if (target_choice.slot0_has_action) {
             factorized_slot_policy_gradients(model, h_states + ((steps - 1) * hdim), combined_legal, 0, &target_choice, policy_scale, entropy_coef,
+                factorized_anchor_policy, factorized_anchor_kl_coef,
                 &action_loss_sum, &accuracy_sum, grad_h,
                 grad_slot0_kind_head, grad_slot0_kind_bias,
                 grad_slot0_move_head, grad_slot0_move_bias,
@@ -2589,6 +2637,7 @@ static int recurrent_update_sequence(
         }
         if (target_choice.slot1_has_action) {
             factorized_slot_policy_gradients(model, h_states + ((steps - 1) * hdim), combined_legal, 1, &target_choice, policy_scale, entropy_coef,
+                factorized_anchor_policy, factorized_anchor_kl_coef,
                 &action_loss_sum, &accuracy_sum, grad_h,
                 grad_slot1_kind_head, grad_slot1_kind_bias,
                 grad_slot1_move_head, grad_slot1_move_bias,
@@ -2840,7 +2889,7 @@ int gru_model_supervised_update_sequence(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, target_action, 1.0f, target_value, 0.0f,
-        NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out, NULL);
+        NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
 }
 
 int gru_model_supervised_update_sequence_window(
@@ -2857,7 +2906,7 @@ int gru_model_supervised_update_sequence_window(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, NULL, -1, legal_mask, target_action,
-        1.0f, target_value, 0.0f, NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out, NULL);
+        1.0f, target_value, 0.0f, NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
 }
 
 int gru_model_supervised_update_sequence_window_dual(
@@ -2877,7 +2926,7 @@ int gru_model_supervised_update_sequence_window_dual(
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, legal_mask_b, target_action_b,
         legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, NULL, 0.0f, learning_rate, 0,
-        action_loss_out, value_loss_out, accuracy_out, NULL);
+        action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
 }
 
 int gru_model_supervised_accumulate_sequence_window(
@@ -2893,7 +2942,7 @@ int gru_model_supervised_accumulate_sequence_window(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, NULL, -1, legal_mask, target_action,
-        1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1, action_loss_out, value_loss_out, accuracy_out, NULL);
+        1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1, action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
 }
 
 int gru_model_supervised_accumulate_sequence_window_dual(
@@ -2912,7 +2961,7 @@ int gru_model_supervised_accumulate_sequence_window_dual(
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, legal_mask_b, target_action_b,
         legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1,
-        action_loss_out, value_loss_out, accuracy_out, NULL);
+        action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
 }
 
 int gru_model_supervised_accumulate_sequence_window_factorized(
@@ -2953,7 +3002,7 @@ int gru_model_supervised_accumulate_sequence_window_factorized(
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state,
         secondary_mask, secondary_action, primary_mask, primary_action,
         1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1,
-        action_loss_out, value_loss_out, accuracy_out, choice);
+        action_loss_out, value_loss_out, accuracy_out, choice, NULL, 0.0f);
 }
 
 int gru_model_supervised_update_heads(
@@ -3098,7 +3147,7 @@ int gru_model_policy_gradient_update_sequence(
     float learning_rate
 ) {
     return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, action, advantage, target_value, entropy_coef,
-        NULL, 0.0f, learning_rate, 0, NULL, NULL, NULL, NULL);
+        NULL, 0.0f, learning_rate, 0, NULL, NULL, NULL, NULL, NULL, 0.0f);
 }
 
 int gru_model_policy_gradient_update_sequence_window(
@@ -3132,7 +3181,9 @@ int gru_model_policy_gradient_update_sequence_window(
         NULL,
         NULL,
         NULL,
-        NULL);
+        NULL,
+        NULL,
+        0.0f);
 }
 
 int gru_model_policy_gradient_accumulate_sequence_window(
@@ -3165,7 +3216,9 @@ int gru_model_policy_gradient_accumulate_sequence_window(
         NULL,
         NULL,
         NULL,
-        NULL);
+        NULL,
+        NULL,
+        0.0f);
 }
 
 int gru_model_policy_gradient_update_sequence_window_anchored(
@@ -3201,7 +3254,9 @@ int gru_model_policy_gradient_update_sequence_window_anchored(
         NULL,
         NULL,
         NULL,
-        NULL);
+        NULL,
+        NULL,
+        0.0f);
 }
 
 int gru_model_policy_gradient_accumulate_sequence_window_anchored(
@@ -3236,7 +3291,9 @@ int gru_model_policy_gradient_accumulate_sequence_window_anchored(
         NULL,
         NULL,
         NULL,
-        NULL);
+        NULL,
+        NULL,
+        0.0f);
 }
 
 int gru_model_policy_gradient_update_sequence_window_dual(
@@ -3272,7 +3329,9 @@ int gru_model_policy_gradient_update_sequence_window_dual(
         NULL,
         NULL,
         NULL,
-        NULL);
+        NULL,
+        NULL,
+        0.0f);
 }
 
 int gru_model_policy_gradient_accumulate_sequence_window_dual(
@@ -3307,7 +3366,9 @@ int gru_model_policy_gradient_accumulate_sequence_window_dual(
         NULL,
         NULL,
         NULL,
-        NULL);
+        NULL,
+        NULL,
+        0.0f);
 }
 
 int gru_model_policy_gradient_accumulate_sequence_window_factorized(
@@ -3347,7 +3408,50 @@ int gru_model_policy_gradient_accumulate_sequence_window_factorized(
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state,
         secondary_mask, secondary_action, primary_mask, primary_action,
         advantage, target_value, entropy_coef, NULL, 0.0f, 0.0f, 1,
-        NULL, NULL, NULL, choice);
+        NULL, NULL, NULL, choice, NULL, 0.0f);
+}
+
+int gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    const unsigned char* legal_mask_b,
+    const FactorizedActionChoice* choice,
+    float advantage,
+    float target_value,
+    float entropy_coef,
+    const FactorizedPolicySnapshot* anchor_policy,
+    float anchor_kl_coef
+) {
+    int action_a = -1;
+    int action_b = -1;
+    const unsigned char* primary_mask;
+    const unsigned char* secondary_mask = NULL;
+    int primary_action;
+    int secondary_action = -1;
+    if (!choice || !anchor_policy || anchor_kl_coef <= 0.0f ||
+            !factorized_action_choice_to_flat_actions(choice, &action_a, &action_b)) {
+        return 0;
+    }
+    if (action_a >= 0) {
+        primary_mask = legal_mask_a;
+        primary_action = action_a;
+        if (action_b >= 0) {
+            secondary_mask = legal_mask_b;
+            secondary_action = action_b;
+        }
+    } else if (action_b >= 0) {
+        primary_mask = legal_mask_b;
+        primary_action = action_b;
+    } else {
+        return 0;
+    }
+    return recurrent_update_sequence(model, sequence, steps, initial_hidden_state,
+        secondary_mask, secondary_action, primary_mask, primary_action,
+        advantage, target_value, entropy_coef, NULL, 0.0f, 0.0f, 1,
+        NULL, NULL, NULL, choice, anchor_policy, anchor_kl_coef);
 }
 
 int gru_model_policy_gradient_update_sequence_window_dual_anchored(

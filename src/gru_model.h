@@ -16,6 +16,21 @@
 
 typedef struct GruModel GruModel;
 
+typedef struct {
+    float joint_policy[FACTORIZED_JOINT_DIM];
+    float slot0_kind_policy[FACTORIZED_KIND_DIM];
+    float slot0_move_policy[FACTORIZED_MOVE_DIM];
+    float slot0_switch_policy[FACTORIZED_SWITCH_DIM];
+    float slot0_tera_policy[FACTORIZED_TERA_DIM];
+    float slot0_target_policy[FACTORIZED_TARGET_DIM];
+    float slot1_kind_policy[FACTORIZED_KIND_DIM];
+    float slot1_move_policy[FACTORIZED_MOVE_DIM];
+    float slot1_switch_policy[FACTORIZED_SWITCH_DIM];
+    float slot1_tera_policy[FACTORIZED_TERA_DIM];
+    float slot1_target_policy[FACTORIZED_TARGET_DIM];
+    int has_joint_policy;
+} FactorizedPolicySnapshot;
+
 GruModel* gru_model_create(size_t input_dim, size_t hidden_dim, size_t num_actions);
 void gru_model_destroy(GruModel* model);
 
@@ -306,6 +321,20 @@ int gru_model_policy_gradient_accumulate_sequence_window_factorized(
     float advantage,
     float target_value,
     float entropy_coef
+);
+int gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    const unsigned char* legal_mask_b,
+    const FactorizedActionChoice* choice,
+    float advantage,
+    float target_value,
+    float entropy_coef,
+    const FactorizedPolicySnapshot* anchor_policy,
+    float anchor_kl_coef
 );
 int gru_model_policy_gradient_update_sequence_window_dual_anchored(
     GruModel* model,

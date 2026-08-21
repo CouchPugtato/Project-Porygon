@@ -2,6 +2,7 @@
 #include "id_tables.h"
 #include "observation_builder.h"
 #include "checkpoint.h"
+#include "gru_trainer.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -3087,6 +3088,115 @@ static int test_factorized_target_head_training(void) {
     return ok;
 }
 
+static int test_factorized_ppo_anchor_regularization(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* anchor = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode episode;
+    GruTrainer trainer;
+    float sequence[4] = {0};
+    float hidden[8] = {0};
+    unsigned char legal0[OBS_NUM_ACTIONS] = {0};
+    unsigned char legal1[OBS_NUM_ACTIONS] = {0};
+    unsigned char combined_legal[OBS_NUM_ACTIONS] = {0};
+    FactorizedActionChoice drift_choice;
+    float joint_before[FACTORIZED_JOINT_DIM] = {0};
+    float joint_after[FACTORIZED_JOINT_DIM] = {0};
+    float* zero_parameters = NULL;
+    size_t parameter_count;
+    float before_distance;
+    float after_distance = 0.0f;
+    int legal_joint_indices[4] = {0, 1, FACTORIZED_LOCAL_ACTION_DIM, FACTORIZED_LOCAL_ACTION_DIM + 1};
+    int i;
+    int ok = 1;
+    memset(&episode, 0, sizeof(episode));
+    ok &= assert_true(model != NULL && anchor != NULL, "PPO anchor test creates matching models");
+    if (!model || !anchor) {
+        gru_model_destroy(model);
+        gru_model_destroy(anchor);
+        return 0;
+    }
+    parameter_count = gru_model_parameter_count(model);
+    zero_parameters = (float*)calloc(parameter_count, sizeof(float));
+    ok &= assert_true(zero_parameters != NULL &&
+        gru_model_import_parameters(model, zero_parameters, parameter_count) &&
+        gru_model_import_parameters(anchor, zero_parameters, parameter_count),
+        "PPO anchor test starts from identical models");
+    if (!zero_parameters) {
+        gru_model_destroy(model);
+        gru_model_destroy(anchor);
+        return 0;
+    }
+    legal0[OBS_A1_MOVE1] = 1;
+    legal0[OBS_A1_MOVE2] = 1;
+    legal1[OBS_A2_MOVE1] = 1;
+    legal1[OBS_A2_MOVE2] = 1;
+    memcpy(combined_legal, legal0, sizeof(combined_legal));
+    combined_legal[OBS_A2_MOVE1] = 1;
+    combined_legal[OBS_A2_MOVE2] = 1;
+    factorized_action_choice_init(&drift_choice);
+    drift_choice.slot0_has_action = 1;
+    drift_choice.slot0_kind = FACTORIZED_ACTION_MOVE;
+    drift_choice.slot0_move_index = 1;
+    drift_choice.slot1_has_action = 1;
+    drift_choice.slot1_kind = FACTORIZED_ACTION_MOVE;
+    drift_choice.slot1_move_index = 1;
+    gru_model_clear_accumulated_supervised_updates(model);
+    ok &= assert_true(gru_model_supervised_accumulate_sequence_window_factorized(
+        model, sequence, 1u, NULL, legal0, legal1, &drift_choice, 0.0f,
+        NULL, NULL, NULL), "PPO anchor test creates policy drift");
+    ok &= assert_true(gru_model_apply_accumulated_supervised_updates(model, 1.0f),
+        "PPO anchor test applies policy drift");
+    ok &= assert_true(gru_model_evaluate_joint_hidden(
+        model, hidden, combined_legal, joint_before, NULL),
+        "PPO anchor test evaluates drifted policy");
+    before_distance = 0.0f;
+    for (i = 0; i < 4; ++i) {
+        float delta = joint_before[legal_joint_indices[i]] - 0.25f;
+        before_distance += delta * delta;
+    }
+    ok &= assert_true(before_distance > 0.01f, "PPO anchor test has measurable drift from anchor");
+
+    ok &= assert_true(episode_init(&episode, 1u, 4u), "PPO anchor test initializes episode");
+    ok &= assert_true(episode_append(&episode, sequence, combined_legal, OBS_A1_MOVE1, 0.0f, 1),
+        "PPO anchor test appends zero-advantage step");
+    episode.actions2[0] = OBS_A2_MOVE1;
+    episode.factorized_actions[0].slot0_has_action = 1;
+    episode.factorized_actions[0].slot0_kind = FACTORIZED_ACTION_MOVE;
+    episode.factorized_actions[0].slot0_move_index = 0;
+    episode.factorized_actions[0].slot1_has_action = 1;
+    episode.factorized_actions[0].slot1_kind = FACTORIZED_ACTION_MOVE;
+    episode.factorized_actions[0].slot1_move_index = 0;
+    episode.old_log_probs[0] = logf(joint_before[0] > 1.0e-8f ? joint_before[0] : 1.0e-8f);
+    episode.old_values[0] = 0.0f;
+
+    gru_trainer_init(&trainer, 0.01f, 1u, 1.0f, 7u);
+    trainer.advantage_norm = 0;
+    trainer.entropy_coef = 0.0f;
+    trainer.anchor_model = anchor;
+    trainer.anchor_kl_coef = 0.1f;
+    ok &= assert_true(gru_trainer_ppo_episode(&trainer, model, &episode),
+        "factorized PPO applies anchored update");
+    ok &= assert_true(trainer.last_anchor_kl_mean > 1.0e-5f &&
+        trainer.last_anchor_kl_max >= trainer.last_anchor_kl_mean &&
+        trainer.last_anchor_loss > 0.0f,
+        "factorized PPO reports nonzero anchor KL and loss");
+    ok &= assert_true(gru_model_evaluate_joint_hidden(
+        model, hidden, combined_legal, joint_after, NULL),
+        "PPO anchor test evaluates regularized policy");
+    for (i = 0; i < 4; ++i) {
+        float delta = joint_after[legal_joint_indices[i]] - 0.25f;
+        after_distance += delta * delta;
+    }
+    ok &= assert_true(after_distance < before_distance,
+        "factorized PPO anchor moves policy back toward reference");
+
+    episode_free(&episode);
+    free(zero_parameters);
+    gru_model_destroy(model);
+    gru_model_destroy(anchor);
+    return ok;
+}
+
 static int test_symmetric_joint_action_training(void) {
     GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     float sequence[4] = {0};
@@ -3663,6 +3773,7 @@ int main(int argc, char** argv) {
     }
     if (!test_episode_target_roundtrip()) return 1;
     if (!test_factorized_target_head_training()) return 1;
+    if (!test_factorized_ppo_anchor_regularization()) return 1;
     if (!test_symmetric_joint_action_training()) return 1;
     if (!test_shared_entity_encoder_training_and_migration()) return 1;
     if (!test_active_slot_schema_rejects_older_checkpoint()) return 1;

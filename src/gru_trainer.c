@@ -97,6 +97,47 @@ static float masked_small_entropy(const float* policy, const unsigned char* mask
     return entropy;
 }
 
+static float masked_policy_kl(
+    const float* anchor_policy,
+    const float* current_policy,
+    const unsigned char* mask,
+    size_t dim
+) {
+    float anchor_sum = 0.0f;
+    float current_sum = 0.0f;
+    float kl = 0.0f;
+    size_t i;
+    if (!anchor_policy || !current_policy) {
+        return 0.0f;
+    }
+    for (i = 0; i < dim; ++i) {
+        if (!mask || mask[i]) {
+            anchor_sum += anchor_policy[i];
+            current_sum += current_policy[i];
+        }
+    }
+    if (anchor_sum <= 1.0e-8f || current_sum <= 1.0e-8f) {
+        return 0.0f;
+    }
+    for (i = 0; i < dim; ++i) {
+        float q;
+        float p;
+        if (mask && !mask[i]) {
+            continue;
+        }
+        q = anchor_policy[i] / anchor_sum;
+        if (q <= 0.0f) {
+            continue;
+        }
+        p = current_policy[i] / current_sum;
+        if (p < 1.0e-8f) {
+            p = 1.0e-8f;
+        }
+        kl += q * (logf(q > 1.0e-8f ? q : 1.0e-8f) - logf(p));
+    }
+    return kl > 0.0f ? kl : 0.0f;
+}
+
 static void build_factor_masks_from_episode(const Episode* episode, size_t step_index, int slot, unsigned char* kind_mask, unsigned char* move_mask, unsigned char* switch_mask) {
     const uint8_t* legal_mask = episode->legal_masks + (step_index * OBS_NUM_ACTIONS);
     int base = slot == 0 ? 0 : 14;
@@ -119,13 +160,14 @@ static void build_factor_masks_from_episode(const Episode* episode, size_t step_
 }
 
 static int evaluate_joint_step(
-    GruModel* model,
+    const GruModel* model,
     const float* hidden_state,
     const Episode* episode,
     size_t step_index,
     float* joint_log_prob_out,
     float* value_out,
-    float* entropy_out
+    float* entropy_out,
+    FactorizedPolicySnapshot* snapshot_out
 ) {
     unsigned char kind_mask[FACTORIZED_KIND_DIM];
     unsigned char move_mask[FACTORIZED_MOVE_DIM];
@@ -150,6 +192,9 @@ static int evaluate_joint_step(
     if (!model || !hidden_state || !episode || step_index >= episode->count) {
         return 0;
     }
+    if (snapshot_out) {
+        memset(snapshot_out, 0, sizeof(*snapshot_out));
+    }
     if (!gru_model_evaluate_factorized_hidden(
             model,
             hidden_state,
@@ -167,6 +212,18 @@ static int evaluate_joint_step(
             &value)) {
         return 0;
     }
+    if (snapshot_out) {
+        memcpy(snapshot_out->slot0_kind_policy, slot0_kind_policy, sizeof(slot0_kind_policy));
+        memcpy(snapshot_out->slot0_move_policy, slot0_move_policy, sizeof(slot0_move_policy));
+        memcpy(snapshot_out->slot0_switch_policy, slot0_switch_policy, sizeof(slot0_switch_policy));
+        memcpy(snapshot_out->slot0_tera_policy, slot0_tera_policy, sizeof(slot0_tera_policy));
+        memcpy(snapshot_out->slot0_target_policy, slot0_target_policy, sizeof(slot0_target_policy));
+        memcpy(snapshot_out->slot1_kind_policy, slot1_kind_policy, sizeof(slot1_kind_policy));
+        memcpy(snapshot_out->slot1_move_policy, slot1_move_policy, sizeof(slot1_move_policy));
+        memcpy(snapshot_out->slot1_switch_policy, slot1_switch_policy, sizeof(slot1_switch_policy));
+        memcpy(snapshot_out->slot1_tera_policy, slot1_tera_policy, sizeof(slot1_tera_policy));
+        memcpy(snapshot_out->slot1_target_policy, slot1_target_policy, sizeof(slot1_target_policy));
+    }
     choice = &episode->factorized_actions[step_index];
     if (choice->slot0_has_action && choice->slot1_has_action) {
         int flat0 = -1;
@@ -179,6 +236,10 @@ static int evaluate_joint_step(
             return 0;
         }
         selected = flat0 * FACTORIZED_LOCAL_ACTION_DIM + (flat1 - 14);
+        if (snapshot_out) {
+            memcpy(snapshot_out->joint_policy, joint_policy, sizeof(joint_policy));
+            snapshot_out->has_joint_policy = 1;
+        }
         joint_log_prob += masked_action_log_prob(joint_policy, selected);
         for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) {
             if (joint_policy[i] > 0.0f) {
@@ -256,6 +317,82 @@ static int evaluate_joint_step(
         *entropy_out = entropy;
     }
     return 1;
+}
+
+static float factorized_step_anchor_kl(
+    const FactorizedPolicySnapshot* current,
+    const FactorizedPolicySnapshot* anchor,
+    const Episode* episode,
+    size_t step_index
+) {
+    unsigned char kind_mask[FACTORIZED_KIND_DIM];
+    unsigned char move_mask[FACTORIZED_MOVE_DIM];
+    unsigned char switch_mask[FACTORIZED_SWITCH_DIM];
+    unsigned char tera_mask[FACTORIZED_TERA_DIM];
+    unsigned char target_mask[FACTORIZED_TARGET_DIM];
+    const FactorizedActionChoice* choice;
+    float kl = 0.0f;
+    if (!current || !anchor || !episode || step_index >= episode->count) {
+        return 0.0f;
+    }
+    choice = &episode->factorized_actions[step_index];
+    if (choice->slot0_has_action && choice->slot1_has_action) {
+        kl += masked_policy_kl(anchor->joint_policy, current->joint_policy, NULL, FACTORIZED_JOINT_DIM);
+        if (choice->slot0_kind == FACTORIZED_ACTION_MOVE && choice->slot0_target_mask != 0u) {
+            factorized_target_mask_to_array(choice->slot0_target_mask, target_mask);
+            kl += masked_policy_kl(anchor->slot0_target_policy, current->slot0_target_policy,
+                target_mask, FACTORIZED_TARGET_DIM);
+        }
+        if (choice->slot1_kind == FACTORIZED_ACTION_MOVE && choice->slot1_target_mask != 0u) {
+            factorized_target_mask_to_array(choice->slot1_target_mask, target_mask);
+            kl += masked_policy_kl(anchor->slot1_target_policy, current->slot1_target_policy,
+                target_mask, FACTORIZED_TARGET_DIM);
+        }
+        return kl;
+    }
+    if (choice->slot0_has_action) {
+        build_factor_masks_from_episode(episode, step_index, 0, kind_mask, move_mask, switch_mask);
+        kl += masked_policy_kl(anchor->slot0_kind_policy, current->slot0_kind_policy,
+            kind_mask, FACTORIZED_KIND_DIM);
+        if (choice->slot0_kind == FACTORIZED_ACTION_MOVE) {
+            tera_mask[0] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + choice->slot0_move_index] ? 1 : 0;
+            tera_mask[1] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 4 + choice->slot0_move_index] ? 1 : 0;
+            kl += masked_policy_kl(anchor->slot0_move_policy, current->slot0_move_policy,
+                move_mask, FACTORIZED_MOVE_DIM);
+            kl += masked_policy_kl(anchor->slot0_tera_policy, current->slot0_tera_policy,
+                tera_mask, FACTORIZED_TERA_DIM);
+            if (choice->slot0_target_mask != 0u) {
+                factorized_target_mask_to_array(choice->slot0_target_mask, target_mask);
+                kl += masked_policy_kl(anchor->slot0_target_policy, current->slot0_target_policy,
+                    target_mask, FACTORIZED_TARGET_DIM);
+            }
+        } else if (choice->slot0_kind == FACTORIZED_ACTION_SWITCH) {
+            kl += masked_policy_kl(anchor->slot0_switch_policy, current->slot0_switch_policy,
+                switch_mask, FACTORIZED_SWITCH_DIM);
+        }
+    }
+    if (choice->slot1_has_action) {
+        build_factor_masks_from_episode(episode, step_index, 1, kind_mask, move_mask, switch_mask);
+        kl += masked_policy_kl(anchor->slot1_kind_policy, current->slot1_kind_policy,
+            kind_mask, FACTORIZED_KIND_DIM);
+        if (choice->slot1_kind == FACTORIZED_ACTION_MOVE) {
+            tera_mask[0] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 14 + choice->slot1_move_index] ? 1 : 0;
+            tera_mask[1] = episode->legal_masks[step_index * OBS_NUM_ACTIONS + 18 + choice->slot1_move_index] ? 1 : 0;
+            kl += masked_policy_kl(anchor->slot1_move_policy, current->slot1_move_policy,
+                move_mask, FACTORIZED_MOVE_DIM);
+            kl += masked_policy_kl(anchor->slot1_tera_policy, current->slot1_tera_policy,
+                tera_mask, FACTORIZED_TERA_DIM);
+            if (choice->slot1_target_mask != 0u) {
+                factorized_target_mask_to_array(choice->slot1_target_mask, target_mask);
+                kl += masked_policy_kl(anchor->slot1_target_policy, current->slot1_target_policy,
+                    target_mask, FACTORIZED_TARGET_DIM);
+            }
+        } else if (choice->slot1_kind == FACTORIZED_ACTION_SWITCH) {
+            kl += masked_policy_kl(anchor->slot1_switch_policy, current->slot1_switch_policy,
+                switch_mask, FACTORIZED_SWITCH_DIM);
+        }
+    }
+    return kl;
 }
 
 TrainerCheckpointState gru_trainer_checkpoint_state(const GruTrainer* trainer) {
@@ -960,6 +1097,9 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
     float* hidden = NULL;
     float* next_hidden = NULL;
     float* hidden_after = NULL;
+    float* anchor_hidden = NULL;
+    float* anchor_next_hidden = NULL;
+    float* anchor_hidden_after = NULL;
     float gae = 0.0f;
     float advantage_sum = 0.0f;
     float return_sum = 0.0f;
@@ -970,10 +1110,20 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
     float entropy_sum = 0.0f;
     float approx_kl_sum = 0.0f;
     float clip_fraction_sum = 0.0f;
+    float anchor_kl_sum = 0.0f;
+    float anchor_kl_max = 0.0f;
     uint8_t slot_mask_a[OBS_NUM_ACTIONS];
     uint8_t slot_mask_b[OBS_NUM_ACTIONS];
+    int anchor_enabled;
 
     if (!trainer || !model || !episode) {
+        return 0;
+    }
+    anchor_enabled = trainer->anchor_model && trainer->anchor_kl_coef > 0.0f;
+    if (anchor_enabled &&
+            (gru_model_input_dim(trainer->anchor_model) != gru_model_input_dim(model) ||
+             gru_model_hidden_dim(trainer->anchor_model) != gru_model_hidden_dim(model) ||
+             gru_model_num_actions(trainer->anchor_model) != gru_model_num_actions(model))) {
         return 0;
     }
     if (episode->count == 0) {
@@ -986,6 +1136,9 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         trainer->last_entropy = 0.0f;
         trainer->last_approx_kl = 0.0f;
         trainer->last_clip_fraction = 0.0f;
+        trainer->last_anchor_kl_mean = 0.0f;
+        trainer->last_anchor_kl_max = 0.0f;
+        trainer->last_anchor_loss = 0.0f;
         trainer->last_rl_labels = 0;
         return 1;
     }
@@ -997,6 +1150,11 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
     hidden = (float*)calloc(hidden_dim, sizeof(float));
     next_hidden = (float*)malloc(hidden_dim * sizeof(float));
     hidden_after = (float*)calloc(episode->count * hidden_dim, sizeof(float));
+    if (anchor_enabled) {
+        anchor_hidden = (float*)calloc(hidden_dim, sizeof(float));
+        anchor_next_hidden = (float*)malloc(hidden_dim * sizeof(float));
+        anchor_hidden_after = (float*)calloc(episode->count * hidden_dim, sizeof(float));
+    }
     if (!advantages || !returns || !labeled_indices || !hidden || !next_hidden || !hidden_after) {
         free(advantages);
         free(returns);
@@ -1004,12 +1162,24 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         free(hidden);
         free(next_hidden);
         free(hidden_after);
+        free(anchor_hidden);
+        free(anchor_next_hidden);
+        free(anchor_hidden_after);
+        return 0;
+    }
+    if (anchor_enabled && (!anchor_hidden || !anchor_next_hidden || !anchor_hidden_after)) {
+        free(advantages); free(returns); free(labeled_indices);
+        free(hidden); free(next_hidden); free(hidden_after);
+        free(anchor_hidden); free(anchor_next_hidden); free(anchor_hidden_after);
         return 0;
     }
 
     gru_model_clear_accumulated_supervised_updates(model);
 
     gru_model_zero_state(model, hidden);
+    if (anchor_enabled) {
+        gru_model_zero_state(trainer->anchor_model, anchor_hidden);
+    }
     for (t = 0; t < episode->count; ++t) {
         gru_model_forward_step(
             model,
@@ -1020,6 +1190,17 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
             NULL);
         memcpy(hidden_after + (t * hidden_dim), next_hidden, hidden_dim * sizeof(float));
         memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
+        if (anchor_enabled) {
+            gru_model_forward_step(
+                trainer->anchor_model,
+                episode->observations + (t * episode->obs_dim),
+                anchor_hidden,
+                anchor_next_hidden,
+                NULL,
+                NULL);
+            memcpy(anchor_hidden_after + (t * hidden_dim), anchor_next_hidden, hidden_dim * sizeof(float));
+            memcpy(anchor_hidden, anchor_next_hidden, hidden_dim * sizeof(float));
+        }
     }
 
     for (t = episode->count; t > 0; --t) {
@@ -1075,19 +1256,42 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         size_t steps;
         const float* initial_hidden;
         const float* stored_hidden;
+        FactorizedPolicySnapshot current_snapshot;
+        FactorizedPolicySnapshot anchor_snapshot;
 
         if (episode->actions[t] < 0 && episode->actions2[t] < 0) {
             continue;
         }
         stored_hidden = hidden_after + (t * hidden_dim);
-        if (!evaluate_joint_step(model, stored_hidden, episode, t, &current_log_prob, &current_value, &current_entropy)) {
+        if (!evaluate_joint_step(model, stored_hidden, episode, t, &current_log_prob, &current_value,
+                &current_entropy, &current_snapshot)) {
             free(advantages);
             free(returns);
             free(labeled_indices);
             free(hidden);
             free(next_hidden);
             free(hidden_after);
+            free(anchor_hidden); free(anchor_next_hidden); free(anchor_hidden_after);
             return 0;
+        }
+        if (anchor_enabled) {
+            float anchor_log_prob;
+            float anchor_value;
+            float anchor_entropy;
+            float step_anchor_kl;
+            if (!evaluate_joint_step(trainer->anchor_model,
+                    anchor_hidden_after + (t * hidden_dim), episode, t,
+                    &anchor_log_prob, &anchor_value, &anchor_entropy, &anchor_snapshot)) {
+                free(advantages); free(returns); free(labeled_indices);
+                free(hidden); free(next_hidden); free(hidden_after);
+                free(anchor_hidden); free(anchor_next_hidden); free(anchor_hidden_after);
+                return 0;
+            }
+            step_anchor_kl = factorized_step_anchor_kl(&current_snapshot, &anchor_snapshot, episode, t);
+            anchor_kl_sum += step_anchor_kl;
+            if (step_anchor_kl > anchor_kl_max) {
+                anchor_kl_max = step_anchor_kl;
+            }
         }
         ratio = expf(current_log_prob - episode->old_log_probs[t]);
         clipped_ratio = ratio;
@@ -1138,8 +1342,9 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         if (episode->actions2[t] >= 0) {
             build_step_slot_legal_mask(episode, t, 1, slot_mask_b);
         }
-        if (fabsf(effective_advantage) > 0.0f &&
-                !gru_model_policy_gradient_accumulate_sequence_window_factorized(
+        if ((fabsf(effective_advantage) > 0.0f || anchor_enabled) &&
+                !(anchor_enabled ?
+                gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
                     model,
                     episode->observations + (start * episode->obs_dim),
                     steps,
@@ -1149,8 +1354,22 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
                     &episode->factorized_actions[t],
                     effective_advantage,
                     value_target,
-                    trainer->entropy_coef)) {
+                    trainer->entropy_coef,
+                    &anchor_snapshot,
+                    trainer->anchor_kl_coef) :
+                gru_model_policy_gradient_accumulate_sequence_window_factorized(
+                    model,
+                    episode->observations + (start * episode->obs_dim),
+                    steps,
+                    initial_hidden,
+                    slot_mask_a,
+                    slot_mask_b,
+                    &episode->factorized_actions[t],
+                    effective_advantage,
+                    value_target,
+                    trainer->entropy_coef))) {
             free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
+            free(anchor_hidden); free(anchor_next_hidden); free(anchor_hidden_after);
             return 0;
         }
         ++trained_labels;
@@ -1171,6 +1390,9 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
         free(hidden);
         free(next_hidden);
         free(hidden_after);
+        free(anchor_hidden);
+        free(anchor_next_hidden);
+        free(anchor_hidden_after);
         return 0;
     }
 
@@ -1183,6 +1405,9 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
     trainer->last_entropy = labeled_steps > 0 ? entropy_sum / (float)labeled_steps : 0.0f;
     trainer->last_approx_kl = labeled_steps > 0 ? approx_kl_sum / (float)labeled_steps : 0.0f;
     trainer->last_clip_fraction = labeled_steps > 0 ? clip_fraction_sum / (float)labeled_steps : 0.0f;
+    trainer->last_anchor_kl_mean = labeled_steps > 0 ? anchor_kl_sum / (float)labeled_steps : 0.0f;
+    trainer->last_anchor_kl_max = anchor_kl_max;
+    trainer->last_anchor_loss = trainer->anchor_kl_coef * trainer->last_anchor_kl_mean;
     trainer->last_rl_labels = trained_labels;
 
     free(advantages);
@@ -1191,5 +1416,8 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
     free(hidden);
     free(next_hidden);
     free(hidden_after);
+    free(anchor_hidden);
+    free(anchor_next_hidden);
+    free(anchor_hidden_after);
     return 1;
 }

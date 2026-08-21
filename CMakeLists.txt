@@ -68,6 +68,7 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/observation.c
 	src/episode.c
 	src/gru_model.c
+	src/gru_trainer.c
 	src/id_tables.c
 	src/state_value.c
 	src/request_parser.c
