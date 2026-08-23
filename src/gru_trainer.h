@@ -57,5 +57,11 @@ int gru_trainer_ppo_minibatch(
     GruModel* model,
     const Episode* const* episodes,
     size_t episode_count);
+int gru_trainer_ppo_hard_kl_stop_update(
+    float approx_kl,
+    float target_kl,
+    float hard_multiplier,
+    int required_consecutive_updates,
+    int* consecutive_breaches);
 
 #endif

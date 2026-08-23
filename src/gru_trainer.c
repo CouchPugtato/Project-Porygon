@@ -1434,6 +1434,26 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
     return gru_trainer_ppo_episode_accumulate(trainer, model, episode, 1, 1);
 }
 
+int gru_trainer_ppo_hard_kl_stop_update(
+    float approx_kl,
+    float target_kl,
+    float hard_multiplier,
+    int required_consecutive_updates,
+    int* consecutive_breaches
+) {
+    int required = required_consecutive_updates > 0 ? required_consecutive_updates : 1;
+    if (!consecutive_breaches) {
+        return 0;
+    }
+    if (target_kl <= 0.0f || hard_multiplier <= 0.0f ||
+            approx_kl <= target_kl * hard_multiplier) {
+        *consecutive_breaches = 0;
+        return 0;
+    }
+    ++(*consecutive_breaches);
+    return *consecutive_breaches >= required;
+}
+
 int gru_trainer_ppo_minibatch(
     GruTrainer* trainer,
     GruModel* model,

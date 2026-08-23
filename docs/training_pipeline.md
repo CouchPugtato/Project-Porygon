@@ -118,7 +118,7 @@ PPO safety behavior:
 - PPO accumulates a configurable number of episodes before each Adam update (`--ppo-minibatch-episodes`, default `8`), reducing sensitivity to one unusually short or unusual battle
 - `--shuffle-seed` makes the episode order reproducible across candidates trained from the same batch
 - `--target-kl` uses the label-weighted running mean and does not stop until both `--target-kl-min-episodes` and `--target-kl-min-labels` have been processed
-- `--target-kl-hard-multiplier` remains an emergency stop for an update whose KL is far beyond the target
+- `--target-kl-hard-multiplier` defines an extreme-minibatch threshold, and `--target-kl-hard-consecutive-updates` requires repeated breaches (default `2`) before the emergency stop fires; isolated outliers remain visible in the summary without discarding the candidate
 - the training summary records the input parent, output checkpoint, anchor, shuffle seed, minibatch size, available/processed episode counts, and whether the ordinary or emergency KL stop fired
 
 Stable algorithm and guardrail defaults are centralized in `config/rl_defaults.toml`. Reward weights remain in `config/reward_weights.toml` because both the C runtime and Python communicator consume them.

@@ -230,6 +230,7 @@ def build_train_command(
         "--target-kl-min-episodes", str(args.target_kl_min_episodes),
         "--target-kl-min-labels", str(args.target_kl_min_labels),
         "--target-kl-hard-multiplier", str(args.target_kl_hard_multiplier),
+        "--target-kl-hard-consecutive-updates", str(args.target_kl_hard_consecutive_updates),
         "--shuffle-seed", str(params.shuffle_seed),
         "--ppo-minibatch-episodes", str(args.ppo_minibatch_episodes),
         "--adam-beta1", str(args.adam_beta1),
@@ -374,6 +375,8 @@ def training_artifacts_match(
         return (
             int(summary.get("shuffle_seed", -1)) == params.shuffle_seed
             and int(summary.get("minibatch_episodes", -1)) == args.ppo_minibatch_episodes
+            and int(summary.get("target_kl_hard_consecutive_updates", -1))
+                == args.target_kl_hard_consecutive_updates
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
@@ -508,6 +511,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-kl-min-episodes", type=positive_int, default=int_default("ppo_target_kl_min_episodes"))
     parser.add_argument("--target-kl-min-labels", type=positive_int, default=int_default("ppo_target_kl_min_labels"))
     parser.add_argument("--target-kl-hard-multiplier", type=positive_float, default=float_default("ppo_target_kl_hard_multiplier"))
+    parser.add_argument("--target-kl-hard-consecutive-updates", type=positive_int, default=int_default("ppo_target_kl_hard_consecutive_updates"))
     parser.add_argument("--adam-beta1", type=float, default=float_default("adam_beta1"))
     parser.add_argument("--adam-beta2", type=float, default=float_default("adam_beta2"))
     parser.add_argument("--adam-epsilon", type=float, default=float_default("adam_epsilon"))

@@ -31,6 +31,7 @@ def train_args() -> SimpleNamespace:
         target_kl_min_episodes=20,
         target_kl_min_labels=500,
         target_kl_hard_multiplier=4.0,
+        target_kl_hard_consecutive_updates=2,
         ppo_minibatch_episodes=8,
         adam_beta1=0.9,
         adam_beta2=0.999,
@@ -105,6 +106,7 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(command[command.index("--anchor-kl-coef") + 1], "0.01")
         self.assertEqual(command[command.index("--shuffle-seed") + 1], "101")
         self.assertEqual(command[command.index("--target-kl-min-labels") + 1], "500")
+        self.assertEqual(command[command.index("--target-kl-hard-consecutive-updates") + 1], "2")
         self.assertEqual(command[command.index("--ppo-minibatch-episodes") + 1], "8")
 
     def test_eval_command_clears_both_pools_and_swaps_candidate_side(self) -> None:
@@ -169,6 +171,7 @@ class PpoSearchTests(unittest.TestCase):
                 "ppo_clip_epsilon": params.ppo_clip_epsilon,
                 "shuffle_seed": params.shuffle_seed,
                 "minibatch_episodes": args.ppo_minibatch_episodes,
+                "target_kl_hard_consecutive_updates": args.target_kl_hard_consecutive_updates,
             }), encoding="utf-8")
             self.assertTrue(training_artifacts_match(
                 summary, batch, parent, anchor, candidate, params, args,

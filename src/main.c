@@ -46,6 +46,7 @@ typedef struct {
     int ppo_target_kl_min_episodes;
     int ppo_target_kl_min_labels;
     float ppo_target_kl_hard_multiplier;
+    int ppo_target_kl_hard_consecutive_updates;
     int ppo_shuffle_seed;
     int ppo_minibatch_episodes;
     float adam_beta1;
@@ -84,6 +85,8 @@ typedef struct {
     int target_kl_min_episodes;
     int target_kl_min_labels;
     float target_kl_hard_multiplier;
+    int target_kl_hard_consecutive_updates;
+    int target_kl_hard_breach_count;
     double value_mean_sum;
     double advantage_mean_sum;
     double abs_advantage_mean_sum;
@@ -673,6 +676,7 @@ static void rl_defaults_config_init(RlDefaultsConfig* config) {
     config->ppo_target_kl_min_episodes = 20;
     config->ppo_target_kl_min_labels = 500;
     config->ppo_target_kl_hard_multiplier = 4.0f;
+    config->ppo_target_kl_hard_consecutive_updates = 2;
     config->ppo_shuffle_seed = 1337;
     config->ppo_minibatch_episodes = 8;
     config->adam_beta1 = 0.90f;
@@ -712,6 +716,7 @@ static int assign_rl_default_value(RlDefaultsConfig* config, const char* key, co
     else if (strcmp(key, "ppo_target_kl_min_episodes") == 0) config->ppo_target_kl_min_episodes = (int)value;
     else if (strcmp(key, "ppo_target_kl_min_labels") == 0) config->ppo_target_kl_min_labels = (int)value;
     else if (strcmp(key, "ppo_target_kl_hard_multiplier") == 0) config->ppo_target_kl_hard_multiplier = value;
+    else if (strcmp(key, "ppo_target_kl_hard_consecutive_updates") == 0) config->ppo_target_kl_hard_consecutive_updates = (int)value;
     else if (strcmp(key, "ppo_shuffle_seed") == 0) config->ppo_shuffle_seed = (int)value;
     else if (strcmp(key, "ppo_minibatch_episodes") == 0) config->ppo_minibatch_episodes = (int)value;
     else if (strcmp(key, "adam_beta1") == 0) config->adam_beta1 = value;
@@ -1539,6 +1544,8 @@ static int write_rl_training_summary_json(
     fprintf(out, "  \"target_kl_min_episodes\": %d,\n", summary->target_kl_min_episodes);
     fprintf(out, "  \"target_kl_min_labels\": %d,\n", summary->target_kl_min_labels);
     fprintf(out, "  \"target_kl_hard_multiplier\": %.6f,\n", summary->target_kl_hard_multiplier);
+    fprintf(out, "  \"target_kl_hard_consecutive_updates\": %d,\n", summary->target_kl_hard_consecutive_updates);
+    fprintf(out, "  \"target_kl_hard_breach_count\": %d,\n", summary->target_kl_hard_breach_count);
     fprintf(out, "  \"target_kl_exceeded\": %s,\n", summary->target_kl_exceeded ? "true" : "false");
     fprintf(out, "  \"target_kl_hard_stop\": %s,\n", summary->target_kl_hard_stop ? "true" : "false");
     fprintf(out, "  \"target_kl_trigger\": %.6f,\n", summary->target_kl_trigger);
@@ -2362,6 +2369,7 @@ static int train_from_input_file(
     int ppo_target_kl_min_episodes,
     int ppo_target_kl_min_labels,
     float ppo_target_kl_hard_multiplier,
+    int ppo_target_kl_hard_consecutive_updates,
     int ppo_shuffle_seed,
     int ppo_minibatch_episodes,
     float adam_beta1,
@@ -2530,6 +2538,8 @@ static int train_from_input_file(
         rl_summary.target_kl_min_episodes = ppo_target_kl_min_episodes;
         rl_summary.target_kl_min_labels = ppo_target_kl_min_labels;
         rl_summary.target_kl_hard_multiplier = ppo_target_kl_hard_multiplier;
+        rl_summary.target_kl_hard_consecutive_updates =
+            ppo_target_kl_hard_consecutive_updates > 0 ? ppo_target_kl_hard_consecutive_updates : 1;
         printf("[train-rl] filtered train_sessions labeled_only=%zu/%zu\n",
             train_sessions, train_sessions_before_filter);
         printf("[train-rl] validation_split disabled train_sessions=%zu val_sessions=%zu\n",
@@ -2552,6 +2562,7 @@ static int train_from_input_file(
     for (epoch = 1; epoch <= epochs; ++epoch) {
         size_t trained_in_epoch = 0;
         int ppo_early_stop = 0;
+        int consecutive_hard_kl_updates = 0;
         float val_action_loss = 0.0f;
         float val_value_loss = 0.0f;
         float val_accuracy = 0.0f;
@@ -2628,8 +2639,18 @@ static int train_from_input_file(
                     int minimum_reached =
                         rl_summary.episode_count >= (size_t)(ppo_target_kl_min_episodes > 0 ? ppo_target_kl_min_episodes : 0) &&
                         rl_summary.label_weight_sum >= (size_t)(ppo_target_kl_min_labels > 0 ? ppo_target_kl_min_labels : 0);
-                    int hard_stop = ppo_target_kl_hard_multiplier > 0.0f &&
-                        trainer.last_approx_kl > trainer.target_kl * ppo_target_kl_hard_multiplier;
+                    int required_hard_breaches = ppo_target_kl_hard_consecutive_updates > 0
+                        ? ppo_target_kl_hard_consecutive_updates
+                        : 1;
+                    int hard_stop = gru_trainer_ppo_hard_kl_stop_update(
+                        trainer.last_approx_kl,
+                        trainer.target_kl,
+                        ppo_target_kl_hard_multiplier,
+                        required_hard_breaches,
+                        &consecutive_hard_kl_updates);
+                    if (consecutive_hard_kl_updates > rl_summary.target_kl_hard_breach_count) {
+                        rl_summary.target_kl_hard_breach_count = consecutive_hard_kl_updates;
+                    }
                     if ((minimum_reached && running_approx_kl > trainer.target_kl) || hard_stop) {
                         ppo_early_stop = 1;
                         rl_summary.target_kl_exceeded = 1;
@@ -2940,6 +2961,7 @@ static int showdown_client_main(int argc, char** argv) {
     int ppo_target_kl_min_episodes;
     int ppo_target_kl_min_labels;
     float ppo_target_kl_hard_multiplier;
+    int ppo_target_kl_hard_consecutive_updates;
     int ppo_shuffle_seed;
     int ppo_minibatch_episodes;
     float adam_beta1;
@@ -2972,6 +2994,8 @@ static int showdown_client_main(int argc, char** argv) {
     ppo_target_kl_min_episodes = parse_int_flag(argc, argv, "--target-kl-min-episodes", rl_defaults.ppo_target_kl_min_episodes);
     ppo_target_kl_min_labels = parse_int_flag(argc, argv, "--target-kl-min-labels", rl_defaults.ppo_target_kl_min_labels);
     ppo_target_kl_hard_multiplier = parse_float_flag(argc, argv, "--target-kl-hard-multiplier", rl_defaults.ppo_target_kl_hard_multiplier);
+    ppo_target_kl_hard_consecutive_updates = parse_int_flag(
+        argc, argv, "--target-kl-hard-consecutive-updates", rl_defaults.ppo_target_kl_hard_consecutive_updates);
     ppo_shuffle_seed = parse_int_flag(argc, argv, "--shuffle-seed", rl_defaults.ppo_shuffle_seed);
     ppo_minibatch_episodes = parse_int_flag(argc, argv, "--ppo-minibatch-episodes", rl_defaults.ppo_minibatch_episodes);
     adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", rl_defaults.adam_beta1);
@@ -3048,6 +3072,7 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_target_kl_min_episodes,
             ppo_target_kl_min_labels,
             ppo_target_kl_hard_multiplier,
+            ppo_target_kl_hard_consecutive_updates,
             ppo_shuffle_seed,
             ppo_minibatch_episodes,
             adam_beta1,
@@ -3081,6 +3106,7 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_target_kl_min_episodes,
             ppo_target_kl_min_labels,
             ppo_target_kl_hard_multiplier,
+            ppo_target_kl_hard_consecutive_updates,
             ppo_shuffle_seed,
             ppo_minibatch_episodes,
             adam_beta1,
@@ -3114,6 +3140,7 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_target_kl_min_episodes,
             ppo_target_kl_min_labels,
             ppo_target_kl_hard_multiplier,
+            ppo_target_kl_hard_consecutive_updates,
             ppo_shuffle_seed,
             ppo_minibatch_episodes,
             adam_beta1,
@@ -3147,6 +3174,7 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_target_kl_min_episodes,
             ppo_target_kl_min_labels,
             ppo_target_kl_hard_multiplier,
+            ppo_target_kl_hard_consecutive_updates,
             ppo_shuffle_seed,
             ppo_minibatch_episodes,
             adam_beta1,

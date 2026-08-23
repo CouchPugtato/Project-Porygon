@@ -228,6 +228,8 @@ def build_train_command(args: argparse.Namespace, trainer_exe: Path, episode_bat
         str(args.target_kl_min_labels),
         "--target-kl-hard-multiplier",
         str(args.target_kl_hard_multiplier),
+        "--target-kl-hard-consecutive-updates",
+        str(args.target_kl_hard_consecutive_updates),
         "--shuffle-seed",
         str(args.shuffle_seed),
         "--ppo-minibatch-episodes",
@@ -348,6 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-kl-min-episodes", type=int, default=int_default("ppo_target_kl_min_episodes"))
     parser.add_argument("--target-kl-min-labels", type=int, default=int_default("ppo_target_kl_min_labels"))
     parser.add_argument("--target-kl-hard-multiplier", type=float, default=float_default("ppo_target_kl_hard_multiplier"))
+    parser.add_argument("--target-kl-hard-consecutive-updates", type=int, default=int_default("ppo_target_kl_hard_consecutive_updates"))
     parser.add_argument("--shuffle-seed", type=int, default=int_default("ppo_shuffle_seed"))
     parser.add_argument("--ppo-minibatch-episodes", type=int, default=int_default("ppo_minibatch_episodes"))
     parser.add_argument("--adam-beta1", type=float, default=float_default("adam_beta1"))

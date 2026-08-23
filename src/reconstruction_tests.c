@@ -3202,6 +3202,20 @@ static int test_factorized_ppo_anchor_regularization(void) {
     return ok;
 }
 
+static int test_ppo_hard_kl_requires_consecutive_breaches(void) {
+    int breaches = 0;
+    int ok = 1;
+    ok &= assert_true(!gru_trainer_ppo_hard_kl_stop_update(0.10f, 0.02f, 4.0f, 2, &breaches) && breaches == 1,
+        "first extreme PPO KL minibatch is recorded without stopping");
+    ok &= assert_true(!gru_trainer_ppo_hard_kl_stop_update(0.01f, 0.02f, 4.0f, 2, &breaches) && breaches == 0,
+        "ordinary PPO KL minibatch resets consecutive breach count");
+    ok &= assert_true(!gru_trainer_ppo_hard_kl_stop_update(0.09f, 0.02f, 4.0f, 2, &breaches) && breaches == 1,
+        "new extreme PPO KL sequence starts at one breach");
+    ok &= assert_true(gru_trainer_ppo_hard_kl_stop_update(0.11f, 0.02f, 4.0f, 2, &breaches) && breaches == 2,
+        "second consecutive extreme PPO KL minibatch triggers emergency stop");
+    return ok;
+}
+
 static int test_symmetric_joint_action_training(void) {
     GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     float sequence[4] = {0};
@@ -3779,6 +3793,7 @@ int main(int argc, char** argv) {
     if (!test_episode_target_roundtrip()) return 1;
     if (!test_factorized_target_head_training()) return 1;
     if (!test_factorized_ppo_anchor_regularization()) return 1;
+    if (!test_ppo_hard_kl_requires_consecutive_breaches()) return 1;
     if (!test_symmetric_joint_action_training()) return 1;
     if (!test_shared_entity_encoder_training_and_migration()) return 1;
     if (!test_active_slot_schema_rejects_older_checkpoint()) return 1;

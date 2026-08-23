@@ -23,6 +23,9 @@ ppo_target_kl_min_episodes = 20
 ppo_target_kl_min_labels = 500
 # A single episode may still stop immediately when it exceeds this multiple.
 ppo_target_kl_hard_multiplier = 4.0
+# Require repeated extreme minibatches so one reconstruction/outlier batch is
+# recorded without immediately discarding an otherwise stable candidate.
+ppo_target_kl_hard_consecutive_updates = 2
 ppo_shuffle_seed = 1337
 # Accumulate this many episodes before each PPO Adam update.
 ppo_minibatch_episodes = 8

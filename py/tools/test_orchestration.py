@@ -372,6 +372,7 @@ class ResumeAndCollapseTests(unittest.TestCase):
             target_kl_min_episodes=20,
             target_kl_min_labels=500,
             target_kl_hard_multiplier=4.0,
+            target_kl_hard_consecutive_updates=2,
             shuffle_seed=1337,
             ppo_minibatch_episodes=8,
             adam_beta1=0.9,
@@ -391,6 +392,7 @@ class ResumeAndCollapseTests(unittest.TestCase):
         self.assertEqual(command[command.index("--target-kl") + 1], "0.02")
         self.assertEqual(command[command.index("--target-kl-min-episodes") + 1], "20")
         self.assertEqual(command[command.index("--target-kl-min-labels") + 1], "500")
+        self.assertEqual(command[command.index("--target-kl-hard-consecutive-updates") + 1], "2")
         self.assertEqual(command[command.index("--shuffle-seed") + 1], "1337")
         self.assertEqual(command[command.index("--ppo-minibatch-episodes") + 1], "8")
         self.assertEqual(command[command.index("--parent-checkpoint") + 1], "parent.chk")
