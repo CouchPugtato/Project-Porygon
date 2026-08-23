@@ -39,6 +39,8 @@ Files:
 - `ppo_search.toml`
   - consumed by `py/tools/ppo_search.py` before CLI arguments are applied
   - controls the candidate grid, staged evaluation sizes, worker limits, and search dashboard
+  - supports bounded adaptive screening blocks when the finalist cutoff remains statistically unresolved
+  - records the top-ranked result separately from the gated winner and confidence-based promotion assessment
   - renders training, active-operation, screening, and final-evaluation progress bars when `dashboard = true`
   - writes live progress into the search manifest and optional raw subprocess logs under `models/search/<run_prefix>/logs/`
   - always uses `build-fresh/showdown_client.exe`; the trainer path is intentionally not configurable

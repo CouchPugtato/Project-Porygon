@@ -136,11 +136,11 @@ In an interactive terminal, the search dashboard shows separate progress bars fo
 The search is staged:
 
 1. Train all sampled combinations and reject candidates that trip KL, anchor, or clipping safety checks.
-2. Evaluate the safest candidates against the parent with the candidate on both sides of the matchup; these live games provide the candidate-specific Tera and move-slot collapse checks.
+2. Evaluate the safest candidates against the parent with the candidate on both sides of the matchup; these live games provide the candidate-specific Tera and move-slot collapse checks. When the finalist cutoff remains unresolved, schedule additional balanced blocks for the provisional finalists and statistically plausible challengers up to a configured cap.
 3. Give only the leading candidates a larger final evaluation.
-4. Rank results by the lower bound of the 95% Wilson interval, with collapse-free candidates first.
+4. Rank results by the lower bound of the 95% Wilson interval, with collapse-free candidates first. The top-ranked finalist is only written as `best_result` when its point estimate exceeds the configured parent baseline; otherwise the search explicitly reports no winner.
 
-Screening defaults to 250 games per side and final evaluation defaults to 1,000 games per side. These values are intentionally much larger than a smoke test; reduce them only when validating that the workflow itself runs. Existing candidate and evaluation artifacts are reused by default, so rerunning the same command resumes interrupted work.
+Screening starts at 100 games per side and adaptively grows in 100-game blocks to at most 200 games per side while the cutoff is unresolved. Final evaluation defaults to 300 games per side. Existing candidate and evaluation artifacts are reused by default, so rerunning the same command resumes interrupted work. Set `adaptive_screen = false` to use only the initial screening allocation.
 
 Example shape (run this only after building and copying the current client):
 
@@ -148,7 +148,7 @@ Example shape (run this only after building and copying the current client):
 python .\py\tools\ppo_search.py --run-prefix search_replace_me --init-checkpoint .\models\runs\parent\parent.chk --episode-batch .\matches\runs\collection\collection_episodes_a.jsonl --anchor-checkpoint .\models\runs\parent\parent.chk --eval-model-b .\models\runs\parent\parent.chk
 ```
 
-For a robustness check, pass multiple deterministic orders such as `--shuffle-seeds 101,202,303`. The manifest under `models/search/<run-prefix>/` contains all training diagnostics, balanced evaluation results, confidence intervals, and the selected result. A search result is evidence for the tested parent, batch, opponent, and parameter ranges—not a universally optimal PPO setting.
+For a robustness check, pass multiple deterministic orders such as `--shuffle-seeds 101,202,303`. The manifest under `models/search/<run-prefix>/` contains all training diagnostics, balanced evaluation results, confidence intervals, `top_result`, the gated `best_result`, and a separate `promotion_assessment`. `tentative_winner` means the point estimate passed but its confidence interval did not clear the parent; only `confident_winner` supports automatic promotion. A search result is evidence for the tested parent, batch, opponent, and parameter ranges—not a universally optimal PPO setting.
 
 ## Collection provenance
 

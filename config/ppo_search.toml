@@ -14,8 +14,15 @@ max_trials = 18
 # Successive evaluation stages.
 screen_candidates = 8
 finalists = 3
-screen_games_per_side = 250
-final_games_per_side = 1000
+screen_games_per_side = 100
+adaptive_screen = true
+screen_game_block_per_side = 100
+screen_max_games_per_side = 200
+final_games_per_side = 300
+
+# A top-ranked result is only a winner above 50%; confidence is reported separately.
+promotion_min_win_rate = 0.50
+promotion_confidence_threshold = 0.50
 
 # Training and safety screening.
 epochs = 1

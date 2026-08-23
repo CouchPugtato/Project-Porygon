@@ -8,18 +8,23 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from ppo_search import (
+    EvaluationResult,
     BaseSearchReporter,
     DEFAULT_TRAINER_EXE,
     Hyperparameters,
     ManifestProgressWriter,
     SearchDisplayState,
+    aggregate_group_stats,
+    adaptive_screen_contenders,
     build_eval_command,
     build_train_command,
     evaluation_artifacts_match,
     load_config_args,
+    merge_evaluation_results,
     parse_evaluation_progress,
     parse_search_args,
     parse_training_progress,
+    promotion_assessment,
     run_command,
     training_safety_flags,
     training_artifacts_match,
@@ -76,6 +81,21 @@ def safety_args() -> SimpleNamespace:
 
 
 class PpoSearchTests(unittest.TestCase):
+    @staticmethod
+    def evaluation(stage: str, wins: int, games: int, low: float, high: float) -> EvaluationResult:
+        return EvaluationResult(
+            stage=stage,
+            games=games,
+            wins=wins,
+            earned_wins=wins,
+            win_rate=wins / games,
+            earned_win_rate=wins / games,
+            confidence_low=low,
+            confidence_high=high,
+            collapse_flags=[],
+            run_names=[f"{stage}_{games}"],
+        )
+
     def test_search_config_loads_and_cli_overrides_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = Path(temp_dir) / "search.toml"
@@ -132,6 +152,70 @@ class PpoSearchTests(unittest.TestCase):
         assert isinstance(active, dict)
         self.assertEqual(active["current"], 24)
         self.assertEqual(active["total"], 128)
+
+    def test_evaluation_blocks_merge_counts_and_recompute_confidence(self) -> None:
+        first = self.evaluation("screen", 55, 100, 0.45, 0.64)
+        second = self.evaluation("screen", 50, 100, 0.40, 0.60)
+        merged = merge_evaluation_results(first, second)
+        self.assertEqual(merged.games, 200)
+        self.assertEqual(merged.wins, 105)
+        self.assertAlmostEqual(merged.win_rate, 0.525)
+        self.assertLess(merged.confidence_low, merged.win_rate)
+        self.assertGreater(merged.confidence_high, merged.win_rate)
+        self.assertEqual(merged.run_names, ["screen_100", "screen_100"])
+
+    def test_evaluation_merge_recomputes_collapse_from_aggregate_behavior(self) -> None:
+        balanced_counts = {
+            "matches_played": 100,
+            "wins": 55,
+            "earned_wins": 55,
+            "losses": 45,
+            "tera_battles": 80,
+            "total_move_slot_1": 25,
+            "total_move_slot_2": 25,
+            "total_move_slot_3": 25,
+            "total_move_slot_4": 25,
+            "total_switch_slot_3": 25,
+            "total_switch_slot_4": 25,
+            "total_switch_slot_5": 25,
+            "total_switch_slot_6": 25,
+        }
+        stats = aggregate_group_stats({}, balanced_counts)
+        first = self.evaluation("screen", 55, 100, 0.45, 0.64)
+        second = self.evaluation("screen", 55, 100, 0.45, 0.64)
+        first.collapse_flags = ["transient_block_warning"]
+        first.candidate_stats = stats
+        first.baseline_stats = stats
+        second.candidate_stats = stats
+        second.baseline_stats = stats
+        merged = merge_evaluation_results(first, second)
+        self.assertNotIn("transient_block_warning", merged.collapse_flags)
+        self.assertEqual(merged.candidate_stats["matches_played"], 200)
+
+    def test_adaptive_screening_refines_only_an_unresolved_cutoff(self) -> None:
+        first = SimpleNamespace(run_name="first", screen_evaluation=self.evaluation("screen", 56, 100, 0.47, 0.65))
+        cutoff = SimpleNamespace(run_name="cutoff", screen_evaluation=self.evaluation("screen", 52, 100, 0.43, 0.61))
+        challenger = SimpleNamespace(run_name="challenger", screen_evaluation=self.evaluation("screen", 48, 100, 0.39, 0.52))
+        requested = {"first": 100, "cutoff": 100, "challenger": 100}
+        contenders = adaptive_screen_contenders([first, cutoff, challenger], 2, requested, 200)
+        self.assertEqual([trial.run_name for trial in contenders], ["first", "cutoff", "challenger"])
+        challenger.screen_evaluation.confidence_high = 0.42
+        self.assertEqual(adaptive_screen_contenders([first, cutoff, challenger], 2, requested, 200), [])
+
+    def test_promotion_gate_distinguishes_no_tentative_and_confident_winner(self) -> None:
+        trial = SimpleNamespace(run_name="candidate", final_evaluation=self.evaluation("final", 49, 100, 0.39, 0.59))
+        winner, assessment = promotion_assessment([trial], 0.5, 0.5)
+        self.assertIsNone(winner)
+        self.assertEqual(assessment["status"], "no_winner")
+        trial.final_evaluation = self.evaluation("final", 52, 100, 0.42, 0.62)
+        winner, assessment = promotion_assessment([trial], 0.5, 0.5)
+        self.assertIs(winner, trial)
+        self.assertEqual(assessment["status"], "tentative_winner")
+        trial.final_evaluation = self.evaluation("final", 550, 1000, 0.519, 0.581)
+        winner, assessment = promotion_assessment([trial], 0.5, 0.5)
+        self.assertIs(winner, trial)
+        self.assertEqual(assessment["status"], "confident_winner")
+        self.assertTrue(assessment["promotion_confident"])
 
     def test_streamed_command_updates_progress_and_writes_raw_log(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

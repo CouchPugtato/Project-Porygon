@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TextIO
 
 from rl_defaults import bool_default, float_default, int_default
+from eval_collapse_check import collapse_flags_for_group
 
 try:
     from rich.console import Console, Group
@@ -176,6 +177,100 @@ class EvaluationResult:
     confidence_high: float
     collapse_flags: list[str]
     run_names: list[str]
+    candidate_stats: dict[str, object] = field(default_factory=dict)
+    baseline_stats: dict[str, object] = field(default_factory=dict)
+
+
+GROUP_COUNT_KEYS = (
+    "matches_played", "wins", "earned_wins", "losses", "draws",
+    "total_moves", "total_protects", "total_passes", "total_teras", "tera_battles",
+    "total_move_slot_1", "total_move_slot_2", "total_move_slot_3", "total_move_slot_4",
+    "total_switch_slot_1", "total_switch_slot_2", "total_switch_slot_3",
+    "total_switch_slot_4", "total_switch_slot_5", "total_switch_slot_6",
+)
+
+
+def safe_rate(numerator: int | float, denominator: int | float) -> float:
+    return float(numerator) / float(denominator) if denominator else 0.0
+
+
+def aggregate_group_stats(
+    existing: dict[str, object],
+    addition: dict[str, object],
+) -> dict[str, object]:
+    counts = {
+        key: int(existing.get(key, 0) or 0) + int(addition.get(key, 0) or 0)
+        for key in GROUP_COUNT_KEYS
+    }
+    move_total = sum(counts[f"total_move_slot_{slot}"] for slot in range(1, 5))
+    switch_total = sum(counts[f"total_switch_slot_{slot}"] for slot in range(1, 7))
+    matches = counts["matches_played"]
+    counts.update({
+        "win_rate": safe_rate(counts["wins"], matches),
+        "earned_win_rate": safe_rate(counts["earned_wins"], matches),
+        "tera_battle_rate": safe_rate(counts["tera_battles"], matches),
+        "tera_rate": safe_rate(counts["tera_battles"], matches),
+        "move_slot_rates": {
+            f"slot_{slot}": safe_rate(counts[f"total_move_slot_{slot}"], move_total)
+            for slot in range(1, 5)
+        },
+        "switch_slot_rates": {
+            f"slot_{slot}": safe_rate(counts[f"total_switch_slot_{slot}"], switch_total)
+            for slot in range(1, 7)
+        },
+    })
+    return counts
+
+
+def aggregate_collapse_flags(
+    candidate_stats: dict[str, object],
+    baseline_stats: dict[str, object],
+) -> list[str]:
+    return collapse_flags_for_group(
+        candidate_stats,
+        baseline_stats,
+        warn_move_slot_concentration=float_default("warn_move_slot_concentration"),
+        hard_move_slot_collapse=float_default("hard_move_slot_collapse"),
+        warn_switch_slot6_concentration=float_default("warn_switch_slot_6_concentration"),
+        warn_tera_baseline_ratio=float_default("warn_tera_baseline_ratio"),
+        fail_fast_earned_win_rate=float_default("fail_fast_earned_win_rate"),
+        fail_fast_min_games=int_default("fail_fast_min_games"),
+    )
+
+
+def merge_evaluation_results(
+    existing: EvaluationResult | None,
+    addition: EvaluationResult,
+) -> EvaluationResult:
+    if existing is None:
+        return addition
+    if existing.stage != addition.stage:
+        raise ValueError(f"cannot merge {existing.stage} and {addition.stage} evaluations")
+    games = existing.games + addition.games
+    wins = existing.wins + addition.wins
+    earned_wins = existing.earned_wins + addition.earned_wins
+    low, high = wilson_interval(wins, games)
+    candidate_stats = aggregate_group_stats(existing.candidate_stats, addition.candidate_stats)
+    baseline_stats = aggregate_group_stats(existing.baseline_stats, addition.baseline_stats)
+    collapse_flags = (
+        aggregate_collapse_flags(candidate_stats, baseline_stats)
+        if candidate_stats.get("matches_played")
+        else sorted(set(existing.collapse_flags + addition.collapse_flags))
+    )
+    return EvaluationResult(
+        stage=existing.stage,
+        games=games,
+        wins=wins,
+        earned_wins=earned_wins,
+        win_rate=(wins / games) if games else 0.0,
+        earned_win_rate=(earned_wins / games) if games else 0.0,
+        confidence_low=low,
+        confidence_high=high,
+        collapse_flags=collapse_flags,
+        run_names=existing.run_names + addition.run_names,
+        candidate_stats=candidate_stats,
+        baseline_stats=baseline_stats,
+    )
 
 
 @dataclass
@@ -256,6 +351,8 @@ class SearchDisplayState:
     finalized_count: int = 0
     screen_games_completed: int = 0
     final_games_completed: int = 0
+    screen_games_planned: int = 0
+    final_games_planned: int = 0
     screen_planned_candidates: int = 0
     final_planned_candidates: int = 0
     screen_plan_finalized: bool = False
@@ -337,8 +434,8 @@ class SearchDisplayState:
             seconds_per_game = self.evaluation_seconds / self.evaluation_games
             screen_candidates = self.screen_planned_candidates if self.screen_plan_finalized else self.configured_screen_candidates
             final_candidates = self.final_planned_candidates if self.final_plan_finalized else self.configured_finalists
-            screen_total = 2 * screen_candidates * self.screen_games_per_side
-            final_total = 2 * final_candidates * self.final_games_per_side
+            screen_total = self.screen_games_planned or (2 * screen_candidates * self.screen_games_per_side)
+            final_total = self.final_games_planned or (2 * final_candidates * self.final_games_per_side)
             active_screen = self.active_current if self.active_kind == "evaluation" and self.active_stage == "screen" else 0
             active_final = self.active_current if self.active_kind == "evaluation" and self.active_stage == "final" else 0
             remaining_games = max(0, screen_total - self.screen_games_completed - active_screen)
@@ -359,7 +456,9 @@ class SearchDisplayState:
             "screened_candidates": self.screened_count,
             "finalized_candidates": self.finalized_count,
             "screen_games_completed": self.screen_games_completed,
+            "screen_games_planned": self.screen_games_planned,
             "final_games_completed": self.final_games_completed,
+            "final_games_planned": self.final_games_planned,
             "active": {
                 "kind": self.active_kind,
                 "stage": self.active_stage,
@@ -527,8 +626,8 @@ class RichSearchReporter(BaseSearchReporter):
         table.add_column(width=20, justify="right")
         screen_candidates = self.state.screen_planned_candidates if self.state.screen_plan_finalized else self.state.configured_screen_candidates
         final_candidates = self.state.final_planned_candidates if self.state.final_plan_finalized else self.state.configured_finalists
-        screen_total = 2 * screen_candidates * self.state.screen_games_per_side
-        final_total = 2 * final_candidates * self.state.final_games_per_side
+        screen_total = self.state.screen_games_planned or (2 * screen_candidates * self.state.screen_games_per_side)
+        final_total = self.state.final_games_planned or (2 * final_candidates * self.state.final_games_per_side)
         screen_current = self.state.screen_games_completed
         final_current = self.state.final_games_completed
         if self.state.active_kind == "evaluation" and self.state.active_stage == "screen":
@@ -914,15 +1013,18 @@ def run_balanced_evaluation(
     reporter: BaseSearchReporter,
     state: SearchDisplayState,
     logs_dir: Path,
+    block_index: int = 0,
 ) -> EvaluationResult:
     total_games = 0
     total_wins = 0
     total_earned_wins = 0
-    collapse_flags: list[str] = []
+    candidate_stats: dict[str, object] = {}
+    baseline_stats: dict[str, object] = {}
     run_names: list[str] = []
     candidate_checkpoint = Path(trial.checkpoint_path)
     for side_index, side in enumerate(("a", "b")):
-        run_name = f"{trial.run_name}_{stage}_side_{side}_{games_per_side}"
+        block_token = f"_block_{block_index:02d}" if block_index > 0 else ""
+        run_name = f"{trial.run_name}_{stage}{block_token}_side_{side}_{games_per_side}"
         state.begin_operation(
             "evaluation", trial.run_name, trial_index, trial.hyperparameters,
             games_per_side, stage=stage, side=side,
@@ -947,18 +1049,20 @@ def run_balanced_evaluation(
         if summary.get("status") != "completed":
             raise RuntimeError(f"evaluation did not complete: {run_name}")
         group = ((summary.get("group_stats", {}) or {}).get(side, {}) or {})
+        baseline_side = "b" if side == "a" else "a"
+        baseline_group = ((summary.get("group_stats", {}) or {}).get(baseline_side, {}) or {})
+        candidate_stats = aggregate_group_stats(candidate_stats, group)
+        baseline_stats = aggregate_group_stats(baseline_stats, baseline_group)
         games = int(group.get("matches_played", 0) or 0)
         total_games += games
         total_wins += int(group.get("wins", 0) or 0)
         total_earned_wins += int(group.get("earned_wins", 0) or 0)
         state.finish_operation(games, record_duration=not can_resume)
         if stage == "screen":
-            state.screen_games_completed += games
+            state.screen_games_completed += min(games, games_per_side)
         else:
-            state.final_games_completed += games
+            state.final_games_completed += min(games, games_per_side)
         reporter.refresh()
-        side_flags = ((summary.get("group_collapse_flags", {}) or {}).get(side, []) or [])
-        collapse_flags.extend(str(flag) for flag in side_flags)
     low, high = wilson_interval(total_wins, total_games)
     return EvaluationResult(
         stage=stage,
@@ -969,8 +1073,10 @@ def run_balanced_evaluation(
         earned_win_rate=(total_earned_wins / total_games) if total_games else 0.0,
         confidence_low=low,
         confidence_high=high,
-        collapse_flags=sorted(set(collapse_flags)),
+        collapse_flags=aggregate_collapse_flags(candidate_stats, baseline_stats),
         run_names=run_names,
+        candidate_stats=candidate_stats,
+        baseline_stats=baseline_stats,
     )
 
 
@@ -979,6 +1085,77 @@ def evaluation_rank_key(trial: TrialResult, final: bool = False) -> tuple[int, f
     if result is None:
         return (0, 0.0, 0.0, 0.0)
     return (1 if not result.collapse_flags else 0, result.confidence_low, result.win_rate, -trial.anchor_kl_mean)
+
+
+def adaptive_screen_contenders(
+    ranked_trials: list[TrialResult],
+    finalist_count: int,
+    requested_games_per_side: dict[str, int],
+    max_games_per_side: int,
+) -> list[TrialResult]:
+    usable = [
+        trial for trial in ranked_trials
+        if trial.screen_evaluation is not None and not trial.screen_evaluation.collapse_flags
+    ]
+    if finalist_count <= 0 or len(usable) <= finalist_count:
+        return []
+    provisional = usable[:finalist_count]
+    cutoff = provisional[-1].screen_evaluation
+    assert cutoff is not None
+    challengers = [
+        trial for trial in usable[finalist_count:]
+        if trial.screen_evaluation is not None
+        and trial.screen_evaluation.confidence_high >= cutoff.confidence_low
+    ]
+    if not challengers:
+        return []
+    unresolved = provisional + challengers
+    return [
+        trial for trial in unresolved
+        if requested_games_per_side.get(trial.run_name, 0) < max_games_per_side
+    ]
+
+
+def promotion_assessment(
+    ranked_final: list[TrialResult],
+    minimum_win_rate: float,
+    confidence_threshold: float,
+) -> tuple[TrialResult | None, dict[str, object]]:
+    if not ranked_final:
+        return None, {
+            "status": "no_finalist",
+            "candidate": None,
+            "minimum_win_rate": minimum_win_rate,
+            "confidence_threshold": confidence_threshold,
+            "promotion_confident": False,
+        }
+    top = ranked_final[0]
+    result = top.final_evaluation
+    assert result is not None
+    collapse_free = not result.collapse_flags
+    clears_point_gate = result.win_rate > minimum_win_rate
+    clears_confidence_gate = result.confidence_low > confidence_threshold
+    winner = top if collapse_free and clears_point_gate else None
+    if not collapse_free:
+        status = "collapse_rejected"
+    elif not clears_point_gate:
+        status = "no_winner"
+    elif clears_confidence_gate:
+        status = "confident_winner"
+    else:
+        status = "tentative_winner"
+    return winner, {
+        "status": status,
+        "candidate": top.run_name,
+        "minimum_win_rate": minimum_win_rate,
+        "confidence_threshold": confidence_threshold,
+        "win_rate": result.win_rate,
+        "confidence_low": result.confidence_low,
+        "confidence_high": result.confidence_high,
+        "collapse_free": collapse_free,
+        "clears_point_gate": clears_point_gate,
+        "promotion_confident": bool(winner is not None and clears_confidence_gate),
+    }
 
 
 def trial_payload(trial: TrialResult) -> dict[str, object]:
@@ -1026,7 +1203,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-anchor-kl-max", type=float, default=0.20)
     parser.add_argument("--max-clip-fraction", type=float, default=0.25)
     parser.add_argument("--screen-games-per-side", type=positive_int, default=250)
+    parser.add_argument("--adaptive-screen", type=parse_bool, default=True)
+    parser.add_argument("--screen-game-block-per-side", type=positive_int, default=100)
+    parser.add_argument("--screen-max-games-per-side", type=positive_int, default=500)
     parser.add_argument("--final-games-per-side", type=positive_int, default=1000)
+    parser.add_argument("--promotion-min-win-rate", type=float, default=0.5)
+    parser.add_argument("--promotion-confidence-threshold", type=float, default=0.5)
     parser.add_argument("--eval-concurrent-games", type=positive_int, default=70)
     parser.add_argument("--eval-worker-pairs", type=positive_int, default=125)
     parser.add_argument("--format", default="gen9randomdoublesbattle")
@@ -1053,6 +1235,14 @@ def parse_search_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_search_args()
+    if args.screen_max_games_per_side < args.screen_games_per_side:
+        raise SystemExit("screen-max-games-per-side must be >= screen-games-per-side")
+    for label, value in (
+        ("promotion-min-win-rate", args.promotion_min_win_rate),
+        ("promotion-confidence-threshold", args.promotion_confidence_threshold),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise SystemExit(f"{label} must be between 0 and 1")
     repo_root = resolve_repo_root()
     trainer_exe = resolve_path(repo_root, DEFAULT_TRAINER_EXE)
     init_checkpoint = resolve_path(repo_root, args.init_checkpoint)
@@ -1106,7 +1296,12 @@ def main() -> None:
             "screen_candidates": args.screen_candidates,
             "finalists": args.finalists,
             "screen_games_per_side": args.screen_games_per_side,
+            "adaptive_screen": args.adaptive_screen,
+            "screen_game_block_per_side": args.screen_game_block_per_side,
+            "screen_max_games_per_side": args.screen_max_games_per_side,
             "final_games_per_side": args.final_games_per_side,
+            "promotion_min_win_rate": args.promotion_min_win_rate,
+            "promotion_confidence_threshold": args.promotion_confidence_threshold,
         },
         "search_seed": args.search_seed,
         "trials": [],
@@ -1185,14 +1380,17 @@ def main() -> None:
         state.phase = "screening"
         state.screen_planned_candidates = len(screen_trials)
         state.screen_plan_finalized = True
+        state.screen_games_planned = 2 * len(screen_trials) * args.screen_games_per_side
         reporter.refresh()
         trial_indices = {trial.run_name: index for index, trial in enumerate(trials, start=1)}
+        requested_screen_games = {trial.run_name: 0 for trial in screen_trials}
         for index, trial in enumerate(screen_trials, start=1):
             trial.screen_evaluation = run_balanced_evaluation(
                 args, repo_root, trial, parent_checkpoint, "screen",
                 args.screen_games_per_side, args.search_seed * 1000 + index * 10,
-                trial_indices[trial.run_name], reporter, state, logs_dir,
+                trial_indices[trial.run_name], reporter, state, logs_dir, block_index=1,
             )
+            requested_screen_games[trial.run_name] = args.screen_games_per_side
             state.screened_count += 1
             state.trial_status[trial.run_name] = "screened"
             manifest["trials"] = [trial_payload(item) for item in trials]
@@ -1203,6 +1401,41 @@ def main() -> None:
             progress_writer.update(force=True)
 
         ranked_screen = sorted(screen_trials, key=evaluation_rank_key, reverse=True)
+        adaptive_block_index = 1
+        while args.adaptive_screen:
+            contenders = adaptive_screen_contenders(
+                ranked_screen,
+                min(args.finalists, len(ranked_screen)),
+                requested_screen_games,
+                args.screen_max_games_per_side,
+            )
+            if not contenders:
+                break
+            adaptive_block_index += 1
+            reporter.notice(
+                f"adaptive screening block {adaptive_block_index}: refining {len(contenders)} unresolved candidates"
+            )
+            for trial in contenders:
+                remaining = args.screen_max_games_per_side - requested_screen_games[trial.run_name]
+                block_games = min(args.screen_game_block_per_side, remaining)
+                if block_games <= 0:
+                    continue
+                state.screen_games_planned += 2 * block_games
+                state.trial_status[trial.run_name] = "refining"
+                addition = run_balanced_evaluation(
+                    args, repo_root, trial, parent_checkpoint, "screen",
+                    block_games,
+                    args.search_seed * 1000000 + adaptive_block_index * 10000 + trial_indices[trial.run_name] * 10,
+                    trial_indices[trial.run_name], reporter, state, logs_dir,
+                    block_index=adaptive_block_index,
+                )
+                trial.screen_evaluation = merge_evaluation_results(trial.screen_evaluation, addition)
+                requested_screen_games[trial.run_name] += block_games
+                state.trial_status[trial.run_name] = "screened"
+                manifest["trials"] = [trial_payload(item) for item in trials]
+                progress_writer.update(force=True)
+            ranked_screen = sorted(screen_trials, key=evaluation_rank_key, reverse=True)
+
         finalists = [
             trial for trial in ranked_screen
             if trial.screen_evaluation and not trial.screen_evaluation.collapse_flags
@@ -1210,12 +1443,13 @@ def main() -> None:
         state.phase = "final evaluation"
         state.final_planned_candidates = len(finalists)
         state.final_plan_finalized = True
+        state.final_games_planned = 2 * len(finalists) * args.final_games_per_side
         reporter.refresh()
         for index, trial in enumerate(finalists, start=1):
             trial.final_evaluation = run_balanced_evaluation(
                 args, repo_root, trial, parent_checkpoint, "final",
                 args.final_games_per_side, args.search_seed * 100000 + index * 10,
-                trial_indices[trial.run_name], reporter, state, logs_dir,
+                trial_indices[trial.run_name], reporter, state, logs_dir, block_index=1,
             )
             state.finalized_count += 1
             state.trial_status[trial.run_name] = "finalized"
@@ -1227,20 +1461,35 @@ def main() -> None:
             progress_writer.update(force=True)
 
         ranked_final = sorted(finalists, key=lambda trial: evaluation_rank_key(trial, final=True), reverse=True)
+        winner, assessment = promotion_assessment(
+            ranked_final,
+            args.promotion_min_win_rate,
+            args.promotion_confidence_threshold,
+        )
         state.phase = "completed"
         state.clear_operation()
         manifest["status"] = "completed"
         manifest["completed_at_unix"] = time.time()
         manifest["ranked_screen_results"] = [trial_payload(trial) for trial in ranked_screen]
         manifest["ranked_final_results"] = [trial_payload(trial) for trial in ranked_final]
-        manifest["best_result"] = trial_payload(ranked_final[0]) if ranked_final else None
-        if ranked_final:
-            best = ranked_final[0]
-            assert best.final_evaluation is not None
+        manifest["top_result"] = trial_payload(ranked_final[0]) if ranked_final else None
+        manifest["best_result"] = trial_payload(winner) if winner else None
+        manifest["promotion_assessment"] = assessment
+        if winner:
+            assert winner.final_evaluation is not None
             reporter.notice(
-                f"best run={best.run_name} lr={best.hyperparameters.learning_rate:g} "
-                f"entropy={best.hyperparameters.entropy_coef:g} anchor={best.hyperparameters.anchor_kl_coef:g} "
-                f"win_rate={best.final_evaluation.win_rate:.4f} lower95={best.final_evaluation.confidence_low:.4f}"
+                f"winner run={winner.run_name} lr={winner.hyperparameters.learning_rate:g} "
+                f"entropy={winner.hyperparameters.entropy_coef:g} anchor={winner.hyperparameters.anchor_kl_coef:g} "
+                f"win_rate={winner.final_evaluation.win_rate:.4f} "
+                f"lower95={winner.final_evaluation.confidence_low:.4f} "
+                f"promotion_confident={assessment['promotion_confident']}"
+            )
+        elif ranked_final:
+            top = ranked_final[0]
+            assert top.final_evaluation is not None
+            reporter.notice(
+                f"no winner; top run={top.run_name} win_rate={top.final_evaluation.win_rate:.4f} "
+                f"lower95={top.final_evaluation.confidence_low:.4f}"
             )
         else:
             reporter.notice("no safe finalist completed")
