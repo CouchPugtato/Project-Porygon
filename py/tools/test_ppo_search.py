@@ -11,6 +11,8 @@ from ppo_search import (
     build_eval_command,
     build_train_command,
     evaluation_artifacts_match,
+    load_config_args,
+    parse_search_args,
     training_safety_flags,
     training_artifacts_match,
     wilson_interval,
@@ -65,6 +67,26 @@ def safety_args() -> SimpleNamespace:
 
 
 class PpoSearchTests(unittest.TestCase):
+    def test_search_config_loads_and_cli_overrides_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "search.toml"
+            config.write_text(
+                'max_trials = 5\nscreen_games_per_side = 40\nresume = false\n',
+                encoding="utf-8",
+            )
+            config_args = load_config_args(config)
+            self.assertEqual(config_args[:2], ["--max-trials", "5"])
+            args = parse_search_args([
+                "--config", str(config),
+                "--run-prefix", "test",
+                "--init-checkpoint", "parent.chk",
+                "--episode-batch", "batch.jsonl",
+                "--max-trials", "2",
+            ])
+            self.assertEqual(args.max_trials, 2)
+            self.assertEqual(args.screen_games_per_side, 40)
+            self.assertFalse(args.resume)
+
     def test_train_command_uses_fixed_batch_anchor_and_reproducible_guards(self) -> None:
         params = Hyperparameters(2.5e-5, 3e-4, 0.01, 0.2, 101)
         command = build_train_command(

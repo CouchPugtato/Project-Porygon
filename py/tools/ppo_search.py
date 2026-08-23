@@ -20,6 +20,40 @@ DEFAULT_RUNS_ROOT = Path("models") / "runs"
 DEFAULT_MATCH_RUNS_ROOT = Path("matches") / "runs"
 DEFAULT_SEARCH_ROOT = Path("models") / "search"
 DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "ppo_search.toml"
+
+
+def load_config_args(path: Path) -> list[str]:
+    if not path.exists():
+        raise RuntimeError(f"PPO search config not found: {path}")
+    args: list[str] = []
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise RuntimeError(f"invalid PPO search config {path}:{line_number}: expected key = value")
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip()
+        value_text = raw_value.strip()
+        if not key or not value_text:
+            raise RuntimeError(f"invalid PPO search config {path}:{line_number}: empty key or value")
+        if len(value_text) >= 2 and value_text[0] == '"' and value_text[-1] == '"':
+            value = bytes(value_text[1:-1], "utf-8").decode("unicode_escape")
+        else:
+            value = value_text
+        args.extend(["--" + key.replace("_", "-"), value])
+    return args
+
+
+def config_path_from_args(argv: list[str]) -> Path:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    known, _ = parser.parse_known_args(argv)
+    path = Path(known.config)
+    if not path.is_absolute():
+        path = (resolve_repo_root() / path).resolve()
+    return path
 
 
 def parse_bool(value: str) -> bool:
@@ -447,6 +481,7 @@ def trial_payload(trial: TrialResult) -> dict[str, object]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Controlled anchored PPO hyperparameter search")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Search defaults file; CLI flags override it")
     parser.add_argument("--run-prefix", required=True)
     parser.add_argument("--init-checkpoint", required=True)
     parser.add_argument("--episode-batch", required=True)
@@ -499,14 +534,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_search_args(argv: list[str] | None = None) -> argparse.Namespace:
+    cli_args = list(sys.argv[1:] if argv is None else argv)
+    config_args = load_config_args(config_path_from_args(cli_args))
+    return build_parser().parse_args(config_args + cli_args)
+
+
 def main() -> None:
-    args = build_parser().parse_args()
+    args = parse_search_args()
     repo_root = resolve_repo_root()
     trainer_exe = resolve_path(repo_root, args.trainer_exe)
     init_checkpoint = resolve_path(repo_root, args.init_checkpoint)
     episode_batch = resolve_path(repo_root, args.episode_batch)
     anchor_checkpoint = resolve_path(repo_root, args.anchor_checkpoint) if args.anchor_checkpoint else init_checkpoint
     parent_checkpoint = resolve_path(repo_root, args.eval_model_b) if args.eval_model_b else init_checkpoint
+    config_path = resolve_path(repo_root, args.config)
     for label, path in (
         ("trainer executable", trainer_exe),
         ("initial checkpoint", init_checkpoint),
@@ -538,6 +580,21 @@ def main() -> None:
             "episode_batch": str(episode_batch),
             "anchor_checkpoint": str(anchor_checkpoint),
             "evaluation_parent": str(parent_checkpoint),
+        },
+        "config_path": str(config_path),
+        "search_space": {
+            "learning_rates": args.learning_rates,
+            "entropy_coefs": args.entropy_coefs,
+            "anchor_kl_coefs": args.anchor_kl_coefs,
+            "ppo_clip_epsilons": args.ppo_clip_epsilons,
+            "shuffle_seeds": args.shuffle_seeds,
+            "max_trials": args.max_trials,
+        },
+        "staging": {
+            "screen_candidates": args.screen_candidates,
+            "finalists": args.finalists,
+            "screen_games_per_side": args.screen_games_per_side,
+            "final_games_per_side": args.final_games_per_side,
         },
         "search_seed": args.search_seed,
         "trials": [],
