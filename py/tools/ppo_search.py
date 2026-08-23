@@ -146,7 +146,7 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def wilson_interval(wins: int, games: int, z: float = 1.959963984540054) -> tuple[float, float]:
+def wilson_interval(wins: int | float, games: int, z: float = 1.959963984540054) -> tuple[float, float]:
     if games <= 0:
         return (0.0, 1.0)
     p = wins / games
@@ -163,6 +163,7 @@ class Hyperparameters:
     anchor_kl_coef: float
     ppo_clip_epsilon: float
     shuffle_seed: int
+    episode_limit: int = 0
 
 
 @dataclass
@@ -177,6 +178,12 @@ class EvaluationResult:
     confidence_high: float
     collapse_flags: list[str]
     run_names: list[str]
+    valid_games: int = 0
+    invalid_games: int = 0
+    valid_wins: int = 0
+    valid_draws: int = 0
+    valid_score: float = 0.0
+    valid_win_rate: float = 0.0
     candidate_stats: dict[str, object] = field(default_factory=dict)
     baseline_stats: dict[str, object] = field(default_factory=dict)
 
@@ -192,6 +199,35 @@ GROUP_COUNT_KEYS = (
 
 def safe_rate(numerator: int | float, denominator: int | float) -> float:
     return float(numerator) / float(denominator) if denominator else 0.0
+
+
+def valid_outcome_counts(
+    candidate_stats: dict[str, object],
+    baseline_stats: dict[str, object],
+) -> dict[str, int | float]:
+    """Separate normal outcomes from disconnect/forfeit results.
+
+    A normally decided game contributes one earned win across the two sides. A
+    normal draw contributes one draw to each side. Raw wins without an earned
+    win are Showdown disconnect/forfeit outcomes and are excluded.
+    """
+    raw_games = int(candidate_stats.get("matches_played", 0) or 0)
+    candidate_earned_wins = int(candidate_stats.get("earned_wins", 0) or 0)
+    baseline_earned_wins = int(baseline_stats.get("earned_wins", 0) or 0)
+    candidate_draws = int(candidate_stats.get("draws", 0) or 0)
+    baseline_draws = int(baseline_stats.get("draws", 0) or 0)
+    valid_draws = min(candidate_draws, baseline_draws)
+    valid_games = min(raw_games, candidate_earned_wins + baseline_earned_wins + valid_draws)
+    valid_score = candidate_earned_wins + 0.5 * valid_draws
+    return {
+        "raw_games": raw_games,
+        "valid_games": valid_games,
+        "invalid_games": max(0, raw_games - valid_games),
+        "valid_wins": candidate_earned_wins,
+        "valid_draws": valid_draws,
+        "valid_score": valid_score,
+        "valid_win_rate": safe_rate(valid_score, valid_games),
+    }
 
 
 def aggregate_group_stats(
@@ -249,9 +285,10 @@ def merge_evaluation_results(
     games = existing.games + addition.games
     wins = existing.wins + addition.wins
     earned_wins = existing.earned_wins + addition.earned_wins
-    low, high = wilson_interval(wins, games)
     candidate_stats = aggregate_group_stats(existing.candidate_stats, addition.candidate_stats)
     baseline_stats = aggregate_group_stats(existing.baseline_stats, addition.baseline_stats)
+    valid = valid_outcome_counts(candidate_stats, baseline_stats)
+    low, high = wilson_interval(float(valid["valid_score"]), int(valid["valid_games"]))
     collapse_flags = (
         aggregate_collapse_flags(candidate_stats, baseline_stats)
         if candidate_stats.get("matches_played")
@@ -268,6 +305,12 @@ def merge_evaluation_results(
         confidence_high=high,
         collapse_flags=collapse_flags,
         run_names=existing.run_names + addition.run_names,
+        valid_games=int(valid["valid_games"]),
+        invalid_games=int(valid["invalid_games"]),
+        valid_wins=int(valid["valid_wins"]),
+        valid_draws=int(valid["valid_draws"]),
+        valid_score=float(valid["valid_score"]),
+        valid_win_rate=float(valid["valid_win_rate"]),
         candidate_stats=candidate_stats,
         baseline_stats=baseline_stats,
     )
@@ -653,11 +696,14 @@ class RichSearchReporter(BaseSearchReporter):
         result = trial.final_evaluation or trial.screen_evaluation
         if not result:
             return "-"
-        return f"{result.win_rate:.1%} [{result.confidence_low:.1%}, {result.confidence_high:.1%}]"
+        return (
+            f"{result.valid_win_rate:.1%} [{result.confidence_low:.1%}, {result.confidence_high:.1%}] "
+            f"valid={result.valid_games} invalid={result.invalid_games}"
+        )
 
     def _candidate_table(self) -> Table:
         table = Table(expand=True, box=None, pad_edge=False, header_style="bold white")
-        for name, width in (("#", 3), ("Status", 11), ("LR", 9), ("Entropy", 9), ("Anchor", 8), ("Clip", 6), ("KL", 8), ("Anchor KL", 10), ("Clip frac", 10), ("KL guard", 9)):
+        for name, width in (("#", 3), ("Status", 11), ("Data", 6), ("LR", 9), ("Entropy", 9), ("Anchor", 8), ("Clip", 6), ("KL", 8), ("Anchor KL", 10), ("Clip frac", 10), ("KL guard", 9)):
             table.add_column(name, width=width)
         table.add_column("Safety", ratio=1)
         table.add_column("Evaluation", ratio=1)
@@ -666,7 +712,8 @@ class RichSearchReporter(BaseSearchReporter):
             status = self.state.trial_status.get(trial.run_name, "safe" if not trial.safety_flags else "rejected")
             style = "red" if trial.safety_flags else ("green" if status in {"safe", "screened", "finalized"} else "cyan")
             table.add_row(
-                str(index), f"[{style}]{status}[/{style}]", f"{trial.hyperparameters.learning_rate:g}",
+                str(index), f"[{style}]{status}[/{style}]",
+                str(trial.hyperparameters.episode_limit or "all"), f"{trial.hyperparameters.learning_rate:g}",
                 f"{trial.hyperparameters.entropy_coef:g}", f"{trial.hyperparameters.anchor_kl_coef:g}",
                 f"{trial.hyperparameters.ppo_clip_epsilon:g}", f"{trial.approx_kl:.4f}",
                 f"{trial.anchor_kl_mean:.4f}", f"{trial.clip_fraction:.3f}",
@@ -678,7 +725,7 @@ class RichSearchReporter(BaseSearchReporter):
             metrics = self.state.active_metrics
             if params:
                 table.add_row(
-                    str(self.state.active_trial_index), "[cyan]training[/cyan]", f"{params.learning_rate:g}",
+                    str(self.state.active_trial_index), "[cyan]training[/cyan]", str(params.episode_limit or "all"), f"{params.learning_rate:g}",
                     f"{params.entropy_coef:g}", f"{params.anchor_kl_coef:g}", f"{params.ppo_clip_epsilon:g}",
                     f"{float(metrics.get('approx_kl', 0.0)):.4f}", f"{float(metrics.get('anchor_kl_mean', 0.0)):.4f}",
                     f"{float(metrics.get('clip_fraction', 0.0)):.3f}",
@@ -704,7 +751,7 @@ class RichSearchReporter(BaseSearchReporter):
         for index, trial in enumerate(ranked, start=1):
             result = trial.final_evaluation or trial.screen_evaluation
             assert result is not None
-            table.add_row(str(index), trial.run_name, result.stage, f"{result.win_rate:.1%}", f"{result.confidence_low:.1%}")
+            table.add_row(str(index), trial.run_name, result.stage, f"{result.valid_win_rate:.1%}", f"{result.confidence_low:.1%}")
         return table
 
     def _render(self) -> Group:
@@ -779,13 +826,14 @@ def safe_float_token(value: float) -> str:
 
 
 def trial_run_name(prefix: str, index: int, params: Hyperparameters) -> str:
-    return (
+    base = (
         f"{prefix}_{index:02d}_lr{safe_float_token(params.learning_rate)}"
         f"_ent{safe_float_token(params.entropy_coef)}"
         f"_anchor{safe_float_token(params.anchor_kl_coef)}"
         f"_clip{safe_float_token(params.ppo_clip_epsilon)}"
         f"_seed{params.shuffle_seed}"
     )
+    return f"{base}_eps{params.episode_limit}" if params.episode_limit > 0 else base
 
 
 def build_train_command(
@@ -817,6 +865,7 @@ def build_train_command(
         "--target-kl-hard-multiplier", str(args.target_kl_hard_multiplier),
         "--target-kl-hard-consecutive-updates", str(args.target_kl_hard_consecutive_updates),
         "--shuffle-seed", str(params.shuffle_seed),
+        "--episode-limit", str(params.episode_limit),
         "--ppo-minibatch-episodes", str(args.ppo_minibatch_episodes),
         "--adam-beta1", str(args.adam_beta1),
         "--adam-beta2", str(args.adam_beta2),
@@ -961,6 +1010,7 @@ def training_artifacts_match(
                 return False
         return (
             int(summary.get("shuffle_seed", -1)) == params.shuffle_seed
+            and int(summary.get("episode_limit", 0) or 0) == params.episode_limit
             and int(summary.get("minibatch_episodes", -1)) == args.ppo_minibatch_episodes
             and int(summary.get("target_kl_hard_consecutive_updates", -1))
                 == args.target_kl_hard_consecutive_updates
@@ -1024,46 +1074,75 @@ def run_balanced_evaluation(
     candidate_checkpoint = Path(trial.checkpoint_path)
     for side_index, side in enumerate(("a", "b")):
         block_token = f"_block_{block_index:02d}" if block_index > 0 else ""
-        run_name = f"{trial.run_name}_{stage}{block_token}_side_{side}_{games_per_side}"
-        state.begin_operation(
-            "evaluation", trial.run_name, trial_index, trial.hyperparameters,
-            games_per_side, stage=stage, side=side,
-        )
-        reporter.refresh()
-        summary_path = evaluation_summary_path(repo_root, run_name)
-        run_names.append(run_name)
         model_a = candidate_checkpoint if side == "a" else parent_checkpoint
         model_b = parent_checkpoint if side == "a" else candidate_checkpoint
-        can_resume = (
-            args.resume
-            and trial.training_reused
-            and summary_path.exists()
-            and evaluation_artifacts_match(summary_path, model_a, model_b, games_per_side)
-        )
-        if not can_resume:
-            run_command(build_eval_command(
-                args, repo_root, run_name, candidate_checkpoint, parent_checkpoint,
-                side, games_per_side, seed_base + side_index,
-            ), repo_root, reporter, logs_dir / f"{run_name}.log" if args.dashboard_write_raw_logs else None)
-        summary = load_json(summary_path)
-        if summary.get("status") != "completed":
-            raise RuntimeError(f"evaluation did not complete: {run_name}")
-        group = ((summary.get("group_stats", {}) or {}).get(side, {}) or {})
-        baseline_side = "b" if side == "a" else "a"
-        baseline_group = ((summary.get("group_stats", {}) or {}).get(baseline_side, {}) or {})
-        candidate_stats = aggregate_group_stats(candidate_stats, group)
-        baseline_stats = aggregate_group_stats(baseline_stats, baseline_group)
-        games = int(group.get("matches_played", 0) or 0)
-        total_games += games
-        total_wins += int(group.get("wins", 0) or 0)
-        total_earned_wins += int(group.get("earned_wins", 0) or 0)
-        state.finish_operation(games, record_duration=not can_resume)
-        if stage == "screen":
-            state.screen_games_completed += min(games, games_per_side)
-        else:
-            state.final_games_completed += min(games, games_per_side)
+        side_candidate_stats: dict[str, object] = {}
+        side_baseline_stats: dict[str, object] = {}
+        for attempt in range(1, args.eval_max_replacement_attempts + 1):
+            before = valid_outcome_counts(side_candidate_stats, side_baseline_stats)
+            valid_shortfall = games_per_side - int(before["valid_games"])
+            if valid_shortfall <= 0:
+                break
+            attempt_token = "" if attempt == 1 else f"_attempt_{attempt:02d}"
+            run_name = (
+                f"{trial.run_name}_{stage}{block_token}_side_{side}_{games_per_side}"
+                f"{attempt_token}"
+            )
+            state.begin_operation(
+                "evaluation", trial.run_name, trial_index, trial.hyperparameters,
+                valid_shortfall, stage=stage, side=side,
+            )
+            reporter.refresh()
+            summary_path = evaluation_summary_path(repo_root, run_name)
+            run_names.append(run_name)
+            can_resume = (
+                args.resume
+                and trial.training_reused
+                and summary_path.exists()
+                and evaluation_artifacts_match(summary_path, model_a, model_b, valid_shortfall)
+            )
+            if not can_resume:
+                run_command(build_eval_command(
+                    args, repo_root, run_name, candidate_checkpoint, parent_checkpoint,
+                    side, valid_shortfall, seed_base + side_index + (attempt - 1) * 100,
+                ), repo_root, reporter, logs_dir / f"{run_name}.log" if args.dashboard_write_raw_logs else None)
+            summary = load_json(summary_path)
+            if summary.get("status") != "completed":
+                raise RuntimeError(f"evaluation did not complete: {run_name}")
+            group = ((summary.get("group_stats", {}) or {}).get(side, {}) or {})
+            baseline_side = "b" if side == "a" else "a"
+            baseline_group = ((summary.get("group_stats", {}) or {}).get(baseline_side, {}) or {})
+            side_candidate_stats = aggregate_group_stats(side_candidate_stats, group)
+            side_baseline_stats = aggregate_group_stats(side_baseline_stats, baseline_group)
+            after = valid_outcome_counts(side_candidate_stats, side_baseline_stats)
+            added_valid = max(0, int(after["valid_games"]) - int(before["valid_games"]))
+            raw_games = int(group.get("matches_played", 0) or 0)
+            state.finish_operation(raw_games, record_duration=not can_resume)
+            if stage == "screen":
+                state.screen_games_completed += min(added_valid, valid_shortfall)
+            else:
+                state.final_games_completed += min(added_valid, valid_shortfall)
+            reporter.notice(
+                f"{stage} {trial.run_name} side {side.upper()}: "
+                f"valid={int(after['valid_games'])}/{games_per_side} "
+                f"invalid={int(after['invalid_games'])} raw={int(after['raw_games'])}"
+            )
+        side_outcomes = valid_outcome_counts(side_candidate_stats, side_baseline_stats)
+        if int(side_outcomes["valid_games"]) < games_per_side:
+            raise RuntimeError(
+                f"evaluation could not collect {games_per_side} valid games for {trial.run_name} "
+                f"{stage} side {side} after {args.eval_max_replacement_attempts} attempts; "
+                f"collected {int(side_outcomes['valid_games'])} valid and "
+                f"{int(side_outcomes['invalid_games'])} invalid games"
+            )
+        candidate_stats = aggregate_group_stats(candidate_stats, side_candidate_stats)
+        baseline_stats = aggregate_group_stats(baseline_stats, side_baseline_stats)
+        total_games += int(side_outcomes["raw_games"])
+        total_wins += int(side_candidate_stats.get("wins", 0) or 0)
+        total_earned_wins += int(side_candidate_stats.get("earned_wins", 0) or 0)
         reporter.refresh()
-    low, high = wilson_interval(total_wins, total_games)
+    valid = valid_outcome_counts(candidate_stats, baseline_stats)
+    low, high = wilson_interval(float(valid["valid_score"]), int(valid["valid_games"]))
     return EvaluationResult(
         stage=stage,
         games=total_games,
@@ -1075,6 +1154,12 @@ def run_balanced_evaluation(
         confidence_high=high,
         collapse_flags=aggregate_collapse_flags(candidate_stats, baseline_stats),
         run_names=run_names,
+        valid_games=int(valid["valid_games"]),
+        invalid_games=int(valid["invalid_games"]),
+        valid_wins=int(valid["valid_wins"]),
+        valid_draws=int(valid["valid_draws"]),
+        valid_score=float(valid["valid_score"]),
+        valid_win_rate=float(valid["valid_win_rate"]),
         candidate_stats=candidate_stats,
         baseline_stats=baseline_stats,
     )
@@ -1084,7 +1169,7 @@ def evaluation_rank_key(trial: TrialResult, final: bool = False) -> tuple[int, f
     result = trial.final_evaluation if final else trial.screen_evaluation
     if result is None:
         return (0, 0.0, 0.0, 0.0)
-    return (1 if not result.collapse_flags else 0, result.confidence_low, result.win_rate, -trial.anchor_kl_mean)
+    return (1 if not result.collapse_flags else 0, result.confidence_low, result.valid_win_rate, -trial.anchor_kl_mean)
 
 
 def adaptive_screen_contenders(
@@ -1133,7 +1218,7 @@ def promotion_assessment(
     result = top.final_evaluation
     assert result is not None
     collapse_free = not result.collapse_flags
-    clears_point_gate = result.win_rate > minimum_win_rate
+    clears_point_gate = result.valid_win_rate > minimum_win_rate
     clears_confidence_gate = result.confidence_low > confidence_threshold
     winner = top if collapse_free and clears_point_gate else None
     if not collapse_free:
@@ -1149,13 +1234,59 @@ def promotion_assessment(
         "candidate": top.run_name,
         "minimum_win_rate": minimum_win_rate,
         "confidence_threshold": confidence_threshold,
-        "win_rate": result.win_rate,
+        "win_rate": result.valid_win_rate,
+        "raw_win_rate": result.win_rate,
+        "valid_win_rate": result.valid_win_rate,
+        "valid_games": result.valid_games,
+        "invalid_games": result.invalid_games,
         "confidence_low": result.confidence_low,
         "confidence_high": result.confidence_high,
         "collapse_free": collapse_free,
         "clears_point_gate": clears_point_gate,
         "promotion_confident": bool(winner is not None and clears_confidence_gate),
     }
+
+
+def build_data_scale_summary(trials: list[TrialResult]) -> list[dict[str, object]]:
+    grouped: dict[int, list[TrialResult]] = {}
+    for trial in trials:
+        grouped.setdefault(trial.hyperparameters.episode_limit, []).append(trial)
+    summaries: list[dict[str, object]] = []
+    for episode_limit, group in sorted(grouped.items()):
+        evaluated = [trial for trial in group if trial.screen_evaluation or trial.final_evaluation]
+        candidate_stats: dict[str, object] = {}
+        baseline_stats: dict[str, object] = {}
+        rates: list[float] = []
+        stages: dict[str, int] = {}
+        for trial in evaluated:
+            # Screening is the common allocation across all scale/seed trials;
+            # finals are intentionally ignored here because only a subset advances.
+            result = trial.screen_evaluation or trial.final_evaluation
+            assert result is not None
+            candidate_stats = aggregate_group_stats(candidate_stats, result.candidate_stats)
+            baseline_stats = aggregate_group_stats(baseline_stats, result.baseline_stats)
+            rates.append(result.valid_win_rate)
+            stages[result.stage] = stages.get(result.stage, 0) + 1
+        valid = valid_outcome_counts(candidate_stats, baseline_stats)
+        low, high = wilson_interval(float(valid["valid_score"]), int(valid["valid_games"]))
+        summaries.append({
+            "episode_limit": episode_limit,
+            "episode_limit_label": str(episode_limit) if episode_limit > 0 else "all",
+            "configured_seeds": sorted(trial.hyperparameters.shuffle_seed for trial in group),
+            "evaluated_seeds": sorted(trial.hyperparameters.shuffle_seed for trial in evaluated),
+            "safe_trials": sum(1 for trial in group if not trial.safety_flags),
+            "rejected_trials": sum(1 for trial in group if trial.safety_flags),
+            "evaluation_stages": stages,
+            "raw_games": int(valid["raw_games"]),
+            "valid_games": int(valid["valid_games"]),
+            "invalid_games": int(valid["invalid_games"]),
+            "pooled_valid_score": float(valid["valid_score"]),
+            "pooled_valid_win_rate": float(valid["valid_win_rate"]),
+            "confidence_low": low,
+            "confidence_high": high,
+            "mean_seed_valid_win_rate": (sum(rates) / len(rates)) if rates else 0.0,
+        })
+    return summaries
 
 
 def trial_payload(trial: TrialResult) -> dict[str, object]:
@@ -1176,6 +1307,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-kl-coefs", type=csv_floats, default=[0.003, 0.01, 0.03])
     parser.add_argument("--ppo-clip-epsilons", type=csv_floats, default=[0.2])
     parser.add_argument("--shuffle-seeds", type=csv_ints, default=[101])
+    parser.add_argument("--episode-limits", type=csv_ints, default=[0], help="Nested deterministic PPO data sizes; 0 uses every episode")
     parser.add_argument("--ppo-minibatch-episodes", type=positive_int, default=int_default("ppo_minibatch_episodes"))
     parser.add_argument("--max-trials", type=positive_int, default=18)
     parser.add_argument("--screen-candidates", type=positive_int, default=8)
@@ -1211,6 +1343,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--promotion-confidence-threshold", type=float, default=0.5)
     parser.add_argument("--eval-concurrent-games", type=positive_int, default=70)
     parser.add_argument("--eval-worker-pairs", type=positive_int, default=125)
+    parser.add_argument("--eval-max-replacement-attempts", type=positive_int, default=5)
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--launch-stagger-seconds", type=float, default=0.25)
     parser.add_argument("--resource-check-seconds", type=float, default=2.0)
@@ -1237,6 +1370,31 @@ def main() -> None:
     args = parse_search_args()
     if args.screen_max_games_per_side < args.screen_games_per_side:
         raise SystemExit("screen-max-games-per-side must be >= screen-games-per-side")
+    if any(limit < 0 for limit in args.episode_limits):
+        raise SystemExit("episode-limits values must be >= 0")
+    if len(set(args.episode_limits)) > 1:
+        varying_training_axes = [
+            name for name, values in (
+                ("learning-rates", args.learning_rates),
+                ("entropy-coefs", args.entropy_coefs),
+                ("anchor-kl-coefs", args.anchor_kl_coefs),
+                ("ppo-clip-epsilons", args.ppo_clip_epsilons),
+            )
+            if len(values) != 1
+        ]
+        if varying_training_axes:
+            raise SystemExit(
+                "data-scale sweeps require fixed PPO hyperparameters; provide one value for "
+                + ", ".join(varying_training_axes)
+            )
+        scale_trial_count = len(set(args.episode_limits)) * len(set(args.shuffle_seeds))
+        if args.max_trials < scale_trial_count or args.screen_candidates < scale_trial_count:
+            raise SystemExit(
+                "data-scale sweeps must include and screen every scale/seed trial; "
+                f"set max-trials and screen-candidates to at least {scale_trial_count}"
+            )
+        if args.adaptive_screen:
+            raise SystemExit("data-scale sweeps require adaptive-screen=false for equal evaluation budgets")
     for label, value in (
         ("promotion-min-win-rate", args.promotion_min_win_rate),
         ("promotion-confidence-threshold", args.promotion_confidence_threshold),
@@ -1264,10 +1422,10 @@ def main() -> None:
     search_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = search_dir / f"{args.run_prefix}_search_manifest.json"
     combinations = [
-        Hyperparameters(lr, entropy, anchor, clip, shuffle_seed)
-        for lr, entropy, anchor, clip, shuffle_seed in itertools.product(
+        Hyperparameters(lr, entropy, anchor, clip, shuffle_seed, episode_limit)
+        for lr, entropy, anchor, clip, shuffle_seed, episode_limit in itertools.product(
             args.learning_rates, args.entropy_coefs, args.anchor_kl_coefs,
-            args.ppo_clip_epsilons, args.shuffle_seeds,
+            args.ppo_clip_epsilons, args.shuffle_seeds, args.episode_limits,
         )
     ]
     random.Random(args.search_seed).shuffle(combinations)
@@ -1290,6 +1448,7 @@ def main() -> None:
             "anchor_kl_coefs": args.anchor_kl_coefs,
             "ppo_clip_epsilons": args.ppo_clip_epsilons,
             "shuffle_seeds": args.shuffle_seeds,
+            "episode_limits": args.episode_limits,
             "max_trials": args.max_trials,
         },
         "staging": {
@@ -1302,6 +1461,8 @@ def main() -> None:
             "final_games_per_side": args.final_games_per_side,
             "promotion_min_win_rate": args.promotion_min_win_rate,
             "promotion_confidence_threshold": args.promotion_confidence_threshold,
+            "valid_games_required": True,
+            "eval_max_replacement_attempts": args.eval_max_replacement_attempts,
         },
         "search_seed": args.search_seed,
         "trials": [],
@@ -1395,7 +1556,8 @@ def main() -> None:
             state.trial_status[trial.run_name] = "screened"
             manifest["trials"] = [trial_payload(item) for item in trials]
             reporter.notice(
-                f"screened {trial.run_name} win_rate={trial.screen_evaluation.win_rate:.4f} "
+                f"screened {trial.run_name} valid_win_rate={trial.screen_evaluation.valid_win_rate:.4f} "
+                f"valid={trial.screen_evaluation.valid_games} invalid={trial.screen_evaluation.invalid_games} "
                 f"lower95={trial.screen_evaluation.confidence_low:.4f}"
             )
             progress_writer.update(force=True)
@@ -1455,7 +1617,8 @@ def main() -> None:
             state.trial_status[trial.run_name] = "finalized"
             manifest["trials"] = [trial_payload(item) for item in trials]
             reporter.notice(
-                f"finalized {trial.run_name} win_rate={trial.final_evaluation.win_rate:.4f} "
+                f"finalized {trial.run_name} valid_win_rate={trial.final_evaluation.valid_win_rate:.4f} "
+                f"valid={trial.final_evaluation.valid_games} invalid={trial.final_evaluation.invalid_games} "
                 f"lower95={trial.final_evaluation.confidence_low:.4f}"
             )
             progress_writer.update(force=True)
@@ -1475,12 +1638,14 @@ def main() -> None:
         manifest["top_result"] = trial_payload(ranked_final[0]) if ranked_final else None
         manifest["best_result"] = trial_payload(winner) if winner else None
         manifest["promotion_assessment"] = assessment
+        if len(set(args.episode_limits)) > 1:
+            manifest["data_scale_summary"] = build_data_scale_summary(trials)
         if winner:
             assert winner.final_evaluation is not None
             reporter.notice(
                 f"winner run={winner.run_name} lr={winner.hyperparameters.learning_rate:g} "
                 f"entropy={winner.hyperparameters.entropy_coef:g} anchor={winner.hyperparameters.anchor_kl_coef:g} "
-                f"win_rate={winner.final_evaluation.win_rate:.4f} "
+                f"valid_win_rate={winner.final_evaluation.valid_win_rate:.4f} "
                 f"lower95={winner.final_evaluation.confidence_low:.4f} "
                 f"promotion_confident={assessment['promotion_confident']}"
             )
@@ -1488,7 +1653,7 @@ def main() -> None:
             top = ranked_final[0]
             assert top.final_evaluation is not None
             reporter.notice(
-                f"no winner; top run={top.run_name} win_rate={top.final_evaluation.win_rate:.4f} "
+                f"no winner; top run={top.run_name} valid_win_rate={top.final_evaluation.valid_win_rate:.4f} "
                 f"lower95={top.final_evaluation.confidence_low:.4f}"
             )
         else:

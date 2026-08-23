@@ -16,6 +16,7 @@ from ppo_search import (
     SearchDisplayState,
     aggregate_group_stats,
     adaptive_screen_contenders,
+    build_data_scale_summary,
     build_eval_command,
     build_train_command,
     evaluation_artifacts_match,
@@ -28,6 +29,7 @@ from ppo_search import (
     run_command,
     training_safety_flags,
     training_artifacts_match,
+    valid_outcome_counts,
     wilson_interval,
 )
 
@@ -94,6 +96,19 @@ class PpoSearchTests(unittest.TestCase):
             confidence_high=high,
             collapse_flags=[],
             run_names=[f"{stage}_{games}"],
+            valid_games=games,
+            invalid_games=0,
+            valid_wins=wins,
+            valid_score=float(wins),
+            valid_win_rate=wins / games,
+            candidate_stats=aggregate_group_stats({}, {
+                "matches_played": games, "wins": wins, "earned_wins": wins,
+                "losses": games - wins,
+            }),
+            baseline_stats=aggregate_group_stats({}, {
+                "matches_played": games, "wins": games - wins, "earned_wins": games - wins,
+                "losses": wins,
+            }),
         )
 
     def test_search_config_loads_and_cli_overrides_it(self) -> None:
@@ -116,6 +131,7 @@ class PpoSearchTests(unittest.TestCase):
             self.assertEqual(args.screen_games_per_side, 40)
             self.assertFalse(args.resume)
             self.assertTrue(args.dashboard)
+            self.assertEqual(args.episode_limits, [0])
 
     def test_trainer_executable_is_fixed_and_rejected_in_config(self) -> None:
         self.assertEqual(DEFAULT_TRAINER_EXE.as_posix(), "build-fresh/showdown_client.exe")
@@ -160,6 +176,8 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(merged.games, 200)
         self.assertEqual(merged.wins, 105)
         self.assertAlmostEqual(merged.win_rate, 0.525)
+        self.assertEqual(merged.valid_games, 200)
+        self.assertAlmostEqual(merged.valid_win_rate, 0.525)
         self.assertLess(merged.confidence_low, merged.win_rate)
         self.assertGreater(merged.confidence_high, merged.win_rate)
         self.assertEqual(merged.run_names, ["screen_100", "screen_100"])
@@ -254,6 +272,7 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(command[command.index("--anchor-checkpoint") + 1], "anchor.chk")
         self.assertEqual(command[command.index("--anchor-kl-coef") + 1], "0.01")
         self.assertEqual(command[command.index("--shuffle-seed") + 1], "101")
+        self.assertEqual(command[command.index("--episode-limit") + 1], "0")
         self.assertEqual(command[command.index("--target-kl-min-labels") + 1], "500")
         self.assertEqual(command[command.index("--target-kl-hard-consecutive-updates") + 1], "2")
         self.assertEqual(command[command.index("--ppo-minibatch-episodes") + 1], "8")
@@ -319,6 +338,7 @@ class PpoSearchTests(unittest.TestCase):
                 "anchor_kl_coef": params.anchor_kl_coef,
                 "ppo_clip_epsilon": params.ppo_clip_epsilon,
                 "shuffle_seed": params.shuffle_seed,
+                "episode_limit": params.episode_limit,
                 "minibatch_episodes": args.ppo_minibatch_episodes,
                 "target_kl_hard_consecutive_updates": args.target_kl_hard_consecutive_updates,
             }), encoding="utf-8")
@@ -346,6 +366,39 @@ class PpoSearchTests(unittest.TestCase):
             }), encoding="utf-8")
             self.assertTrue(evaluation_artifacts_match(summary, candidate, parent, 250))
             self.assertFalse(evaluation_artifacts_match(summary, parent, candidate, 250))
+
+    def test_valid_outcomes_exclude_disconnect_and_forfeit_results(self) -> None:
+        candidate = {"matches_played": 100, "wins": 53, "earned_wins": 49, "draws": 2}
+        baseline = {"matches_played": 100, "wins": 47, "earned_wins": 44, "draws": 2}
+        counts = valid_outcome_counts(candidate, baseline)
+        self.assertEqual(counts["raw_games"], 100)
+        self.assertEqual(counts["valid_games"], 95)
+        self.assertEqual(counts["invalid_games"], 5)
+        self.assertEqual(counts["valid_score"], 50.0)
+        self.assertAlmostEqual(float(counts["valid_win_rate"]), 50.0 / 95.0)
+
+    def test_data_scale_summary_pools_seed_results_by_episode_limit(self) -> None:
+        trials = []
+        for seed, wins in ((101, 55), (202, 45)):
+            result = self.evaluation("final", wins, 100, 0.40, 0.60)
+            result.candidate_stats = aggregate_group_stats({}, {
+                "matches_played": 100, "wins": wins, "earned_wins": wins,
+                "losses": 100 - wins,
+            })
+            result.baseline_stats = aggregate_group_stats({}, {
+                "matches_played": 100, "wins": 100 - wins, "earned_wins": 100 - wins,
+                "losses": wins,
+            })
+            trials.append(SimpleNamespace(
+                hyperparameters=Hyperparameters(1e-5, 3e-4, 0.01, 0.2, seed, 128),
+                safety_flags=[], final_evaluation=result, screen_evaluation=None,
+            ))
+        summary = build_data_scale_summary(trials)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["episode_limit"], 128)
+        self.assertEqual(summary[0]["configured_seeds"], [101, 202])
+        self.assertEqual(summary[0]["valid_games"], 200)
+        self.assertAlmostEqual(float(summary[0]["pooled_valid_win_rate"]), 0.5)
 
 
 if __name__ == "__main__":

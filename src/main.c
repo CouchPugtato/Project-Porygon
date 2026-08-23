@@ -80,6 +80,8 @@ typedef struct {
     int target_kl_exceeded;
     int target_kl_hard_stop;
     size_t available_episode_count;
+    size_t selected_episode_count;
+    int episode_limit;
     int shuffle_seed;
     int minibatch_episodes;
     int target_kl_min_episodes;
@@ -1503,8 +1505,10 @@ static int write_rl_training_summary_json(
     fprintf(out, "  \"dense_additive_reward_clip\": %.6f,\n", reward_config->dense_additive.reward_clip);
     fprintf(out, "  \"episode_count\": %zu,\n", summary->episode_count);
     fprintf(out, "  \"available_episode_count\": %zu,\n", summary->available_episode_count);
+    fprintf(out, "  \"selected_episode_count\": %zu,\n", summary->selected_episode_count);
+    fprintf(out, "  \"episode_limit\": %d,\n", summary->episode_limit);
     fprintf(out, "  \"processed_episode_fraction\": %.6f,\n",
-        summary->available_episode_count > 0 ? (double)summary->episode_count / (double)summary->available_episode_count : 0.0);
+        summary->selected_episode_count > 0 ? (double)summary->episode_count / (double)summary->selected_episode_count : 0.0);
     fprintf(out, "  \"shuffle_seed\": %d,\n", summary->shuffle_seed);
     fprintf(out, "  \"minibatch_episodes\": %d,\n", summary->minibatch_episodes);
     fprintf(out, "  \"avg_episode_length\": %.6f,\n", summary->episode_count > 0 ? (double)summary->total_steps / (double)summary->episode_count : 0.0);
@@ -2371,6 +2375,7 @@ static int train_from_input_file(
     float ppo_target_kl_hard_multiplier,
     int ppo_target_kl_hard_consecutive_updates,
     int ppo_shuffle_seed,
+    int ppo_episode_limit,
     int ppo_minibatch_episodes,
     float adam_beta1,
     float adam_beta2,
@@ -2410,6 +2415,10 @@ static int train_from_input_file(
     const size_t train_eta_min_episodes = 5;
 
     if (!input_path || !checkpoint_path || epochs <= 0) {
+        return 1;
+    }
+    if (ppo_episode_limit < 0) {
+        fprintf(stderr, "--episode-limit must be >= 0\n");
         return 1;
     }
     rl_training_summary_init(&rl_summary);
@@ -2533,6 +2542,7 @@ static int train_from_input_file(
         size_t train_sessions_before_filter = train_sessions;
         filter_labeled_train_indices(&runtime, train_indices, &train_sessions);
         rl_summary.available_episode_count = train_sessions;
+        rl_summary.episode_limit = ppo_episode_limit;
         rl_summary.shuffle_seed = ppo_shuffle_seed;
         rl_summary.minibatch_episodes = ppo_minibatch_episodes > 0 ? ppo_minibatch_episodes : 1;
         rl_summary.target_kl_min_episodes = ppo_target_kl_min_episodes;
@@ -2542,6 +2552,16 @@ static int train_from_input_file(
             ppo_target_kl_hard_consecutive_updates > 0 ? ppo_target_kl_hard_consecutive_updates : 1;
         printf("[train-rl] filtered train_sessions labeled_only=%zu/%zu\n",
             train_sessions, train_sessions_before_filter);
+        if (ppo_episode_limit > 0 && train_sessions > (size_t)ppo_episode_limit) {
+            if (ppo_shuffle_seed >= 0) {
+                srand((unsigned int)ppo_shuffle_seed);
+            }
+            shuffle_indices(train_indices, train_sessions);
+            train_sessions = (size_t)ppo_episode_limit;
+            printf("[train-rl] deterministic episode subset selected=%zu/%zu seed=%d\n",
+                train_sessions, rl_summary.available_episode_count, ppo_shuffle_seed);
+        }
+        rl_summary.selected_episode_count = train_sessions;
         printf("[train-rl] validation_split disabled train_sessions=%zu val_sessions=%zu\n",
             train_sessions,
             val_sessions);
@@ -2967,6 +2987,7 @@ static int showdown_client_main(int argc, char** argv) {
     float ppo_target_kl_hard_multiplier;
     int ppo_target_kl_hard_consecutive_updates;
     int ppo_shuffle_seed;
+    int ppo_episode_limit;
     int ppo_minibatch_episodes;
     float adam_beta1;
     float adam_beta2;
@@ -3001,6 +3022,7 @@ static int showdown_client_main(int argc, char** argv) {
     ppo_target_kl_hard_consecutive_updates = parse_int_flag(
         argc, argv, "--target-kl-hard-consecutive-updates", rl_defaults.ppo_target_kl_hard_consecutive_updates);
     ppo_shuffle_seed = parse_int_flag(argc, argv, "--shuffle-seed", rl_defaults.ppo_shuffle_seed);
+    ppo_episode_limit = parse_int_flag(argc, argv, "--episode-limit", 0);
     ppo_minibatch_episodes = parse_int_flag(argc, argv, "--ppo-minibatch-episodes", rl_defaults.ppo_minibatch_episodes);
     adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", rl_defaults.adam_beta1);
     adam_beta2 = parse_float_flag(argc, argv, "--adam-beta2", rl_defaults.adam_beta2);
@@ -3078,6 +3100,7 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_target_kl_hard_multiplier,
             ppo_target_kl_hard_consecutive_updates,
             ppo_shuffle_seed,
+            ppo_episode_limit,
             ppo_minibatch_episodes,
             adam_beta1,
             adam_beta2,
@@ -3112,6 +3135,7 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_target_kl_hard_multiplier,
             ppo_target_kl_hard_consecutive_updates,
             ppo_shuffle_seed,
+            ppo_episode_limit,
             ppo_minibatch_episodes,
             adam_beta1,
             adam_beta2,
@@ -3146,6 +3170,7 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_target_kl_hard_multiplier,
             ppo_target_kl_hard_consecutive_updates,
             ppo_shuffle_seed,
+            ppo_episode_limit,
             ppo_minibatch_episodes,
             adam_beta1,
             adam_beta2,
@@ -3180,6 +3205,7 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_target_kl_hard_multiplier,
             ppo_target_kl_hard_consecutive_updates,
             ppo_shuffle_seed,
+            ppo_episode_limit,
             ppo_minibatch_episodes,
             adam_beta1,
             adam_beta2,
@@ -3224,7 +3250,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-profile 0|1]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
-        "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--ppo-minibatch-episodes N] [--target-kl F] [--shuffle-seed N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
+        "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--ppo-minibatch-episodes N] [--target-kl F] [--shuffle-seed N] [--episode-limit N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
         "  showdown_client --export-battle <replay.jsonl> <battle_id> <output.json>\n"

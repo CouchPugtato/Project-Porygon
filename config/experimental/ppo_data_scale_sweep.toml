@@ -1,0 +1,46 @@
+# Controlled data-scale experiment using the best settings from run_0098.
+# Run-specific paths and the run prefix remain command-line arguments.
+
+learning_rates = "0.00001"
+entropy_coefs = "0.0001"
+anchor_kl_coefs = "0.01"
+ppo_clip_epsilons = "0.2"
+shuffle_seeds = "101,202,303"
+episode_limits = "128,256,512,1018"
+search_seed = 2026
+max_trials = 12
+
+# Every scale/seed trial receives the same valid-game screening budget.
+screen_candidates = 12
+finalists = 1
+screen_games_per_side = 200
+adaptive_screen = false
+screen_game_block_per_side = 100
+screen_max_games_per_side = 200
+final_games_per_side = 300
+
+promotion_min_win_rate = 0.50
+promotion_confidence_threshold = 0.50
+epochs = 1
+reward_mode = "terminal"
+max_anchor_kl_mean = 0.05
+max_anchor_kl_max = 0.20
+max_clip_fraction = 0.25
+
+eval_concurrent_games = 70
+eval_worker_pairs = 125
+eval_max_replacement_attempts = 5
+format = "gen9randomdoublesbattle"
+launch_stagger_seconds = 0.25
+resource_check_seconds = 2.0
+min_available_memory_gb = 2.0
+min_available_pagefile_gb = 4.0
+startup_timeout_seconds = 120
+omp_threads = 8
+resume = true
+
+dashboard = true
+dashboard_refresh_per_second = 8
+dashboard_visible_trials = 12
+dashboard_leaderboard_size = 12
+dashboard_write_raw_logs = true

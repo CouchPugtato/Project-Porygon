@@ -40,6 +40,8 @@ Files:
   - consumed by `py/tools/ppo_search.py` before CLI arguments are applied
   - controls the candidate grid, staged evaluation sizes, worker limits, and search dashboard
   - supports bounded adaptive screening blocks when the finalist cutoff remains statistically unresolved
+  - excludes disconnect/forfeit outcomes from ranking and collects replacement games until each valid-game target is reached
+  - supports deterministic nested data scales through `episode_limits`; `0` uses the full eligible batch
   - records the top-ranked result separately from the gated winner and confidence-based promotion assessment
   - renders training, active-operation, screening, and final-evaluation progress bars when `dashboard = true`
   - writes live progress into the search manifest and optional raw subprocess logs under `models/search/<run_prefix>/logs/`
@@ -49,6 +51,7 @@ Files:
 - `experimental/*.toml`
   - example templates for common collection/training regimes
   - intended as copy/rename starting points rather than auto-loaded defaults
+  - `ppo_data_scale_sweep.toml` fixes PPO settings and compares 128/256/512/1018 episodes over three seeds
 
 Example:
 

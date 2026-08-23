@@ -136,11 +136,11 @@ In an interactive terminal, the search dashboard shows separate progress bars fo
 The search is staged:
 
 1. Train all sampled combinations and reject candidates that trip KL, anchor, or clipping safety checks.
-2. Evaluate the safest candidates against the parent with the candidate on both sides of the matchup; these live games provide the candidate-specific Tera and move-slot collapse checks. When the finalist cutoff remains unresolved, schedule additional balanced blocks for the provisional finalists and statistically plausible challengers up to a configured cap.
+2. Evaluate the safest candidates against the parent with the candidate on both sides of the matchup; these live games provide the candidate-specific Tera and move-slot collapse checks. Disconnect/forfeit outcomes are reported as invalid and excluded from ranking and confidence intervals. The evaluator automatically runs the remaining shortfall until each side has the requested number of normally completed games. When the finalist cutoff remains unresolved, schedule additional balanced blocks for the provisional finalists and statistically plausible challengers up to a configured cap.
 3. Give only the leading candidates a larger final evaluation.
 4. Rank results by the lower bound of the 95% Wilson interval, with collapse-free candidates first. The top-ranked finalist is only written as `best_result` when its point estimate exceeds the configured parent baseline; otherwise the search explicitly reports no winner.
 
-Screening starts at 100 games per side and adaptively grows in 100-game blocks to at most 200 games per side while the cutoff is unresolved. Final evaluation defaults to 300 games per side. Existing candidate and evaluation artifacts are reused by default, so rerunning the same command resumes interrupted work. Set `adaptive_screen = false` to use only the initial screening allocation.
+Screening starts at 100 valid games per side and adaptively grows in 100-game blocks to at most 200 valid games per side while the cutoff is unresolved. Final evaluation defaults to 300 valid games per side. Each result retains raw win rate and earned-win rate for diagnostics, plus explicit `valid_games`, `invalid_games`, `valid_score`, and `valid_win_rate`; ranking and promotion use the valid-game fields. Existing candidate and evaluation artifacts are reused by default, so rerunning the same command resumes interrupted work. Set `adaptive_screen = false` to use only the initial screening allocation. `eval_max_replacement_attempts` bounds repeated shortfall collection and fails the search loudly if the valid target cannot be reached.
 
 Example shape (run this only after building and copying the current client):
 
@@ -149,6 +149,10 @@ python .\py\tools\ppo_search.py --run-prefix search_replace_me --init-checkpoint
 ```
 
 For a robustness check, pass multiple deterministic orders such as `--shuffle-seeds 101,202,303`. The manifest under `models/search/<run-prefix>/` contains all training diagnostics, balanced evaluation results, confidence intervals, `top_result`, the gated `best_result`, and a separate `promotion_assessment`. `tentative_winner` means the point estimate passed but its confidence interval did not clear the parent; only `confident_winner` supports automatic promotion. A search result is evidence for the tested parent, batch, opponent, and parameter ranges—not a universally optimal PPO setting.
+
+For a deterministic data-scale experiment, fix the PPO hyperparameters and pass nested episode limits such as `--episode-limits 128,256,512,1018` with multiple shuffle seeds. `0` means the full eligible batch. For each seed, the trainer deterministically permutes the full batch once and uses a nested prefix, avoiding copied multi-gigabyte batch files. Set `adaptive_screen = false`, and set `max_trials` and `screen_candidates` high enough to include every scale/seed combination; the tool rejects unequal or mixed-hyperparameter scale comparisons. When multiple limits are present, the manifest adds `data_scale_summary`, pooling the common screening allocation by scale while retaining seed-level trials. The training summary records the requested limit, full available count, and selected count.
+
+`config/experimental/ppo_data_scale_sweep.toml` provides the 128/256/512/1018-by-three-seed experiment using the current leading PPO settings. Supply it with `--config` plus the usual run prefix, parent checkpoint, episode batch, anchor, and evaluation parent paths.
 
 ## Collection provenance
 

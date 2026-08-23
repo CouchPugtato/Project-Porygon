@@ -8,6 +8,8 @@ entropy_coefs = "0.0001,0.0003,0.001"
 anchor_kl_coefs = "0.003,0.01,0.03"
 ppo_clip_epsilons = "0.2"
 shuffle_seeds = "101"
+# 0 uses the full batch. Multiple values create deterministic nested data-scale trials.
+episode_limits = "0"
 search_seed = 2026
 max_trials = 18
 
@@ -34,6 +36,8 @@ max_clip_fraction = 0.25
 # Evaluation worker and resource controls.
 eval_concurrent_games = 70
 eval_worker_pairs = 125
+# Re-run only the valid-game shortfall when disconnects or forfeits occur.
+eval_max_replacement_attempts = 5
 format = "gen9randomdoublesbattle"
 launch_stagger_seconds = 0.25
 resource_check_seconds = 2.0
