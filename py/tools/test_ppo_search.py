@@ -2,17 +2,25 @@ from __future__ import annotations
 
 import unittest
 import json
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 from ppo_search import (
+    BaseSearchReporter,
+    DEFAULT_TRAINER_EXE,
     Hyperparameters,
+    ManifestProgressWriter,
+    SearchDisplayState,
     build_eval_command,
     build_train_command,
     evaluation_artifacts_match,
     load_config_args,
+    parse_evaluation_progress,
     parse_search_args,
+    parse_training_progress,
+    run_command,
     training_safety_flags,
     training_artifacts_match,
     wilson_interval,
@@ -87,6 +95,63 @@ class PpoSearchTests(unittest.TestCase):
             self.assertEqual(args.max_trials, 2)
             self.assertEqual(args.screen_games_per_side, 40)
             self.assertFalse(args.resume)
+            self.assertTrue(args.dashboard)
+
+    def test_trainer_executable_is_fixed_and_rejected_in_config(self) -> None:
+        self.assertEqual(DEFAULT_TRAINER_EXE.as_posix(), "build-fresh/showdown_client.exe")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "search.toml"
+            config.write_text('trainer_exe = "custom.exe"\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "fixed internally"):
+                load_config_args(config)
+
+    def test_live_progress_parsers_extract_trainer_and_selfplay_state(self) -> None:
+        training = parse_training_progress(
+            "[train-ppo] epoch=1 episodes=24/128 step=3 approx_kl=0.0123 "
+            "anchor_kl_mean=0.0042 anchor_kl_max=0.0190 clip_fraction=0.1250 "
+            "hard_kl_breaches=1/2 labels=640\n"
+        )
+        self.assertIsNotNone(training)
+        assert training is not None
+        self.assertEqual(training["current"], 24)
+        self.assertEqual(training["total"], 128)
+        self.assertAlmostEqual(float(training["approx_kl"]), 0.0123)
+        self.assertAlmostEqual(float(training["anchor_kl_mean"]), 0.0042)
+        self.assertEqual(parse_evaluation_progress("[selfplay] completed_games=71/100\n"), (71, 100))
+
+    def test_dashboard_progress_payload_tracks_active_operation(self) -> None:
+        state = SearchDisplayState("search", 6, 4, 2, 50, 100)
+        params = Hyperparameters(1e-5, 3e-4, 0.01, 0.2, 101)
+        state.phase = "training"
+        state.begin_operation("training", "trial", 1, params, 128)
+        state.active_current = 24
+        state.active_metrics = {"approx_kl": 0.0123}
+        payload = state.progress_payload()
+        self.assertEqual(payload["phase"], "training")
+        active = payload["active"]
+        assert isinstance(active, dict)
+        self.assertEqual(active["current"], 24)
+        self.assertEqual(active["total"], 128)
+
+    def test_streamed_command_updates_progress_and_writes_raw_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state = SearchDisplayState("search", 1, 1, 1, 10, 10)
+            params = Hyperparameters(1e-5, 3e-4, 0.01, 0.2, 101)
+            state.begin_operation("training", "trial", 1, params, 16)
+            manifest: dict[str, object] = {}
+            writer = ManifestProgressWriter(root / "manifest.json", manifest, state)
+            reporter = BaseSearchReporter(SimpleNamespace(), state, writer)
+            raw_log = root / "trial.log"
+            run_command([
+                sys.executable,
+                "-c",
+                "print('[train-ppo] epoch=1 episodes=8/16 approx_kl=0.01 anchor_kl_mean=0.002 clip_fraction=0.1')",
+            ], root, reporter, raw_log)
+            self.assertEqual(state.active_current, 8)
+            self.assertEqual(state.active_total, 16)
+            self.assertAlmostEqual(float(state.active_metrics["approx_kl"]), 0.01)
+            self.assertIn("episodes=8/16", raw_log.read_text(encoding="utf-8"))
 
     def test_train_command_uses_fixed_batch_anchor_and_reproducible_guards(self) -> None:
         params = Hyperparameters(2.5e-5, 3e-4, 0.01, 0.2, 101)

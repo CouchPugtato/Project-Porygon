@@ -36,6 +36,12 @@ Files:
   - collects `episode_complete` records directly from worker JSONLs and trains with `showdown_client --train-live-rl`
   - copies the parent checkpoint into each round output path before the RL update so actor rollouts stay versioned by round
   - writes one workflow manifest under `models/runs/<run_name>/` plus one per-round manifest
+- `ppo_search.toml`
+  - consumed by `py/tools/ppo_search.py` before CLI arguments are applied
+  - controls the candidate grid, staged evaluation sizes, worker limits, and search dashboard
+  - renders training, active-operation, screening, and final-evaluation progress bars when `dashboard = true`
+  - writes live progress into the search manifest and optional raw subprocess logs under `models/search/<run_prefix>/logs/`
+  - always uses `build-fresh/showdown_client.exe`; the trainer path is intentionally not configurable
 - `reward_weights.toml`
   - runtime-loaded by both `showdown_client` and `py/communicator/main.py`
 - `experimental/*.toml`
@@ -81,6 +87,13 @@ Training dashboard notes:
 - raw trainer stdout is written to:
   - `models/runs/<run>/<checkpoint_stem>/<checkpoint_stem>_batch_training_logs/`
 - if `Rich` is missing or the output is not a TTY, the wrapper falls back to the current plain-text logging style
+
+PPO-search dashboard notes:
+
+- candidate rows show the searched hyperparameters, PPO/anchor KL, clip fraction, safety state, and evaluation confidence interval
+- the leaderboard ranks evaluated candidates by the same confidence-aware search ordering used to choose finalists
+- `dashboard_visible_trials` and `dashboard_leaderboard_size` control table sizes; `dashboard_refresh_per_second` controls terminal refresh rate
+- disabling `dashboard_write_raw_logs` suppresses per-candidate trainer and evaluation logs but does not disable manifest progress updates
 
 Examples:
 

@@ -2683,7 +2683,7 @@ static int train_from_input_file(
                     eta = (double)(train_sessions - trained_in_epoch) / train_eta_rate_ema;
                 }
                 if (rl_mode) {
-                    printf("[train-%s] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f clip_fraction=%.4f labels=%zu\n",
+                    printf("[train-%s] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f anchor_kl_mean=%.4f anchor_kl_max=%.4f clip_fraction=%.4f hard_kl_breaches=%d/%d labels=%zu\n",
                         ppo_mode ? "ppo" : "rl",
                         epoch,
                         trained_in_epoch,
@@ -2695,7 +2695,11 @@ static int train_from_input_file(
                         trainer.last_mean_advantage,
                         trainer.last_entropy,
                         trainer.last_approx_kl,
+                        trainer.last_anchor_kl_mean,
+                        trainer.last_anchor_kl_max,
                         trainer.last_clip_fraction,
+                        consecutive_hard_kl_updates,
+                        ppo_target_kl_hard_consecutive_updates > 0 ? ppo_target_kl_hard_consecutive_updates : 1,
                         trainer.last_rl_labels);
                 } else {
                     printf("[train] epoch=%d episodes=%zu/%zu step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f\n",

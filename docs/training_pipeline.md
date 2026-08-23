@@ -129,7 +129,9 @@ Use `py/tools/eval_collapse_check.py` to re-run those checks from an existing su
 
 `py/tools/ppo_search.py` compares candidates without mixing data quality into the result. Every trial starts from the same `--init-checkpoint`, trains on the same required `--episode-batch`, and uses the same anchor and parent opponent. It searches learning rate, entropy coefficient, anchor strength, PPO clip, and deterministic shuffle seed.
 
-Search-grid, staging, and worker defaults live in `config/ppo_search.toml`. Use `--config <path>` for a different experiment file. Explicit command-line flags take precedence over config values; run name, initial checkpoint, and episode batch remain required so a config cannot accidentally launch against stale artifacts.
+Search-grid, staging, worker, and dashboard defaults live in `config/ppo_search.toml`. Use `--config <path>` for a different experiment file. Explicit command-line flags take precedence over config values; run name, initial checkpoint, and episode batch remain required so a config cannot accidentally launch against stale artifacts. The trainer executable is fixed at `build-fresh/showdown_client.exe` and cannot be overridden by the config.
+
+In an interactive terminal, the search dashboard shows separate progress bars for candidate training, screening games, final games, and the active training/evaluation subprocess. Its candidate table reports live PPO KL, anchor KL, clip fraction, safety status, win rate, and Wilson confidence intervals; an evaluated-candidate leaderboard uses the same confidence-aware ordering as finalist selection. Non-interactive output falls back to plain text. Live state is also written to the manifest's `progress` object, while raw child-process output is stored under `models/search/<run_prefix>/logs/` when `dashboard_write_raw_logs = true`.
 
 The search is staged:
 

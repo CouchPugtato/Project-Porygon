@@ -2,8 +2,6 @@
 # Run-specific paths and names remain required command-line arguments.
 # Any command-line flag overrides the value in this file.
 
-trainer_exe = "build-fresh/showdown_client.exe"
-
 # Candidate grid. max_trials samples this Cartesian product reproducibly.
 learning_rates = "0.000005,0.00001,0.000025,0.00005"
 entropy_coefs = "0.0001,0.0003,0.001"
@@ -37,3 +35,10 @@ min_available_pagefile_gb = 4.0
 startup_timeout_seconds = 120
 omp_threads = 8
 resume = true
+
+# Terminal progress dashboard. Raw subprocess logs are stored under the search run.
+dashboard = true
+dashboard_refresh_per_second = 8
+dashboard_visible_trials = 10
+dashboard_leaderboard_size = 5
+dashboard_write_raw_logs = true

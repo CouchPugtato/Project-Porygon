@@ -6,14 +6,26 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TextIO
 
 from rl_defaults import bool_default, float_default, int_default
+
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
 
 
 DEFAULT_RUNS_ROOT = Path("models") / "runs"
@@ -21,6 +33,11 @@ DEFAULT_MATCH_RUNS_ROOT = Path("matches") / "runs"
 DEFAULT_SEARCH_ROOT = Path("models") / "search"
 DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "ppo_search.toml"
+TRAIN_PROGRESS_RE = re.compile(r"^\[train-ppo\].*\bepisodes=(\d+)/(\d+)")
+TRAIN_ETA_RE = re.compile(r"^\[train\].*\bepisodes_per_sec=([^\s]+)\s+eta=([^\s]+)")
+SELFPLAY_PROGRESS_RE = re.compile(r"^\[selfplay\].*\bcompleted_games=(\d+)/(\d+)")
+KEY_VALUE_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
+FIXED_CONFIG_KEYS = {"trainer_exe"}
 
 
 def load_config_args(path: Path) -> list[str]:
@@ -38,6 +55,10 @@ def load_config_args(path: Path) -> list[str]:
         value_text = raw_value.strip()
         if not key or not value_text:
             raise RuntimeError(f"invalid PPO search config {path}:{line_number}: empty key or value")
+        if key in FIXED_CONFIG_KEYS:
+            raise RuntimeError(
+                f"invalid PPO search config {path}:{line_number}: {key} is fixed internally and cannot be configured"
+            )
         if len(value_text) >= 2 and value_text[0] == '"' and value_text[-1] == '"':
             value = bytes(value_text[1:-1], "utf-8").decode("unicode_escape")
         else:
@@ -115,16 +136,6 @@ def log(message: str) -> None:
     print(f"[ppo-search] {message}", flush=True)
 
 
-def run_command(command: list[str], cwd: Path, env_updates: dict[str, str] | None = None) -> None:
-    log("exec: " + " ".join(f'"{part}"' if " " in part else part for part in command))
-    env = os.environ.copy()
-    if env_updates:
-        env.update(env_updates)
-    completed = subprocess.run(command, cwd=str(cwd), env=env)
-    if completed.returncode != 0:
-        raise RuntimeError(f"command failed with exit code {completed.returncode}")
-
-
 def load_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -178,6 +189,8 @@ class TrialResult:
     target_kl_trigger: float
     target_kl_exceeded: bool
     target_kl_hard_stop: bool
+    target_kl_hard_breach_count: int
+    target_kl_hard_consecutive_updates: int
     anchor_kl_mean: float
     anchor_kl_max: float
     clip_fraction: float
@@ -187,6 +200,479 @@ class TrialResult:
     training_reused: bool
     screen_evaluation: EvaluationResult | None = None
     final_evaluation: EvaluationResult | None = None
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "estimating"
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:d}:{secs:02d}"
+
+
+def parse_key_values(line: str) -> dict[str, int | float | str]:
+    values: dict[str, int | float | str] = {}
+    for match in KEY_VALUE_RE.finditer(line):
+        raw = match.group(2)
+        try:
+            values[match.group(1)] = float(raw) if any(token in raw for token in (".", "e", "E")) else int(raw)
+        except ValueError:
+            values[match.group(1)] = raw
+    return values
+
+
+def parse_training_progress(line: str) -> dict[str, int | float | str] | None:
+    match = TRAIN_PROGRESS_RE.search(line)
+    if not match:
+        return None
+    values = parse_key_values(line)
+    values["current"] = int(match.group(1))
+    values["total"] = int(match.group(2))
+    return values
+
+
+def parse_evaluation_progress(line: str) -> tuple[int, int] | None:
+    match = SELFPLAY_PROGRESS_RE.search(line)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+@dataclass
+class SearchDisplayState:
+    run_prefix: str
+    max_trials: int
+    configured_screen_candidates: int
+    configured_finalists: int
+    screen_games_per_side: int
+    final_games_per_side: int
+    started_at: float = field(default_factory=time.monotonic)
+    phase: str = "starting"
+    trained_count: int = 0
+    safe_count: int = 0
+    rejected_count: int = 0
+    screened_count: int = 0
+    finalized_count: int = 0
+    screen_games_completed: int = 0
+    final_games_completed: int = 0
+    screen_planned_candidates: int = 0
+    final_planned_candidates: int = 0
+    screen_plan_finalized: bool = False
+    final_plan_finalized: bool = False
+    active_trial_index: int = 0
+    active_run_name: str = ""
+    active_params: Hyperparameters | None = None
+    active_kind: str = ""
+    active_stage: str = ""
+    active_side: str = ""
+    active_current: int = 0
+    active_total: int = 0
+    active_started_at: float | None = None
+    active_eta_seconds: float | None = None
+    active_metrics: dict[str, int | float | str] = field(default_factory=dict)
+    trials: list[TrialResult] = field(default_factory=list)
+    trial_status: dict[str, str] = field(default_factory=dict)
+    training_durations: list[float] = field(default_factory=list)
+    evaluation_seconds: float = 0.0
+    evaluation_games: int = 0
+    last_notice: str = ""
+    dashboard_mode: str = "plain-text"
+
+    def begin_operation(
+        self,
+        kind: str,
+        run_name: str,
+        index: int,
+        params: Hyperparameters,
+        total: int,
+        stage: str = "",
+        side: str = "",
+    ) -> None:
+        self.active_kind = kind
+        self.active_run_name = run_name
+        self.active_trial_index = index
+        self.active_params = params
+        self.active_stage = stage
+        self.active_side = side
+        self.active_current = 0
+        self.active_total = total
+        self.active_started_at = time.monotonic()
+        self.active_eta_seconds = None
+        self.active_metrics = {}
+        self.trial_status[run_name] = "training" if kind == "training" else stage
+
+    def finish_operation(self, completed: int | None = None, record_duration: bool = True) -> None:
+        elapsed = time.monotonic() - self.active_started_at if self.active_started_at is not None else 0.0
+        if record_duration and self.active_kind == "training" and elapsed > 0.0:
+            self.training_durations.append(elapsed)
+        elif record_duration and self.active_kind == "evaluation" and elapsed > 0.0:
+            games = completed if completed is not None else self.active_current
+            self.evaluation_seconds += elapsed
+            self.evaluation_games += max(0, games)
+        self.active_current = self.active_total if completed is None else completed
+        self.active_eta_seconds = 0.0
+
+    def clear_operation(self) -> None:
+        self.active_kind = ""
+        self.active_stage = ""
+        self.active_side = ""
+        self.active_run_name = ""
+        self.active_trial_index = 0
+        self.active_params = None
+        self.active_current = 0
+        self.active_total = 0
+        self.active_started_at = None
+        self.active_eta_seconds = None
+        self.active_metrics = {}
+
+    def estimated_remaining_seconds(self) -> float | None:
+        estimate = self.active_eta_seconds or 0.0
+        has_estimate = self.active_eta_seconds is not None
+        if self.training_durations:
+            remaining_trials = max(0, self.max_trials - self.trained_count - (1 if self.active_kind == "training" else 0))
+            estimate += remaining_trials * (sum(self.training_durations) / len(self.training_durations))
+            has_estimate = True
+        if self.evaluation_games > 0:
+            seconds_per_game = self.evaluation_seconds / self.evaluation_games
+            screen_candidates = self.screen_planned_candidates if self.screen_plan_finalized else self.configured_screen_candidates
+            final_candidates = self.final_planned_candidates if self.final_plan_finalized else self.configured_finalists
+            screen_total = 2 * screen_candidates * self.screen_games_per_side
+            final_total = 2 * final_candidates * self.final_games_per_side
+            active_screen = self.active_current if self.active_kind == "evaluation" and self.active_stage == "screen" else 0
+            active_final = self.active_current if self.active_kind == "evaluation" and self.active_stage == "final" else 0
+            remaining_games = max(0, screen_total - self.screen_games_completed - active_screen)
+            remaining_games += max(0, final_total - self.final_games_completed - active_final)
+            estimate += remaining_games * seconds_per_game
+            has_estimate = True
+        return estimate if has_estimate else None
+
+    def progress_payload(self) -> dict[str, object]:
+        return {
+            "phase": self.phase,
+            "dashboard_mode": self.dashboard_mode,
+            "elapsed_seconds": time.monotonic() - self.started_at,
+            "eta_seconds": self.estimated_remaining_seconds(),
+            "trained_candidates": self.trained_count,
+            "safe_candidates": self.safe_count,
+            "rejected_candidates": self.rejected_count,
+            "screened_candidates": self.screened_count,
+            "finalized_candidates": self.finalized_count,
+            "screen_games_completed": self.screen_games_completed,
+            "final_games_completed": self.final_games_completed,
+            "active": {
+                "kind": self.active_kind,
+                "stage": self.active_stage,
+                "side": self.active_side,
+                "trial_index": self.active_trial_index,
+                "run_name": self.active_run_name,
+                "current": self.active_current,
+                "total": self.active_total,
+                "eta_seconds": self.active_eta_seconds,
+                "metrics": self.active_metrics,
+            },
+        }
+
+
+class ManifestProgressWriter:
+    def __init__(self, path: Path, manifest: dict[str, object], state: SearchDisplayState) -> None:
+        self.path = path
+        self.manifest = manifest
+        self.state = state
+        self.last_write = 0.0
+
+    def update(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_write < 1.0:
+            return
+        self.manifest["progress"] = self.state.progress_payload()
+        write_json(self.path, self.manifest)
+        self.last_write = now
+
+
+class BaseSearchReporter:
+    def __init__(self, args: argparse.Namespace, state: SearchDisplayState, progress_writer: ManifestProgressWriter) -> None:
+        self.args = args
+        self.state = state
+        self.progress_writer = progress_writer
+
+    def start(self) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+    def refresh(self) -> None:
+        self.progress_writer.update()
+
+    def notice(self, message: str) -> None:
+        self.state.last_notice = message
+        self.refresh()
+
+    def command_started(self, command: list[str]) -> None:
+        self.notice(f"running {Path(command[0]).name}")
+
+    def child_line(self, line: str) -> None:
+        if self.state.active_kind == "training":
+            progress = parse_training_progress(line)
+            if progress:
+                self.state.active_current = int(progress.pop("current"))
+                self.state.active_total = int(progress.pop("total"))
+                self.state.active_metrics.update(progress)
+            eta_match = TRAIN_ETA_RE.search(line)
+            if eta_match and eta_match.group(2) != "estimating":
+                try:
+                    self.state.active_eta_seconds = float(eta_match.group(2).removesuffix("s"))
+                except ValueError:
+                    pass
+        elif self.state.active_kind == "evaluation":
+            progress = parse_evaluation_progress(line)
+            if progress:
+                self.state.active_current, self.state.active_total = progress
+                if self.state.active_started_at is not None and self.state.active_current > 0:
+                    elapsed = time.monotonic() - self.state.active_started_at
+                    self.state.active_eta_seconds = max(0.0, elapsed / self.state.active_current * (self.state.active_total - self.state.active_current))
+        self.refresh()
+
+
+class PlainTextSearchReporter(BaseSearchReporter):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        state: SearchDisplayState,
+        progress_writer: ManifestProgressWriter,
+        fallback_notice: str = "",
+    ) -> None:
+        super().__init__(args, state, progress_writer)
+        self.fallback_notice = fallback_notice
+
+    def start(self) -> None:
+        if self.fallback_notice:
+            log(self.fallback_notice)
+
+    def notice(self, message: str) -> None:
+        super().notice(message)
+        log(message)
+
+    def command_started(self, command: list[str]) -> None:
+        self.notice("exec: " + " ".join(f'\"{part}\"' if " " in part else part for part in command))
+
+    def child_line(self, line: str) -> None:
+        super().child_line(line)
+        print(line, end="")
+
+
+class RichSearchReporter(BaseSearchReporter):
+    def __init__(self, args: argparse.Namespace, state: SearchDisplayState, progress_writer: ManifestProgressWriter) -> None:
+        super().__init__(args, state, progress_writer)
+        self.console = Console()
+        self.live = Live(
+            self._render(),
+            console=self.console,
+            refresh_per_second=args.dashboard_refresh_per_second,
+            transient=False,
+        )
+        self.started = False
+
+    def start(self) -> None:
+        self.live.start()
+        self.started = True
+        self.refresh()
+
+    def close(self) -> None:
+        if self.started:
+            self.live.stop()
+            self.started = False
+
+    def refresh(self) -> None:
+        super().refresh()
+        if self.started:
+            self.live.update(self._render(), refresh=True)
+
+    @staticmethod
+    def _bar(current: int, total: int, width: int = 28, style: str = "cyan") -> str:
+        if total <= 0:
+            return "[grey50]estimating[/grey50]"
+        bounded = min(max(0, current), total)
+        filled = min(width, int(round(width * bounded / total)))
+        return f"[{style}]" + "=" * filled + f"[/{style}][grey27]" + "-" * (width - filled) + "[/grey27]"
+
+    def _summary(self) -> Panel:
+        table = Table.grid(expand=True)
+        for _ in range(4):
+            table.add_column()
+        table.add_row(
+            f"[bold]Search[/]: {self.state.run_prefix}",
+            f"[bold]Phase[/]: {self.state.phase}",
+            f"[bold]Elapsed[/]: {format_duration(time.monotonic() - self.state.started_at)}",
+            f"[bold]ETA[/]: {format_duration(self.state.estimated_remaining_seconds())}",
+        )
+        table.add_row(
+            f"[bold]Trained[/]: {self.state.trained_count}/{self.state.max_trials}",
+            f"[green]Safe[/]: {self.state.safe_count}",
+            f"[red]Rejected[/]: {self.state.rejected_count}",
+            f"[bold]Screened/Final[/]: {self.state.screened_count}/{self.state.finalized_count}",
+        )
+        active = self.state.active_run_name or "-"
+        detail = self.state.active_kind
+        if self.state.active_side:
+            detail += f" {self.state.active_stage} side {self.state.active_side.upper()}"
+        table.add_row(f"[bold]Active[/]: {active}", f"[bold]Operation[/]: {detail or '-'}", "", "")
+        return Panel(table, title="PPO Search", border_style="cyan")
+
+    def _progress(self) -> Panel:
+        table = Table.grid(expand=True)
+        table.add_column(width=18)
+        table.add_column(ratio=1)
+        table.add_column(width=20, justify="right")
+        screen_candidates = self.state.screen_planned_candidates if self.state.screen_plan_finalized else self.state.configured_screen_candidates
+        final_candidates = self.state.final_planned_candidates if self.state.final_plan_finalized else self.state.configured_finalists
+        screen_total = 2 * screen_candidates * self.state.screen_games_per_side
+        final_total = 2 * final_candidates * self.state.final_games_per_side
+        screen_current = self.state.screen_games_completed
+        final_current = self.state.final_games_completed
+        if self.state.active_kind == "evaluation" and self.state.active_stage == "screen":
+            screen_current += self.state.active_current
+        elif self.state.active_kind == "evaluation" and self.state.active_stage == "final":
+            final_current += self.state.active_current
+        active_label = "idle"
+        if self.state.active_kind:
+            unit = "episodes" if self.state.active_kind == "training" else "games"
+            active_label = f"{self.state.active_current}/{self.state.active_total} {unit}"
+        rows = (
+            ("Training sweep", self.state.trained_count, self.state.max_trials, f"{self.state.trained_count}/{self.state.max_trials}"),
+            ("Screening", screen_current, screen_total, f"{screen_current}/{screen_total} games"),
+            ("Final evaluation", final_current, final_total, f"{final_current}/{final_total} games"),
+            ("Active operation", self.state.active_current, self.state.active_total, active_label),
+        )
+        for label, current, total, text_value in rows:
+            table.add_row(f"[bold]{label}[/]", self._bar(current, total), text_value)
+        return Panel(table, border_style="grey42", padding=(0, 1))
+
+    @staticmethod
+    def _result_text(trial: TrialResult) -> str:
+        result = trial.final_evaluation or trial.screen_evaluation
+        if not result:
+            return "-"
+        return f"{result.win_rate:.1%} [{result.confidence_low:.1%}, {result.confidence_high:.1%}]"
+
+    def _candidate_table(self) -> Table:
+        table = Table(expand=True, box=None, pad_edge=False, header_style="bold white")
+        for name, width in (("#", 3), ("Status", 11), ("LR", 9), ("Entropy", 9), ("Anchor", 8), ("Clip", 6), ("KL", 8), ("Anchor KL", 10), ("Clip frac", 10), ("KL guard", 9)):
+            table.add_column(name, width=width)
+        table.add_column("Safety", ratio=1)
+        table.add_column("Evaluation", ratio=1)
+        indexed = list(enumerate(self.state.trials, start=1))[-self.args.dashboard_visible_trials :]
+        for index, trial in indexed:
+            status = self.state.trial_status.get(trial.run_name, "safe" if not trial.safety_flags else "rejected")
+            style = "red" if trial.safety_flags else ("green" if status in {"safe", "screened", "finalized"} else "cyan")
+            table.add_row(
+                str(index), f"[{style}]{status}[/{style}]", f"{trial.hyperparameters.learning_rate:g}",
+                f"{trial.hyperparameters.entropy_coef:g}", f"{trial.hyperparameters.anchor_kl_coef:g}",
+                f"{trial.hyperparameters.ppo_clip_epsilon:g}", f"{trial.approx_kl:.4f}",
+                f"{trial.anchor_kl_mean:.4f}", f"{trial.clip_fraction:.3f}",
+                f"{trial.target_kl_hard_breach_count}/{trial.target_kl_hard_consecutive_updates}",
+                trial.safety_flags[0] if trial.safety_flags else "ok", self._result_text(trial),
+            )
+        if self.state.active_run_name and not any(t.run_name == self.state.active_run_name for t in self.state.trials):
+            params = self.state.active_params
+            metrics = self.state.active_metrics
+            if params:
+                table.add_row(
+                    str(self.state.active_trial_index), "[cyan]training[/cyan]", f"{params.learning_rate:g}",
+                    f"{params.entropy_coef:g}", f"{params.anchor_kl_coef:g}", f"{params.ppo_clip_epsilon:g}",
+                    f"{float(metrics.get('approx_kl', 0.0)):.4f}", f"{float(metrics.get('anchor_kl_mean', 0.0)):.4f}",
+                    f"{float(metrics.get('clip_fraction', 0.0)):.3f}",
+                    str(metrics.get("hard_kl_breaches", "0/0")), "pending",
+                    f"{self.state.active_current}/{self.state.active_total} episodes",
+                )
+        return table
+
+    def _leaderboard(self) -> Table | None:
+        ranked = sorted(
+            (trial for trial in self.state.trials if trial.final_evaluation or trial.screen_evaluation),
+            key=lambda trial: evaluation_rank_key(trial, final=trial.final_evaluation is not None),
+            reverse=True,
+        )[: self.args.dashboard_leaderboard_size]
+        if not ranked:
+            return None
+        table = Table(expand=True, box=None, title="Current leaderboard", header_style="bold white")
+        table.add_column("Rank", width=5)
+        table.add_column("Candidate", ratio=1)
+        table.add_column("Stage", width=8)
+        table.add_column("Win rate", width=10)
+        table.add_column("Lower 95%", width=11)
+        for index, trial in enumerate(ranked, start=1):
+            result = trial.final_evaluation or trial.screen_evaluation
+            assert result is not None
+            table.add_row(str(index), trial.run_name, result.stage, f"{result.win_rate:.1%}", f"{result.confidence_low:.1%}")
+        return table
+
+    def _render(self) -> Group:
+        divider = "[grey50]" + ("-" * 72) + "[/grey50]"
+        items: list[object] = [self._summary(), self._progress(), divider, self._candidate_table()]
+        leaderboard = self._leaderboard()
+        if leaderboard is not None:
+            items.extend((divider, leaderboard))
+        if self.state.last_notice:
+            items.append(Panel(self.state.last_notice, border_style="grey42"))
+        return Group(*items)
+
+
+def select_search_reporter(
+    args: argparse.Namespace,
+    state: SearchDisplayState,
+    progress_writer: ManifestProgressWriter,
+) -> BaseSearchReporter:
+    if not args.dashboard:
+        return PlainTextSearchReporter(args, state, progress_writer)
+    if not RICH_AVAILABLE:
+        return PlainTextSearchReporter(args, state, progress_writer, "dashboard unavailable; using plain-text output")
+    if not sys.stdout.isatty():
+        return PlainTextSearchReporter(args, state, progress_writer, "live terminal unavailable; using plain-text output")
+    state.dashboard_mode = "terminal"
+    return RichSearchReporter(args, state, progress_writer)
+
+
+def run_command(
+    command: list[str],
+    cwd: Path,
+    reporter: BaseSearchReporter,
+    raw_log_path: Path | None,
+    env_updates: dict[str, str] | None = None,
+) -> None:
+    reporter.command_started(command)
+    env = os.environ.copy()
+    if env_updates:
+        env.update(env_updates)
+    if raw_log_path:
+        raw_log_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_log: TextIO | None = raw_log_path.open("w", encoding="utf-8") if raw_log_path else None
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        with process.stdout:
+            for line in process.stdout:
+                if raw_log:
+                    raw_log.write(line)
+                    raw_log.flush()
+                reporter.child_line(line)
+        return_code = process.wait()
+    finally:
+        if raw_log:
+            raw_log.close()
+    if return_code != 0:
+        raise RuntimeError(f"command failed with exit code {return_code}")
 
 
 def safe_float_token(value: float) -> str:
@@ -332,6 +818,8 @@ def collect_training_result(
         target_kl_trigger=float(summary.get("target_kl_trigger", 0.0) or 0.0),
         target_kl_exceeded=bool(summary.get("target_kl_exceeded", False)),
         target_kl_hard_stop=bool(summary.get("target_kl_hard_stop", False)),
+        target_kl_hard_breach_count=int(summary.get("target_kl_hard_breach_count", 0) or 0),
+        target_kl_hard_consecutive_updates=int(summary.get("target_kl_hard_consecutive_updates", 1) or 1),
         anchor_kl_mean=float(summary.get("anchor_kl_mean", 0.0) or 0.0),
         anchor_kl_max=float(summary.get("anchor_kl_max", 0.0) or 0.0),
         clip_fraction=float(summary.get("clip_fraction", 0.0) or 0.0),
@@ -422,6 +910,10 @@ def run_balanced_evaluation(
     stage: str,
     games_per_side: int,
     seed_base: int,
+    trial_index: int,
+    reporter: BaseSearchReporter,
+    state: SearchDisplayState,
+    logs_dir: Path,
 ) -> EvaluationResult:
     total_games = 0
     total_wins = 0
@@ -431,6 +923,11 @@ def run_balanced_evaluation(
     candidate_checkpoint = Path(trial.checkpoint_path)
     for side_index, side in enumerate(("a", "b")):
         run_name = f"{trial.run_name}_{stage}_side_{side}_{games_per_side}"
+        state.begin_operation(
+            "evaluation", trial.run_name, trial_index, trial.hyperparameters,
+            games_per_side, stage=stage, side=side,
+        )
+        reporter.refresh()
         summary_path = evaluation_summary_path(repo_root, run_name)
         run_names.append(run_name)
         model_a = candidate_checkpoint if side == "a" else parent_checkpoint
@@ -445,7 +942,7 @@ def run_balanced_evaluation(
             run_command(build_eval_command(
                 args, repo_root, run_name, candidate_checkpoint, parent_checkpoint,
                 side, games_per_side, seed_base + side_index,
-            ), repo_root)
+            ), repo_root, reporter, logs_dir / f"{run_name}.log" if args.dashboard_write_raw_logs else None)
         summary = load_json(summary_path)
         if summary.get("status") != "completed":
             raise RuntimeError(f"evaluation did not complete: {run_name}")
@@ -454,6 +951,12 @@ def run_balanced_evaluation(
         total_games += games
         total_wins += int(group.get("wins", 0) or 0)
         total_earned_wins += int(group.get("earned_wins", 0) or 0)
+        state.finish_operation(games, record_duration=not can_resume)
+        if stage == "screen":
+            state.screen_games_completed += games
+        else:
+            state.final_games_completed += games
+        reporter.refresh()
         side_flags = ((summary.get("group_collapse_flags", {}) or {}).get(side, []) or [])
         collapse_flags.extend(str(flag) for flag in side_flags)
     low, high = wilson_interval(total_wins, total_games)
@@ -491,7 +994,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-checkpoint", default="")
     parser.add_argument("--eval-model-b", default="")
     parser.add_argument("--policy-tag-expected", default="")
-    parser.add_argument("--trainer-exe", default=str(DEFAULT_TRAINER_EXE))
     parser.add_argument("--learning-rates", type=csv_floats, default=[5e-6, 1e-5, 2.5e-5, 5e-5])
     parser.add_argument("--entropy-coefs", type=csv_floats, default=[1e-4, 3e-4, 1e-3])
     parser.add_argument("--anchor-kl-coefs", type=csv_floats, default=[0.003, 0.01, 0.03])
@@ -535,6 +1037,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--startup-timeout-seconds", type=positive_int, default=120)
     parser.add_argument("--omp-threads", type=nonnegative_int, default=8)
     parser.add_argument("--resume", type=parse_bool, default=True)
+    parser.add_argument("--dashboard", type=parse_bool, default=True)
+    parser.add_argument("--dashboard-refresh-per-second", type=positive_float, default=8.0)
+    parser.add_argument("--dashboard-visible-trials", type=positive_int, default=10)
+    parser.add_argument("--dashboard-leaderboard-size", type=positive_int, default=5)
+    parser.add_argument("--dashboard-write-raw-logs", type=parse_bool, default=True)
     return parser
 
 
@@ -547,7 +1054,7 @@ def parse_search_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_search_args()
     repo_root = resolve_repo_root()
-    trainer_exe = resolve_path(repo_root, args.trainer_exe)
+    trainer_exe = resolve_path(repo_root, DEFAULT_TRAINER_EXE)
     init_checkpoint = resolve_path(repo_root, args.init_checkpoint)
     episode_batch = resolve_path(repo_root, args.episode_batch)
     anchor_checkpoint = resolve_path(repo_root, args.anchor_checkpoint) if args.anchor_checkpoint else init_checkpoint
@@ -580,6 +1087,7 @@ def main() -> None:
         "run_prefix": args.run_prefix,
         "started_at_unix": time.time(),
         "fixed_inputs": {
+            "trainer_executable": str(trainer_exe),
             "init_checkpoint": str(init_checkpoint),
             "episode_batch": str(episode_batch),
             "anchor_checkpoint": str(anchor_checkpoint),
@@ -603,89 +1111,149 @@ def main() -> None:
         "search_seed": args.search_seed,
         "trials": [],
     }
-    write_json(manifest_path, manifest)
-
-    trials: list[TrialResult] = []
+    state = SearchDisplayState(
+        run_prefix=args.run_prefix,
+        max_trials=len(combinations),
+        configured_screen_candidates=min(args.screen_candidates, len(combinations)),
+        configured_finalists=min(args.finalists, args.screen_candidates, len(combinations)),
+        screen_games_per_side=args.screen_games_per_side,
+        final_games_per_side=args.final_games_per_side,
+    )
+    progress_writer = ManifestProgressWriter(manifest_path, manifest, state)
+    reporter = select_search_reporter(args, state, progress_writer)
+    logs_dir = search_dir / "logs"
+    trials = state.trials
     trainer_env = {"PORYGON_OMP_THREADS": str(args.omp_threads)} if args.omp_threads > 0 else None
-    for index, params in enumerate(combinations, start=1):
-        run_name = trial_run_name(args.run_prefix, index, params)
-        run_dir = (repo_root / DEFAULT_RUNS_ROOT / run_name).resolve()
-        checkpoint_path = run_dir / "candidate.chk"
-        summary_path = run_dir / "training_summary.json"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        can_resume = (
-            args.resume
-            and checkpoint_path.exists()
-            and summary_path.exists()
-            and training_artifacts_match(
-                summary_path, episode_batch, init_checkpoint, anchor_checkpoint,
-                checkpoint_path, params, args,
+    progress_writer.update(force=True)
+    reporter.start()
+    try:
+        state.phase = "training"
+        reporter.refresh()
+        for index, params in enumerate(combinations, start=1):
+            run_name = trial_run_name(args.run_prefix, index, params)
+            run_dir = (repo_root / DEFAULT_RUNS_ROOT / run_name).resolve()
+            checkpoint_path = run_dir / "candidate.chk"
+            summary_path = run_dir / "training_summary.json"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            state.begin_operation("training", run_name, index, params, 0)
+            reporter.refresh()
+            can_resume = (
+                args.resume
+                and checkpoint_path.exists()
+                and summary_path.exists()
+                and training_artifacts_match(
+                    summary_path, episode_batch, init_checkpoint, anchor_checkpoint,
+                    checkpoint_path, params, args,
+                )
             )
-        )
-        if not can_resume:
-            shutil.copy2(init_checkpoint, checkpoint_path)
-            run_command(build_train_command(
-                args, trainer_exe, episode_batch, init_checkpoint, anchor_checkpoint,
-                checkpoint_path, summary_path, params,
-            ), repo_root, trainer_env)
-        trial = collect_training_result(
-            run_name, params, checkpoint_path, summary_path, args,
-            training_reused=can_resume,
-        )
-        trials.append(trial)
-        manifest["trials"] = [trial_payload(item) for item in trials]
-        write_json(manifest_path, manifest)
-        log(f"trained {run_name} safe={not trial.safety_flags} labels={trial.labels} approx_kl={trial.approx_kl:.6f}")
+            if not can_resume:
+                shutil.copy2(init_checkpoint, checkpoint_path)
+                run_command(
+                    build_train_command(
+                        args, trainer_exe, episode_batch, init_checkpoint, anchor_checkpoint,
+                        checkpoint_path, summary_path, params,
+                    ),
+                    repo_root,
+                    reporter,
+                    logs_dir / f"{run_name}_training.log" if args.dashboard_write_raw_logs else None,
+                    trainer_env,
+                )
+            trial = collect_training_result(
+                run_name, params, checkpoint_path, summary_path, args,
+                training_reused=can_resume,
+            )
+            state.active_total = trial.available_episode_count or trial.episode_count
+            state.finish_operation(trial.episode_count, record_duration=not can_resume)
+            trials.append(trial)
+            state.trained_count += 1
+            if trial.safety_flags:
+                state.rejected_count += 1
+                state.trial_status[run_name] = "rejected"
+            else:
+                state.safe_count += 1
+                state.trial_status[run_name] = "safe"
+            manifest["trials"] = [trial_payload(item) for item in trials]
+            reporter.notice(
+                f"trained {run_name} safe={not trial.safety_flags} labels={trial.labels} "
+                f"approx_kl={trial.approx_kl:.6f}"
+            )
+            progress_writer.update(force=True)
 
-    safe_trials = [trial for trial in trials if not trial.safety_flags]
-    safe_trials.sort(key=lambda trial: training_screen_key(trial, args.target_kl), reverse=True)
-    screen_trials = safe_trials[: args.screen_candidates]
-    for index, trial in enumerate(screen_trials, start=1):
-        trial.screen_evaluation = run_balanced_evaluation(
-            args, repo_root, trial, parent_checkpoint, "screen",
-            args.screen_games_per_side, args.search_seed * 1000 + index * 10,
-        )
-        manifest["trials"] = [trial_payload(item) for item in trials]
-        write_json(manifest_path, manifest)
-        log(
-            f"screened {trial.run_name} win_rate={trial.screen_evaluation.win_rate:.4f} "
-            f"lower95={trial.screen_evaluation.confidence_low:.4f}"
-        )
+        safe_trials = [trial for trial in trials if not trial.safety_flags]
+        safe_trials.sort(key=lambda trial: training_screen_key(trial, args.target_kl), reverse=True)
+        screen_trials = safe_trials[: args.screen_candidates]
+        state.phase = "screening"
+        state.screen_planned_candidates = len(screen_trials)
+        state.screen_plan_finalized = True
+        reporter.refresh()
+        trial_indices = {trial.run_name: index for index, trial in enumerate(trials, start=1)}
+        for index, trial in enumerate(screen_trials, start=1):
+            trial.screen_evaluation = run_balanced_evaluation(
+                args, repo_root, trial, parent_checkpoint, "screen",
+                args.screen_games_per_side, args.search_seed * 1000 + index * 10,
+                trial_indices[trial.run_name], reporter, state, logs_dir,
+            )
+            state.screened_count += 1
+            state.trial_status[trial.run_name] = "screened"
+            manifest["trials"] = [trial_payload(item) for item in trials]
+            reporter.notice(
+                f"screened {trial.run_name} win_rate={trial.screen_evaluation.win_rate:.4f} "
+                f"lower95={trial.screen_evaluation.confidence_low:.4f}"
+            )
+            progress_writer.update(force=True)
 
-    ranked_screen = sorted(screen_trials, key=evaluation_rank_key, reverse=True)
-    finalists = [
-        trial for trial in ranked_screen
-        if trial.screen_evaluation and not trial.screen_evaluation.collapse_flags
-    ][: args.finalists]
-    for index, trial in enumerate(finalists, start=1):
-        trial.final_evaluation = run_balanced_evaluation(
-            args, repo_root, trial, parent_checkpoint, "final",
-            args.final_games_per_side, args.search_seed * 100000 + index * 10,
-        )
-        manifest["trials"] = [trial_payload(item) for item in trials]
-        write_json(manifest_path, manifest)
-        log(
-            f"finalized {trial.run_name} win_rate={trial.final_evaluation.win_rate:.4f} "
-            f"lower95={trial.final_evaluation.confidence_low:.4f}"
-        )
+        ranked_screen = sorted(screen_trials, key=evaluation_rank_key, reverse=True)
+        finalists = [
+            trial for trial in ranked_screen
+            if trial.screen_evaluation and not trial.screen_evaluation.collapse_flags
+        ][: args.finalists]
+        state.phase = "final evaluation"
+        state.final_planned_candidates = len(finalists)
+        state.final_plan_finalized = True
+        reporter.refresh()
+        for index, trial in enumerate(finalists, start=1):
+            trial.final_evaluation = run_balanced_evaluation(
+                args, repo_root, trial, parent_checkpoint, "final",
+                args.final_games_per_side, args.search_seed * 100000 + index * 10,
+                trial_indices[trial.run_name], reporter, state, logs_dir,
+            )
+            state.finalized_count += 1
+            state.trial_status[trial.run_name] = "finalized"
+            manifest["trials"] = [trial_payload(item) for item in trials]
+            reporter.notice(
+                f"finalized {trial.run_name} win_rate={trial.final_evaluation.win_rate:.4f} "
+                f"lower95={trial.final_evaluation.confidence_low:.4f}"
+            )
+            progress_writer.update(force=True)
 
-    ranked_final = sorted(finalists, key=lambda trial: evaluation_rank_key(trial, final=True), reverse=True)
-    manifest["status"] = "completed"
-    manifest["completed_at_unix"] = time.time()
-    manifest["ranked_screen_results"] = [trial_payload(trial) for trial in ranked_screen]
-    manifest["ranked_final_results"] = [trial_payload(trial) for trial in ranked_final]
-    manifest["best_result"] = trial_payload(ranked_final[0]) if ranked_final else None
-    write_json(manifest_path, manifest)
-    if ranked_final:
-        best = ranked_final[0]
-        assert best.final_evaluation is not None
-        log(
-            f"best run={best.run_name} lr={best.hyperparameters.learning_rate:g} "
-            f"entropy={best.hyperparameters.entropy_coef:g} anchor={best.hyperparameters.anchor_kl_coef:g} "
-            f"win_rate={best.final_evaluation.win_rate:.4f} lower95={best.final_evaluation.confidence_low:.4f}"
-        )
-    else:
-        log("no safe finalist completed")
+        ranked_final = sorted(finalists, key=lambda trial: evaluation_rank_key(trial, final=True), reverse=True)
+        state.phase = "completed"
+        state.clear_operation()
+        manifest["status"] = "completed"
+        manifest["completed_at_unix"] = time.time()
+        manifest["ranked_screen_results"] = [trial_payload(trial) for trial in ranked_screen]
+        manifest["ranked_final_results"] = [trial_payload(trial) for trial in ranked_final]
+        manifest["best_result"] = trial_payload(ranked_final[0]) if ranked_final else None
+        if ranked_final:
+            best = ranked_final[0]
+            assert best.final_evaluation is not None
+            reporter.notice(
+                f"best run={best.run_name} lr={best.hyperparameters.learning_rate:g} "
+                f"entropy={best.hyperparameters.entropy_coef:g} anchor={best.hyperparameters.anchor_kl_coef:g} "
+                f"win_rate={best.final_evaluation.win_rate:.4f} lower95={best.final_evaluation.confidence_low:.4f}"
+            )
+        else:
+            reporter.notice("no safe finalist completed")
+        progress_writer.update(force=True)
+    except BaseException as exc:
+        state.phase = "failed"
+        manifest["status"] = "failed"
+        manifest["failed_at_unix"] = time.time()
+        manifest["error"] = f"{type(exc).__name__}: {exc}"
+        progress_writer.update(force=True)
+        raise
+    finally:
+        reporter.close()
 
 
 if __name__ == "__main__":
