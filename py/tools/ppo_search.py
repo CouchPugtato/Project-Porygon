@@ -38,6 +38,7 @@ TRAIN_PROGRESS_RE = re.compile(r"^\[train-ppo\].*\bepisodes=(\d+)/(\d+)")
 TRAIN_ETA_RE = re.compile(r"^\[train\].*\bepisodes_per_sec=([^\s]+)\s+eta=([^\s]+)")
 SELFPLAY_PROGRESS_RE = re.compile(r"^\[selfplay\].*\bcompleted_games=(\d+)/(\d+)")
 KEY_VALUE_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
+POLICY_TAG_RE = re.compile(r'"policy_tag"\s*:\s*("(?:\\.|[^"\\])*")')
 FIXED_CONFIG_KEYS = {"trainer_exe"}
 
 
@@ -139,6 +140,30 @@ def log(message: str) -> None:
 
 def load_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_episode_batch_policy_tag(path: Path, max_prefix_bytes: int = 1024 * 1024) -> str:
+    """Read the first episode's tag without loading its very large JSON line."""
+    with path.open("r", encoding="utf-8") as handle:
+        prefix = handle.read(max_prefix_bytes)
+    match = POLICY_TAG_RE.search(prefix)
+    if not match:
+        return ""
+    value = json.loads(match.group(1))
+    return value if isinstance(value, str) else ""
+
+
+def inferred_policy_tag(repo_root: Path, episode_batch: Path, init_checkpoint: Path) -> str:
+    tag = read_episode_batch_policy_tag(episode_batch)
+    if not tag:
+        return str(init_checkpoint)
+    looks_like_path = Path(tag).suffix.lower() == ".chk" or any(separator in tag for separator in ("/", "\\"))
+    if looks_like_path and resolve_path(repo_root, tag) != init_checkpoint.resolve():
+        raise RuntimeError(
+            "episode batch policy_tag does not identify the initial checkpoint: "
+            f"tag={tag} init_checkpoint={init_checkpoint}"
+        )
+    return tag
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
@@ -1417,6 +1442,11 @@ def main() -> None:
     ):
         if not path.exists():
             raise SystemExit(f"{label} not found: {path}")
+    if not args.policy_tag_expected:
+        try:
+            args.policy_tag_expected = inferred_policy_tag(repo_root, episode_batch, init_checkpoint)
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from exc
 
     search_dir = (repo_root / DEFAULT_SEARCH_ROOT / args.run_prefix).resolve()
     search_dir.mkdir(parents=True, exist_ok=True)
@@ -1438,6 +1468,7 @@ def main() -> None:
             "trainer_executable": str(trainer_exe),
             "init_checkpoint": str(init_checkpoint),
             "episode_batch": str(episode_batch),
+            "policy_tag_expected": args.policy_tag_expected,
             "anchor_checkpoint": str(anchor_checkpoint),
             "evaluation_parent": str(parent_checkpoint),
         },

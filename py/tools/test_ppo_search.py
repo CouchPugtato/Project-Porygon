@@ -20,6 +20,7 @@ from ppo_search import (
     build_eval_command,
     build_train_command,
     evaluation_artifacts_match,
+    inferred_policy_tag,
     load_config_args,
     merge_evaluation_results,
     parse_evaluation_progress,
@@ -140,6 +141,25 @@ class PpoSearchTests(unittest.TestCase):
             config.write_text('trainer_exe = "custom.exe"\n', encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "fixed internally"):
                 load_config_args(config)
+
+    def test_policy_tag_uses_exact_batch_spelling_after_path_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            checkpoint = root / "models" / "parent.chk"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"checkpoint")
+            batch = root / "batch.jsonl"
+            relative_tag = ".\\models\\parent.chk"
+            batch.write_text(json.dumps({
+                "type": "episode_complete",
+                "policy_tag": relative_tag,
+                "observations": [0],
+            }) + "\n", encoding="utf-8")
+            self.assertEqual(inferred_policy_tag(root, batch, checkpoint), relative_tag)
+            other = root / "models" / "other.chk"
+            other.write_bytes(b"checkpoint")
+            with self.assertRaisesRegex(RuntimeError, "does not identify"):
+                inferred_policy_tag(root, batch, other)
 
     def test_live_progress_parsers_extract_trainer_and_selfplay_state(self) -> None:
         training = parse_training_progress(
