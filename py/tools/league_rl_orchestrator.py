@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -23,6 +22,13 @@ from league_manage import (
     save_registry,
 )
 from opponent_sampling import ADAPTIVE_STRATEGY, matchup_difficulty_weight as calculate_matchup_difficulty_weight
+from live_rl_orchestrator import (
+    BaseWorkflowReporter,
+    DashboardProgressWriter,
+    WorkflowDashboardState,
+    run_reported_command,
+    select_workflow_reporter,
+)
 from ppo_search import (
     aggregate_collapse_flags,
     aggregate_group_stats,
@@ -130,13 +136,6 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
 
 def log(message: str) -> None:
     print(f"[league-rl] {message}", flush=True)
-
-
-def run_command(command: list[str], cwd: Path) -> None:
-    log("exec: " + " ".join(f'"{part}"' if " " in part else part for part in command))
-    completed = subprocess.run(command, cwd=str(cwd))
-    if completed.returncode != 0:
-        raise SystemExit(completed.returncode)
 
 
 def registry_has_member(registry: LeagueRegistry, member_id: str) -> bool:
@@ -476,6 +475,10 @@ def build_live_command(args: argparse.Namespace, repo_root: Path, pool_path: Pat
         str(args.omp_threads),
         "--resume",
         "true" if args.resume else "false",
+        "--dashboard",
+        "false",
+        "--dashboard-write-raw-logs",
+        "true" if args.dashboard_write_raw_logs else "false",
     ]
     return command
 
@@ -570,6 +573,8 @@ def run_balanced_valid_evaluation(
     repo_root: Path,
     candidate_checkpoint: Path,
     champion_checkpoint: Path,
+    reporter: BaseWorkflowReporter,
+    logs_dir: Path,
 ) -> tuple[Path, dict[str, object]]:
     combined_path = evaluation_summary_path(repo_root, args.eval_run_name)
     if args.resume and combined_path.exists():
@@ -577,7 +582,15 @@ def run_balanced_valid_evaluation(
         if balanced_evaluation_artifacts_match(
             existing, candidate_checkpoint, champion_checkpoint, args.eval_games,
         ):
-            log(f"reusing balanced valid-game evaluation: {combined_path}")
+            for side in ("a", "b"):
+                side_result = ((existing.get("side_results", {}) or {}).get(side, {}) or {})
+                reporter.state.update_evaluation(
+                    side,
+                    int(side_result.get("valid_games", 0) or 0),
+                    int(side_result.get("invalid_games", 0) or 0),
+                )
+            reporter.state.finish_evaluation(existing)
+            reporter.notice(f"reusing balanced valid-game evaluation: {combined_path}")
             return combined_path, existing
 
     candidate_stats: dict[str, object] = {}
@@ -602,19 +615,34 @@ def run_balanced_valid_evaluation(
                 and summary_path.exists()
                 and evaluation_artifacts_match(summary_path, model_a, model_b, shortfall)
             )
+            reporter.state.begin_evaluation(
+                candidate_side,
+                int(before["valid_games"]),
+                int(before["invalid_games"]),
+                shortfall,
+            )
+            reporter.notice(
+                f"evaluation side {candidate_side.upper()} attempt {attempt}: "
+                f"need {shortfall} valid games"
+            )
             if can_resume:
-                log(f"reusing evaluation block: {run_name}")
+                reporter.notice(f"reusing evaluation block: {run_name}")
             else:
-                run_command(build_eval_command(
-                    args,
+                run_reported_command(
+                    build_eval_command(
+                        args,
+                        repo_root,
+                        run_name,
+                        candidate_checkpoint,
+                        champion_checkpoint,
+                        candidate_side,
+                        shortfall,
+                        args.pool_seed + 100000 + side_index * 1000 + attempt,
+                    ),
                     repo_root,
-                    run_name,
-                    candidate_checkpoint,
-                    champion_checkpoint,
-                    candidate_side,
-                    shortfall,
-                    args.pool_seed + 100000 + side_index * 1000 + attempt,
-                ), repo_root)
+                    reporter,
+                    logs_dir / f"{run_name}.log" if args.dashboard_write_raw_logs else None,
+                )
             block = load_json(summary_path)
             if block.get("status") != "completed":
                 raise SystemExit(f"evaluation block did not complete: {run_name}")
@@ -627,7 +655,10 @@ def run_balanced_valid_evaluation(
             side_runs.append(run_name)
             run_names.append(run_name)
             after = valid_outcome_counts(side_candidate_stats, side_champion_stats)
-            log(
+            reporter.state.update_evaluation(
+                candidate_side, int(after["valid_games"]), int(after["invalid_games"]),
+            )
+            reporter.notice(
                 f"evaluation side={candidate_side} valid={int(after['valid_games'])}/{args.eval_games} "
                 f"invalid={int(after['invalid_games'])} raw={int(after['raw_games'])}"
             )
@@ -681,6 +712,11 @@ def run_balanced_valid_evaluation(
         },
     }
     write_json(combined_path, summary)
+    reporter.state.finish_evaluation(summary)
+    reporter.notice(
+        f"evaluation complete: score={float(valid['valid_win_rate']):.2%} "
+        f"95% CI=[{confidence_low:.2%}, {confidence_high:.2%}]"
+    )
     return combined_path, summary
 
 
@@ -840,6 +876,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-on-collapse", type=parse_bool, default=True)
     parser.add_argument("--omp-threads", type=int, default=8)
     parser.add_argument("--resume", type=parse_bool, default=True)
+    parser.add_argument("--dashboard", type=parse_bool, default=True)
+    parser.add_argument("--dashboard-refresh-per-second", type=positive_float, default=8.0)
+    parser.add_argument("--dashboard-write-raw-logs", type=parse_bool, default=True)
     parser.add_argument("--include-random-weight", type=float, default=0.0)
     parser.add_argument("--matchup-target-win-rate", type=target_win_rate_float, default=DEFAULT_MATCHUP_TARGET_WIN_RATE)
     parser.add_argument("--matchup-min-weight", type=positive_unit_float, default=DEFAULT_MATCHUP_MIN_WEIGHT)
@@ -957,12 +996,41 @@ def main() -> None:
         "anchor_checkpoint": args.anchor_checkpoint,
         "anchor_kl_coef": args.anchor_kl_coef,
     }
+    workflow_manifest["dashboard_config"] = {
+        "enabled": args.dashboard,
+        "refresh_per_second": args.dashboard_refresh_per_second,
+        "write_raw_logs": args.dashboard_write_raw_logs,
+    }
     write_json(workflow_manifest_path, workflow_manifest)
 
     live_command = build_live_command(args, repo_root, pool_path, parent_checkpoint)
     workflow_manifest["live_command"] = live_command
     write_json(workflow_manifest_path, workflow_manifest)
-    run_command(live_command, repo_root)
+    dashboard_state = WorkflowDashboardState(
+        run_name=args.run_name,
+        rounds_total=args.rounds,
+        games_per_round=args.games,
+        evaluation_games_per_side=args.eval_games,
+        title="League PPO" if args.training_mode == "ppo" else "League RL",
+    )
+    dashboard_state.metrics.update({
+        "learning_rate": args.learning_rate,
+        "entropy_coef": args.entropy_coef,
+        "anchor_kl_coef": args.anchor_kl_coef,
+        "ppo_clip_epsilon": args.ppo_clip_epsilon,
+    })
+    progress_writer = DashboardProgressWriter(workflow_manifest_path, workflow_manifest, dashboard_state)
+    reporter = select_workflow_reporter(
+        args.dashboard, args.dashboard_refresh_per_second, dashboard_state, progress_writer,
+    )
+    logs_dir = workflow_dir / "logs"
+    reporter.start()
+    run_reported_command(
+        live_command,
+        repo_root,
+        reporter,
+        logs_dir / f"{args.run_name}_live_rl.log" if args.dashboard_write_raw_logs else None,
+    )
 
     live_manifest_path = (repo_root / DEFAULT_RUNS_ROOT / workflow_run_name / f"{workflow_run_name}_live_rl_manifest.json").resolve()
     live_manifest = load_json(live_manifest_path)
@@ -982,13 +1050,16 @@ def main() -> None:
     promotion_assessment = None
     if champion is not None and champion_checkpoint is not None:
         eval_summary_path, eval_summary = run_balanced_valid_evaluation(
-            args, repo_root, candidate_checkpoint, champion_checkpoint,
+            args, repo_root, candidate_checkpoint, champion_checkpoint, reporter, logs_dir,
         )
         workflow_manifest["eval_run_names"] = list(eval_summary.get("run_names", []) or [])
         write_json(workflow_manifest_path, workflow_manifest)
         collapse_flags.extend([str(flag) for flag in (eval_summary.get("candidate_collapse_flags", []) or [])])
         collapse_flags = sorted(set(collapse_flags))
+        reporter.state.collapse_flags = list(collapse_flags)
         promotion_assessment = league_promotion_assessment(args, eval_summary, collapse_flags)
+        reporter.state.set_promotion(promotion_assessment)
+        reporter.notice(f"promotion assessment: {promotion_assessment['status']}")
 
     candidate_id = args.member_id or args.run_name
     if registry_has_member(registry, candidate_id):
@@ -1050,6 +1121,7 @@ def main() -> None:
     workflow_manifest["recent_opponent_stats"] = opponent_stats_payload(recent_opponent_stats)
     workflow_manifest["promoted"] = bool(registry.champion_id == candidate.id)
     write_json(workflow_manifest_path, workflow_manifest)
+    reporter.close()
 
 
 if __name__ == "__main__":

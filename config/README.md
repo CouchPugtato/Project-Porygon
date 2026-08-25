@@ -36,6 +36,8 @@ Files:
   - collects `episode_complete` records directly from worker JSONLs and trains with `showdown_client --train-live-rl`
   - copies the parent checkpoint into each round output path before the RL update so actor rollouts stay versioned by round
   - writes one workflow manifest under `models/runs/<run_name>/` plus one per-round manifest
+  - renders collection, PPO training, round, KL/safety, and ETA progress when `dashboard = true`
+  - writes live state to the workflow manifest and raw per-round subprocess logs under `models/runs/<run_name>/logs/`
 - `ppo_search.toml`
   - consumed by `py/tools/ppo_search.py` before CLI arguments are applied
   - controls the candidate grid, staged evaluation sizes, worker limits, and search dashboard
@@ -99,6 +101,13 @@ PPO-search dashboard notes:
 - the leaderboard ranks evaluated candidates by the same confidence-aware search ordering used to choose finalists
 - `dashboard_visible_trials` and `dashboard_leaderboard_size` control table sizes; `dashboard_refresh_per_second` controls terminal refresh rate
 - disabling `dashboard_write_raw_logs` suppresses per-candidate trainer and evaluation logs but does not disable manifest progress updates
+
+Live/league dashboard notes:
+
+- standalone live RL shows round, collection, PPO-training, KL, anchor, clipping, and safety state
+- league RL uses the same display across nested live training, balanced side-A/side-B evaluation, confidence intervals, and the final promotion gate
+- the nested live process runs in plain-output mode during a league workflow so only one terminal dashboard owns the screen
+- non-interactive runs retain plain-text output and still write the manifest `progress` object
 
 Examples:
 
@@ -325,6 +334,8 @@ Artifacts:
   - `models/runs/<run_name>/roundXX/<run_name>_roundXX_opponent_pool_next.json`
 - extracted episode batches:
   - `matches/runs/<collect_run>/episode_batch_<side>.jsonl`
+- optional raw collection/training logs:
+  - `models/runs/<run_name>/logs/`
 
 Example:
 

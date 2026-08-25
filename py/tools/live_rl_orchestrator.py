@@ -1,22 +1,507 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TextIO
 
 from opponent_sampling import is_adaptive_pool, refresh_adaptive_pool
 from rl_defaults import bool_default, float_default, int_default, reward_float_default
+
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.markup import escape
+    from rich.panel import Panel
+    from rich.table import Table
+
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
 
 
 DEFAULT_ARGS_PATH = Path("config/live_rl_orchestrator.toml")
 DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
 DEFAULT_RUNS_ROOT = Path("matches") / "runs"
 DEFAULT_MODELS_ROOT = Path("models") / "runs"
+SELFPLAY_PROGRESS_RE = re.compile(r"^\[selfplay\].*\bcompleted_games=(\d+)/(\d+)")
+TRAIN_PROGRESS_RE = re.compile(r"^\[train-(?:ppo|rl)\].*\bepisodes=(\d+)/(\d+)")
+TRAIN_ETA_RE = re.compile(r"^\[train\].*\beta=([^\s]+)")
+KEY_VALUE_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
+LIVE_PHASE_RE = re.compile(
+    r"^\[live-rl\] dashboard phase=(collection|training) round=(\d+)/(\d+)(?: total=(\d+))?"
+)
+LIVE_ROUND_COMPLETE_RE = re.compile(r"^\[live-rl\] dashboard round_completed=(\d+)/(\d+)")
+LIVE_COLLAPSE_RE = re.compile(r"^\[live-rl\] dashboard collapse_flags=(\[.*\])$")
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "estimating"
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def parse_key_values(line: str) -> dict[str, int | float | str]:
+    values: dict[str, int | float | str] = {}
+    for match in KEY_VALUE_RE.finditer(line):
+        raw = match.group(2)
+        try:
+            values[match.group(1)] = float(raw) if any(token in raw for token in (".", "e", "E")) else int(raw)
+        except ValueError:
+            values[match.group(1)] = raw
+    return values
+
+
+@dataclass
+class WorkflowDashboardState:
+    run_name: str
+    rounds_total: int
+    games_per_round: int
+    evaluation_games_per_side: int = 0
+    title: str = "Live PPO"
+    started_at: float = field(default_factory=time.monotonic)
+    phase: str = "starting"
+    round_index: int = 0
+    rounds_completed: int = 0
+    collection_current: int = 0
+    collection_total: int = 0
+    training_current: int = 0
+    training_total: int = 0
+    evaluation_side: str = ""
+    evaluation_valid: dict[str, int] = field(default_factory=lambda: {"a": 0, "b": 0})
+    evaluation_invalid: dict[str, int] = field(default_factory=lambda: {"a": 0, "b": 0})
+    evaluation_attempt_current: int = 0
+    evaluation_attempt_total: int = 0
+    active_started_at: float | None = None
+    active_eta_seconds: float | None = None
+    metrics: dict[str, int | float | str] = field(default_factory=dict)
+    collapse_flags: list[str] = field(default_factory=list)
+    promotion_status: str = "pending"
+    valid_win_rate: float | None = None
+    confidence_low: float | None = None
+    confidence_high: float | None = None
+    last_notice: str = ""
+    dashboard_mode: str = "plain-text"
+
+    def begin_collection(self, round_index: int, total: int) -> None:
+        self.phase = "collection"
+        self.round_index = round_index
+        self.collection_current = 0
+        self.collection_total = total
+        self.training_current = 0
+        self.training_total = 0
+        self.active_started_at = time.monotonic()
+        self.active_eta_seconds = None
+
+    def begin_training(self, round_index: int, total: int) -> None:
+        self.phase = "training"
+        self.round_index = round_index
+        self.training_current = 0
+        self.training_total = total
+        self.active_started_at = time.monotonic()
+        self.active_eta_seconds = None
+        for key in (
+            "policy_loss", "value_loss", "entropy", "approx_kl", "anchor_kl_mean",
+            "anchor_kl_max", "clip_fraction", "hard_kl_breaches", "labels",
+        ):
+            self.metrics.pop(key, None)
+
+    def complete_round(self, round_index: int, metrics: dict[str, object] | None = None, collapse_flags: list[str] | None = None) -> None:
+        self.rounds_completed = max(self.rounds_completed, round_index)
+        self.round_index = round_index
+        self.phase = "round complete"
+        self.active_eta_seconds = 0.0
+        if metrics:
+            self.metrics.update({key: value for key, value in metrics.items() if isinstance(value, (int, float, str))})
+        if collapse_flags is not None:
+            self.collapse_flags = list(collapse_flags)
+
+    def begin_evaluation(self, side: str, valid: int, invalid: int, attempt_total: int) -> None:
+        self.phase = "evaluation"
+        self.evaluation_side = side
+        self.evaluation_valid[side] = valid
+        self.evaluation_invalid[side] = invalid
+        self.evaluation_attempt_current = 0
+        self.evaluation_attempt_total = attempt_total
+        self.active_started_at = time.monotonic()
+        self.active_eta_seconds = None
+
+    def update_evaluation(self, side: str, valid: int, invalid: int) -> None:
+        self.evaluation_valid[side] = valid
+        self.evaluation_invalid[side] = invalid
+
+    def finish_evaluation(self, summary: dict[str, object]) -> None:
+        self.phase = "promotion decision"
+        self.valid_win_rate = float(summary.get("valid_win_rate", 0.0) or 0.0)
+        self.confidence_low = float(summary.get("confidence_low", 0.0) or 0.0)
+        self.confidence_high = float(summary.get("confidence_high", 1.0) or 1.0)
+        self.active_eta_seconds = 0.0
+
+    def set_promotion(self, assessment: dict[str, object] | None) -> None:
+        if assessment is None:
+            return
+        self.promotion_status = str(assessment.get("status", "pending"))
+        self.phase = "completed"
+
+    def active_progress(self) -> tuple[int, int]:
+        if self.phase == "collection":
+            return self.collection_current, self.collection_total
+        if self.phase == "training":
+            return self.training_current, self.training_total
+        if self.phase == "evaluation":
+            return self.evaluation_attempt_current, self.evaluation_attempt_total
+        return 0, 0
+
+    def update_rate_eta(self, current: int, total: int) -> None:
+        if self.active_started_at is None or current <= 0 or total <= current:
+            return
+        elapsed = time.monotonic() - self.active_started_at
+        if elapsed > 0.0:
+            self.active_eta_seconds = elapsed / current * (total - current)
+
+    def progress_payload(self) -> dict[str, object]:
+        return {
+            "phase": self.phase,
+            "dashboard_mode": self.dashboard_mode,
+            "elapsed_seconds": time.monotonic() - self.started_at,
+            "active_eta_seconds": self.active_eta_seconds,
+            "round": self.round_index,
+            "rounds_completed": self.rounds_completed,
+            "rounds_total": self.rounds_total,
+            "collection": {"current": self.collection_current, "total": self.collection_total},
+            "training": {"current": self.training_current, "total": self.training_total},
+            "evaluation": {
+                "side": self.evaluation_side,
+                "valid": dict(self.evaluation_valid),
+                "invalid": dict(self.evaluation_invalid),
+                "valid_target_per_side": self.evaluation_games_per_side,
+                "attempt_current": self.evaluation_attempt_current,
+                "attempt_total": self.evaluation_attempt_total,
+            },
+            "metrics": dict(self.metrics),
+            "collapse_flags": list(self.collapse_flags),
+            "promotion_status": self.promotion_status,
+            "valid_win_rate": self.valid_win_rate,
+            "confidence_low": self.confidence_low,
+            "confidence_high": self.confidence_high,
+        }
+
+
+class DashboardProgressWriter:
+    def __init__(self, path: Path, manifest: dict[str, object], state: WorkflowDashboardState) -> None:
+        self.path = path
+        self.manifest = manifest
+        self.state = state
+        self.last_write = 0.0
+
+    def update(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_write < 1.0:
+            return
+        self.manifest["progress"] = self.state.progress_payload()
+        write_json(self.path, self.manifest)
+        self.last_write = now
+
+
+class BaseWorkflowReporter:
+    def __init__(self, state: WorkflowDashboardState, progress_writer: DashboardProgressWriter | None = None) -> None:
+        self.state = state
+        self.progress_writer = progress_writer
+
+    def start(self) -> None:
+        return
+
+    def close(self) -> None:
+        if self.progress_writer:
+            self.progress_writer.update(force=True)
+
+    def refresh(self) -> None:
+        if self.progress_writer:
+            self.progress_writer.update()
+
+    def notice(self, message: str) -> None:
+        self.state.last_notice = message
+        self.refresh()
+
+    def command_started(self, command: list[str]) -> None:
+        self.notice(f"running {Path(command[0]).name}")
+
+    def child_line(self, line: str) -> None:
+        phase_match = LIVE_PHASE_RE.search(line)
+        if phase_match:
+            phase, current_round, total_rounds, raw_total = phase_match.groups()
+            self.state.rounds_total = int(total_rounds)
+            total = int(raw_total or 0)
+            if phase == "collection":
+                self.state.begin_collection(int(current_round), total)
+            else:
+                self.state.begin_training(int(current_round), total)
+        completed_match = LIVE_ROUND_COMPLETE_RE.search(line)
+        if completed_match:
+            self.state.complete_round(int(completed_match.group(1)))
+        collapse_match = LIVE_COLLAPSE_RE.search(line.strip())
+        if collapse_match:
+            try:
+                parsed_flags = json.loads(collapse_match.group(1))
+                if isinstance(parsed_flags, list):
+                    self.state.collapse_flags = [str(flag) for flag in parsed_flags]
+            except json.JSONDecodeError:
+                pass
+
+        selfplay_match = SELFPLAY_PROGRESS_RE.search(line)
+        if selfplay_match:
+            current, total = int(selfplay_match.group(1)), int(selfplay_match.group(2))
+            if self.state.phase == "evaluation":
+                self.state.evaluation_attempt_current = current
+                self.state.evaluation_attempt_total = total
+            else:
+                self.state.collection_current = current
+                self.state.collection_total = total
+            self.state.update_rate_eta(current, total)
+
+        train_match = TRAIN_PROGRESS_RE.search(line)
+        if train_match:
+            self.state.training_current = int(train_match.group(1))
+            self.state.training_total = int(train_match.group(2))
+            values = parse_key_values(line)
+            for key in (
+                "policy_loss", "value_loss", "entropy", "approx_kl", "anchor_kl_mean",
+                "anchor_kl_max", "clip_fraction", "hard_kl_breaches", "labels",
+            ):
+                if key in values:
+                    self.state.metrics[key] = values[key]
+            self.state.update_rate_eta(self.state.training_current, self.state.training_total)
+
+        eta_match = TRAIN_ETA_RE.search(line)
+        if eta_match and eta_match.group(1) != "estimating":
+            try:
+                self.state.active_eta_seconds = float(eta_match.group(1).removesuffix("s"))
+            except ValueError:
+                pass
+        self.refresh()
+
+
+class PlainTextWorkflowReporter(BaseWorkflowReporter):
+    def __init__(
+        self,
+        state: WorkflowDashboardState,
+        progress_writer: DashboardProgressWriter | None = None,
+        fallback_notice: str = "",
+    ) -> None:
+        super().__init__(state, progress_writer)
+        self.fallback_notice = fallback_notice
+
+    def start(self) -> None:
+        if self.fallback_notice:
+            log(self.fallback_notice)
+
+    def notice(self, message: str) -> None:
+        super().notice(message)
+        log(message)
+
+    def command_started(self, command: list[str]) -> None:
+        self.notice("exec: " + " ".join(f'\"{part}\"' if " " in part else part for part in command))
+
+    def child_line(self, line: str) -> None:
+        super().child_line(line)
+        print(line, end="")
+
+
+class RichWorkflowReporter(BaseWorkflowReporter):
+    def __init__(
+        self,
+        state: WorkflowDashboardState,
+        refresh_per_second: float,
+        progress_writer: DashboardProgressWriter | None = None,
+    ) -> None:
+        super().__init__(state, progress_writer)
+        self.console = Console()
+        self.live = Live(self._render(), console=self.console, refresh_per_second=refresh_per_second, transient=False)
+        self.started = False
+
+    def start(self) -> None:
+        self.live.start()
+        self.started = True
+        atexit.register(self.close)
+        self.refresh()
+
+    def close(self) -> None:
+        super().close()
+        if self.started:
+            self.live.stop()
+            self.started = False
+            try:
+                atexit.unregister(self.close)
+            except Exception:
+                pass
+
+    def refresh(self) -> None:
+        super().refresh()
+        if self.started:
+            self.live.update(self._render(), refresh=True)
+
+    @staticmethod
+    def _bar(current: int, total: int, width: int = 28, style: str = "cyan") -> str:
+        if total <= 0:
+            return "[grey50]waiting[/grey50]"
+        bounded = min(max(0, current), total)
+        filled = min(width, int(round(width * bounded / total)))
+        return f"[{style}]" + "=" * filled + f"[/{style}][grey27]" + "-" * (width - filled) + "[/grey27]"
+
+    def _summary(self) -> Panel:
+        state = self.state
+        table = Table.grid(expand=True)
+        for _ in range(4):
+            table.add_column()
+        round_text = f"{state.round_index}/{state.rounds_total}" if state.rounds_total else "-"
+        table.add_row(
+            f"[bold]Run[/]: {state.run_name}", f"[bold]Phase[/]: {state.phase}",
+            f"[bold]Round[/]: {round_text}", f"[bold]Elapsed[/]: {format_duration(time.monotonic() - state.started_at)}",
+        )
+        table.add_row(
+            f"[bold]Rounds done[/]: {state.rounds_completed}/{state.rounds_total}",
+            f"[bold]Active ETA[/]: {format_duration(state.active_eta_seconds)}",
+            f"[bold]Promotion[/]: {state.promotion_status}", "",
+        )
+        return Panel(table, title=state.title, border_style="cyan")
+
+    def _progress(self) -> Panel:
+        state = self.state
+        table = Table.grid(expand=True)
+        table.add_column(width=18)
+        table.add_column(ratio=1)
+        table.add_column(width=30, justify="right")
+        rows: list[tuple[str, int, int, str]] = [
+            ("Rounds", state.rounds_completed, state.rounds_total, f"{state.rounds_completed}/{state.rounds_total}"),
+            ("Collection", state.collection_current, state.collection_total, f"{state.collection_current}/{state.collection_total} games"),
+            ("PPO training", state.training_current, state.training_total, f"{state.training_current}/{state.training_total} episodes"),
+        ]
+        if state.evaluation_games_per_side:
+            for side in ("a", "b"):
+                valid = state.evaluation_valid[side]
+                invalid = state.evaluation_invalid[side]
+                detail = f"{valid}/{state.evaluation_games_per_side} valid; {invalid} invalid"
+                if state.phase == "evaluation" and state.evaluation_side == side and state.evaluation_attempt_total:
+                    detail += f"; attempt {state.evaluation_attempt_current}/{state.evaluation_attempt_total} raw"
+                rows.append((f"Evaluation {side.upper()}", valid, state.evaluation_games_per_side, detail))
+        for label, current, total, detail in rows:
+            style = "green" if total > 0 and current >= total else "cyan"
+            table.add_row(f"[bold]{label}[/]", self._bar(current, total, style=style), detail)
+        return Panel(table, border_style="grey42", padding=(0, 1))
+
+    def _metrics(self) -> Panel:
+        state = self.state
+        table = Table.grid(expand=True)
+        for _ in range(4):
+            table.add_column()
+        metrics = state.metrics
+        def metric(key: str, digits: int = 4) -> str:
+            value = metrics.get(key)
+            if value is None:
+                return "-"
+            if isinstance(value, float):
+                return f"{value:.{digits}f}"
+            return str(value)
+        table.add_row(
+            f"[bold]LR[/]: {metric('learning_rate')}", f"[bold]Entropy coef[/]: {metric('entropy_coef')}",
+            f"[bold]Anchor coef[/]: {metric('anchor_kl_coef')}", f"[bold]Clip[/]: {metric('ppo_clip_epsilon')}",
+        )
+        table.add_row(
+            f"[bold]Policy loss[/]: {metric('policy_loss')}", f"[bold]Value loss[/]: {metric('value_loss')}",
+            f"[bold]Entropy[/]: {metric('entropy')}", f"[bold]Labels[/]: {metric('labels', 0)}",
+        )
+        table.add_row(
+            f"[bold]Approx KL[/]: {metric('approx_kl')}", f"[bold]Anchor KL[/]: {metric('anchor_kl_mean')}",
+            f"[bold]Clip frac[/]: {metric('clip_fraction', 3)}", f"[bold]KL guard[/]: {metric('hard_kl_breaches', 0)}",
+        )
+        if state.valid_win_rate is not None:
+            table.add_row(
+                f"[bold]Valid score[/]: {state.valid_win_rate:.2%}",
+                f"[bold]Lower 95%[/]: {state.confidence_low:.2%}" if state.confidence_low is not None else "",
+                f"[bold]Upper 95%[/]: {state.confidence_high:.2%}" if state.confidence_high is not None else "",
+                "",
+            )
+        if state.collapse_flags:
+            table.add_row("[red]Safety[/]: " + ", ".join(state.collapse_flags[:2]), "", "", "")
+        return Panel(table, title="Current metrics", border_style="grey42")
+
+    def _render(self) -> Group:
+        items: list[object] = [self._summary(), self._progress(), self._metrics()]
+        if self.state.last_notice:
+            items.append(Panel(escape(self.state.last_notice), border_style="grey42"))
+        return Group(*items)
+
+
+def select_workflow_reporter(
+    dashboard: bool,
+    refresh_per_second: float,
+    state: WorkflowDashboardState,
+    progress_writer: DashboardProgressWriter | None = None,
+) -> BaseWorkflowReporter:
+    if not dashboard:
+        return PlainTextWorkflowReporter(state, progress_writer)
+    if not RICH_AVAILABLE:
+        return PlainTextWorkflowReporter(state, progress_writer, "dashboard unavailable; using plain-text output")
+    if not sys.stdout.isatty():
+        return PlainTextWorkflowReporter(state, progress_writer, "live terminal unavailable; using plain-text output")
+    state.dashboard_mode = "terminal"
+    return RichWorkflowReporter(state, refresh_per_second, progress_writer)
+
+
+def run_reported_command(
+    command: list[str],
+    cwd: Path,
+    reporter: BaseWorkflowReporter,
+    raw_log_path: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    reporter.command_started(command)
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    if raw_log_path:
+        raw_log_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_log: TextIO | None = raw_log_path.open("w", encoding="utf-8") if raw_log_path else None
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        with process.stdout:
+            for line in process.stdout:
+                if raw_log:
+                    raw_log.write(line)
+                    raw_log.flush()
+                reporter.child_line(line)
+        return_code = process.wait()
+    finally:
+        if raw_log:
+            raw_log.close()
+    if return_code != 0:
+        raise RuntimeError(f"command failed with exit code {return_code}")
 
 
 def positive_int(value: str) -> int:
@@ -30,6 +515,13 @@ def nonnegative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0.0:
+        raise argparse.ArgumentTypeError("value must be > 0")
     return parsed
 
 
@@ -91,19 +583,6 @@ def worker_glob_for_side(side: str) -> str:
 
 def log(message: str) -> None:
     print(f"[live-rl] {message}", flush=True)
-
-
-def run_command(command: list[str], cwd: Path, extra_env: dict[str, str] | None = None) -> None:
-    log("exec: " + " ".join(f'"{part}"' if " " in part else part for part in command))
-    env = None
-    if extra_env:
-        env = dict(**extra_env)
-        merged = dict(os.environ)
-        merged.update(env)
-        env = merged
-    completed = subprocess.run(command, cwd=str(cwd), env=env)
-    if completed.returncode != 0:
-        raise SystemExit(completed.returncode)
 
 
 def extract_episode_batch(run_dir: Path, side: str, output_path: Path) -> dict[str, int]:
@@ -374,6 +853,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-on-collapse", type=parse_bool, default=True)
     parser.add_argument("--omp-threads", type=int, default=0)
     parser.add_argument("--resume", type=parse_bool, default=True)
+    parser.add_argument("--dashboard", type=parse_bool, default=True)
+    parser.add_argument("--dashboard-refresh-per-second", type=positive_float, default=8.0)
+    parser.add_argument("--dashboard-write-raw-logs", type=parse_bool, default=True)
     return parser
 
 
@@ -458,6 +940,8 @@ def main() -> None:
             "adam_epsilon": args.adam_epsilon,
             "episode_side": args.episode_side,
             "omp_threads": args.omp_threads,
+            "dashboard": args.dashboard,
+            "dashboard_write_raw_logs": args.dashboard_write_raw_logs,
             "opponent": {
                 "model_b": args.model_b,
                 "model_b_pool": str(initial_pool_path) if initial_pool_path else "",
@@ -473,6 +957,25 @@ def main() -> None:
     current_checkpoint = Path(str(workflow_manifest.get("latest_checkpoint", init_checkpoint))).resolve()
     if not completed_round_paths or not current_checkpoint.exists():
         current_checkpoint = init_checkpoint
+    dashboard_state = WorkflowDashboardState(
+        run_name=args.run_name,
+        rounds_total=args.rounds,
+        games_per_round=args.games,
+        title="Live PPO" if args.training_mode == "ppo" else "Live RL",
+    )
+    dashboard_state.rounds_completed = len(completed_round_paths)
+    dashboard_state.metrics.update({
+        "learning_rate": args.learning_rate,
+        "entropy_coef": args.entropy_coef,
+        "anchor_kl_coef": args.anchor_kl_coef,
+        "ppo_clip_epsilon": args.ppo_clip_epsilon,
+    })
+    progress_writer = DashboardProgressWriter(workflow_manifest_path, workflow_manifest, dashboard_state)
+    reporter = select_workflow_reporter(
+        args.dashboard, args.dashboard_refresh_per_second, dashboard_state, progress_writer,
+    )
+    logs_dir = workflow_dir / "logs"
+    reporter.start()
     try:
         for round_index in range(1, args.rounds + 1):
             round_token = f"round{round_index:02d}"
@@ -496,7 +999,8 @@ def main() -> None:
                     workflow_manifest["round_manifests"].append(str(round_manifest_path))
                 workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
                 write_json(workflow_manifest_path, workflow_manifest)
-                log(f"skipping completed {round_token}")
+                reporter.child_line(f"[live-rl] dashboard round_completed={round_index}/{args.rounds}\n")
+                reporter.notice(f"skipping completed {round_token}")
                 continue
 
             round_pool_path: Path | None = None
@@ -528,7 +1032,17 @@ def main() -> None:
             )
             round_manifest["selfplay_command"] = selfplay_command
             write_json(round_manifest_path, round_manifest)
-            run_command(selfplay_command, repo_root)
+            dashboard_state.begin_collection(round_index, args.games)
+            reporter.notice(f"collecting round {round_index}/{args.rounds}: {args.games} games")
+            reporter.child_line(
+                f"[live-rl] dashboard phase=collection round={round_index}/{args.rounds} total={args.games}\n"
+            )
+            run_reported_command(
+                selfplay_command,
+                repo_root,
+                reporter,
+                logs_dir / f"{collect_run_name}.log" if args.dashboard_write_raw_logs else None,
+            )
 
             collection_summary_path = (
                 run_dir_for_name(repo_root, collect_run_name)
@@ -568,7 +1082,7 @@ def main() -> None:
                         "used": str(round_pool_path),
                         "next": str(next_pool_path),
                     })
-                log(f"refreshed adaptive opponent pool for {round_token}: {next_pool_path}")
+                reporter.notice(f"refreshed adaptive opponent pool for {round_token}: {next_pool_path}")
             write_json(round_manifest_path, round_manifest)
 
             extract_stats = extract_episode_batch(run_dir_for_name(repo_root, collect_run_name), args.episode_side, episode_batch_path)
@@ -585,7 +1099,21 @@ def main() -> None:
             train_command = build_train_command(args, trainer_exe, episode_batch_path, output_checkpoint)
             round_manifest["train_command"] = train_command
             write_json(round_manifest_path, round_manifest)
-            run_command(train_command, repo_root, extra_env=trainer_env(args))
+            dashboard_state.begin_training(round_index, int(extract_stats["written_episodes"]))
+            reporter.notice(
+                f"training round {round_index}/{args.rounds}: {int(extract_stats['written_episodes'])} episodes"
+            )
+            reporter.child_line(
+                f"[live-rl] dashboard phase=training round={round_index}/{args.rounds} "
+                f"total={int(extract_stats['written_episodes'])}\n"
+            )
+            run_reported_command(
+                train_command,
+                repo_root,
+                reporter,
+                logs_dir / f"{args.run_name}_{round_token}_training.log" if args.dashboard_write_raw_logs else None,
+                extra_env=trainer_env(args),
+            )
 
             training_summary = load_json(training_summary_path)
             collapse_flags = collapse_flags_from_training_summary(
@@ -611,24 +1139,40 @@ def main() -> None:
             workflow_manifest["round_manifests"].append(str(round_manifest_path))
             workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
             write_json(workflow_manifest_path, workflow_manifest)
+            dashboard_state.complete_round(round_index, training_summary, collapse_flags)
+            reporter.child_line(
+                "[live-rl] dashboard collapse_flags="
+                + json.dumps(collapse_flags, separators=(",", ":"))
+                + "\n"
+            )
+            reporter.child_line(f"[live-rl] dashboard round_completed={round_index}/{args.rounds}\n")
+            reporter.notice(f"completed round {round_index}/{args.rounds}")
             if args.stop_on_collapse and any(flag.startswith("hard_move_slot_collapse") for flag in collapse_flags):
                 workflow_manifest["status"] = "stopped_on_collapse"
                 workflow_manifest["completed_at_unix"] = time.time()
                 workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
                 workflow_manifest["stop_reason"] = collapse_flags
                 write_json(workflow_manifest_path, workflow_manifest)
+                dashboard_state.phase = "stopped on collapse"
+                reporter.notice("stopped on hard policy collapse")
                 return
 
         workflow_manifest["status"] = "completed"
         workflow_manifest["completed_at_unix"] = time.time()
         workflow_manifest["latest_checkpoint"] = str(current_checkpoint)
         write_json(workflow_manifest_path, workflow_manifest)
+        dashboard_state.phase = "completed"
+        reporter.notice("live training completed")
     except Exception as exc:
         workflow_manifest["status"] = "failed"
         workflow_manifest["failure_reason"] = str(exc)
         workflow_manifest["completed_at_unix"] = time.time()
         write_json(workflow_manifest_path, workflow_manifest)
+        dashboard_state.phase = "failed"
+        reporter.notice(str(exc))
         raise
+    finally:
+        reporter.close()
 
 
 if __name__ == "__main__":

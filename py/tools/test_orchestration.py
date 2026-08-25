@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,7 +19,16 @@ from league_rl_orchestrator import (
     matchup_difficulty_weight,
     maybe_promote_candidate,
 )
-from live_rl_orchestrator import build_selfplay_command, build_train_command, collapse_flags_from_training_summary, round_manifest_completed
+from live_rl_orchestrator import (
+    BaseWorkflowReporter,
+    DashboardProgressWriter,
+    WorkflowDashboardState,
+    build_selfplay_command,
+    build_train_command,
+    collapse_flags_from_training_summary,
+    round_manifest_completed,
+    run_reported_command,
+)
 from opponent_sampling import refresh_adaptive_pool
 from rl_defaults import float_default
 from selfplay_server import load_model_pool, pool_coverage_summary, sample_pool_member, validate_pool_member
@@ -398,6 +408,7 @@ class PromotionTests(unittest.TestCase):
             stop_on_collapse=True,
             omp_threads=8,
             resume=True,
+            dashboard_write_raw_logs=True,
         )
         command = build_league_live_command(
             args, Path("repo"), Path("pool.json"), Path("parent.chk"),
@@ -407,6 +418,72 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(command[command.index("--target-kl") + 1], "0.02")
         self.assertEqual(command[command.index("--ppo-minibatch-episodes") + 1], "8")
         self.assertEqual(command[command.index("--learning-rate") + 1], "1e-05")
+        self.assertEqual(command[command.index("--dashboard") + 1], "false")
+        self.assertEqual(command[command.index("--dashboard-write-raw-logs") + 1], "true")
+
+
+class WorkflowDashboardTests(unittest.TestCase):
+    def test_reporter_tracks_nested_collection_training_and_round_progress(self) -> None:
+        state = WorkflowDashboardState("league-run", 4, 500, 500, "League PPO")
+        reporter = BaseWorkflowReporter(state)
+
+        reporter.child_line("[live-rl] dashboard phase=collection round=2/4 total=500\n")
+        reporter.child_line("[selfplay] completed_games=125/500\n")
+        self.assertEqual(state.phase, "collection")
+        self.assertEqual((state.round_index, state.collection_current, state.collection_total), (2, 125, 500))
+
+        reporter.child_line("[live-rl] dashboard phase=training round=2/4 total=480\n")
+        reporter.child_line(
+            "[train-ppo] epoch=1 episodes=16/480 policy_loss=0.0123 value_loss=0.1010 "
+            "entropy=2.2000 approx_kl=0.0040 anchor_kl_mean=0.0010 "
+            "clip_fraction=0.020 hard_kl_breaches=0/2 labels=320\n"
+        )
+        reporter.child_line("[train] epoch=1 elapsed=2.0s episodes_per_sec=8.00 eta=58.0s\n")
+        self.assertEqual((state.training_current, state.training_total), (16, 480))
+        self.assertEqual(state.metrics["hard_kl_breaches"], "0/2")
+        self.assertAlmostEqual(float(state.metrics["approx_kl"]), 0.004)
+        self.assertEqual(state.active_eta_seconds, 58.0)
+
+        reporter.child_line('[live-rl] dashboard collapse_flags=["warn_anchor_kl_high:0.120"]\n')
+        reporter.child_line("[live-rl] dashboard round_completed=2/4\n")
+        self.assertEqual(state.rounds_completed, 2)
+        self.assertEqual(state.collapse_flags, ["warn_anchor_kl_high:0.120"])
+
+    def test_reporter_separates_valid_evaluation_progress_from_raw_attempts(self) -> None:
+        state = WorkflowDashboardState("league-run", 2, 500, 500, "League PPO")
+        reporter = BaseWorkflowReporter(state)
+        state.begin_evaluation("a", valid=490, invalid=3, attempt_total=10)
+        reporter.child_line("[selfplay] completed_games=7/10\n")
+        self.assertEqual(state.evaluation_valid["a"], 490)
+        self.assertEqual(state.evaluation_attempt_current, 7)
+        state.update_evaluation("a", valid=500, invalid=4)
+        state.finish_evaluation({"valid_win_rate": 0.53, "confidence_low": 0.501, "confidence_high": 0.559})
+        state.set_promotion({"status": "confident_winner"})
+        payload = state.progress_payload()
+        self.assertEqual(payload["evaluation"]["valid"]["a"], 500)
+        self.assertEqual(payload["evaluation"]["invalid"]["a"], 4)
+        self.assertEqual(payload["promotion_status"], "confident_winner")
+
+    def test_reported_command_captures_logs_and_persists_manifest_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest_path = root / "manifest.json"
+            raw_log_path = root / "child.log"
+            manifest: dict[str, object] = {"status": "running"}
+            state = WorkflowDashboardState("live-run", 1, 10)
+            writer = DashboardProgressWriter(manifest_path, manifest, state)
+            reporter = BaseWorkflowReporter(state, writer)
+            command = [
+                sys.executable,
+                "-c",
+                "print('[live-rl] dashboard phase=collection round=1/1 total=10'); "
+                "print('[selfplay] completed_games=10/10')",
+            ]
+            run_reported_command(command, root, reporter, raw_log_path)
+            reporter.close()
+            saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["progress"]["collection"], {"current": 10, "total": 10})
+            self.assertIn("completed_games=10/10", raw_log_path.read_text(encoding="utf-8"))
 
 
 class ResumeAndCollapseTests(unittest.TestCase):

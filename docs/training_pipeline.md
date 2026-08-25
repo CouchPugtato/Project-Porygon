@@ -206,6 +206,8 @@ Collection summaries expose both configured and realized sampling shares plus pe
 
 During a multi-round live run, `live_rl_orchestrator.py` also closes the loop immediately. It snapshots the pool used for each round, recalculates within-category weights from the completed collection, and passes the refreshed snapshot to the next round. Both the used and next pool paths are stored in the round manifest, and resume restores the recorded chain.
 
+Interactive live and league runs share a single terminal dashboard. It tracks round completion, current collection games, PPO episodes and optimization metrics, active ETA, and collapse warnings. During a league run the same display continues through valid-game evaluation on both sides, then reports the Wilson interval and promotion-gate result. Non-interactive terminals fall back to plain text; progress remains available in the workflow manifest and raw child output is retained in the workflow's `logs/` directory by default.
+
 League candidates are evaluated against the current champion on both player sides. `--eval-games` is the required number of valid games per side; disconnects and forfeits do not count, and the orchestrator launches replacement blocks up to `--eval-max-replacement-attempts`. The combined evaluation summary records raw, valid, and invalid totals, per-side results, collapse metrics, and a 95% Wilson interval for the candidate's valid-game score.
 
 Promotion now requires all of the following:
