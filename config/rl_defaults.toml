@@ -7,8 +7,9 @@ policy_gradient_entropy_coef = 0.001
 ppo_gamma = 0.99
 live_ppo_learning_rate = 0.001
 ppo_entropy_coef = 0.001
-league_ppo_learning_rate = 0.0003
-league_ppo_entropy_coef = 0.0003
+# Stable anchored settings selected for iterative league updates.
+league_ppo_learning_rate = 0.00001
+league_ppo_entropy_coef = 0.0001
 league_matchup_target_win_rate = 0.50
 league_matchup_min_weight = 0.10
 league_matchup_confidence_games = 20
@@ -47,6 +48,8 @@ warn_tera_baseline_ratio = 0.50
 fail_fast_earned_win_rate = 0.40
 fail_fast_min_games = 150
 promotion_earned_win_rate = 0.52
+# A candidate must also have its lower 95% confidence bound above this value.
+promotion_confidence_threshold = 0.50
 promotion_min_tera_baseline_ratio = 0.60
 # Slightly above the 0.02 training target so a normal boundary crossing is not
 # confused with an unsafe update; the 4x emergency stop is still rejected.

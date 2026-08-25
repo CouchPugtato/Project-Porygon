@@ -23,6 +23,13 @@ from league_manage import (
     save_registry,
 )
 from opponent_sampling import ADAPTIVE_STRATEGY, matchup_difficulty_weight as calculate_matchup_difficulty_weight
+from ppo_search import (
+    aggregate_collapse_flags,
+    aggregate_group_stats,
+    evaluation_artifacts_match,
+    valid_outcome_counts,
+    wilson_interval,
+)
 from rl_defaults import bool_default, float_default, int_default
 
 
@@ -32,6 +39,7 @@ DEFAULT_MATCHUP_TARGET_WIN_RATE = float_default("league_matchup_target_win_rate"
 DEFAULT_MATCHUP_MIN_WEIGHT = float_default("league_matchup_min_weight")
 DEFAULT_MATCHUP_CONFIDENCE_GAMES = int_default("league_matchup_confidence_games")
 DEFAULT_MIN_CATEGORY_STARTS = int_default("league_min_category_starts")
+DEFAULT_PROMOTION_CONFIDENCE_THRESHOLD = float_default("promotion_confidence_threshold")
 
 
 def positive_int(value: str) -> int:
@@ -422,6 +430,36 @@ def build_live_command(args: argparse.Namespace, repo_root: Path, pool_path: Pat
         str(args.entropy_coef),
         "--advantage-norm",
         "1" if args.advantage_norm else "0",
+        "--gae-lambda",
+        str(args.gae_lambda),
+        "--ppo-clip-epsilon",
+        str(args.ppo_clip_epsilon),
+        "--ppo-value-clip-epsilon",
+        str(args.ppo_value_clip_epsilon),
+        "--target-kl",
+        str(args.target_kl),
+        "--target-kl-min-episodes",
+        str(args.target_kl_min_episodes),
+        "--target-kl-min-labels",
+        str(args.target_kl_min_labels),
+        "--target-kl-hard-multiplier",
+        str(args.target_kl_hard_multiplier),
+        "--target-kl-hard-consecutive-updates",
+        str(args.target_kl_hard_consecutive_updates),
+        "--shuffle-seed",
+        str(args.shuffle_seed),
+        "--ppo-minibatch-episodes",
+        str(args.ppo_minibatch_episodes),
+        "--adam-beta1",
+        str(args.adam_beta1),
+        "--adam-beta2",
+        str(args.adam_beta2),
+        "--adam-epsilon",
+        str(args.adam_epsilon),
+        "--anchor-checkpoint",
+        str(args.anchor_checkpoint),
+        "--anchor-kl-coef",
+        str(args.anchor_kl_coef),
         "--reward-mode",
         args.reward_mode,
         "--launch-stagger-seconds",
@@ -442,26 +480,55 @@ def build_live_command(args: argparse.Namespace, repo_root: Path, pool_path: Pat
     return command
 
 
-def build_eval_command(args: argparse.Namespace, repo_root: Path, candidate_checkpoint: Path, champion_checkpoint: Path) -> list[str]:
+def evaluation_summary_path(repo_root: Path, run_name: str) -> Path:
+    return (repo_root / "matches" / "runs" / run_name / f"{run_name}_summary.json").resolve()
+
+
+def build_eval_command(
+    args: argparse.Namespace,
+    repo_root: Path,
+    run_name: str,
+    candidate_checkpoint: Path,
+    champion_checkpoint: Path,
+    candidate_side: str,
+    games: int,
+    pool_seed: int,
+) -> list[str]:
+    model_a = candidate_checkpoint if candidate_side == "a" else champion_checkpoint
+    model_b = champion_checkpoint if candidate_side == "a" else candidate_checkpoint
     return [
         sys.executable,
         str((repo_root / "py" / "tools" / "selfplay_server.py").resolve()),
         "--run-name",
-        args.eval_run_name,
+        run_name,
         "--games",
-        str(args.eval_games),
+        str(games),
         "--concurrent-games",
         str(args.eval_concurrent_games),
         "--worker-pairs",
         str(args.eval_worker_pairs),
+        "--worker-games",
+        "0",
         "--ensure-shard-count",
-        "false",
+        "true",
         "--model-a-pool",
         "",
         "--model-a",
-        str(candidate_checkpoint),
+        str(model_a),
+        "--model-b-pool",
+        "",
         "--model-b",
-        str(champion_checkpoint),
+        str(model_b),
+        "--pool-seed",
+        str(pool_seed),
+        "--format",
+        args.format,
+        "--worker-think-mode",
+        "live",
+        "--serve-client",
+        "0",
+        "--worker-log-stdout",
+        "0",
         "--launch-stagger-seconds",
         str(args.launch_stagger_seconds),
         "--resource-check-seconds",
@@ -473,6 +540,148 @@ def build_eval_command(args: argparse.Namespace, repo_root: Path, candidate_chec
         "--startup-timeout-seconds",
         str(args.startup_timeout_seconds),
     ]
+
+
+def balanced_evaluation_artifacts_match(
+    summary: dict[str, object],
+    candidate_checkpoint: Path,
+    champion_checkpoint: Path,
+    valid_games_per_side: int,
+) -> bool:
+    models = summary.get("model_specs", {}) or {}
+    candidate_path = str((models.get("candidate", {}) or {}).get("path", "")).strip()
+    champion_path = str((models.get("champion", {}) or {}).get("path", "")).strip()
+    try:
+        return (
+            summary.get("status") == "completed"
+            and summary.get("evaluation_mode") == "balanced_valid_games"
+            and int(summary.get("target_valid_games_per_side", 0) or 0) == valid_games_per_side
+            and bool(candidate_path)
+            and bool(champion_path)
+            and resolve_path(resolve_repo_root(), candidate_path) == candidate_checkpoint.resolve()
+            and resolve_path(resolve_repo_root(), champion_path) == champion_checkpoint.resolve()
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def run_balanced_valid_evaluation(
+    args: argparse.Namespace,
+    repo_root: Path,
+    candidate_checkpoint: Path,
+    champion_checkpoint: Path,
+) -> tuple[Path, dict[str, object]]:
+    combined_path = evaluation_summary_path(repo_root, args.eval_run_name)
+    if args.resume and combined_path.exists():
+        existing = load_json(combined_path)
+        if balanced_evaluation_artifacts_match(
+            existing, candidate_checkpoint, champion_checkpoint, args.eval_games,
+        ):
+            log(f"reusing balanced valid-game evaluation: {combined_path}")
+            return combined_path, existing
+
+    candidate_stats: dict[str, object] = {}
+    champion_stats: dict[str, object] = {}
+    run_names: list[str] = []
+    side_results: dict[str, dict[str, int | float | list[str]]] = {}
+    for side_index, candidate_side in enumerate(("a", "b")):
+        side_candidate_stats: dict[str, object] = {}
+        side_champion_stats: dict[str, object] = {}
+        side_runs: list[str] = []
+        for attempt in range(1, args.eval_max_replacement_attempts + 1):
+            before = valid_outcome_counts(side_candidate_stats, side_champion_stats)
+            shortfall = args.eval_games - int(before["valid_games"])
+            if shortfall <= 0:
+                break
+            run_name = f"{args.eval_run_name}_side_{candidate_side}_attempt_{attempt:02d}"
+            summary_path = evaluation_summary_path(repo_root, run_name)
+            model_a = candidate_checkpoint if candidate_side == "a" else champion_checkpoint
+            model_b = champion_checkpoint if candidate_side == "a" else candidate_checkpoint
+            can_resume = (
+                args.resume
+                and summary_path.exists()
+                and evaluation_artifacts_match(summary_path, model_a, model_b, shortfall)
+            )
+            if can_resume:
+                log(f"reusing evaluation block: {run_name}")
+            else:
+                run_command(build_eval_command(
+                    args,
+                    repo_root,
+                    run_name,
+                    candidate_checkpoint,
+                    champion_checkpoint,
+                    candidate_side,
+                    shortfall,
+                    args.pool_seed + 100000 + side_index * 1000 + attempt,
+                ), repo_root)
+            block = load_json(summary_path)
+            if block.get("status") != "completed":
+                raise SystemExit(f"evaluation block did not complete: {run_name}")
+            groups = block.get("group_stats", {}) or {}
+            candidate_group = groups.get(candidate_side, {}) or {}
+            champion_side = "b" if candidate_side == "a" else "a"
+            champion_group = groups.get(champion_side, {}) or {}
+            side_candidate_stats = aggregate_group_stats(side_candidate_stats, candidate_group)
+            side_champion_stats = aggregate_group_stats(side_champion_stats, champion_group)
+            side_runs.append(run_name)
+            run_names.append(run_name)
+            after = valid_outcome_counts(side_candidate_stats, side_champion_stats)
+            log(
+                f"evaluation side={candidate_side} valid={int(after['valid_games'])}/{args.eval_games} "
+                f"invalid={int(after['invalid_games'])} raw={int(after['raw_games'])}"
+            )
+        side_outcomes = valid_outcome_counts(side_candidate_stats, side_champion_stats)
+        if int(side_outcomes["valid_games"]) < args.eval_games:
+            raise SystemExit(
+                f"could not collect {args.eval_games} valid games with candidate on side {candidate_side}; "
+                f"collected {int(side_outcomes['valid_games'])} valid and "
+                f"{int(side_outcomes['invalid_games'])} invalid after "
+                f"{args.eval_max_replacement_attempts} attempts"
+            )
+        side_results[candidate_side] = {**side_outcomes, "run_names": side_runs}
+        candidate_stats = aggregate_group_stats(candidate_stats, side_candidate_stats)
+        champion_stats = aggregate_group_stats(champion_stats, side_champion_stats)
+
+    valid = valid_outcome_counts(candidate_stats, champion_stats)
+    confidence_low, confidence_high = wilson_interval(
+        float(valid["valid_score"]), int(valid["valid_games"]),
+    )
+    collapse_flags = aggregate_collapse_flags(candidate_stats, champion_stats)
+    summary: dict[str, object] = {
+        "status": "completed",
+        "run_name": args.eval_run_name,
+        "evaluation_mode": "balanced_valid_games",
+        "target_valid_games_per_side": args.eval_games,
+        "target_valid_games": 2 * args.eval_games,
+        "raw_games": int(valid["raw_games"]),
+        "valid_games": int(valid["valid_games"]),
+        "invalid_games": int(valid["invalid_games"]),
+        "valid_wins": int(valid["valid_wins"]),
+        "valid_draws": int(valid["valid_draws"]),
+        "valid_score": float(valid["valid_score"]),
+        "valid_win_rate": float(valid["valid_win_rate"]),
+        "confidence_low": confidence_low,
+        "confidence_high": confidence_high,
+        "confidence_level": 0.95,
+        "run_names": run_names,
+        "side_results": side_results,
+        "group_stats": {
+            "candidate": candidate_stats,
+            "champion": champion_stats,
+        },
+        "candidate_collapse_flags": collapse_flags,
+        "model_specs": {
+            "candidate": {"kind": "checkpoint", "path": str(candidate_checkpoint)},
+            "champion": {"kind": "checkpoint", "path": str(champion_checkpoint)},
+        },
+        "metric_definitions": {
+            "valid_game": "normal earned decision or draw; disconnect/forfeit outcomes excluded",
+            "valid_win_rate": "candidate earned wins plus half of valid draws / valid games",
+        },
+    }
+    write_json(combined_path, summary)
+    return combined_path, summary
 
 
 def create_member_from_run(
@@ -488,9 +697,7 @@ def create_member_from_run(
     generation = registry.current_generation + 1
     vs_champion_win_rate = None
     if eval_summary is not None:
-        group_stats = eval_summary.get("group_stats", {}) or {}
-        side_a = group_stats.get("a", {}) or {}
-        vs_champion_win_rate = float(side_a.get("earned_win_rate", 0.0) or 0.0)
+        vs_champion_win_rate = float(eval_summary.get("valid_win_rate", 0.0) or 0.0)
     return LeagueMember(
         id=args.member_id or args.run_name,
         path=str(candidate_checkpoint),
@@ -522,25 +729,64 @@ def create_member_from_run(
     )
 
 
-def maybe_promote_candidate(args: argparse.Namespace, registry: LeagueRegistry, candidate: LeagueMember, eval_summary: dict[str, object], collapse_flags: list[str]) -> bool:
+def league_promotion_assessment(
+    args: argparse.Namespace,
+    eval_summary: dict[str, object],
+    collapse_flags: list[str],
+) -> dict[str, object]:
     group_stats = eval_summary.get("group_stats", {}) or {}
-    side_a = group_stats.get("a", {}) or {}
-    earned_win_rate = float(side_a.get("earned_win_rate", 0.0) or 0.0)
-    tera_rate = float(side_a.get("tera_battle_rate", side_a.get("tera_rate", 0.0)) or 0.0)
-    champion = find_member(registry, registry.champion_id) if registry.champion_id else None
-    champion_tera_baseline = 1.0
-    if champion and champion.eval.summary_path:
-        try:
-            champion_eval = load_json(Path(champion.eval.summary_path))
-            champion_stats = (champion_eval.get("group_stats", {}) or {}).get("a", {}) or {}
-            champion_tera_baseline = float(champion_stats.get("tera_battle_rate", champion_stats.get("tera_rate", 1.0)) or 1.0)
-        except Exception:
-            champion_tera_baseline = 1.0
-    if earned_win_rate < args.promote_threshold:
-        return False
-    if collapse_flags:
-        return False
-    if tera_rate < (args.min_promotion_tera_ratio * champion_tera_baseline):
+    candidate_stats = group_stats.get("candidate", {}) or {}
+    champion_stats = group_stats.get("champion", {}) or {}
+    valid_win_rate = float(eval_summary.get("valid_win_rate", 0.0) or 0.0)
+    confidence_low = float(eval_summary.get("confidence_low", 0.0) or 0.0)
+    confidence_high = float(eval_summary.get("confidence_high", 1.0) or 1.0)
+    candidate_tera_rate = float(candidate_stats.get("tera_battle_rate", candidate_stats.get("tera_rate", 0.0)) or 0.0)
+    champion_tera_rate = float(champion_stats.get("tera_battle_rate", champion_stats.get("tera_rate", 0.0)) or 0.0)
+    required_tera_rate = args.min_promotion_tera_ratio * champion_tera_rate
+    clears_point_gate = valid_win_rate >= args.promote_threshold
+    clears_confidence_gate = confidence_low > args.promotion_confidence_threshold
+    clears_tera_gate = candidate_tera_rate >= required_tera_rate
+    collapse_free = not collapse_flags
+    promotion_confident = collapse_free and clears_point_gate and clears_confidence_gate and clears_tera_gate
+    if not collapse_free:
+        status = "collapse_rejected"
+    elif not clears_tera_gate:
+        status = "tera_rejected"
+    elif not clears_point_gate:
+        status = "no_winner"
+    elif not clears_confidence_gate:
+        status = "tentative_winner"
+    else:
+        status = "confident_winner"
+    return {
+        "status": status,
+        "valid_win_rate": valid_win_rate,
+        "valid_games": int(eval_summary.get("valid_games", 0) or 0),
+        "invalid_games": int(eval_summary.get("invalid_games", 0) or 0),
+        "confidence_low": confidence_low,
+        "confidence_high": confidence_high,
+        "minimum_win_rate": args.promote_threshold,
+        "confidence_threshold": args.promotion_confidence_threshold,
+        "candidate_tera_rate": candidate_tera_rate,
+        "champion_tera_rate": champion_tera_rate,
+        "minimum_tera_ratio": args.min_promotion_tera_ratio,
+        "collapse_free": collapse_free,
+        "clears_point_gate": clears_point_gate,
+        "clears_confidence_gate": clears_confidence_gate,
+        "clears_tera_gate": clears_tera_gate,
+        "promotion_confident": promotion_confident,
+    }
+
+
+def maybe_promote_candidate(
+    args: argparse.Namespace,
+    registry: LeagueRegistry,
+    candidate: LeagueMember,
+    eval_summary: dict[str, object],
+    collapse_flags: list[str],
+) -> bool:
+    assessment = league_promotion_assessment(args, eval_summary, collapse_flags)
+    if not assessment["promotion_confident"]:
         return False
     candidate.status = "active"
     candidate.role = "champion" if args.learner_role == "main" else candidate.role
@@ -571,6 +817,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
     parser.add_argument("--entropy-coef", type=float, default=float_default("league_ppo_entropy_coef"))
     parser.add_argument("--advantage-norm", type=parse_bool, default=bool_default("advantage_norm"))
+    parser.add_argument("--gae-lambda", type=float, default=float_default("gae_lambda"))
+    parser.add_argument("--ppo-clip-epsilon", type=float, default=float_default("ppo_clip_epsilon"))
+    parser.add_argument("--ppo-value-clip-epsilon", type=float, default=float_default("ppo_value_clip_epsilon"))
+    parser.add_argument("--target-kl", type=float, default=float_default("ppo_target_kl"))
+    parser.add_argument("--target-kl-min-episodes", type=positive_int, default=int_default("ppo_target_kl_min_episodes"))
+    parser.add_argument("--target-kl-min-labels", type=positive_int, default=int_default("ppo_target_kl_min_labels"))
+    parser.add_argument("--target-kl-hard-multiplier", type=positive_float, default=float_default("ppo_target_kl_hard_multiplier"))
+    parser.add_argument("--target-kl-hard-consecutive-updates", type=positive_int, default=int_default("ppo_target_kl_hard_consecutive_updates"))
+    parser.add_argument("--shuffle-seed", type=int, default=int_default("ppo_shuffle_seed"))
+    parser.add_argument("--ppo-minibatch-episodes", type=positive_int, default=int_default("ppo_minibatch_episodes"))
+    parser.add_argument("--adam-beta1", type=float, default=float_default("adam_beta1"))
+    parser.add_argument("--adam-beta2", type=float, default=float_default("adam_beta2"))
+    parser.add_argument("--adam-epsilon", type=positive_float, default=float_default("adam_epsilon"))
+    parser.add_argument("--anchor-checkpoint", default="", help="Fixed PPO anchor; defaults to the selected parent checkpoint")
+    parser.add_argument("--anchor-kl-coef", type=float, default=float_default("anchor_kl_coef"))
     parser.add_argument("--reward-mode", choices=["terminal", "dense_additive"], default="terminal")
     parser.add_argument("--launch-stagger-seconds", type=float, default=0.35)
     parser.add_argument("--resource-check-seconds", type=float, default=2.0)
@@ -584,11 +845,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--matchup-min-weight", type=positive_unit_float, default=DEFAULT_MATCHUP_MIN_WEIGHT)
     parser.add_argument("--matchup-confidence-games", type=positive_int, default=DEFAULT_MATCHUP_CONFIDENCE_GAMES)
     parser.add_argument("--min-category-starts", type=nonnegative_int, default=DEFAULT_MIN_CATEGORY_STARTS)
-    parser.add_argument("--eval-games", type=positive_int, default=500)
+    parser.add_argument("--eval-games", type=positive_int, default=500, help="Required valid evaluation games per candidate side")
     parser.add_argument("--eval-concurrent-games", type=positive_int, default=40)
     parser.add_argument("--eval-worker-pairs", type=positive_int, default=120)
+    parser.add_argument("--eval-max-replacement-attempts", type=positive_int, default=5)
     parser.add_argument("--startup-timeout-seconds", type=positive_int, default=120)
     parser.add_argument("--promote-threshold", type=float, default=float_default("promotion_earned_win_rate"))
+    parser.add_argument("--promotion-confidence-threshold", type=float, default=DEFAULT_PROMOTION_CONFIDENCE_THRESHOLD)
     parser.add_argument("--min-promotion-tera-ratio", type=float, default=float_default("promotion_min_tera_baseline_ratio"))
     parser.add_argument("--snapshot-cadence", type=positive_int, default=5)
     parser.add_argument("--max-active-historical", type=positive_int, default=20)
@@ -598,17 +861,38 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args(sys.argv[1:])
+    for label, value in (
+        ("promote-threshold", args.promote_threshold),
+        ("promotion-confidence-threshold", args.promotion_confidence_threshold),
+        ("min-promotion-tera-ratio", args.min_promotion_tera_ratio),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise SystemExit(f"{label} must be between 0 and 1")
     repo_root = resolve_repo_root()
     registry_path = resolve_path(repo_root, args.registry)
     registry = load_registry(registry_path)
     parent_member = choose_parent_member(registry, args.parent_id, args.learner_role)
+    parent_checkpoint = resolve_path(repo_root, parent_member.path)
+    if not parent_checkpoint.exists():
+        raise SystemExit(f"parent checkpoint not found: {parent_checkpoint}")
+    champion = find_member(registry, registry.champion_id) if registry.champion_id else None
+    champion_checkpoint = resolve_path(repo_root, champion.path) if champion is not None else None
+    if champion_checkpoint is not None and not champion_checkpoint.exists():
+        raise SystemExit(f"champion checkpoint not found: {champion_checkpoint}")
+    if args.anchor_checkpoint:
+        anchor_checkpoint = resolve_path(repo_root, args.anchor_checkpoint)
+        if not anchor_checkpoint.exists():
+            raise SystemExit(f"anchor checkpoint not found: {anchor_checkpoint}")
+    else:
+        anchor_checkpoint = parent_checkpoint
+    args.anchor_checkpoint = str(anchor_checkpoint)
 
     workflow_dir = (repo_root / DEFAULT_LEAGUE_ROOT / args.run_name).resolve()
     workflow_dir.mkdir(parents=True, exist_ok=True)
     workflow_manifest_path = workflow_dir / f"{args.run_name}_league_manifest.json"
     pool_path = workflow_dir / f"{args.run_name}_opponent_pool.json"
     workflow_run_name = args.run_name
-    args.eval_run_name = f"{args.run_name}_vs_champion_{args.eval_games}"
+    args.eval_run_name = f"{args.run_name}_vs_champion_balanced_{args.eval_games}_per_side"
 
     pool_payload = build_weighted_pool(
         registry,
@@ -643,9 +927,39 @@ def main() -> None:
             "pool_path": str(pool_path),
             "pool_payload": pool_payload,
         }
+    workflow_manifest["evaluation_config"] = {
+        "mode": "balanced_valid_games",
+        "valid_games_per_side": args.eval_games,
+        "max_replacement_attempts": args.eval_max_replacement_attempts,
+        "promotion_min_win_rate": args.promote_threshold,
+        "promotion_confidence_threshold": args.promotion_confidence_threshold,
+        "min_promotion_tera_ratio": args.min_promotion_tera_ratio,
+        "champion_id": champion.id if champion is not None else "",
+        "champion_checkpoint": str(champion_checkpoint) if champion_checkpoint is not None else "",
+    }
+    workflow_manifest["training_config"] = {
+        "mode": args.training_mode,
+        "learning_rate": args.learning_rate,
+        "entropy_coef": args.entropy_coef,
+        "gae_lambda": args.gae_lambda,
+        "ppo_clip_epsilon": args.ppo_clip_epsilon,
+        "ppo_value_clip_epsilon": args.ppo_value_clip_epsilon,
+        "target_kl": args.target_kl,
+        "target_kl_min_episodes": args.target_kl_min_episodes,
+        "target_kl_min_labels": args.target_kl_min_labels,
+        "target_kl_hard_multiplier": args.target_kl_hard_multiplier,
+        "target_kl_hard_consecutive_updates": args.target_kl_hard_consecutive_updates,
+        "shuffle_seed": args.shuffle_seed,
+        "ppo_minibatch_episodes": args.ppo_minibatch_episodes,
+        "adam_beta1": args.adam_beta1,
+        "adam_beta2": args.adam_beta2,
+        "adam_epsilon": args.adam_epsilon,
+        "anchor_checkpoint": args.anchor_checkpoint,
+        "anchor_kl_coef": args.anchor_kl_coef,
+    }
     write_json(workflow_manifest_path, workflow_manifest)
 
-    live_command = build_live_command(args, repo_root, pool_path, Path(parent_member.path))
+    live_command = build_live_command(args, repo_root, pool_path, parent_checkpoint)
     workflow_manifest["live_command"] = live_command
     write_json(workflow_manifest_path, workflow_manifest)
     run_command(live_command, repo_root)
@@ -665,16 +979,16 @@ def main() -> None:
 
     eval_summary = None
     eval_summary_path = None
-    if registry.champion_id:
-        champion = find_member(registry, registry.champion_id)
-        eval_command = build_eval_command(args, repo_root, candidate_checkpoint, Path(champion.path))
-        workflow_manifest["eval_command"] = eval_command
+    promotion_assessment = None
+    if champion is not None and champion_checkpoint is not None:
+        eval_summary_path, eval_summary = run_balanced_valid_evaluation(
+            args, repo_root, candidate_checkpoint, champion_checkpoint,
+        )
+        workflow_manifest["eval_run_names"] = list(eval_summary.get("run_names", []) or [])
         write_json(workflow_manifest_path, workflow_manifest)
-        eval_summary_path = (repo_root / "matches" / "runs" / args.eval_run_name / f"{args.eval_run_name}_summary.json").resolve()
-        if not (args.resume and eval_summary_path.exists()):
-            run_command(eval_command, repo_root)
-        eval_summary = load_json(eval_summary_path)
-        collapse_flags.extend([str(flag) for flag in ((eval_summary.get("group_collapse_flags", {}) or {}).get("a", []) or [])])
+        collapse_flags.extend([str(flag) for flag in (eval_summary.get("candidate_collapse_flags", []) or [])])
+        collapse_flags = sorted(set(collapse_flags))
+        promotion_assessment = league_promotion_assessment(args, eval_summary, collapse_flags)
 
     candidate_id = args.member_id or args.run_name
     if registry_has_member(registry, candidate_id):
@@ -694,6 +1008,10 @@ def main() -> None:
         )
         registry.members.append(candidate)
         registry.current_generation = max(registry.current_generation, candidate.generation)
+    if eval_summary is not None:
+        candidate.eval.vs_champion_win_rate = float(eval_summary.get("valid_win_rate", 0.0) or 0.0)
+        candidate.eval.summary_path = str(eval_summary_path) if eval_summary_path else ""
+        candidate.eval.collapse_flags = list(collapse_flags)
 
     if args.learner_role == "main" and args.rounds >= args.snapshot_cadence:
         snapshot_member = LeagueMember(
@@ -728,6 +1046,7 @@ def main() -> None:
     workflow_manifest["candidate_checkpoint"] = str(candidate_checkpoint)
     workflow_manifest["eval_summary_path"] = str(eval_summary_path) if eval_summary_path else ""
     workflow_manifest["post_eval_collapse_flags"] = collapse_flags
+    workflow_manifest["promotion_assessment"] = promotion_assessment
     workflow_manifest["recent_opponent_stats"] = opponent_stats_payload(recent_opponent_stats)
     workflow_manifest["promoted"] = bool(registry.champion_id == candidate.id)
     write_json(workflow_manifest_path, workflow_manifest)

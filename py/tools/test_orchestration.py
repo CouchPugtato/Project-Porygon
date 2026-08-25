@@ -8,7 +8,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from league_manage import LeagueEval, LeagueMember, LeagueRegistry, OpponentStats, build_pool_payload, league_member_from_json, member_to_json_dict
-from league_rl_orchestrator import build_weighted_pool, collect_recent_opponent_stats, matchup_difficulty_weight, maybe_promote_candidate
+from league_rl_orchestrator import (
+    balanced_evaluation_artifacts_match,
+    build_eval_command as build_league_eval_command,
+    build_live_command as build_league_live_command,
+    build_weighted_pool,
+    collect_recent_opponent_stats,
+    league_promotion_assessment,
+    matchup_difficulty_weight,
+    maybe_promote_candidate,
+)
 from live_rl_orchestrator import build_selfplay_command, build_train_command, collapse_flags_from_training_summary, round_manifest_completed
 from opponent_sampling import refresh_adaptive_pool
 from rl_defaults import float_default
@@ -279,18 +288,125 @@ class LeaguePoolTests(unittest.TestCase):
 
 
 class PromotionTests(unittest.TestCase):
-    def test_promotion_requires_win_rate_and_no_collapse_flags(self) -> None:
+    def test_promotion_requires_confidence_win_rate_and_no_collapse_flags(self) -> None:
         champion = member("champion")
         candidate = member("candidate", generation=2)
         candidate.status = "candidate"
         registry = LeagueRegistry(2, champion.id, 5, [champion, candidate])
-        args = SimpleNamespace(promote_threshold=0.52, min_promotion_tera_ratio=0.60, learner_role="main")
-        summary = {"group_stats": {"a": {"earned_win_rate": 0.53, "tera_battle_rate": 0.90}}}
+        args = SimpleNamespace(
+            promote_threshold=0.52,
+            promotion_confidence_threshold=0.50,
+            min_promotion_tera_ratio=0.60,
+            learner_role="main",
+        )
+        summary = {
+            "valid_win_rate": 0.54,
+            "valid_games": 1000,
+            "invalid_games": 20,
+            "confidence_low": 0.509,
+            "confidence_high": 0.571,
+            "group_stats": {
+                "candidate": {"tera_battle_rate": 0.90},
+                "champion": {"tera_battle_rate": 0.92},
+            },
+        }
 
         self.assertFalse(maybe_promote_candidate(args, registry, candidate, summary, ["warn_move_slot_concentration"]))
         self.assertEqual(registry.champion_id, champion.id)
+        summary["confidence_low"] = 0.499
+        assessment = league_promotion_assessment(args, summary, [])
+        self.assertEqual(assessment["status"], "tentative_winner")
+        self.assertFalse(maybe_promote_candidate(args, registry, candidate, summary, []))
+        summary["confidence_low"] = 0.509
         self.assertTrue(maybe_promote_candidate(args, registry, candidate, summary, []))
         self.assertEqual(registry.champion_id, candidate.id)
+
+    def test_balanced_eval_command_swaps_candidate_side_and_requires_shards(self) -> None:
+        args = SimpleNamespace(
+            eval_concurrent_games=40,
+            eval_worker_pairs=120,
+            format="gen9randomdoublesbattle",
+            launch_stagger_seconds=0.25,
+            resource_check_seconds=2.0,
+            min_available_memory_gb=2.0,
+            min_available_pagefile_gb=4.0,
+            startup_timeout_seconds=120,
+        )
+        command = build_league_eval_command(
+            args, Path("repo"), "eval-side-b", Path("candidate.chk"),
+            Path("champion.chk"), "b", 250, 77,
+        )
+        self.assertEqual(command[command.index("--model-a") + 1], "champion.chk")
+        self.assertEqual(command[command.index("--model-b") + 1], "candidate.chk")
+        self.assertEqual(command[command.index("--games") + 1], "250")
+        self.assertEqual(command[command.index("--ensure-shard-count") + 1], "true")
+        self.assertEqual(command[command.index("--model-a-pool") + 1], "")
+        self.assertEqual(command[command.index("--model-b-pool") + 1], "")
+
+    def test_balanced_eval_resume_checks_models_and_valid_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            candidate = root / "candidate.chk"
+            champion = root / "champion.chk"
+            summary = {
+                "status": "completed",
+                "evaluation_mode": "balanced_valid_games",
+                "target_valid_games_per_side": 500,
+                "model_specs": {
+                    "candidate": {"path": str(candidate)},
+                    "champion": {"path": str(champion)},
+                },
+            }
+            self.assertTrue(balanced_evaluation_artifacts_match(summary, candidate, champion, 500))
+            self.assertFalse(balanced_evaluation_artifacts_match(summary, champion, candidate, 500))
+            self.assertFalse(balanced_evaluation_artifacts_match(summary, candidate, champion, 250))
+
+    def test_league_live_command_forwards_anchored_ppo_controls(self) -> None:
+        args = SimpleNamespace(
+            run_name="league-round",
+            training_mode="ppo",
+            rounds=3,
+            games=2000,
+            concurrent_games=70,
+            worker_pairs=125,
+            ensure_shard_count=True,
+            pool_seed=11,
+            learning_rate=1e-5,
+            gamma=0.99,
+            entropy_coef=1e-4,
+            advantage_norm=True,
+            gae_lambda=0.95,
+            ppo_clip_epsilon=0.2,
+            ppo_value_clip_epsilon=0.2,
+            target_kl=0.02,
+            target_kl_min_episodes=20,
+            target_kl_min_labels=500,
+            target_kl_hard_multiplier=4.0,
+            target_kl_hard_consecutive_updates=2,
+            shuffle_seed=1337,
+            ppo_minibatch_episodes=8,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_epsilon=1e-8,
+            anchor_checkpoint="anchor.chk",
+            anchor_kl_coef=0.01,
+            reward_mode="terminal",
+            launch_stagger_seconds=0.25,
+            resource_check_seconds=2.0,
+            min_available_memory_gb=2.0,
+            min_available_pagefile_gb=4.0,
+            stop_on_collapse=True,
+            omp_threads=8,
+            resume=True,
+        )
+        command = build_league_live_command(
+            args, Path("repo"), Path("pool.json"), Path("parent.chk"),
+        )
+        self.assertEqual(command[command.index("--anchor-checkpoint") + 1], "anchor.chk")
+        self.assertEqual(command[command.index("--anchor-kl-coef") + 1], "0.01")
+        self.assertEqual(command[command.index("--target-kl") + 1], "0.02")
+        self.assertEqual(command[command.index("--ppo-minibatch-episodes") + 1], "8")
+        self.assertEqual(command[command.index("--learning-rate") + 1], "1e-05")
 
 
 class ResumeAndCollapseTests(unittest.TestCase):

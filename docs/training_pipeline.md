@@ -206,6 +206,17 @@ Collection summaries expose both configured and realized sampling shares plus pe
 
 During a multi-round live run, `live_rl_orchestrator.py` also closes the loop immediately. It snapshots the pool used for each round, recalculates within-category weights from the completed collection, and passes the refreshed snapshot to the next round. Both the used and next pool paths are stored in the round manifest, and resume restores the recorded chain.
 
+League candidates are evaluated against the current champion on both player sides. `--eval-games` is the required number of valid games per side; disconnects and forfeits do not count, and the orchestrator launches replacement blocks up to `--eval-max-replacement-attempts`. The combined evaluation summary records raw, valid, and invalid totals, per-side results, collapse metrics, and a 95% Wilson interval for the candidate's valid-game score.
+
+Promotion now requires all of the following:
+
+- the valid-game score meets `--promote-threshold`
+- the lower Wilson bound is above `--promotion-confidence-threshold`
+- no policy-collapse guard fires
+- candidate Tera use meets the configured champion-relative minimum
+
+A candidate that clears the point estimate but not the confidence bound is retained as a tentative winner rather than promoted. League PPO training also forwards the shared anchor, clipping, KL-guard, minibatch, and Adam settings to the trainer; the league-specific learning-rate and entropy defaults are the stable anchored values in `config/rl_defaults.toml`.
+
 ## Recommended first RL ladder
 
 The current recommended first RL sweep is:
