@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from balanced_checkpoint_eval import build_parser as build_balanced_eval_parser, prepare_shared_args
 from league_manage import LeagueEval, LeagueMember, LeagueRegistry, OpponentStats, build_pool_payload, league_member_from_json, member_to_json_dict
 from league_rl_orchestrator import (
     balanced_evaluation_artifacts_match,
@@ -502,6 +503,31 @@ class WorkflowDashboardTests(unittest.TestCase):
             saved = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["progress"]["collection"], {"current": 10, "total": 10})
             self.assertIn("completed_games=10/10", raw_log_path.read_text(encoding="utf-8"))
+
+
+class BalancedCheckpointEvalTests(unittest.TestCase):
+    def test_cli_maps_to_shared_balanced_evaluation_arguments(self) -> None:
+        args = prepare_shared_args(build_balanced_eval_parser().parse_args([
+            "--run-name", "round03-eval",
+            "--candidate-checkpoint", "round03.chk",
+            "--baseline-checkpoint", "champion.chk",
+            "--games-per-side", "300",
+            "--concurrent-games", "12",
+            "--worker-pairs", "20",
+            "--max-replacement-attempts", "7",
+        ]))
+        self.assertEqual(args.eval_run_name, "round03-eval")
+        self.assertEqual(args.eval_games, 300)
+        self.assertEqual(args.eval_concurrent_games, 12)
+        self.assertEqual(args.eval_worker_pairs, 20)
+        self.assertEqual(args.eval_max_replacement_attempts, 7)
+        self.assertEqual(args.promote_threshold, args.promotion_min_win_rate)
+        command = build_league_eval_command(
+            args, Path("repo"), args.run_name, Path("round03.chk"),
+            Path("champion.chk"), "b", args.eval_games, args.pool_seed,
+        )
+        self.assertEqual(command[command.index("--games") + 1], "300")
+        self.assertEqual(command[command.index("--format") + 1], "gen9randomdoublesbattle")
 
 
 class ResumeAndCollapseTests(unittest.TestCase):

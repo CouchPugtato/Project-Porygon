@@ -125,6 +125,20 @@ Stable algorithm and guardrail defaults are centralized in `config/rl_defaults.t
 
 Use `py/tools/eval_collapse_check.py` to re-run those checks from an existing summary JSON.
 
+## Standalone balanced checkpoint evaluation
+
+`py/tools/balanced_checkpoint_eval.py` compares any existing candidate and baseline checkpoints without training, changing the league registry, or creating a temporary league member. It reuses the league evaluator's side balancing, valid-outcome rules, replacement blocks, Wilson interval, collapse checks, resume provenance, dashboard, and promotion assessment.
+
+The combined summary and manifest are written under `matches/runs/<run-name>/`. Raw self-play logs are retained in that run's `logs/` directory by default. `--games-per-side` is a valid-game target: disconnect and forfeit outcomes remain visible as invalid but do not satisfy it.
+
+Example:
+
+```powershell
+python .\py\tools\balanced_checkpoint_eval.py --run-name eval_round03_vs_champion --candidate-checkpoint .\models\runs\candidate\round03.chk --baseline-checkpoint .\models\runs\champion\champion.chk --games-per-side 250 --concurrent-games 70 --worker-pairs 125 --pool-seed 10301 --format gen9randomdoublesbattle --resume true
+```
+
+Use this path to screen intermediate checkpoints or perform an independent comparison. Automatic league promotion remains the responsibility of `league_rl_orchestrator.py`; the standalone evaluator reports what the configured gates would decide but does not mutate registry state.
+
 ## Controlled PPO hyperparameter search
 
 `py/tools/ppo_search.py` compares candidates without mixing data quality into the result. Every trial starts from the same `--init-checkpoint`, trains on the same required `--episode-batch`, and uses the same anchor and parent opponent. It searches learning rate, entropy coefficient, anchor strength, PPO clip, and deterministic shuffle seed.

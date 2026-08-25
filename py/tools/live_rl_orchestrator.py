@@ -386,11 +386,13 @@ class RichWorkflowReporter(BaseWorkflowReporter):
         table.add_column(width=18)
         table.add_column(ratio=1)
         table.add_column(width=30, justify="right")
-        rows: list[tuple[str, int, int, str]] = [
-            ("Rounds", state.rounds_completed, state.rounds_total, f"{state.rounds_completed}/{state.rounds_total}"),
-            ("Collection", state.collection_current, state.collection_total, f"{state.collection_current}/{state.collection_total} games"),
-            ("PPO training", state.training_current, state.training_total, f"{state.training_current}/{state.training_total} episodes"),
-        ]
+        rows: list[tuple[str, int, int, str]] = []
+        if state.rounds_total > 0:
+            rows.extend((
+                ("Rounds", state.rounds_completed, state.rounds_total, f"{state.rounds_completed}/{state.rounds_total}"),
+                ("Collection", state.collection_current, state.collection_total, f"{state.collection_current}/{state.collection_total} games"),
+                ("PPO training", state.training_current, state.training_total, f"{state.training_current}/{state.training_total} episodes"),
+            ))
         if state.evaluation_games_per_side:
             for side in ("a", "b"):
                 valid = state.evaluation_valid[side]
@@ -417,18 +419,23 @@ class RichWorkflowReporter(BaseWorkflowReporter):
             if isinstance(value, float):
                 return f"{value:.{digits}f}"
             return str(value)
-        table.add_row(
-            f"[bold]LR[/]: {metric('learning_rate')}", f"[bold]Entropy coef[/]: {metric('entropy_coef')}",
-            f"[bold]Anchor coef[/]: {metric('anchor_kl_coef')}", f"[bold]Clip[/]: {metric('ppo_clip_epsilon')}",
-        )
-        table.add_row(
-            f"[bold]Policy loss[/]: {metric('policy_loss')}", f"[bold]Value loss[/]: {metric('value_loss')}",
-            f"[bold]Entropy[/]: {metric('entropy')}", f"[bold]Labels[/]: {metric('labels', 0)}",
-        )
-        table.add_row(
-            f"[bold]Approx KL[/]: {metric('approx_kl')}", f"[bold]Anchor KL[/]: {metric('anchor_kl_mean')}",
-            f"[bold]Clip frac[/]: {metric('clip_fraction', 3)}", f"[bold]KL guard[/]: {metric('hard_kl_breaches', 0)}",
-        )
+        has_rows = False
+        if any(key in metrics for key in ("learning_rate", "entropy_coef", "anchor_kl_coef", "ppo_clip_epsilon")):
+            table.add_row(
+                f"[bold]LR[/]: {metric('learning_rate')}", f"[bold]Entropy coef[/]: {metric('entropy_coef')}",
+                f"[bold]Anchor coef[/]: {metric('anchor_kl_coef')}", f"[bold]Clip[/]: {metric('ppo_clip_epsilon')}",
+            )
+            has_rows = True
+        if any(key in metrics for key in ("policy_loss", "value_loss", "entropy", "labels")):
+            table.add_row(
+                f"[bold]Policy loss[/]: {metric('policy_loss')}", f"[bold]Value loss[/]: {metric('value_loss')}",
+                f"[bold]Entropy[/]: {metric('entropy')}", f"[bold]Labels[/]: {metric('labels', 0)}",
+            )
+            table.add_row(
+                f"[bold]Approx KL[/]: {metric('approx_kl')}", f"[bold]Anchor KL[/]: {metric('anchor_kl_mean')}",
+                f"[bold]Clip frac[/]: {metric('clip_fraction', 3)}", f"[bold]KL guard[/]: {metric('hard_kl_breaches', 0)}",
+            )
+            has_rows = True
         if state.valid_win_rate is not None:
             table.add_row(
                 f"[bold]Valid score[/]: {state.valid_win_rate:.2%}",
@@ -436,8 +443,12 @@ class RichWorkflowReporter(BaseWorkflowReporter):
                 f"[bold]Upper 95%[/]: {state.confidence_high:.2%}" if state.confidence_high is not None else "",
                 "",
             )
+            has_rows = True
         if state.collapse_flags:
             table.add_row("[red]Safety[/]: " + ", ".join(state.collapse_flags[:2]), "", "", "")
+            has_rows = True
+        if not has_rows:
+            table.add_row("[grey50]Awaiting evaluation results[/grey50]", "", "", "")
         return Panel(table, title="Current metrics", border_style="grey42")
 
     def _render(self) -> Group:
