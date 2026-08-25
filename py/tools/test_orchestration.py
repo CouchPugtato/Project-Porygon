@@ -13,6 +13,7 @@ from league_rl_orchestrator import (
     balanced_evaluation_artifacts_match,
     build_eval_command as build_league_eval_command,
     build_live_command as build_league_live_command,
+    build_parser as build_league_parser,
     build_weighted_pool,
     collect_recent_opponent_stats,
     league_promotion_assessment,
@@ -381,6 +382,7 @@ class PromotionTests(unittest.TestCase):
             worker_pairs=125,
             ensure_shard_count=True,
             pool_seed=11,
+            format="gen9randomdoublesbattle",
             learning_rate=1e-5,
             gamma=0.99,
             entropy_coef=1e-4,
@@ -418,8 +420,24 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(command[command.index("--target-kl") + 1], "0.02")
         self.assertEqual(command[command.index("--ppo-minibatch-episodes") + 1], "8")
         self.assertEqual(command[command.index("--learning-rate") + 1], "1e-05")
+        self.assertEqual(command[command.index("--format") + 1], "gen9randomdoublesbattle")
         self.assertEqual(command[command.index("--dashboard") + 1], "false")
         self.assertEqual(command[command.index("--dashboard-write-raw-logs") + 1], "true")
+
+    def test_league_parser_defines_format_used_by_collection_and_evaluation(self) -> None:
+        args = build_league_parser().parse_args([
+            "--run-name", "league-run", "--games", "10", "--concurrent-games", "2",
+        ])
+        self.assertEqual(args.format, "gen9randomdoublesbattle")
+        live_command = build_league_live_command(
+            args, Path("repo"), Path("pool.json"), Path("parent.chk"),
+        )
+        eval_command = build_league_eval_command(
+            args, Path("repo"), "eval-run", Path("candidate.chk"),
+            Path("champion.chk"), "a", 10, 12,
+        )
+        self.assertEqual(live_command[live_command.index("--format") + 1], args.format)
+        self.assertEqual(eval_command[eval_command.index("--format") + 1], args.format)
 
 
 class WorkflowDashboardTests(unittest.TestCase):

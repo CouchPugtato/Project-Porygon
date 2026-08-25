@@ -421,6 +421,8 @@ def build_live_command(args: argparse.Namespace, repo_root: Path, pool_path: Pat
         "",
         "--pool-seed",
         str(args.pool_seed),
+        "--format",
+        args.format,
         "--learning-rate",
         str(args.learning_rate),
         "--gamma",
@@ -848,6 +850,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-pairs", type=positive_int, default=60)
     parser.add_argument("--ensure-shard-count", type=parse_bool, default=True)
     parser.add_argument("--pool-seed", type=int, default=1)
+    parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--training-mode", choices=["rl", "ppo"], default="ppo")
     parser.add_argument("--learning-rate", type=float, default=float_default("league_ppo_learning_rate"))
     parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
