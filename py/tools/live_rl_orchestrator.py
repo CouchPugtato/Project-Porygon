@@ -267,12 +267,15 @@ class BaseWorkflowReporter:
         if selfplay_match:
             current, total = int(selfplay_match.group(1)), int(selfplay_match.group(2))
             if self.state.phase == "evaluation":
-                self.state.evaluation_attempt_current = current
+                # selfplay can finish several in-flight games while draining.
+                # Keep the progress-bar value bounded while the final summary
+                # continues to report every raw and valid game collected.
+                self.state.evaluation_attempt_current = min(current, total)
                 self.state.evaluation_attempt_total = total
             else:
                 self.state.collection_current = current
                 self.state.collection_total = total
-            self.state.update_rate_eta(current, total)
+            self.state.update_rate_eta(min(current, total), total)
 
         train_match = TRAIN_PROGRESS_RE.search(line)
         if train_match:

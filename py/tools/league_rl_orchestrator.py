@@ -501,6 +501,11 @@ def build_eval_command(
 ) -> list[str]:
     model_a = candidate_checkpoint if candidate_side == "a" else champion_checkpoint
     model_b = champion_checkpoint if candidate_side == "a" else candidate_checkpoint
+    # A replacement block may only need a handful of games. Do not launch more
+    # worker pairs than the block can use; doing so adds model-loading latency
+    # and allows a small shortfall to overshoot substantially during draining.
+    worker_pairs = min(args.eval_worker_pairs, max(1, games))
+    concurrent_games = min(args.eval_concurrent_games, worker_pairs)
     return [
         sys.executable,
         str((repo_root / "py" / "tools" / "selfplay_server.py").resolve()),
@@ -509,9 +514,9 @@ def build_eval_command(
         "--games",
         str(games),
         "--concurrent-games",
-        str(args.eval_concurrent_games),
+        str(concurrent_games),
         "--worker-pairs",
-        str(args.eval_worker_pairs),
+        str(worker_pairs),
         "--worker-games",
         "0",
         "--ensure-shard-count",

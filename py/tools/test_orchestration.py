@@ -355,6 +355,25 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model-a-pool") + 1], "")
         self.assertEqual(command[command.index("--model-b-pool") + 1], "")
 
+    def test_balanced_eval_command_bounds_workers_for_small_replacement_batch(self) -> None:
+        args = SimpleNamespace(
+            eval_concurrent_games=70,
+            eval_worker_pairs=125,
+            format="gen9randomdoublesbattle",
+            launch_stagger_seconds=0.25,
+            resource_check_seconds=2.0,
+            min_available_memory_gb=2.0,
+            min_available_pagefile_gb=4.0,
+            startup_timeout_seconds=120,
+        )
+        command = build_league_eval_command(
+            args, Path("repo"), "replacement", Path("candidate.chk"),
+            Path("champion.chk"), "a", 16, 78,
+        )
+        self.assertEqual(command[command.index("--games") + 1], "16")
+        self.assertEqual(command[command.index("--worker-pairs") + 1], "16")
+        self.assertEqual(command[command.index("--concurrent-games") + 1], "16")
+
     def test_balanced_eval_resume_checks_models_and_valid_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir).resolve()
@@ -482,6 +501,14 @@ class WorkflowDashboardTests(unittest.TestCase):
         self.assertEqual(payload["evaluation"]["valid"]["a"], 500)
         self.assertEqual(payload["evaluation"]["invalid"]["a"], 4)
         self.assertEqual(payload["promotion_status"], "confident_winner")
+
+    def test_reporter_caps_evaluation_progress_when_draining_overshoots(self) -> None:
+        state = WorkflowDashboardState("eval-run", 0, 0, 250, "Balanced evaluation")
+        reporter = BaseWorkflowReporter(state)
+        state.begin_evaluation("b", valid=234, invalid=12, attempt_total=16)
+        reporter.child_line("[selfplay] completed_games=37/16\n")
+        self.assertEqual(state.evaluation_attempt_current, 16)
+        self.assertEqual(state.evaluation_attempt_total, 16)
 
     def test_reported_command_captures_logs_and_persists_manifest_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
