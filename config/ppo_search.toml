@@ -24,7 +24,16 @@ search_seed = 2026
 # Zero derives separate run-specific matched suites from run_prefix + search_seed.
 screen_seed_suite = 0
 confirmation_seed_suite = 0
+# A fresh retrain uses a third independent matchup suite. Supply
+# fresh_confirmation_episode_batch on the command line to enable this stage.
+fresh_confirmation_seed_suite = 0
 max_trials = 30
+
+# Retrain only the selected setting on separately collected episodes. This is
+# intentionally empty by default because a search batch must not double as its
+# own reproduction batch.
+fresh_confirmation_episode_batch = ""
+fresh_confirmation_shuffle_seeds = "404,505,606"
 
 # Finalist robustness suite: parent/champion plus two distinct active histories.
 confirmation_registry = "models/league/current_arch/league_registry.json"

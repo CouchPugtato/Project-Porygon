@@ -557,6 +557,7 @@ class TrialResult:
     screen_evaluation: EvaluationResult | None = None
     final_evaluation: EvaluationResult | None = None
     confirmation_evaluations: dict[str, EvaluationResult] = field(default_factory=dict)
+    phase: str = "search"
 
 
 def format_duration(seconds: float | None) -> str:
@@ -1489,6 +1490,7 @@ def resolve_evaluation_seed_suites(
     search_seed: int,
     screen_override: int,
     confirmation_override: int,
+    fresh_confirmation_override: int = 0,
 ) -> dict[str, object]:
     screen = screen_override or derived_evaluation_seed_suite(
         run_prefix, search_seed, "screen",
@@ -1496,19 +1498,30 @@ def resolve_evaluation_seed_suites(
     confirmation = confirmation_override or derived_evaluation_seed_suite(
         run_prefix, search_seed, "confirmation",
     )
-    for label, value in (("screen", screen), ("confirmation", confirmation)):
+    fresh_confirmation = fresh_confirmation_override or derived_evaluation_seed_suite(
+        run_prefix, search_seed, "fresh_confirmation",
+    )
+    for label, value in (
+        ("screen", screen),
+        ("confirmation", confirmation),
+        ("fresh_confirmation", fresh_confirmation),
+    ):
         if not 0 < value <= MAX_SHOWDOWN_SEED_BASE:
             raise ValueError(
                 f"{label} evaluation seed suite must be between 1 and "
                 f"{MAX_SHOWDOWN_SEED_BASE}"
             )
-    if screen == confirmation:
-        raise ValueError("screen and confirmation evaluation seed suites must differ")
+    if len({screen, confirmation, fresh_confirmation}) != 3:
+        raise ValueError("screen, confirmation, and fresh-confirmation seed suites must differ")
     return {
         "screen": screen,
         "confirmation": confirmation,
+        "fresh_confirmation": fresh_confirmation,
         "screen_source": "explicit" if screen_override else "derived_from_run",
         "confirmation_source": "explicit" if confirmation_override else "derived_from_run",
+        "fresh_confirmation_source": (
+            "explicit" if fresh_confirmation_override else "derived_from_run"
+        ),
     }
 
 
@@ -2250,6 +2263,35 @@ def robust_grouped_promotion_assessment(
     }
 
 
+def fresh_confirmation_comparison(
+    preliminary: dict[str, object],
+    fresh: dict[str, object],
+) -> dict[str, object]:
+    preliminary_rate = float(preliminary.get("valid_win_rate", 0.0) or 0.0)
+    fresh_rate = float(fresh.get("valid_win_rate", 0.0) or 0.0)
+    fresh_passed = bool(
+        fresh.get("clears_point_gate")
+        and fresh.get("collapse_free")
+        and fresh.get("complete_seed_group")
+        and fresh.get("all_opponents_complete", True)
+        and fresh.get("all_opponents_non_regression", True)
+    )
+    if not fresh_passed:
+        outcome = "reversed"
+    elif fresh_rate < preliminary_rate:
+        outcome = "weakened"
+    else:
+        outcome = "reproduced"
+    return {
+        "outcome": outcome,
+        "preliminary_valid_win_rate": preliminary_rate,
+        "fresh_valid_win_rate": fresh_rate,
+        "valid_win_rate_delta": fresh_rate - preliminary_rate,
+        "fresh_point_result_reproduced": fresh_passed,
+        "fresh_confident_result": bool(fresh.get("promotion_confident")),
+    }
+
+
 def trial_payload(trial: TrialResult) -> dict[str, object]:
     return asdict(trial)
 
@@ -2260,6 +2302,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-prefix", required=True)
     parser.add_argument("--init-checkpoint", required=True)
     parser.add_argument("--episode-batch", required=True)
+    parser.add_argument("--fresh-confirmation-episode-batch", default="", help="Separate episode batch used to retrain the selected setting before promotion")
+    parser.add_argument("--fresh-confirmation-shuffle-seeds", type=csv_ints, default=[404, 505, 606], help="New training-order seeds used only for fresh-data confirmation")
     parser.add_argument("--anchor-checkpoint", default="")
     parser.add_argument("--eval-model-b", default="")
     parser.add_argument("--confirmation-registry", default="", help="Optional league registry used to add champion/historical finalist opponents")
@@ -2291,6 +2335,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--search-seed", type=int, default=2026)
     parser.add_argument("--screen-seed-suite", type=nonnegative_int, default=0, help="Matched screening seed suite; 0 derives a run-specific value")
     parser.add_argument("--confirmation-seed-suite", type=nonnegative_int, default=0, help="Held-out finalist seed suite; 0 derives a separate run-specific value")
+    parser.add_argument("--fresh-confirmation-seed-suite", type=nonnegative_int, default=0, help="Independent evaluation suite for fresh-data retrains; 0 derives a run-specific value")
     parser.add_argument("--epochs", type=positive_int, default=1)
     parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
     parser.add_argument("--advantage-norm", type=parse_bool, default=bool_default("advantage_norm"))
@@ -2362,10 +2407,17 @@ def main() -> None:
             args.search_seed,
             args.screen_seed_suite,
             args.confirmation_seed_suite,
+            args.fresh_confirmation_seed_suite,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     replicate_seed_count = len(set(args.shuffle_seeds))
+    fresh_confirmation_enabled = bool(args.fresh_confirmation_episode_batch.strip())
+    fresh_seed_values = sorted(set(args.fresh_confirmation_shuffle_seeds))
+    if fresh_confirmation_enabled and set(fresh_seed_values) & set(args.shuffle_seeds):
+        raise SystemExit(
+            "fresh-confirmation-shuffle-seeds must not reuse search shuffle-seeds"
+        )
     if args.replicate_ranking and replicate_seed_count > 1:
         if args.max_trials < replicate_seed_count or args.screen_candidates < replicate_seed_count:
             raise SystemExit(
@@ -2406,6 +2458,17 @@ def main() -> None:
     trainer_exe = resolve_path(repo_root, DEFAULT_TRAINER_EXE)
     init_checkpoint = resolve_path(repo_root, args.init_checkpoint)
     episode_batch = resolve_path(repo_root, args.episode_batch)
+    fresh_confirmation_episode_batch = (
+        resolve_path(repo_root, args.fresh_confirmation_episode_batch)
+        if fresh_confirmation_enabled else None
+    )
+    if (
+        fresh_confirmation_episode_batch is not None
+        and fresh_confirmation_episode_batch == episode_batch
+    ):
+        raise SystemExit(
+            "fresh-confirmation-episode-batch must differ from episode-batch"
+        )
     anchor_checkpoint = resolve_path(repo_root, args.anchor_checkpoint) if args.anchor_checkpoint else init_checkpoint
     parent_checkpoint = resolve_path(repo_root, args.eval_model_b) if args.eval_model_b else init_checkpoint
     config_path = resolve_path(repo_root, args.config)
@@ -2418,9 +2481,24 @@ def main() -> None:
     ):
         if not path.exists():
             raise SystemExit(f"{label} not found: {path}")
+    if (
+        fresh_confirmation_episode_batch is not None
+        and not fresh_confirmation_episode_batch.exists()
+    ):
+        raise SystemExit(
+            f"fresh confirmation episode batch not found: {fresh_confirmation_episode_batch}"
+        )
     if not args.policy_tag_expected:
         try:
             args.policy_tag_expected = inferred_policy_tag(repo_root, episode_batch, init_checkpoint)
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from exc
+    fresh_policy_tag_expected = ""
+    if fresh_confirmation_episode_batch is not None:
+        try:
+            fresh_policy_tag_expected = inferred_policy_tag(
+                repo_root, fresh_confirmation_episode_batch, init_checkpoint,
+            )
         except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
             raise SystemExit(str(exc)) from exc
     try:
@@ -2527,6 +2605,13 @@ def main() -> None:
             "init_checkpoint": str(init_checkpoint),
             "episode_batch": str(episode_batch),
             "policy_tag_expected": args.policy_tag_expected,
+            "fresh_confirmation_episode_batch": (
+                str(fresh_confirmation_episode_batch)
+                if fresh_confirmation_episode_batch is not None else None
+            ),
+            "fresh_confirmation_policy_tag_expected": (
+                fresh_policy_tag_expected or None
+            ),
             "anchor_checkpoint": str(anchor_checkpoint),
             "evaluation_parent": str(parent_checkpoint),
             "confirmation_opponents": [asdict(opponent) for opponent in confirmation_opponents],
@@ -2556,6 +2641,9 @@ def main() -> None:
             "replicate_substreams": evaluation_replicate_indices,
             "seed_suites": evaluation_seed_suites,
             "promotion_uses_held_out_confirmation_suite": True,
+            "fresh_data_confirmation_enabled": fresh_confirmation_enabled,
+            "fresh_data_required_for_promotion": fresh_confirmation_enabled,
+            "fresh_confirmation_shuffle_seeds": fresh_seed_values,
             "multi_opponent_confirmation": len(confirmation_opponents) > 1,
             "confirmation_discovery": confirmation_discovery,
             "confirmation_non_regression_threshold": args.confirmation_non_regression_threshold,
@@ -2619,29 +2707,38 @@ def main() -> None:
         requested_screen_games: dict[str, int] = {}
         requested_group_screen_games: dict[tuple[float, float, float, float, int], int] = {}
 
-        def train_one(params: Hyperparameters) -> TrialResult:
+        def train_one(
+            params: Hyperparameters,
+            *,
+            training_batch: Path = episode_batch,
+            policy_tag_expected: str = args.policy_tag_expected,
+            run_prefix: str = args.run_prefix,
+            phase: str = "search",
+        ) -> TrialResult:
             index = len(trials) + 1
-            run_name = trial_run_name(args.run_prefix, index, params)
+            run_name = trial_run_name(run_prefix, index, params)
             run_dir = (repo_root / DEFAULT_RUNS_ROOT / run_name).resolve()
             checkpoint_path = run_dir / "candidate.chk"
             summary_path = run_dir / "training_summary.json"
             run_dir.mkdir(parents=True, exist_ok=True)
             state.begin_operation("training", run_name, index, params, 0)
             reporter.refresh()
+            phase_args = argparse.Namespace(**vars(args))
+            phase_args.policy_tag_expected = policy_tag_expected
             can_resume = (
                 args.resume
                 and checkpoint_path.exists()
                 and summary_path.exists()
                 and training_artifacts_match(
-                    summary_path, episode_batch, init_checkpoint, anchor_checkpoint,
-                    checkpoint_path, params, args,
+                    summary_path, training_batch, init_checkpoint, anchor_checkpoint,
+                    checkpoint_path, params, phase_args,
                 )
             )
             if not can_resume:
                 shutil.copy2(init_checkpoint, checkpoint_path)
                 run_command(
                     build_train_command(
-                        args, trainer_exe, episode_batch, init_checkpoint, anchor_checkpoint,
+                        phase_args, trainer_exe, training_batch, init_checkpoint, anchor_checkpoint,
                         checkpoint_path, summary_path, params,
                     ),
                     repo_root,
@@ -2650,9 +2747,10 @@ def main() -> None:
                     trainer_env,
                 )
             trial = collect_training_result(
-                run_name, params, checkpoint_path, summary_path, args,
+                run_name, params, checkpoint_path, summary_path, phase_args,
                 training_reused=can_resume,
             )
+            trial.phase = phase
             state.active_total = trial.available_episode_count or trial.episode_count
             state.finish_operation(trial.episode_count, record_duration=not can_resume)
             trials.append(trial)
@@ -3002,142 +3100,139 @@ def main() -> None:
                 trial for trial in ranked_screen
                 if trial.screen_evaluation and not trial.screen_evaluation.collapse_flags
             ][: args.finalists]
-        state.phase = "held-out confirmation"
-        state.final_planned_candidates = len(finalists)
-        state.final_plan_finalized = True
-        state.final_games_planned = (
-            2 * len(finalists) * len(confirmation_opponents)
-            * args.confirmation_games_per_side
-        )
-        reporter.notice(
-            "held-out confirmation suite "
-            f"{int(evaluation_seed_suites['confirmation'])}: "
-            f"evaluating {len(finalists)} finalist checkpoints against "
-            f"{len(confirmation_opponents)} opponents"
-        )
-        for warning in confirmation_discovery.get("warnings", []) or []:
-            reporter.notice(str(warning))
-        reporter.refresh()
-        requested_confirmation_games: dict[
-            tuple[tuple[float, float, float, float, int], str], int
-        ] = {}
-        for trial in finalists:
-            trial.final_evaluation = None
-            trial.confirmation_evaluations = {}
-            for opponent_index, opponent in enumerate(confirmation_opponents):
-                opponent_result = run_balanced_evaluation(
-                    args,
-                    repo_root,
-                    trial,
-                    Path(opponent.checkpoint_path),
-                    "final",
-                    args.confirmation_games_per_side,
-                    paired_evaluation_seed(
-                        int(evaluation_seed_suites["confirmation"]),
-                        1,
-                        evaluation_replicate_indices[trial.hyperparameters.shuffle_seed],
-                        opponent_index,
-                    ),
-                    trial_indices[trial.run_name],
-                    reporter,
-                    state,
-                    logs_dir,
-                    block_index=1,
-                    run_suffix=f"_vs_{opponent.id}",
-                )
-                trial.confirmation_evaluations[opponent.id] = opponent_result
-                trial.final_evaluation = merge_evaluation_results(
-                    trial.final_evaluation, opponent_result,
-                )
-                requested_confirmation_games[(
-                    hyperparameter_setting_key(trial.hyperparameters), opponent.id,
-                )] = args.confirmation_games_per_side
-            state.trial_status[trial.run_name] = "confirming"
-            manifest["trials"] = [trial_payload(item) for item in trials]
-            reporter.notice(
-                f"confirmation initial {trial.run_name} "
-                f"valid_win_rate={trial.final_evaluation.valid_win_rate:.4f} "
-                f"valid={trial.final_evaluation.valid_games} invalid={trial.final_evaluation.invalid_games} "
-                f"lower95={trial.final_evaluation.confidence_low:.4f} "
-                f"opponents={len(trial.confirmation_evaluations)}"
-            )
-            progress_writer.update(force=True)
-
-        confirmation_block_index = 1
-        while args.confirmation_adaptive and replicated_mode:
-            unresolved_pairs = unresolved_confirmation_setting_opponents(
-                finalists,
-                expected_seeds=args.shuffle_seeds,
-                opponents=confirmation_opponents,
-                requested_games_per_side=requested_confirmation_games,
-                threshold=args.confirmation_non_regression_threshold,
-                max_games_per_side=args.final_games_per_side,
-            )
-            if not unresolved_pairs:
-                break
-            confirmation_block_index += 1
-            reporter.notice(
-                f"adaptive confirmation block {confirmation_block_index}: "
-                f"refining {len(unresolved_pairs)} unresolved setting/opponent matchups"
-            )
-            pair_block_games = {
-                pair: min(
-                    args.confirmation_game_block_per_side,
-                    args.final_games_per_side
-                    - requested_confirmation_games.get(pair, 0),
-                )
-                for pair in unresolved_pairs
+        def run_confirmation_phase(
+            phase_trials: list[TrialResult],
+            *,
+            expected_seeds: list[int],
+            seed_suite: int,
+            phase_label: str,
+        ) -> None:
+            replicate_indices = {
+                seed: index for index, seed in enumerate(sorted(set(expected_seeds)))
             }
-            for trial in finalists:
-                setting_key = hyperparameter_setting_key(trial.hyperparameters)
+            state.phase = phase_label
+            state.final_planned_candidates += len(phase_trials)
+            state.final_plan_finalized = True
+            state.final_games_planned += (
+                2 * len(phase_trials) * len(confirmation_opponents)
+                * args.confirmation_games_per_side
+            )
+            reporter.notice(
+                f"{phase_label} suite {seed_suite}: evaluating {len(phase_trials)} "
+                f"checkpoints against {len(confirmation_opponents)} opponents"
+            )
+            reporter.refresh()
+            requested_games: dict[
+                tuple[tuple[float, float, float, float, int], str], int
+            ] = {}
+            for trial in phase_trials:
+                trial.final_evaluation = None
+                trial.confirmation_evaluations = {}
                 for opponent_index, opponent in enumerate(confirmation_opponents):
-                    pair = (setting_key, opponent.id)
-                    if pair not in unresolved_pairs:
-                        continue
-                    block_games = pair_block_games[pair]
-                    if block_games <= 0:
-                        continue
-                    state.final_games_planned += 2 * block_games
-                    addition = run_balanced_evaluation(
-                        args,
-                        repo_root,
-                        trial,
-                        Path(opponent.checkpoint_path),
-                        "final",
-                        block_games,
+                    opponent_result = run_balanced_evaluation(
+                        args, repo_root, trial, Path(opponent.checkpoint_path), "final",
+                        args.confirmation_games_per_side,
                         paired_evaluation_seed(
-                            int(evaluation_seed_suites["confirmation"]),
-                            confirmation_block_index,
-                            evaluation_replicate_indices[
-                                trial.hyperparameters.shuffle_seed
-                            ],
+                            seed_suite, 1,
+                            replicate_indices[trial.hyperparameters.shuffle_seed],
                             opponent_index,
                         ),
-                        trial_indices[trial.run_name],
-                        reporter,
-                        state,
-                        logs_dir,
-                        block_index=confirmation_block_index,
+                        trials.index(trial) + 1, reporter, state, logs_dir,
+                        block_index=1,
                         run_suffix=f"_vs_{opponent.id}",
                     )
-                    trial.confirmation_evaluations[opponent.id] = merge_evaluation_results(
-                        trial.confirmation_evaluations.get(opponent.id), addition,
-                    )
+                    trial.confirmation_evaluations[opponent.id] = opponent_result
                     trial.final_evaluation = merge_evaluation_results(
-                        trial.final_evaluation, addition,
+                        trial.final_evaluation, opponent_result,
                     )
-                    manifest["trials"] = [trial_payload(item) for item in trials]
-                    progress_writer.update(force=True)
-            for pair, block_games in pair_block_games.items():
-                requested_confirmation_games[pair] = (
-                    requested_confirmation_games.get(pair, 0) + block_games
+                    requested_games[(
+                        hyperparameter_setting_key(trial.hyperparameters), opponent.id,
+                    )] = args.confirmation_games_per_side
+                state.trial_status[trial.run_name] = "confirming"
+                manifest["trials"] = [trial_payload(item) for item in trials]
+                assert trial.final_evaluation is not None
+                reporter.notice(
+                    f"{phase_label} initial {trial.run_name} "
+                    f"valid_win_rate={trial.final_evaluation.valid_win_rate:.4f} "
+                    f"valid={trial.final_evaluation.valid_games} "
+                    f"invalid={trial.final_evaluation.invalid_games} "
+                    f"lower95={trial.final_evaluation.confidence_low:.4f} "
+                    f"opponents={len(trial.confirmation_evaluations)}"
                 )
+                progress_writer.update(force=True)
 
-        for trial in finalists:
-            state.finalized_count += 1
-            state.trial_status[trial.run_name] = "finalized"
-        manifest["trials"] = [trial_payload(item) for item in trials]
-        progress_writer.update(force=True)
+            block_index = 1
+            replicated_confirmation = len(set(expected_seeds)) > 1
+            while args.confirmation_adaptive and replicated_confirmation:
+                unresolved_pairs = unresolved_confirmation_setting_opponents(
+                    phase_trials,
+                    expected_seeds=expected_seeds,
+                    opponents=confirmation_opponents,
+                    requested_games_per_side=requested_games,
+                    threshold=args.confirmation_non_regression_threshold,
+                    max_games_per_side=args.final_games_per_side,
+                )
+                if not unresolved_pairs:
+                    break
+                block_index += 1
+                reporter.notice(
+                    f"adaptive {phase_label} block {block_index}: refining "
+                    f"{len(unresolved_pairs)} unresolved setting/opponent matchups"
+                )
+                pair_block_games = {
+                    pair: min(
+                        args.confirmation_game_block_per_side,
+                        args.final_games_per_side - requested_games.get(pair, 0),
+                    )
+                    for pair in unresolved_pairs
+                }
+                for trial in phase_trials:
+                    setting_key = hyperparameter_setting_key(trial.hyperparameters)
+                    for opponent_index, opponent in enumerate(confirmation_opponents):
+                        pair = (setting_key, opponent.id)
+                        if pair not in unresolved_pairs:
+                            continue
+                        block_games = pair_block_games[pair]
+                        if block_games <= 0:
+                            continue
+                        state.final_games_planned += 2 * block_games
+                        addition = run_balanced_evaluation(
+                            args, repo_root, trial, Path(opponent.checkpoint_path), "final",
+                            block_games,
+                            paired_evaluation_seed(
+                                seed_suite, block_index,
+                                replicate_indices[trial.hyperparameters.shuffle_seed],
+                                opponent_index,
+                            ),
+                            trials.index(trial) + 1, reporter, state, logs_dir,
+                            block_index=block_index,
+                            run_suffix=f"_vs_{opponent.id}",
+                        )
+                        trial.confirmation_evaluations[opponent.id] = merge_evaluation_results(
+                            trial.confirmation_evaluations.get(opponent.id), addition,
+                        )
+                        trial.final_evaluation = merge_evaluation_results(
+                            trial.final_evaluation, addition,
+                        )
+                        manifest["trials"] = [trial_payload(item) for item in trials]
+                        progress_writer.update(force=True)
+                for pair, block_games in pair_block_games.items():
+                    requested_games[pair] = requested_games.get(pair, 0) + block_games
+
+            for trial in phase_trials:
+                state.finalized_count += 1
+                state.trial_status[trial.run_name] = "finalized"
+            manifest["trials"] = [trial_payload(item) for item in trials]
+            progress_writer.update(force=True)
+
+        for warning in confirmation_discovery.get("warnings", []) or []:
+            reporter.notice(str(warning))
+        run_confirmation_phase(
+            finalists,
+            expected_seeds=args.shuffle_seeds,
+            seed_suite=int(evaluation_seed_suites["confirmation"]),
+            phase_label="held-out confirmation",
+        )
 
         ranked_final = sorted(finalists, key=lambda trial: evaluation_rank_key(trial, final=True), reverse=True)
         ranked_final_groups: list[dict[str, object]] = []
@@ -3213,8 +3308,11 @@ def main() -> None:
         assessment["confirmation_seed_suite"] = int(
             evaluation_seed_suites["confirmation"]
         )
-        state.phase = "completed"
-        state.clear_operation()
+        preliminary_assessment = dict(assessment)
+        preliminary_winner = winner
+        preliminary_best_hyperparameters = (
+            dict(best_hyperparameters) if best_hyperparameters is not None else None
+        )
         top_trial = ranked_final[0] if ranked_final else None
         if ranked_final_groups:
             top_group_key = group_summary_setting_key(ranked_final_groups[0])
@@ -3224,6 +3322,125 @@ def main() -> None:
             ]
             if top_group_trials:
                 top_trial = top_group_trials[0]
+
+        fresh_trials: list[TrialResult] = []
+        ranked_fresh_groups: list[dict[str, object]] = []
+        fresh_confirmation_payload: dict[str, object] = {
+            "enabled": fresh_confirmation_enabled,
+            "required_for_promotion": fresh_confirmation_enabled,
+            "episode_batch": (
+                str(fresh_confirmation_episode_batch)
+                if fresh_confirmation_episode_batch is not None else None
+            ),
+            "shuffle_seeds": fresh_seed_values,
+            "evaluation_seed_suite": int(
+                evaluation_seed_suites["fresh_confirmation"]
+            ),
+            "status": "not_requested",
+        }
+        if (
+            fresh_confirmation_enabled
+            and preliminary_winner is not None
+            and top_trial is not None
+        ):
+            assert fresh_confirmation_episode_batch is not None
+            selected = top_trial.hyperparameters
+            state.max_trials += len(fresh_seed_values)
+            reporter.notice(
+                "fresh-data confirmation: retraining the held-out top setting "
+                f"from {init_checkpoint.name} on {fresh_confirmation_episode_batch.name}"
+            )
+            for shuffle_seed in fresh_seed_values:
+                fresh_trials.append(train_one(
+                    Hyperparameters(
+                        selected.learning_rate,
+                        selected.entropy_coef,
+                        selected.anchor_kl_coef,
+                        selected.ppo_clip_epsilon,
+                        shuffle_seed,
+                        selected.episode_limit,
+                    ),
+                    training_batch=fresh_confirmation_episode_batch,
+                    policy_tag_expected=fresh_policy_tag_expected,
+                    run_prefix=f"{args.run_prefix}_fresh",
+                    phase="fresh_confirmation",
+                ))
+            safe_fresh_trials = [trial for trial in fresh_trials if not trial.safety_flags]
+            run_confirmation_phase(
+                safe_fresh_trials,
+                expected_seeds=fresh_seed_values,
+                seed_suite=int(evaluation_seed_suites["fresh_confirmation"]),
+                phase_label="fresh-data confirmation",
+            )
+            ranked_fresh_groups = build_robust_confirmation_group_summary(
+                fresh_trials,
+                expected_seeds=fresh_seed_values,
+                opponents=confirmation_opponents,
+                non_regression_threshold=args.confirmation_non_regression_threshold,
+                dominance_spread=args.confirmation_dominance_spread,
+            )
+            fresh_winning_group, fresh_assessment = robust_grouped_promotion_assessment(
+                ranked_fresh_groups,
+                args.promotion_min_win_rate,
+                args.promotion_confidence_threshold,
+            )
+            fresh_assessment["held_out_confirmation"] = True
+            fresh_assessment["fresh_data_confirmation"] = True
+            fresh_assessment["confirmation_seed_suite"] = int(
+                evaluation_seed_suites["fresh_confirmation"]
+            )
+            fresh_winner = None
+            if fresh_winning_group is not None:
+                winning_key = group_summary_setting_key(fresh_winning_group)
+                fresh_winner = next(
+                    (
+                        trial for trial in fresh_trials
+                        if hyperparameter_setting_key(trial.hyperparameters) == winning_key
+                        and trial.final_evaluation is not None
+                    ),
+                    None,
+                )
+            comparison = fresh_confirmation_comparison(
+                preliminary_assessment, fresh_assessment,
+            )
+            fresh_confirmation_payload.update({
+                "status": "completed",
+                "selected_hyperparameters": {
+                    "learning_rate": selected.learning_rate,
+                    "entropy_coef": selected.entropy_coef,
+                    "anchor_kl_coef": selected.anchor_kl_coef,
+                    "ppo_clip_epsilon": selected.ppo_clip_epsilon,
+                    "episode_limit": selected.episode_limit,
+                },
+                "comparison": comparison,
+                "assessment": fresh_assessment,
+                "trials": [trial_payload(trial) for trial in fresh_trials],
+                "ranked_hyperparameter_groups": ranked_fresh_groups,
+            })
+            assessment = fresh_assessment
+            winner = fresh_winner
+            best_hyperparameters = (
+                dict(fresh_winning_group.get("hyperparameters", {}) or {})
+                if fresh_winning_group is not None else None
+            )
+            reporter.notice(
+                "fresh-data confirmation "
+                f"outcome={comparison['outcome']} "
+                f"valid_win_rate={float(fresh_assessment.get('valid_win_rate', 0.0)):.4f} "
+                f"promotion_confident={fresh_assessment['promotion_confident']}"
+            )
+        elif fresh_confirmation_enabled:
+            fresh_confirmation_payload["status"] = "preliminary_result_did_not_pass"
+            assessment = {
+                "status": "no_fresh_confirmation_candidate",
+                "fresh_data_confirmation": True,
+                "promotion_confident": False,
+            }
+            winner = None
+            best_hyperparameters = None
+
+        state.phase = "completed"
+        state.clear_operation()
         top_setting = (
             hyperparameter_setting_key(top_trial.hyperparameters)
             if top_trial is not None else None
@@ -3247,6 +3464,12 @@ def main() -> None:
         manifest["top_result"] = trial_payload(top_trial) if top_trial else None
         manifest["best_result"] = trial_payload(winner) if winner else None
         manifest["best_hyperparameters"] = best_hyperparameters
+        manifest["preliminary_best_result"] = (
+            trial_payload(preliminary_winner) if preliminary_winner else None
+        )
+        manifest["preliminary_best_hyperparameters"] = preliminary_best_hyperparameters
+        manifest["preliminary_promotion_assessment"] = preliminary_assessment
+        manifest["fresh_data_confirmation"] = fresh_confirmation_payload
         manifest["promotion_assessment"] = assessment
         manifest["boundary_diagnostics"] = {
             "top_setting": top_boundary_diagnostics,
@@ -3259,7 +3482,9 @@ def main() -> None:
             ),
         }
         if len(set(args.episode_limits)) > 1:
-            manifest["data_scale_summary"] = build_data_scale_summary(trials)
+            manifest["data_scale_summary"] = build_data_scale_summary(
+                [trial for trial in trials if trial.phase == "search"]
+            )
         if winner:
             assert winner.final_evaluation is not None
             reported_win_rate = float(assessment.get("valid_win_rate", winner.final_evaluation.valid_win_rate))

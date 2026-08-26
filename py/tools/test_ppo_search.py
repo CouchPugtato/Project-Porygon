@@ -26,6 +26,7 @@ from ppo_search import (
     configured_boundary_diagnostics,
     discover_confirmation_opponents,
     evaluation_artifacts_match,
+    fresh_confirmation_comparison,
     inferred_policy_tag,
     load_config_args,
     merge_evaluation_results,
@@ -168,6 +169,8 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(args.confirmation_max_opponents, 3)
         self.assertEqual(args.confirmation_games_per_side, 100)
         self.assertTrue(args.confirmation_adaptive)
+        self.assertEqual(args.fresh_confirmation_episode_batch, "")
+        self.assertEqual(args.fresh_confirmation_shuffle_seeds, [404, 505, 606])
 
     def test_trainer_executable_is_fixed_and_rejected_in_config(self) -> None:
         self.assertEqual(DEFAULT_TRAINER_EXE.as_posix(), "build-fresh/showdown_client.exe")
@@ -345,12 +348,48 @@ class PpoSearchTests(unittest.TestCase):
         )
 
     def test_explicit_confirmation_suite_must_be_held_out(self) -> None:
-        suites = resolve_evaluation_seed_suites("run-a", 2026, 11, 22)
+        suites = resolve_evaluation_seed_suites("run-a", 2026, 11, 22, 33)
         self.assertEqual(suites["screen"], 11)
         self.assertEqual(suites["confirmation"], 22)
+        self.assertEqual(suites["fresh_confirmation"], 33)
         self.assertEqual(suites["screen_source"], "explicit")
         with self.assertRaisesRegex(ValueError, "must differ"):
-            resolve_evaluation_seed_suites("run-a", 2026, 11, 11)
+            resolve_evaluation_seed_suites("run-a", 2026, 11, 22, 22)
+
+    def test_fresh_confirmation_uses_a_third_derived_suite(self) -> None:
+        suites = resolve_evaluation_seed_suites("run-a", 2026, 0, 0, 0)
+        self.assertEqual(len({
+            suites["screen"],
+            suites["confirmation"],
+            suites["fresh_confirmation"],
+        }), 3)
+        self.assertEqual(suites["fresh_confirmation_source"], "derived_from_run")
+
+    def test_fresh_confirmation_comparison_reports_reproduction_strength(self) -> None:
+        preliminary = {"valid_win_rate": 0.55}
+        passing = {
+            "valid_win_rate": 0.57,
+            "clears_point_gate": True,
+            "collapse_free": True,
+            "complete_seed_group": True,
+            "all_opponents_complete": True,
+            "all_opponents_non_regression": True,
+            "promotion_confident": True,
+        }
+        self.assertEqual(
+            fresh_confirmation_comparison(preliminary, passing)["outcome"],
+            "reproduced",
+        )
+        passing["valid_win_rate"] = 0.52
+        self.assertEqual(
+            fresh_confirmation_comparison(preliminary, passing)["outcome"],
+            "weakened",
+        )
+        passing["all_opponents_non_regression"] = False
+        self.assertEqual(
+            fresh_confirmation_comparison(preliminary, passing)["outcome"],
+            "reversed",
+        )
 
     def test_promotion_gate_distinguishes_no_tentative_and_confident_winner(self) -> None:
         trial = SimpleNamespace(run_name="candidate", final_evaluation=self.evaluation("final", 49, 100, 0.39, 0.59))
