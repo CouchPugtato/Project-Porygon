@@ -31,6 +31,8 @@ from ppo_search import (
     grouped_promotion_assessment,
     run_command,
     select_search_combinations,
+    select_space_filling_settings,
+    suggest_bayesian_setting,
     training_safety_flags,
     training_artifacts_match,
     valid_outcome_counts,
@@ -459,6 +461,36 @@ class PpoSearchTests(unittest.TestCase):
         winner, assessment = grouped_promotion_assessment(summaries, 0.50, 0.50)
         self.assertIsNotNone(winner)
         self.assertEqual(assessment["selection_scope"], "pooled_hyperparameter_setting")
+
+    def test_bayesian_suggestion_is_untried_and_records_acquisition(self) -> None:
+        space = [
+            (2.5e-6, 1e-4, 0.01, 0.1, 256),
+            (5e-6, 1e-4, 0.03, 0.1, 256),
+            (1e-5, 3e-4, 0.05, 0.2, 256),
+            (5e-6, 3e-4, 0.01, 0.2, 256),
+        ]
+        initial = select_space_filling_settings(space, 2, 2026)
+        observed = []
+        for setting, rate in zip(initial, (0.49, 0.54)):
+            observed.append({
+                "hyperparameters": {
+                    "learning_rate": setting[0],
+                    "entropy_coef": setting[1],
+                    "anchor_kl_coef": setting[2],
+                    "ppo_clip_epsilon": setting[3],
+                    "episode_limit": setting[4],
+                },
+                "complete_seed_group": True,
+                "collapse_flags": [],
+                "rejected_trials": 0,
+                "valid_games": 600,
+                "valid_win_rate": rate,
+            })
+        remaining = [setting for setting in space if setting not in initial]
+        suggestion, acquisition = suggest_bayesian_setting(observed, remaining, space)
+        self.assertIn(suggestion, remaining)
+        self.assertGreaterEqual(acquisition["expected_improvement"], 0.0)
+        self.assertGreater(acquisition["predicted_stddev"], 0.0)
 
 
 if __name__ == "__main__":

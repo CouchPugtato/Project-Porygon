@@ -865,6 +865,7 @@ def run_command(
 ) -> None:
     reporter.command_started(command)
     env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     if env_updates:
         env.update(env_updates)
     if raw_log_path:
@@ -1473,6 +1474,200 @@ def group_summary_setting_key(
     )
 
 
+def hyperparameter_setting_space(
+    learning_rates: list[float],
+    entropy_coefs: list[float],
+    anchor_kl_coefs: list[float],
+    ppo_clip_epsilons: list[float],
+    episode_limits: list[int],
+) -> list[tuple[float, float, float, float, int]]:
+    return list(itertools.product(
+        learning_rates, entropy_coefs, anchor_kl_coefs,
+        ppo_clip_epsilons, episode_limits,
+    ))
+
+
+def normalized_setting_features(
+    settings: list[tuple[float, float, float, float, int]],
+) -> dict[tuple[float, float, float, float, int], tuple[float, ...]]:
+    if not settings:
+        return {}
+    transformed = [
+        (
+            math.log10(setting[0]),
+            math.log10(setting[1]),
+            math.log10(setting[2]),
+            setting[3],
+            math.log1p(setting[4]),
+        )
+        for setting in settings
+    ]
+    mins = [min(row[index] for row in transformed) for index in range(5)]
+    maxs = [max(row[index] for row in transformed) for index in range(5)]
+    features: dict[tuple[float, float, float, float, int], tuple[float, ...]] = {}
+    for setting, row in zip(settings, transformed):
+        features[setting] = tuple(
+            0.5 if maxs[index] == mins[index]
+            else (row[index] - mins[index]) / (maxs[index] - mins[index])
+            for index in range(5)
+        )
+    return features
+
+
+def squared_distance(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    return sum((a - b) ** 2 for a, b in zip(left, right))
+
+
+def select_space_filling_settings(
+    settings: list[tuple[float, float, float, float, int]],
+    count: int,
+    seed: int,
+) -> list[tuple[float, float, float, float, int]]:
+    if count <= 0 or not settings:
+        return []
+    features = normalized_setting_features(settings)
+    order = list(settings)
+    random.Random(seed).shuffle(order)
+    center = tuple(0.5 for _ in range(5))
+    first = min(order, key=lambda setting: squared_distance(features[setting], center))
+    selected = [first]
+    remaining = [setting for setting in order if setting != first]
+    while remaining and len(selected) < count:
+        next_setting = max(
+            remaining,
+            key=lambda setting: min(
+                squared_distance(features[setting], features[chosen]) for chosen in selected
+            ),
+        )
+        selected.append(next_setting)
+        remaining.remove(next_setting)
+    return selected
+
+
+def _cholesky_solve(matrix: list[list[float]], values: list[float]) -> list[float]:
+    size = len(matrix)
+    lower = [[0.0] * size for _ in range(size)]
+    for row in range(size):
+        for column in range(row + 1):
+            residual = matrix[row][column] - sum(
+                lower[row][index] * lower[column][index] for index in range(column)
+            )
+            if row == column:
+                lower[row][column] = math.sqrt(max(residual, 1e-12))
+            else:
+                lower[row][column] = residual / lower[column][column]
+    forward = [0.0] * size
+    for row in range(size):
+        forward[row] = (
+            values[row]
+            - sum(lower[row][column] * forward[column] for column in range(row))
+        ) / lower[row][row]
+    solution = [0.0] * size
+    for row in range(size - 1, -1, -1):
+        solution[row] = (
+            forward[row]
+            - sum(lower[column][row] * solution[column] for column in range(row + 1, size))
+        ) / lower[row][row]
+    return solution
+
+
+def _normal_pdf(value: float) -> float:
+    return math.exp(-0.5 * value * value) / math.sqrt(2.0 * math.pi)
+
+
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def suggest_bayesian_setting(
+    observed_groups: list[dict[str, object]],
+    remaining_settings: list[tuple[float, float, float, float, int]],
+    full_setting_space: list[tuple[float, float, float, float, int]],
+    *,
+    exploration: float = 0.005,
+    length_scale: float = 0.45,
+    signal_variance: float = 0.01,
+) -> tuple[tuple[float, float, float, float, int], dict[str, float]]:
+    if not remaining_settings:
+        raise ValueError("no remaining hyperparameter settings")
+    usable = [
+        summary for summary in observed_groups
+        if summary.get("complete_seed_group")
+        and not summary.get("collapse_flags")
+        and int(summary.get("valid_games", 0) or 0) > 0
+    ]
+    features = normalized_setting_features(full_setting_space)
+    if len(usable) < 2:
+        observed_keys = [group_summary_setting_key(summary) for summary in usable]
+        if not observed_keys:
+            choice = select_space_filling_settings(remaining_settings, 1, 0)[0]
+        else:
+            choice = max(
+                remaining_settings,
+                key=lambda setting: min(
+                    squared_distance(features[setting], features[key]) for key in observed_keys
+                ),
+            )
+        return choice, {"predicted_mean": 0.5, "predicted_stddev": 0.1, "expected_improvement": 0.0}
+
+    observed_keys = [group_summary_setting_key(summary) for summary in usable]
+    observed_x = [features[key] for key in observed_keys]
+    observed_y = [float(summary.get("valid_win_rate", 0.0) or 0.0) - 0.5 for summary in usable]
+    noise = []
+    for summary in usable:
+        games = int(summary.get("valid_games", 0) or 0)
+        rate = float(summary.get("valid_win_rate", 0.5) or 0.5)
+        binomial_noise = rate * (1.0 - rate) / max(1, games)
+        seed_rates = [
+            float(item.get("valid_win_rate", 0.0) or 0.0)
+            for item in (summary.get("seed_results", []) or [])
+            if isinstance(item, dict)
+        ]
+        seed_mean_noise = 0.0
+        if len(seed_rates) > 1:
+            seed_mean = sum(seed_rates) / len(seed_rates)
+            seed_variance = sum(
+                (seed_rate - seed_mean) ** 2 for seed_rate in seed_rates
+            ) / (len(seed_rates) - 1)
+            seed_mean_noise = seed_variance / len(seed_rates)
+        noise.append(max(1e-5, binomial_noise, seed_mean_noise))
+
+    def kernel(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+        return signal_variance * math.exp(
+            -squared_distance(left, right) / (2.0 * length_scale * length_scale)
+        )
+
+    covariance = [
+        [
+            kernel(left, right) + (noise[row] + 1e-8 if row == column else 0.0)
+            for column, right in enumerate(observed_x)
+        ]
+        for row, left in enumerate(observed_x)
+    ]
+    alpha = _cholesky_solve(covariance, observed_y)
+    best_observed = max(observed_y)
+    scored: list[tuple[float, float, float, tuple[float, float, float, float, int]]] = []
+    for setting in remaining_settings:
+        point = features[setting]
+        cross = [kernel(point, observed) for observed in observed_x]
+        mean = sum(value * weight for value, weight in zip(cross, alpha))
+        solved_cross = _cholesky_solve(covariance, cross)
+        variance = max(1e-10, signal_variance - sum(
+            value * weight for value, weight in zip(cross, solved_cross)
+        ))
+        stddev = math.sqrt(variance)
+        improvement = mean - best_observed - exploration
+        z = improvement / stddev
+        expected_improvement = improvement * _normal_cdf(z) + stddev * _normal_pdf(z)
+        scored.append((expected_improvement, stddev, mean, setting))
+    expected_improvement, stddev, mean, choice = max(scored)
+    return choice, {
+        "predicted_mean": 0.5 + mean,
+        "predicted_stddev": stddev,
+        "expected_improvement": expected_improvement,
+    }
+
+
 def grouped_promotion_assessment(
     ranked_groups: list[dict[str, object]],
     minimum_win_rate: float,
@@ -1542,6 +1737,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ppo-clip-epsilons", type=csv_floats, default=[0.2])
     parser.add_argument("--shuffle-seeds", type=csv_ints, default=[101])
     parser.add_argument("--replicate-ranking", type=parse_bool, default=True, help="Rank each setting from pooled results across every configured shuffle seed")
+    parser.add_argument("--selection-strategy", choices=["random", "bayesian"], default="random")
+    parser.add_argument("--bayes-initial-settings", type=positive_int, default=4, help="Space-filling settings evaluated before expected-improvement suggestions")
+    parser.add_argument("--bayes-exploration", type=float, default=0.005, help="Expected-improvement exploration margin in win-rate units")
     parser.add_argument("--episode-limits", type=csv_ints, default=[0], help="Nested deterministic PPO data sizes; 0 uses every episode")
     parser.add_argument("--ppo-minibatch-episodes", type=positive_int, default=int_default("ppo_minibatch_episodes"))
     parser.add_argument("--max-trials", type=positive_int, default=18)
@@ -1607,6 +1805,8 @@ def main() -> None:
         raise SystemExit("screen-max-games-per-side must be >= screen-games-per-side")
     if any(limit < 0 for limit in args.episode_limits):
         raise SystemExit("episode-limits values must be >= 0")
+    if args.bayes_exploration < 0.0:
+        raise SystemExit("bayes-exploration must be >= 0")
     replicate_seed_count = len(set(args.shuffle_seeds))
     if args.replicate_ranking and replicate_seed_count > 1:
         if args.adaptive_screen:
@@ -1673,20 +1873,59 @@ def main() -> None:
     search_dir = (repo_root / DEFAULT_SEARCH_ROOT / args.run_prefix).resolve()
     search_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = search_dir / f"{args.run_prefix}_search_manifest.json"
-    try:
-        combinations = select_search_combinations(
-            args.learning_rates,
-            args.entropy_coefs,
-            args.anchor_kl_coefs,
-            args.ppo_clip_epsilons,
-            args.shuffle_seeds,
-            args.episode_limits,
-            args.max_trials,
-            args.search_seed,
-            args.replicate_ranking,
+    full_setting_space = hyperparameter_setting_space(
+        args.learning_rates,
+        args.entropy_coefs,
+        args.anchor_kl_coefs,
+        args.ppo_clip_epsilons,
+        args.episode_limits,
+    )
+    bayesian_mode = (
+        args.selection_strategy == "bayesian"
+        and args.replicate_ranking
+        and len(set(args.shuffle_seeds)) > 1
+    )
+    if args.selection_strategy == "bayesian" and not bayesian_mode:
+        raise SystemExit(
+            "bayesian selection requires replicate-ranking=true and at least two shuffle seeds"
         )
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
+    if bayesian_mode and any(
+        value <= 0.0
+        for values in (args.learning_rates, args.entropy_coefs, args.anchor_kl_coefs)
+        for value in values
+    ):
+        raise SystemExit("bayesian selection requires positive learning-rate, entropy, and anchor values")
+    seed_values = sorted(set(args.shuffle_seeds))
+    setting_budget = min(len(full_setting_space), args.max_trials // len(seed_values))
+    if bayesian_mode:
+        initial_settings = select_space_filling_settings(
+            full_setting_space,
+            min(args.bayes_initial_settings, setting_budget),
+            args.search_seed,
+        )
+        combinations = [
+            Hyperparameters(lr, entropy, anchor, clip, seed, episode_limit)
+            for lr, entropy, anchor, clip, episode_limit in initial_settings
+            for seed in seed_values
+        ]
+        planned_trial_count = setting_budget * len(seed_values)
+    else:
+        try:
+            combinations = select_search_combinations(
+                args.learning_rates,
+                args.entropy_coefs,
+                args.anchor_kl_coefs,
+                args.ppo_clip_epsilons,
+                args.shuffle_seeds,
+                args.episode_limits,
+                args.max_trials,
+                args.search_seed,
+                args.replicate_ranking,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        initial_settings = []
+        planned_trial_count = len(combinations)
     manifest: dict[str, object] = {
         "status": "running",
         "run_prefix": args.run_prefix,
@@ -1709,6 +1948,8 @@ def main() -> None:
             "replicate_ranking": args.replicate_ranking,
             "episode_limits": args.episode_limits,
             "max_trials": args.max_trials,
+            "selection_strategy": args.selection_strategy,
+            "setting_budget": setting_budget,
         },
         "staging": {
             "screen_candidates": args.screen_candidates,
@@ -1724,13 +1965,28 @@ def main() -> None:
             "eval_max_replacement_attempts": args.eval_max_replacement_attempts,
         },
         "search_seed": args.search_seed,
+        "bayesian_optimization": {
+            "enabled": bayesian_mode,
+            "initial_settings": [
+                {
+                    "learning_rate": setting[0],
+                    "entropy_coef": setting[1],
+                    "anchor_kl_coef": setting[2],
+                    "ppo_clip_epsilon": setting[3],
+                    "episode_limit": setting[4],
+                }
+                for setting in initial_settings
+            ],
+            "exploration": args.bayes_exploration,
+            "suggestions": [],
+        },
         "trials": [],
     }
     state = SearchDisplayState(
         run_prefix=args.run_prefix,
-        max_trials=len(combinations),
-        configured_screen_candidates=min(args.screen_candidates, len(combinations)),
-        configured_finalists=min(args.finalists, args.screen_candidates, len(combinations)),
+        max_trials=planned_trial_count,
+        configured_screen_candidates=min(args.screen_candidates, planned_trial_count),
+        configured_finalists=min(args.finalists, args.screen_candidates, planned_trial_count),
         screen_games_per_side=args.screen_games_per_side,
         final_games_per_side=args.final_games_per_side,
     )
@@ -1742,9 +1998,12 @@ def main() -> None:
     progress_writer.update(force=True)
     reporter.start()
     try:
-        state.phase = "training"
-        reporter.refresh()
-        for index, params in enumerate(combinations, start=1):
+        replicated_mode = args.replicate_ranking and len(set(args.shuffle_seeds)) > 1
+        screen_trials: list[TrialResult] = []
+        requested_screen_games: dict[str, int] = {}
+
+        def train_one(params: Hyperparameters) -> TrialResult:
+            index = len(trials) + 1
             run_name = trial_run_name(args.run_prefix, index, params)
             run_dir = (repo_root / DEFAULT_RUNS_ROOT / run_name).resolve()
             checkpoint_path = run_dir / "candidate.chk"
@@ -1793,43 +2052,18 @@ def main() -> None:
                 f"approx_kl={trial.approx_kl:.6f}"
             )
             progress_writer.update(force=True)
+            return trial
 
-        safe_trials = [trial for trial in trials if not trial.safety_flags]
-        safe_trials.sort(key=lambda trial: training_screen_key(trial, args.target_kl), reverse=True)
-        replicated_mode = args.replicate_ranking and len(set(args.shuffle_seeds)) > 1
-        if replicated_mode:
-            complete_groups = [
-                group for group in group_trials_by_setting(trials).values()
-                if len({trial.hyperparameters.shuffle_seed for trial in group})
-                == len(set(args.shuffle_seeds))
-                and all(not trial.safety_flags for trial in group)
-            ]
-            complete_groups.sort(
-                key=lambda group: replicated_training_group_key(group, args.target_kl),
-                reverse=True,
-            )
-            screen_group_count = args.screen_candidates // len(set(args.shuffle_seeds))
-            screen_trials = [
-                trial
-                for group in complete_groups[:screen_group_count]
-                for trial in sorted(group, key=lambda item: item.hyperparameters.shuffle_seed)
-            ]
-        else:
-            screen_trials = safe_trials[: args.screen_candidates]
-        state.phase = "screening"
-        state.screen_planned_candidates = len(screen_trials)
-        state.screen_plan_finalized = True
-        state.screen_games_planned = 2 * len(screen_trials) * args.screen_games_per_side
-        reporter.refresh()
-        trial_indices = {trial.run_name: index for index, trial in enumerate(trials, start=1)}
-        requested_screen_games = {trial.run_name: 0 for trial in screen_trials}
-        for index, trial in enumerate(screen_trials, start=1):
+        def screen_one(trial: TrialResult) -> None:
+            trial_index = trials.index(trial) + 1
             trial.screen_evaluation = run_balanced_evaluation(
                 args, repo_root, trial, parent_checkpoint, "screen",
-                args.screen_games_per_side, args.search_seed * 1000 + index * 10,
-                trial_indices[trial.run_name], reporter, state, logs_dir, block_index=1,
+                args.screen_games_per_side,
+                args.search_seed * 1000 + trial_index * 10,
+                trial_index, reporter, state, logs_dir, block_index=1,
             )
             requested_screen_games[trial.run_name] = args.screen_games_per_side
+            screen_trials.append(trial)
             state.screened_count += 1
             state.trial_status[trial.run_name] = "screened"
             manifest["trials"] = [trial_payload(item) for item in trials]
@@ -1840,6 +2074,135 @@ def main() -> None:
             )
             progress_writer.update(force=True)
 
+        if bayesian_mode:
+            if args.screen_candidates < planned_trial_count:
+                raise SystemExit(
+                    "bayesian selection screens every seed replicate; set screen-candidates "
+                    f"to at least {planned_trial_count}"
+                )
+            state.screen_planned_candidates = planned_trial_count
+            state.screen_plan_finalized = True
+            state.screen_games_planned = (
+                2 * planned_trial_count * args.screen_games_per_side
+            )
+            pending_settings = list(initial_settings)
+            selected_settings: list[tuple[float, float, float, float, int]] = []
+            while len(selected_settings) < setting_budget:
+                if not pending_settings:
+                    observed_groups = build_hyperparameter_group_summary(
+                        screen_trials,
+                        stage="screen",
+                        expected_seeds=seed_values,
+                    )
+                    remaining_settings = [
+                        setting for setting in full_setting_space
+                        if setting not in selected_settings
+                    ]
+                    suggestion, acquisition = suggest_bayesian_setting(
+                        observed_groups,
+                        remaining_settings,
+                        full_setting_space,
+                        exploration=args.bayes_exploration,
+                    )
+                    pending_settings.append(suggestion)
+                    suggestions = (manifest.get("bayesian_optimization", {}) or {}).setdefault(
+                        "suggestions", []
+                    )
+                    if isinstance(suggestions, list):
+                        suggestions.append({
+                            "after_completed_settings": len(selected_settings),
+                            "hyperparameters": {
+                                "learning_rate": suggestion[0],
+                                "entropy_coef": suggestion[1],
+                                "anchor_kl_coef": suggestion[2],
+                                "ppo_clip_epsilon": suggestion[3],
+                                "episode_limit": suggestion[4],
+                            },
+                            **acquisition,
+                        })
+                    reporter.notice(
+                        "Bayesian suggestion "
+                        f"lr={suggestion[0]:g} entropy={suggestion[1]:g} "
+                        f"anchor={suggestion[2]:g} clip={suggestion[3]:g} "
+                        f"EI={acquisition['expected_improvement']:.6f}"
+                    )
+                    progress_writer.update(force=True)
+
+                setting = pending_settings.pop(0)
+                if setting in selected_settings:
+                    continue
+                selected_settings.append(setting)
+                state.phase = "training"
+                reporter.refresh()
+                lr, entropy, anchor, clip, episode_limit = setting
+                setting_trials = [
+                    train_one(Hyperparameters(
+                        lr, entropy, anchor, clip, seed, episode_limit,
+                    ))
+                    for seed in seed_values
+                ]
+                if all(not trial.safety_flags for trial in setting_trials):
+                    state.phase = "screening"
+                    reporter.refresh()
+                    for trial in setting_trials:
+                        screen_one(trial)
+                else:
+                    reporter.notice(
+                        "rejected Bayesian setting because at least one seed failed safety checks"
+                    )
+                bayes_payload = manifest.get("bayesian_optimization", {}) or {}
+                bayes_payload["completed_settings"] = len(selected_settings)
+                bayes_payload["selected_settings"] = [
+                    {
+                        "learning_rate": item[0],
+                        "entropy_coef": item[1],
+                        "anchor_kl_coef": item[2],
+                        "ppo_clip_epsilon": item[3],
+                        "episode_limit": item[4],
+                    }
+                    for item in selected_settings
+                ]
+                manifest["bayesian_optimization"] = bayes_payload
+                manifest["trials"] = [trial_payload(item) for item in trials]
+                progress_writer.update(force=True)
+        else:
+            state.phase = "training"
+            reporter.refresh()
+            for params in combinations:
+                train_one(params)
+
+            safe_trials = [trial for trial in trials if not trial.safety_flags]
+            safe_trials.sort(key=lambda trial: training_screen_key(trial, args.target_kl), reverse=True)
+            if replicated_mode:
+                complete_groups = [
+                    group for group in group_trials_by_setting(trials).values()
+                    if len({trial.hyperparameters.shuffle_seed for trial in group})
+                    == len(set(args.shuffle_seeds))
+                    and all(not trial.safety_flags for trial in group)
+                ]
+                complete_groups.sort(
+                    key=lambda group: replicated_training_group_key(group, args.target_kl),
+                    reverse=True,
+                )
+                screen_group_count = args.screen_candidates // len(set(args.shuffle_seeds))
+                selected_screen_trials = [
+                    trial
+                    for group in complete_groups[:screen_group_count]
+                    for trial in sorted(group, key=lambda item: item.hyperparameters.shuffle_seed)
+                ]
+            else:
+                selected_screen_trials = safe_trials[: args.screen_candidates]
+            state.phase = "screening"
+            state.screen_planned_candidates = len(selected_screen_trials)
+            state.screen_plan_finalized = True
+            state.screen_games_planned = (
+                2 * len(selected_screen_trials) * args.screen_games_per_side
+            )
+            reporter.refresh()
+            for trial in selected_screen_trials:
+                screen_one(trial)
+
+        trial_indices = {trial.run_name: index for index, trial in enumerate(trials, start=1)}
         ranked_screen = sorted(screen_trials, key=evaluation_rank_key, reverse=True)
         adaptive_block_index = 1
         while args.adaptive_screen:

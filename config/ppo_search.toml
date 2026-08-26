@@ -9,8 +9,14 @@ anchor_kl_coefs = "0.01,0.03,0.05"
 ppo_clip_epsilons = "0.1,0.2"
 shuffle_seeds = "101,202,303"
 replicate_ranking = true
+# Four space-filling settings bootstrap a Gaussian-process surrogate. Remaining
+# settings are selected sequentially by expected improvement.
+selection_strategy = "bayesian"
+bayes_initial_settings = 4
+bayes_exploration = 0.005
 # 256 was the strongest pooled scale; larger single updates degraded performance.
 episode_limits = "256"
+# 24 checkpoints / three seeds = an eight-setting optimization budget.
 search_seed = 2026
 max_trials = 24
 
