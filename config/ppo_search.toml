@@ -14,17 +14,20 @@ replicate_ranking = true
 selection_strategy = "bayesian"
 bayes_initial_settings = 4
 bayes_exploration = 0.005
+# Reserve four settings for a half-step local search around the safe coarse leader.
+bayes_refine_settings = 4
+bayes_refine_fraction = 0.5
 # 256 was the strongest pooled scale; larger single updates degraded performance.
 episode_limits = "256"
-# 24 checkpoints / three seeds = an eight-setting optimization budget.
+# 30 checkpoints / three seeds = six coarse settings plus four refined settings.
 search_seed = 2026
 # Zero derives separate run-specific matched suites from run_prefix + search_seed.
 screen_seed_suite = 0
 confirmation_seed_suite = 0
-max_trials = 24
+max_trials = 30
 
 # Successive evaluation stages.
-screen_candidates = 24
+screen_candidates = 30
 # In replicated mode finalists counts parameter settings, so this evaluates six checkpoints.
 finalists = 2
 screen_games_per_side = 100

@@ -1576,6 +1576,105 @@ def hyperparameter_setting_space(
     ))
 
 
+def _rounded_search_float(value: float) -> float:
+    return float(f"{value:.12g}")
+
+
+def local_axis_values(
+    configured_values: list[float],
+    center: float,
+    *,
+    log_scale: bool,
+    fraction: float,
+) -> list[float]:
+    values = sorted(set(configured_values))
+    if len(values) <= 1:
+        return [center]
+    center_index = min(range(len(values)), key=lambda index: abs(values[index] - center))
+    lower_neighbor = values[center_index - 1] if center_index > 0 else None
+    upper_neighbor = values[center_index + 1] if center_index + 1 < len(values) else None
+
+    def interpolate(target: float, amount: float) -> float:
+        if log_scale:
+            return 10 ** (
+                math.log10(center)
+                + amount * (math.log10(target) - math.log10(center))
+            )
+        return center + amount * (target - center)
+
+    if lower_neighbor is None:
+        assert upper_neighbor is not None
+        if log_scale:
+            lower = center / ((upper_neighbor / center) ** fraction)
+        else:
+            lower = max(1e-8, center - fraction * (upper_neighbor - center))
+    else:
+        lower = interpolate(lower_neighbor, fraction)
+    if upper_neighbor is None:
+        assert lower_neighbor is not None
+        if log_scale:
+            upper = center * ((center / lower_neighbor) ** fraction)
+        else:
+            upper = min(1.0, center + fraction * (center - lower_neighbor))
+    else:
+        upper = interpolate(upper_neighbor, fraction)
+    return sorted({_rounded_search_float(lower), center, _rounded_search_float(upper)})
+
+
+def generate_local_refinement_space(
+    center: tuple[float, float, float, float, int],
+    learning_rates: list[float],
+    entropy_coefs: list[float],
+    anchor_kl_coefs: list[float],
+    ppo_clip_epsilons: list[float],
+    *,
+    fraction: float = 0.5,
+) -> list[tuple[float, float, float, float, int]]:
+    axes = (
+        local_axis_values(learning_rates, center[0], log_scale=True, fraction=fraction),
+        local_axis_values(entropy_coefs, center[1], log_scale=True, fraction=fraction),
+        local_axis_values(anchor_kl_coefs, center[2], log_scale=True, fraction=fraction),
+        local_axis_values(ppo_clip_epsilons, center[3], log_scale=False, fraction=fraction),
+    )
+    candidates = [
+        (lr, entropy, anchor, clip, center[4])
+        for lr, entropy, anchor, clip in itertools.product(*axes)
+    ]
+    return sorted(set(candidate for candidate in candidates if candidate != center))
+
+
+def configured_boundary_diagnostics(
+    setting: tuple[float, float, float, float, int],
+    learning_rates: list[float],
+    entropy_coefs: list[float],
+    anchor_kl_coefs: list[float],
+    ppo_clip_epsilons: list[float],
+) -> dict[str, str]:
+    diagnostics: dict[str, str] = {}
+    for name, value, configured in (
+        ("learning_rate", setting[0], learning_rates),
+        ("entropy_coef", setting[1], entropy_coefs),
+        ("anchor_kl_coef", setting[2], anchor_kl_coefs),
+        ("ppo_clip_epsilon", setting[3], ppo_clip_epsilons),
+    ):
+        low = min(configured)
+        high = max(configured)
+        if math.isclose(low, high):
+            position = "fixed"
+        elif value < low and not math.isclose(value, low):
+            position = "below_configured_min"
+        elif math.isclose(value, low):
+            position = "at_configured_min"
+        elif value > high and not math.isclose(value, high):
+            position = "above_configured_max"
+        elif math.isclose(value, high):
+            position = "at_configured_max"
+        else:
+            position = "interior"
+        diagnostics[name] = position
+    return diagnostics
+
+
 def normalized_setting_features(
     settings: list[tuple[float, float, float, float, int]],
 ) -> dict[tuple[float, float, float, float, int], tuple[float, ...]]:
@@ -1829,6 +1928,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-strategy", choices=["random", "bayesian"], default="random")
     parser.add_argument("--bayes-initial-settings", type=positive_int, default=4, help="Space-filling settings evaluated before expected-improvement suggestions")
     parser.add_argument("--bayes-exploration", type=float, default=0.005, help="Expected-improvement exploration margin in win-rate units")
+    parser.add_argument("--bayes-refine-settings", type=nonnegative_int, default=0, help="Settings reserved for a local coarse-to-fine Bayesian phase")
+    parser.add_argument("--bayes-refine-fraction", type=positive_float, default=0.5, help="Fraction of one configured grid step used for local interpolation/extrapolation")
     parser.add_argument("--episode-limits", type=csv_ints, default=[0], help="Nested deterministic PPO data sizes; 0 uses every episode")
     parser.add_argument("--ppo-minibatch-episodes", type=positive_int, default=int_default("ppo_minibatch_episodes"))
     parser.add_argument("--max-trials", type=positive_int, default=18)
@@ -1898,6 +1999,8 @@ def main() -> None:
         raise SystemExit("episode-limits values must be >= 0")
     if args.bayes_exploration < 0.0:
         raise SystemExit("bayes-exploration must be >= 0")
+    if args.bayes_refine_fraction > 1.0:
+        raise SystemExit("bayes-refine-fraction must be <= 1")
     try:
         evaluation_seed_suites = resolve_evaluation_seed_suites(
             args.run_prefix,
@@ -1994,11 +2097,32 @@ def main() -> None:
     evaluation_replicate_indices = {
         shuffle_seed: index for index, shuffle_seed in enumerate(seed_values)
     }
-    setting_budget = min(len(full_setting_space), args.max_trials // len(seed_values))
+    requested_setting_budget = args.max_trials // len(seed_values)
+    coarse_setting_budget = min(len(full_setting_space), requested_setting_budget)
+    refinement_setting_budget = 0
     if bayesian_mode:
+        refinement_setting_budget = min(
+            args.bayes_refine_settings,
+            max(0, requested_setting_budget - 1),
+        )
+        coarse_setting_budget = min(
+            len(full_setting_space),
+            requested_setting_budget - refinement_setting_budget,
+        )
+        minimum_coarse_settings = min(
+            len(full_setting_space),
+            requested_setting_budget,
+            args.bayes_initial_settings,
+        )
+        if coarse_setting_budget < minimum_coarse_settings:
+            coarse_setting_budget = minimum_coarse_settings
+            refinement_setting_budget = max(
+                0, requested_setting_budget - coarse_setting_budget,
+            )
+        setting_budget = coarse_setting_budget + refinement_setting_budget
         initial_settings = select_space_filling_settings(
             full_setting_space,
-            min(args.bayes_initial_settings, setting_budget),
+            min(args.bayes_initial_settings, coarse_setting_budget),
             args.search_seed,
         )
         combinations = [
@@ -2008,6 +2132,7 @@ def main() -> None:
         ]
         planned_trial_count = setting_budget * len(seed_values)
     else:
+        setting_budget = coarse_setting_budget
         try:
             combinations = select_search_combinations(
                 args.learning_rates,
@@ -2048,6 +2173,8 @@ def main() -> None:
             "max_trials": args.max_trials,
             "selection_strategy": args.selection_strategy,
             "setting_budget": setting_budget,
+            "coarse_setting_budget": coarse_setting_budget,
+            "refinement_setting_budget": refinement_setting_budget,
         },
         "staging": {
             "screen_candidates": args.screen_candidates,
@@ -2081,6 +2208,15 @@ def main() -> None:
                 for setting in initial_settings
             ],
             "exploration": args.bayes_exploration,
+            "refinement": {
+                "enabled": bool(bayesian_mode and refinement_setting_budget > 0),
+                "fraction": args.bayes_refine_fraction,
+                "setting_budget": refinement_setting_budget,
+                "status": "pending" if refinement_setting_budget > 0 else "disabled",
+                "center": None,
+                "center_boundary_diagnostics": None,
+                "candidate_count": 0,
+            },
             "suggestions": [],
         },
         "trials": [],
@@ -2198,6 +2334,9 @@ def main() -> None:
             )
             pending_settings = list(initial_settings)
             selected_settings: list[tuple[float, float, float, float, int]] = []
+            selected_setting_phases: list[str] = []
+            refinement_space: list[tuple[float, float, float, float, int]] = []
+            refinement_started = False
             while len(selected_settings) < setting_budget:
                 if not pending_settings:
                     observed_groups = build_hyperparameter_group_summary(
@@ -2205,14 +2344,89 @@ def main() -> None:
                         stage="screen",
                         expected_seeds=seed_values,
                     )
-                    remaining_settings = [
-                        setting for setting in full_setting_space
+                    if (
+                        not refinement_started
+                        and refinement_setting_budget > 0
+                        and len(selected_settings) >= coarse_setting_budget
+                    ):
+                        refinement_started = True
+                        safe_groups = [
+                            summary for summary in observed_groups
+                            if summary.get("complete_seed_group")
+                            and not summary.get("collapse_flags")
+                            and int(summary.get("rejected_trials", 0) or 0) == 0
+                        ]
+                        refinement_payload = (
+                            manifest.get("bayesian_optimization", {}) or {}
+                        ).get("refinement", {}) or {}
+                        if safe_groups:
+                            refinement_center = group_summary_setting_key(safe_groups[0])
+                            refinement_space = generate_local_refinement_space(
+                                refinement_center,
+                                args.learning_rates,
+                                args.entropy_coefs,
+                                args.anchor_kl_coefs,
+                                args.ppo_clip_epsilons,
+                                fraction=args.bayes_refine_fraction,
+                            )
+                            refinement_payload.update({
+                                "status": "running" if refinement_space else "empty_space",
+                                "center": {
+                                    "learning_rate": refinement_center[0],
+                                    "entropy_coef": refinement_center[1],
+                                    "anchor_kl_coef": refinement_center[2],
+                                    "ppo_clip_epsilon": refinement_center[3],
+                                    "episode_limit": refinement_center[4],
+                                },
+                                "center_boundary_diagnostics": configured_boundary_diagnostics(
+                                    refinement_center,
+                                    args.learning_rates,
+                                    args.entropy_coefs,
+                                    args.anchor_kl_coefs,
+                                    args.ppo_clip_epsilons,
+                                ),
+                                "candidate_count": len(refinement_space),
+                            })
+                            reporter.notice(
+                                "starting local Bayesian refinement around "
+                                f"lr={refinement_center[0]:g} entropy={refinement_center[1]:g} "
+                                f"anchor={refinement_center[2]:g} clip={refinement_center[3]:g} "
+                                f"candidates={len(refinement_space)}"
+                            )
+                        else:
+                            refinement_payload["status"] = "no_safe_coarse_center"
+                            reporter.notice(
+                                "local refinement unavailable: no safe coarse setting completed; "
+                                "using remaining coarse-grid budget"
+                            )
+                        bayes_payload = manifest.get("bayesian_optimization", {}) or {}
+                        bayes_payload["refinement"] = refinement_payload
+                        manifest["bayesian_optimization"] = bayes_payload
+
+                    refinement_remaining = [
+                        setting for setting in refinement_space
                         if setting not in selected_settings
                     ]
+                    if refinement_started and refinement_remaining:
+                        selection_phase = "refinement"
+                        remaining_settings = refinement_remaining
+                        surrogate_space = list(dict.fromkeys(
+                            full_setting_space + refinement_space
+                        ))
+                    else:
+                        selection_phase = "coarse"
+                        remaining_settings = [
+                            setting for setting in full_setting_space
+                            if setting not in selected_settings
+                        ]
+                        surrogate_space = full_setting_space
+                    if not remaining_settings:
+                        reporter.notice("Bayesian candidate space exhausted before budget")
+                        break
                     suggestion, acquisition = suggest_bayesian_setting(
                         observed_groups,
                         remaining_settings,
-                        full_setting_space,
+                        surrogate_space,
                         exploration=args.bayes_exploration,
                     )
                     pending_settings.append(suggestion)
@@ -2222,6 +2436,7 @@ def main() -> None:
                     if isinstance(suggestions, list):
                         suggestions.append({
                             "after_completed_settings": len(selected_settings),
+                            "phase": selection_phase,
                             "hyperparameters": {
                                 "learning_rate": suggestion[0],
                                 "entropy_coef": suggestion[1],
@@ -2232,7 +2447,7 @@ def main() -> None:
                             **acquisition,
                         })
                     reporter.notice(
-                        "Bayesian suggestion "
+                        f"Bayesian {selection_phase} suggestion "
                         f"lr={suggestion[0]:g} entropy={suggestion[1]:g} "
                         f"anchor={suggestion[2]:g} clip={suggestion[3]:g} "
                         f"EI={acquisition['expected_improvement']:.6f}"
@@ -2242,8 +2457,10 @@ def main() -> None:
                 setting = pending_settings.pop(0)
                 if setting in selected_settings:
                     continue
+                setting_phase = "refinement" if setting in refinement_space else "coarse"
                 selected_settings.append(setting)
-                state.phase = "training"
+                selected_setting_phases.append(setting_phase)
+                state.phase = f"{setting_phase} training"
                 reporter.refresh()
                 lr, entropy, anchor, clip, episode_limit = setting
                 setting_trials = [
@@ -2253,7 +2470,7 @@ def main() -> None:
                     for seed in seed_values
                 ]
                 if all(not trial.safety_flags for trial in setting_trials):
-                    state.phase = "screening"
+                    state.phase = f"{setting_phase} screening"
                     reporter.refresh()
                     for trial in setting_trials:
                         screen_one(trial)
@@ -2270,9 +2487,19 @@ def main() -> None:
                         "anchor_kl_coef": item[2],
                         "ppo_clip_epsilon": item[3],
                         "episode_limit": item[4],
+                        "phase": phase,
                     }
-                    for item in selected_settings
+                    for item, phase in zip(selected_settings, selected_setting_phases)
                 ]
+                refinement_payload = bayes_payload.get("refinement", {}) or {}
+                if refinement_started and refinement_space:
+                    completed_refinements = sum(
+                        1 for phase in selected_setting_phases if phase == "refinement"
+                    )
+                    refinement_payload["completed_settings"] = completed_refinements
+                    if completed_refinements >= refinement_setting_budget:
+                        refinement_payload["status"] = "completed"
+                    bayes_payload["refinement"] = refinement_payload
                 manifest["bayesian_optimization"] = bayes_payload
                 manifest["trials"] = [trial_payload(item) for item in trials]
                 progress_writer.update(force=True)
@@ -2479,6 +2706,20 @@ def main() -> None:
             ]
             if top_group_trials:
                 top_trial = top_group_trials[0]
+        top_setting = (
+            hyperparameter_setting_key(top_trial.hyperparameters)
+            if top_trial is not None else None
+        )
+        top_boundary_diagnostics = (
+            configured_boundary_diagnostics(
+                top_setting,
+                args.learning_rates,
+                args.entropy_coefs,
+                args.anchor_kl_coefs,
+                args.ppo_clip_epsilons,
+            )
+            if top_setting is not None else None
+        )
         manifest["status"] = "completed"
         manifest["completed_at_unix"] = time.time()
         manifest["ranked_screen_results"] = [trial_payload(trial) for trial in ranked_screen]
@@ -2489,6 +2730,16 @@ def main() -> None:
         manifest["best_result"] = trial_payload(winner) if winner else None
         manifest["best_hyperparameters"] = best_hyperparameters
         manifest["promotion_assessment"] = assessment
+        manifest["boundary_diagnostics"] = {
+            "top_setting": top_boundary_diagnostics,
+            "touches_or_exceeds_configured_boundary": bool(
+                top_boundary_diagnostics
+                and any(
+                    position not in {"interior", "fixed"}
+                    for position in top_boundary_diagnostics.values()
+                )
+            ),
+        }
         if len(set(args.episode_limits)) > 1:
             manifest["data_scale_summary"] = build_data_scale_summary(trials)
         if winner:

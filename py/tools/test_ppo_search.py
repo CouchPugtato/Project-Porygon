@@ -21,6 +21,7 @@ from ppo_search import (
     build_hyperparameter_group_summary,
     build_eval_command,
     build_train_command,
+    configured_boundary_diagnostics,
     evaluation_artifacts_match,
     inferred_policy_tag,
     load_config_args,
@@ -32,6 +33,7 @@ from ppo_search import (
     promotion_assessment,
     resolve_evaluation_seed_suites,
     grouped_promotion_assessment,
+    generate_local_refinement_space,
     run_command,
     select_search_combinations,
     select_space_filling_settings,
@@ -146,6 +148,17 @@ class PpoSearchTests(unittest.TestCase):
             self.assertFalse(args.resume)
             self.assertTrue(args.dashboard)
             self.assertEqual(args.episode_limits, [0])
+
+    def test_default_search_reserves_a_local_refinement_budget(self) -> None:
+        args = parse_search_args([
+            "--run-prefix", "test",
+            "--init-checkpoint", "parent.chk",
+            "--episode-batch", "batch.jsonl",
+        ])
+        self.assertEqual(args.max_trials, 30)
+        self.assertEqual(args.screen_candidates, 30)
+        self.assertEqual(args.bayes_refine_settings, 4)
+        self.assertEqual(args.bayes_refine_fraction, 0.5)
 
     def test_trainer_executable_is_fixed_and_rejected_in_config(self) -> None:
         self.assertEqual(DEFAULT_TRAINER_EXE.as_posix(), "build-fresh/showdown_client.exe")
@@ -607,6 +620,33 @@ class PpoSearchTests(unittest.TestCase):
         self.assertIn(suggestion, remaining)
         self.assertGreaterEqual(acquisition["expected_improvement"], 0.0)
         self.assertGreater(acquisition["predicted_stddev"], 0.0)
+
+    def test_local_refinement_interpolates_and_explores_past_a_boundary(self) -> None:
+        center = (2.5e-6, 1e-4, 0.03, 0.1, 256)
+        candidates = generate_local_refinement_space(
+            center,
+            [2.5e-6, 5e-6, 1e-5],
+            [1e-4, 3e-4],
+            [0.01, 0.03, 0.05],
+            [0.1, 0.2],
+            fraction=0.5,
+        )
+        self.assertEqual(len(candidates), 80)
+        self.assertNotIn(center, candidates)
+        self.assertTrue(any(setting[0] < 2.5e-6 for setting in candidates))
+        self.assertTrue(any(2.5e-6 < setting[0] < 5e-6 for setting in candidates))
+        self.assertTrue(any(setting[1] < 1e-4 for setting in candidates))
+        self.assertTrue(any(setting[3] < 0.1 for setting in candidates))
+
+        diagnostics = configured_boundary_diagnostics(
+            center,
+            [2.5e-6, 5e-6, 1e-5],
+            [1e-4, 3e-4],
+            [0.01, 0.03, 0.05],
+            [0.1, 0.2],
+        )
+        self.assertEqual(diagnostics["learning_rate"], "at_configured_min")
+        self.assertEqual(diagnostics["anchor_kl_coef"], "interior")
 
 
 if __name__ == "__main__":
