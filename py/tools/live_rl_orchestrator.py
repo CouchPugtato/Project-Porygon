@@ -33,6 +33,10 @@ DEFAULT_TRAINER_EXE = Path("build-fresh") / "showdown_client.exe"
 DEFAULT_RUNS_ROOT = Path("matches") / "runs"
 DEFAULT_MODELS_ROOT = Path("models") / "runs"
 SELFPLAY_PROGRESS_RE = re.compile(r"^\[selfplay\].*\bcompleted_games=(\d+)/(\d+)")
+SELFPLAY_STARTUP_RE = re.compile(
+    r"^\[selfplay\].*\blaunching worker pool:.*\binitial_workers=(\d+)"
+)
+SELFPLAY_WORKER_STARTED_RE = re.compile(r"^\[selfplay\].*\bstarted worker_(\d+)_")
 TRAIN_PROGRESS_RE = re.compile(r"^\[train-(?:ppo|rl)\].*\bepisodes=(\d+)/(\d+)")
 TRAIN_ETA_RE = re.compile(r"^\[train\].*\beta=([^\s]+)")
 KEY_VALUE_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -87,6 +91,8 @@ class WorkflowDashboardState:
     evaluation_invalid: dict[str, int] = field(default_factory=lambda: {"a": 0, "b": 0})
     evaluation_attempt_current: int = 0
     evaluation_attempt_total: int = 0
+    evaluation_workers_started: int = 0
+    evaluation_workers_total: int = 0
     active_started_at: float | None = None
     active_eta_seconds: float | None = None
     metrics: dict[str, int | float | str] = field(default_factory=dict)
@@ -138,6 +144,8 @@ class WorkflowDashboardState:
         self.evaluation_invalid[side] = invalid
         self.evaluation_attempt_current = 0
         self.evaluation_attempt_total = attempt_total
+        self.evaluation_workers_started = 0
+        self.evaluation_workers_total = 0
         self.active_started_at = time.monotonic()
         self.active_eta_seconds = None
 
@@ -192,6 +200,8 @@ class WorkflowDashboardState:
                 "valid_target_per_side": self.evaluation_games_per_side,
                 "attempt_current": self.evaluation_attempt_current,
                 "attempt_total": self.evaluation_attempt_total,
+                "workers_started": self.evaluation_workers_started,
+                "workers_total": self.evaluation_workers_total,
             },
             "metrics": dict(self.metrics),
             "collapse_flags": list(self.collapse_flags),
@@ -276,6 +286,19 @@ class BaseWorkflowReporter:
                 self.state.collection_current = current
                 self.state.collection_total = total
             self.state.update_rate_eta(min(current, total), total)
+
+        startup_match = SELFPLAY_STARTUP_RE.search(line)
+        if startup_match and self.state.phase == "evaluation":
+            self.state.evaluation_workers_started = 0
+            self.state.evaluation_workers_total = int(startup_match.group(1))
+
+        worker_started_match = SELFPLAY_WORKER_STARTED_RE.search(line)
+        if worker_started_match and self.state.phase == "evaluation":
+            started = int(worker_started_match.group(1)) + 1
+            self.state.evaluation_workers_started = min(
+                max(self.state.evaluation_workers_started, started),
+                self.state.evaluation_workers_total or started,
+            )
 
         train_match = TRAIN_PROGRESS_RE.search(line)
         if train_match:
@@ -397,6 +420,13 @@ class RichWorkflowReporter(BaseWorkflowReporter):
                 ("PPO training", state.training_current, state.training_total, f"{state.training_current}/{state.training_total} episodes"),
             ))
         if state.evaluation_games_per_side:
+            if state.phase == "evaluation" and state.evaluation_workers_total:
+                rows.append((
+                    "Worker startup",
+                    state.evaluation_workers_started,
+                    state.evaluation_workers_total,
+                    f"{state.evaluation_workers_started}/{state.evaluation_workers_total} workers",
+                ))
             for side in ("a", "b"):
                 valid = state.evaluation_valid[side]
                 invalid = state.evaluation_invalid[side]
@@ -486,6 +516,9 @@ def run_reported_command(
 ) -> None:
     reporter.command_started(command)
     env = os.environ.copy()
+    # Python block-buffering hides nested self-play progress when stdout is
+    # captured by a dashboard. Force child Python tools to stream each line.
+    env["PYTHONUNBUFFERED"] = "1"
     if extra_env:
         env.update(extra_env)
     if raw_log_path:

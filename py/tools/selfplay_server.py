@@ -1708,6 +1708,16 @@ class PoolOrchestrator:
         try:
             await self._start_server()
             await self._start_client()
+            if self.explicit_worker_pairs:
+                initial_pairs = min(self.total_pairs, self.args.concurrent_games)
+                initial_workers = initial_pairs * 2
+            else:
+                initial_pairs = 0
+                initial_workers = self.total_workers
+            self.log(
+                f"launching worker pool: initial_pairs={initial_pairs} "
+                f"initial_workers={initial_workers} total_pairs={self.total_pairs}"
+            )
             await self._start_workers()
             self.log(
                 f"pool ready: target_games={self.target_games_label} concurrent_games={self.args.concurrent_games} "

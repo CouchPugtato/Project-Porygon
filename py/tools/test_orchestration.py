@@ -510,6 +510,20 @@ class WorkflowDashboardTests(unittest.TestCase):
         self.assertEqual(state.evaluation_attempt_current, 16)
         self.assertEqual(state.evaluation_attempt_total, 16)
 
+    def test_reporter_tracks_evaluation_worker_startup(self) -> None:
+        state = WorkflowDashboardState("eval-run", 0, 0, 500, "Balanced evaluation")
+        reporter = BaseWorkflowReporter(state)
+        state.begin_evaluation("a", valid=0, invalid=0, attempt_total=500)
+        reporter.child_line(
+            "[selfplay] launching worker pool: initial_pairs=70 initial_workers=140 total_pairs=125\n"
+        )
+        reporter.child_line("[selfplay] started worker_091_a user=PoryPoolA045 mode=live\n")
+        self.assertEqual(state.evaluation_workers_started, 92)
+        self.assertEqual(state.evaluation_workers_total, 140)
+        payload = state.progress_payload()
+        self.assertEqual(payload["evaluation"]["workers_started"], 92)
+        self.assertEqual(payload["evaluation"]["workers_total"], 140)
+
     def test_reported_command_captures_logs_and_persists_manifest_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
