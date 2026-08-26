@@ -22,6 +22,7 @@ from typing import Literal, TextIO
 import websockets
 
 from rl_defaults import float_default, int_default
+from showdown_determinism import apply_deterministic_battle_seed_patch
 
 
 DEFAULT_SHOWDOWN_DIR = Path("external/pokemon-showdown")
@@ -552,12 +553,21 @@ def pool_coverage_summary(
 
 
 class ServerProcess:
-    def __init__(self, repo_root: Path, showdown_dir: Path, command: list[str], server_uri: str, log_path: Path) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        showdown_dir: Path,
+        command: list[str],
+        server_uri: str,
+        log_path: Path,
+        environment: dict[str, str] | None = None,
+    ) -> None:
         self.repo_root = repo_root
         self.showdown_dir = showdown_dir
         self.command = command
         self.server_uri = server_uri
         self.log_path = log_path
+        self.environment = environment
         self.process: asyncio.subprocess.Process | None = None
         self._stdout_task: asyncio.Task[None] | None = None
         self._log_handle: TextIO | None = None
@@ -570,6 +580,7 @@ class ServerProcess:
         self.process = await asyncio.create_subprocess_exec(
             *self.command,
             cwd=str(self.showdown_dir),
+            env={**os.environ, **self.environment} if self.environment else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             creationflags=child_creationflags(),
@@ -1270,6 +1281,9 @@ class PoolOrchestrator:
             "worker_games": self.worker_games,
             "ensure_shard_count": bool(self.args.ensure_shard_count),
             "format": self.args.format,
+            "pool_seed": self.args.pool_seed,
+            "battle_seed_base": self.args.battle_seed_base,
+            "deterministic_battle_pairing": self.args.battle_seed_base is not None,
             "server_uri": self.server_uri,
             "collection_pool_source": {
                 "model_a_pool_path": str(Path(self.args.model_a_pool).resolve()) if self.args.model_a_pool else "",
@@ -1307,7 +1321,22 @@ class PoolOrchestrator:
         if not showdown_dir.exists():
             raise FileNotFoundError(f"showdown dir not found: {showdown_dir}")
         command = parse_server_start_command(self.args.server_start_command, self.args.server_port)
-        self.server = ServerProcess(self.repo_root, showdown_dir, command, self.server_uri, self.server_log_path)
+        server_environment = None
+        if self.args.battle_seed_base is not None:
+            changed = apply_deterministic_battle_seed_patch(showdown_dir)
+            if changed:
+                self.log("installed deterministic battle/team seed hook in local Showdown checkout")
+            server_environment = {
+                "PORYGON_BATTLE_SEED_BASE": str(self.args.battle_seed_base),
+            }
+        self.server = ServerProcess(
+            self.repo_root,
+            showdown_dir,
+            command,
+            self.server_uri,
+            self.server_log_path,
+            server_environment,
+        )
         self.log(f"starting local showdown server in {showdown_dir}")
         await self.server.start()
         await self.server.wait_until_ready(self.args.startup_timeout_seconds)
@@ -1659,6 +1688,9 @@ class PoolOrchestrator:
             "model_b_workers": self.model_b_workers,
             "server_uri": self.server_uri,
             "format": self.args.format,
+            "pool_seed": self.args.pool_seed,
+            "battle_seed_base": self.args.battle_seed_base,
+            "deterministic_battle_pairing": self.args.battle_seed_base is not None,
             "model_specs": model_specs,
             "model_group_modes": group_modes,
             "group_stats": group_stats,
@@ -1792,6 +1824,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-a-pool", default="")
     parser.add_argument("--model-b-pool", default="")
     parser.add_argument("--pool-seed", type=int, default=None)
+    parser.add_argument("--battle-seed-base", type=nonnegative_int, default=None)
     parser.add_argument("--showdown-dir", default=str(DEFAULT_SHOWDOWN_DIR))
     parser.add_argument("--client-dir", default=str(DEFAULT_CLIENT_DIR))
     parser.add_argument("--server-host", default=DEFAULT_HOST)

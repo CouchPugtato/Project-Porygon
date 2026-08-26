@@ -16,6 +16,7 @@ from ppo_search import (
     SearchDisplayState,
     aggregate_group_stats,
     adaptive_screen_contenders,
+    adaptive_screen_group_contenders,
     build_data_scale_summary,
     build_hyperparameter_group_summary,
     build_eval_command,
@@ -25,6 +26,7 @@ from ppo_search import (
     load_config_args,
     merge_evaluation_results,
     parse_evaluation_progress,
+    paired_evaluation_seed,
     parse_search_args,
     parse_training_progress,
     promotion_assessment,
@@ -37,6 +39,11 @@ from ppo_search import (
     training_artifacts_match,
     valid_outcome_counts,
     wilson_interval,
+)
+from showdown_determinism import (
+    LADDERS_MARKER,
+    ROOM_BATTLE_MARKER,
+    apply_deterministic_battle_seed_patch,
 )
 
 
@@ -245,6 +252,52 @@ class PpoSearchTests(unittest.TestCase):
         challenger.screen_evaluation.confidence_high = 0.42
         self.assertEqual(adaptive_screen_contenders([first, cutoff, challenger], 2, requested, 200), [])
 
+    def test_replicated_adaptive_screening_refines_whole_unresolved_settings(self) -> None:
+        def group(lr: float, low: float, high: float) -> dict[str, object]:
+            return {
+                "hyperparameters": {
+                    "learning_rate": lr,
+                    "entropy_coef": 1e-4,
+                    "anchor_kl_coef": 0.01,
+                    "ppo_clip_epsilon": 0.2,
+                    "episode_limit": 256,
+                },
+                "complete_seed_group": True,
+                "collapse_flags": [],
+                "rejected_trials": 0,
+                "confidence_low": low,
+                "confidence_high": high,
+            }
+
+        first = group(2.5e-6, 0.47, 0.65)
+        cutoff = group(5e-6, 0.43, 0.61)
+        challenger = group(1e-5, 0.39, 0.52)
+        keys = [
+            (2.5e-6, 1e-4, 0.01, 0.2, 256),
+            (5e-6, 1e-4, 0.01, 0.2, 256),
+            (1e-5, 1e-4, 0.01, 0.2, 256),
+        ]
+        requested = {key: 100 for key in keys}
+        self.assertEqual(
+            adaptive_screen_group_contenders(
+                [first, cutoff, challenger], 2, requested, 200,
+            ),
+            keys,
+        )
+        challenger["confidence_high"] = 0.42
+        self.assertEqual(
+            adaptive_screen_group_contenders(
+                [first, cutoff, challenger], 2, requested, 200,
+            ),
+            [],
+        )
+
+    def test_paired_evaluation_seed_is_shared_within_a_block(self) -> None:
+        screen_seed = paired_evaluation_seed(2026, "screen", 2)
+        self.assertEqual(screen_seed, paired_evaluation_seed(2026, "screen", 2))
+        self.assertNotEqual(screen_seed, paired_evaluation_seed(2026, "screen", 3))
+        self.assertNotEqual(screen_seed, paired_evaluation_seed(2026, "final", 2))
+
     def test_promotion_gate_distinguishes_no_tentative_and_confident_winner(self) -> None:
         trial = SimpleNamespace(run_name="candidate", final_evaluation=self.evaluation("final", 49, 100, 0.39, 0.59))
         winner, assessment = promotion_assessment([trial], 0.5, 0.5)
@@ -317,6 +370,8 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model-b-pool") + 1], "")
         self.assertEqual(command[command.index("--model-a") + 1], "parent.chk")
         self.assertEqual(command[command.index("--model-b") + 1], "candidate.chk")
+        self.assertEqual(command[command.index("--pool-seed") + 1], "7")
+        self.assertEqual(command[command.index("--battle-seed-base") + 1], "7")
 
     def test_safety_flags_reject_hard_stop_and_inactive_anchor(self) -> None:
         flags = training_safety_flags({
@@ -384,13 +439,46 @@ class PpoSearchTests(unittest.TestCase):
             summary.write_text(json.dumps({
                 "status": "completed",
                 "target_games": 250,
+                "battle_seed_base": 7,
                 "model_specs": {
                     "a": {"kind": "checkpoint", "path": str(candidate)},
                     "b": {"kind": "checkpoint", "path": str(parent)},
                 },
             }), encoding="utf-8")
             self.assertTrue(evaluation_artifacts_match(summary, candidate, parent, 250))
+            self.assertTrue(evaluation_artifacts_match(summary, candidate, parent, 250, 7))
+            self.assertFalse(evaluation_artifacts_match(summary, candidate, parent, 250, 8))
             self.assertFalse(evaluation_artifacts_match(summary, parent, candidate, 250))
+
+    def test_showdown_seed_patch_is_opt_in_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            server = root / "server"
+            server.mkdir()
+            (server / "ladders.ts").write_text("""const PERIODIC_MATCH_INTERVAL = 60 * SECONDS;
+\t\tconst delayedStart = format.playerCount > players.length ? 'multi' : false;
+\t\treturn Rooms.createBattle({
+\t\t\tformat: formatid,
+\t\t\tplayers,
+\t\t\trated: minRating,
+\t\t\tchallengeType: readies[0].challengeType,
+\t\t\tdelayedStart,
+\t\t});
+""", encoding="utf-8")
+            (server / "room-battle.ts").write_text("""\tseed?: PRNGSeed;
+\troomid?: RoomID;
+\t\t\tconst options = {
+\t\t\t\tname: player.name,
+\t\t\t\tavatar: user.avatar,
+\t\t\t\tteam: playerOpts?.team,
+\t\t\t};
+""", encoding="utf-8")
+            self.assertTrue(apply_deterministic_battle_seed_patch(root))
+            self.assertFalse(apply_deterministic_battle_seed_patch(root))
+            self.assertIn(LADDERS_MARKER, (server / "ladders.ts").read_text(encoding="utf-8"))
+            room_source = (server / "room-battle.ts").read_text(encoding="utf-8")
+            self.assertIn(ROOM_BATTLE_MARKER, room_source)
+            self.assertIn("seed: this.options.playerSeeds?.[player.num - 1]", room_source)
 
     def test_valid_outcomes_exclude_disconnect_and_forfeit_results(self) -> None:
         candidate = {"matches_played": 100, "wins": 53, "earned_wins": 49, "draws": 2}

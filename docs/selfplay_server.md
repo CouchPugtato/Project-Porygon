@@ -81,6 +81,10 @@ Important flags:
   - if a model spec is exactly `random`, that worker group always uses random mode
 - `--model-a-weight` / `--model-b-weight`
   - population split across the fixed worker pool
+- `--battle-seed-base`
+  - optional deterministic seed sequence for the battle simulator and both random teams
+  - intended for matched research evaluations; omit it for ordinary self-play collection
+  - installs an idempotent, environment-gated hook in the ignored local Showdown checkout
 - `--worker-pairs`
   - explicit shard-producing pair count
   - enables queued shard mode
@@ -99,6 +103,7 @@ Notes:
 - you can set it up with:
   - `python py/tools/setup_showdown_local.py`
 - that setup helper also clones and builds the local client
+- the setup helper installs the dormant deterministic-evaluation hook in the local server; it only activates when `--battle-seed-base` is supplied
 - if the client build step fails, the runner can still try serving `testclient-old.html` from the cloned client repo
 - if the Showdown server exits unexpectedly, the run fails and workers are terminated
 - worker disconnects are handled first by communicator reconnect logic; if a worker exits, the orchestrator respawns it before shutdown begins

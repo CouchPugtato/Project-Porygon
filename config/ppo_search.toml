@@ -25,7 +25,8 @@ screen_candidates = 24
 # In replicated mode finalists counts parameter settings, so this evaluates six checkpoints.
 finalists = 2
 screen_games_per_side = 100
-adaptive_screen = false
+# Expand only pooled settings whose confidence intervals still overlap the finalist cutoff.
+adaptive_screen = true
 screen_game_block_per_side = 100
 screen_max_games_per_side = 200
 final_games_per_side = 300

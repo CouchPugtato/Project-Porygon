@@ -965,7 +965,7 @@ def build_eval_command(
     parent_checkpoint: Path,
     candidate_side: str,
     games: int,
-    pool_seed: int,
+    paired_seed_base: int,
 ) -> list[str]:
     model_a = candidate_checkpoint if candidate_side == "a" else parent_checkpoint
     model_b = parent_checkpoint if candidate_side == "a" else candidate_checkpoint
@@ -981,7 +981,8 @@ def build_eval_command(
         "--model-a", str(model_a),
         "--model-b-pool", "",
         "--model-b", str(model_b),
-        "--pool-seed", str(pool_seed),
+        "--pool-seed", str(paired_seed_base),
+        "--battle-seed-base", str(paired_seed_base),
         "--format", args.format,
         "--worker-think-mode", "live",
         "--serve-client", "1",
@@ -1125,6 +1126,7 @@ def evaluation_artifacts_match(
     model_a: Path,
     model_b: Path,
     requested_games: int,
+    paired_seed_base: int | None = None,
 ) -> bool:
     try:
         summary = load_json(summary_path)
@@ -1138,6 +1140,10 @@ def evaluation_artifacts_match(
             and bool(recorded_b)
             and resolve_path(resolve_repo_root(), recorded_a) == model_a.resolve()
             and resolve_path(resolve_repo_root(), recorded_b) == model_b.resolve()
+            and (
+                paired_seed_base is None
+                or int(summary.get("battle_seed_base", -1)) == paired_seed_base
+            )
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
@@ -1164,7 +1170,7 @@ def run_balanced_evaluation(
     baseline_stats: dict[str, object] = {}
     run_names: list[str] = []
     candidate_checkpoint = Path(trial.checkpoint_path)
-    for side_index, side in enumerate(("a", "b")):
+    for side in ("a", "b"):
         block_token = f"_block_{block_index:02d}" if block_index > 0 else ""
         model_a = candidate_checkpoint if side == "a" else parent_checkpoint
         model_b = parent_checkpoint if side == "a" else candidate_checkpoint
@@ -1191,12 +1197,15 @@ def run_balanced_evaluation(
                 args.resume
                 and trial.training_reused
                 and summary_path.exists()
-                and evaluation_artifacts_match(summary_path, model_a, model_b, valid_shortfall)
+                and evaluation_artifacts_match(
+                    summary_path, model_a, model_b, valid_shortfall,
+                    seed_base + (attempt - 1) * 1000000,
+                )
             )
             if not can_resume:
                 run_command(build_eval_command(
                     args, repo_root, run_name, candidate_checkpoint, parent_checkpoint,
-                    side, valid_shortfall, seed_base + side_index + (attempt - 1) * 100,
+                    side, valid_shortfall, seed_base + (attempt - 1) * 1000000,
                 ), repo_root, reporter, logs_dir / f"{run_name}.log" if args.dashboard_write_raw_logs else None)
             summary = load_json(summary_path)
             if summary.get("status") != "completed":
@@ -1291,6 +1300,43 @@ def adaptive_screen_contenders(
         trial for trial in unresolved
         if requested_games_per_side.get(trial.run_name, 0) < max_games_per_side
     ]
+
+
+def adaptive_screen_group_contenders(
+    ranked_groups: list[dict[str, object]],
+    finalist_count: int,
+    requested_games_per_side: dict[tuple[float, float, float, float, int], int],
+    max_games_per_side: int,
+) -> list[tuple[float, float, float, float, int]]:
+    """Return unresolved replicated settings while preserving equal seed budgets."""
+    usable = [
+        summary for summary in ranked_groups
+        if summary.get("complete_seed_group")
+        and not summary.get("collapse_flags")
+        and int(summary.get("rejected_trials", 0) or 0) == 0
+    ]
+    if finalist_count <= 0 or len(usable) <= finalist_count:
+        return []
+    provisional = usable[:finalist_count]
+    cutoff_low = float(provisional[-1].get("confidence_low", 0.0) or 0.0)
+    challengers = [
+        summary for summary in usable[finalist_count:]
+        if float(summary.get("confidence_high", 1.0) or 1.0) >= cutoff_low
+    ]
+    if not challengers:
+        return []
+    return [
+        group_summary_setting_key(summary)
+        for summary in provisional + challengers
+        if requested_games_per_side.get(group_summary_setting_key(summary), 0)
+        < max_games_per_side
+    ]
+
+
+def paired_evaluation_seed(search_seed: int, stage: str, block_index: int) -> int:
+    """Create a candidate-independent seed for one matched evaluation block."""
+    stage_offset = 100000000 if stage == "final" else 0
+    return abs(search_seed) * 1000000000 + stage_offset + block_index * 10000
 
 
 def promotion_assessment(
@@ -1809,11 +1855,6 @@ def main() -> None:
         raise SystemExit("bayes-exploration must be >= 0")
     replicate_seed_count = len(set(args.shuffle_seeds))
     if args.replicate_ranking and replicate_seed_count > 1:
-        if args.adaptive_screen:
-            raise SystemExit(
-                "replicate-ranking with multiple seeds requires adaptive-screen=false "
-                "so every seed receives an equal evaluation budget"
-            )
         if args.max_trials < replicate_seed_count or args.screen_candidates < replicate_seed_count:
             raise SystemExit(
                 "replicate-ranking must train and screen at least one complete seed group; "
@@ -1956,6 +1997,8 @@ def main() -> None:
             "finalists": args.finalists,
             "screen_games_per_side": args.screen_games_per_side,
             "adaptive_screen": args.adaptive_screen,
+            "paired_evaluation_seeds": True,
+            "paired_seed_scope": "shared by every candidate, training replicate, and player side within each stage/block",
             "screen_game_block_per_side": args.screen_game_block_per_side,
             "screen_max_games_per_side": args.screen_max_games_per_side,
             "final_games_per_side": args.final_games_per_side,
@@ -2001,6 +2044,7 @@ def main() -> None:
         replicated_mode = args.replicate_ranking and len(set(args.shuffle_seeds)) > 1
         screen_trials: list[TrialResult] = []
         requested_screen_games: dict[str, int] = {}
+        requested_group_screen_games: dict[tuple[float, float, float, float, int], int] = {}
 
         def train_one(params: Hyperparameters) -> TrialResult:
             index = len(trials) + 1
@@ -2059,10 +2103,13 @@ def main() -> None:
             trial.screen_evaluation = run_balanced_evaluation(
                 args, repo_root, trial, parent_checkpoint, "screen",
                 args.screen_games_per_side,
-                args.search_seed * 1000 + trial_index * 10,
+                paired_evaluation_seed(args.search_seed, "screen", 1),
                 trial_index, reporter, state, logs_dir, block_index=1,
             )
             requested_screen_games[trial.run_name] = args.screen_games_per_side
+            requested_group_screen_games[
+                hyperparameter_setting_key(trial.hyperparameters)
+            ] = args.screen_games_per_side
             screen_trials.append(trial)
             state.screened_count += 1
             state.trial_status[trial.run_name] = "screened"
@@ -2206,17 +2253,35 @@ def main() -> None:
         ranked_screen = sorted(screen_trials, key=evaluation_rank_key, reverse=True)
         adaptive_block_index = 1
         while args.adaptive_screen:
-            contenders = adaptive_screen_contenders(
-                ranked_screen,
-                min(args.finalists, len(ranked_screen)),
-                requested_screen_games,
-                args.screen_max_games_per_side,
-            )
+            if replicated_mode:
+                adaptive_groups = build_hyperparameter_group_summary(
+                    screen_trials, stage="screen", expected_seeds=args.shuffle_seeds,
+                )
+                contender_keys = set(adaptive_screen_group_contenders(
+                    adaptive_groups,
+                    min(args.finalists, len(adaptive_groups)),
+                    requested_group_screen_games,
+                    args.screen_max_games_per_side,
+                ))
+                contenders = [
+                    trial for trial in screen_trials
+                    if hyperparameter_setting_key(trial.hyperparameters) in contender_keys
+                ]
+            else:
+                contender_keys = set()
+                contenders = adaptive_screen_contenders(
+                    ranked_screen,
+                    min(args.finalists, len(ranked_screen)),
+                    requested_screen_games,
+                    args.screen_max_games_per_side,
+                )
             if not contenders:
                 break
             adaptive_block_index += 1
             reporter.notice(
-                f"adaptive screening block {adaptive_block_index}: refining {len(contenders)} unresolved candidates"
+                f"adaptive screening block {adaptive_block_index}: refining "
+                f"{len(contender_keys) if replicated_mode else len(contenders)} unresolved "
+                f"{'settings' if replicated_mode else 'candidates'}"
             )
             for trial in contenders:
                 remaining = args.screen_max_games_per_side - requested_screen_games[trial.run_name]
@@ -2228,12 +2293,15 @@ def main() -> None:
                 addition = run_balanced_evaluation(
                     args, repo_root, trial, parent_checkpoint, "screen",
                     block_games,
-                    args.search_seed * 1000000 + adaptive_block_index * 10000 + trial_indices[trial.run_name] * 10,
+                    paired_evaluation_seed(args.search_seed, "screen", adaptive_block_index),
                     trial_indices[trial.run_name], reporter, state, logs_dir,
                     block_index=adaptive_block_index,
                 )
                 trial.screen_evaluation = merge_evaluation_results(trial.screen_evaluation, addition)
                 requested_screen_games[trial.run_name] += block_games
+                requested_group_screen_games[
+                    hyperparameter_setting_key(trial.hyperparameters)
+                ] = requested_screen_games[trial.run_name]
                 state.trial_status[trial.run_name] = "screened"
                 manifest["trials"] = [trial_payload(item) for item in trials]
                 progress_writer.update(force=True)
@@ -2267,10 +2335,10 @@ def main() -> None:
         state.final_plan_finalized = True
         state.final_games_planned = 2 * len(finalists) * args.final_games_per_side
         reporter.refresh()
-        for index, trial in enumerate(finalists, start=1):
+        for trial in finalists:
             trial.final_evaluation = run_balanced_evaluation(
                 args, repo_root, trial, parent_checkpoint, "final",
-                args.final_games_per_side, args.search_seed * 100000 + index * 10,
+                args.final_games_per_side, paired_evaluation_seed(args.search_seed, "final", 1),
                 trial_indices[trial.run_name], reporter, state, logs_dir, block_index=1,
             )
             state.finalized_count += 1

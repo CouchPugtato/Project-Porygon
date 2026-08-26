@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from showdown_determinism import apply_deterministic_battle_seed_patch
+
 
 DEFAULT_SERVER_REPO_URL = "https://github.com/smogon/pokemon-showdown.git"
 DEFAULT_SERVER_TARGET_DIR = Path("external/pokemon-showdown")
@@ -113,6 +115,9 @@ def main() -> None:
             force=args.force,
             build_client=False,
         )
+        server_dir = (repo_root / args.server_target_dir).resolve()
+        if apply_deterministic_battle_seed_patch(server_dir):
+            print(f"[setup_showdown_local] installed deterministic evaluation seed hook: {server_dir}")
 
     if not args.skip_client:
         ensure_repo(
