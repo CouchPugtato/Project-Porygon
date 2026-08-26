@@ -26,6 +26,14 @@ screen_seed_suite = 0
 confirmation_seed_suite = 0
 max_trials = 30
 
+# Finalist robustness suite: parent/champion plus two distinct active histories.
+confirmation_registry = "models/league/current_arch/league_registry.json"
+confirmation_opponents = ""
+confirmation_historical_opponents = 2
+confirmation_max_opponents = 3
+confirmation_non_regression_threshold = 0.50
+confirmation_dominance_spread = 0.10
+
 # Successive evaluation stages.
 screen_candidates = 30
 # In replicated mode finalists counts parameter settings, so this evaluates six checkpoints.
@@ -36,6 +44,9 @@ adaptive_screen = true
 screen_game_block_per_side = 100
 screen_max_games_per_side = 200
 final_games_per_side = 300
+confirmation_games_per_side = 100
+confirmation_adaptive = true
+confirmation_game_block_per_side = 100
 
 # A top-ranked result is only a winner above 50%; confidence is reported separately.
 promotion_min_win_rate = 0.50

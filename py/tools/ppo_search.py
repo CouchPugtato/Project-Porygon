@@ -125,6 +125,10 @@ def csv_ints(value: str) -> list[int]:
     return values
 
 
+def csv_strings(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
 def resolve_repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -134,6 +138,133 @@ def resolve_path(repo_root: Path, value: str | Path) -> Path:
     if path.is_absolute():
         return path
     return (repo_root / path).resolve()
+
+
+def safe_name_token(value: str) -> str:
+    token = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
+    return token or "opponent"
+
+
+def discover_confirmation_opponents(
+    repo_root: Path,
+    parent_checkpoint: Path,
+    registry_value: str,
+    explicit_paths: list[str],
+    historical_limit: int,
+    max_opponents: int,
+) -> tuple[list[ConfirmationOpponent], dict[str, object]]:
+    candidates: list[ConfirmationOpponent] = [ConfirmationOpponent(
+        id="parent",
+        checkpoint_path=str(parent_checkpoint.resolve()),
+        source="evaluation_parent",
+        role="parent",
+    )]
+    warnings: list[str] = []
+    registry_path: Path | None = None
+    registry_loaded = False
+    if registry_value.strip():
+        registry_path = resolve_path(repo_root, registry_value)
+        if registry_path.exists():
+            registry = load_json(registry_path)
+            members = [
+                member for member in (registry.get("members", []) or [])
+                if isinstance(member, dict)
+            ]
+            champion_id = str(registry.get("champion_id", "")).strip()
+            champion = next(
+                (member for member in members if str(member.get("id", "")) == champion_id),
+                None,
+            )
+            if champion is not None and str(champion.get("path", "")).strip():
+                candidates.append(ConfirmationOpponent(
+                    id=champion_id or "champion",
+                    checkpoint_path=str(resolve_path(repo_root, str(champion.get("path", "")))),
+                    source=str(registry_path),
+                    role="champion",
+                ))
+            historical = [
+                member for member in members
+                if str(member.get("role", "")) == "historical_snapshot"
+                and str(member.get("status", "")) == "active"
+                and str(member.get("path", "")).strip()
+            ]
+            champion_opponent_stats = (
+                champion.get("opponent_stats", {})
+                if isinstance(champion, dict) else {}
+            ) or {}
+            def historical_rank(member: dict[str, object]) -> tuple[object, ...]:
+                raw_stats = champion_opponent_stats.get(str(member.get("id", "")), {})
+                stats = raw_stats if isinstance(raw_stats, dict) else {}
+                return (
+                    1 if stats else 0,
+                    1.0 - float(stats.get("recent_win_rate", 0.5) or 0.5),
+                    int(member.get("generation", 0) or 0),
+                    str(member.get("promoted_at", "")),
+                    str(member.get("created_at", "")),
+                    str(member.get("id", "")),
+                )
+            historical.sort(key=historical_rank, reverse=True)
+            for member in historical[:historical_limit]:
+                candidates.append(ConfirmationOpponent(
+                    id=str(member.get("id", "historical")),
+                    checkpoint_path=str(resolve_path(repo_root, str(member.get("path", "")))),
+                    source=str(registry_path),
+                    role="historical",
+                    protected=False,
+                ))
+            registry_loaded = True
+        else:
+            warnings.append(f"confirmation registry not found: {registry_path}")
+
+    explicit_candidates = [ConfirmationOpponent(
+        id=f"explicit_{index}_{Path(value).stem}",
+        checkpoint_path=str(resolve_path(repo_root, value)),
+        source="explicit",
+        role="explicit",
+    ) for index, value in enumerate(explicit_paths, start=1)]
+    candidates[1:1] = explicit_candidates
+
+    selected: list[ConfirmationOpponent] = []
+    seen_paths: dict[str, str] = {}
+    duplicates: list[dict[str, str]] = []
+    used_ids: set[str] = set()
+    for candidate in candidates:
+        checkpoint = Path(candidate.checkpoint_path).resolve()
+        if not checkpoint.is_file():
+            if candidate.source == "explicit":
+                raise FileNotFoundError(f"confirmation opponent not found: {checkpoint}")
+            warnings.append(f"skipped missing {candidate.role} checkpoint: {checkpoint}")
+            continue
+        path_key = os.path.normcase(str(checkpoint))
+        if path_key in seen_paths:
+            duplicates.append({"id": candidate.id, "same_as": seen_paths[path_key]})
+            continue
+        if len(selected) >= max_opponents:
+            break
+        base_id = safe_name_token(candidate.id)
+        opponent_id = base_id
+        suffix = 2
+        while opponent_id in used_ids:
+            opponent_id = f"{base_id}_{suffix}"
+            suffix += 1
+        selected.append(ConfirmationOpponent(
+            id=opponent_id,
+            checkpoint_path=str(checkpoint),
+            source=candidate.source,
+            role=candidate.role,
+            protected=candidate.protected,
+        ))
+        used_ids.add(opponent_id)
+        seen_paths[path_key] = opponent_id
+    return selected, {
+        "registry_path": str(registry_path) if registry_path is not None else "",
+        "registry_loaded": registry_loaded,
+        "historical_limit": historical_limit,
+        "historical_selection": "hardest recorded champion matchups, then recency",
+        "max_opponents": max_opponents,
+        "duplicates": duplicates,
+        "warnings": warnings,
+    }
 
 
 def log(message: str) -> None:
@@ -191,6 +322,15 @@ class Hyperparameters:
     ppo_clip_epsilon: float
     shuffle_seed: int
     episode_limit: int = 0
+
+
+@dataclass(frozen=True)
+class ConfirmationOpponent:
+    id: str
+    checkpoint_path: str
+    source: str
+    role: str
+    protected: bool = True
 
 
 def hyperparameter_setting_key(params: Hyperparameters) -> tuple[float, float, float, float, int]:
@@ -416,6 +556,7 @@ class TrialResult:
     training_reused: bool
     screen_evaluation: EvaluationResult | None = None
     final_evaluation: EvaluationResult | None = None
+    confirmation_evaluations: dict[str, EvaluationResult] = field(default_factory=dict)
 
 
 def format_duration(seconds: float | None) -> str:
@@ -1164,6 +1305,7 @@ def run_balanced_evaluation(
     state: SearchDisplayState,
     logs_dir: Path,
     block_index: int = 0,
+    run_suffix: str = "",
 ) -> EvaluationResult:
     total_games = 0
     total_wins = 0
@@ -1185,12 +1327,12 @@ def run_balanced_evaluation(
                 break
             attempt_token = "" if attempt == 1 else f"_attempt_{attempt:02d}"
             run_name = (
-                f"{trial.run_name}_{stage}{block_token}_side_{side}_{games_per_side}"
+                f"{trial.run_name}_{stage}{run_suffix}{block_token}_side_{side}_{games_per_side}"
                 f"{attempt_token}"
             )
             state.begin_operation(
                 "evaluation", trial.run_name, trial_index, trial.hyperparameters,
-                valid_shortfall, stage=stage, side=side,
+                valid_shortfall, stage=f"{stage}{run_suffix}", side=side,
             )
             reporter.refresh()
             summary_path = evaluation_summary_path(repo_root, run_name)
@@ -1226,7 +1368,7 @@ def run_balanced_evaluation(
             else:
                 state.final_games_completed += min(added_valid, valid_shortfall)
             reporter.notice(
-                f"{stage} {trial.run_name} side {side.upper()}: "
+                f"{stage}{run_suffix} {trial.run_name} side {side.upper()}: "
                 f"valid={int(after['valid_games'])}/{games_per_side} "
                 f"invalid={int(after['invalid_games'])} raw={int(after['raw_games'])}"
             )
@@ -1374,10 +1516,14 @@ def paired_evaluation_seed(
     seed_suite: int,
     block_index: int,
     replicate_index: int = 0,
+    opponent_index: int = 0,
 ) -> int:
     """Create a setting-independent seed for one replicate/block pair."""
+    seed_material = f"project-porygon-eval:{seed_suite}:{replicate_index}:{block_index}"
+    if opponent_index > 0:
+        seed_material += f":opponent:{opponent_index}"
     digest = hashlib.sha256(
-        f"project-porygon-eval:{seed_suite}:{replicate_index}:{block_index}".encode("utf-8")
+        seed_material.encode("utf-8")
     ).digest()
     return 1 + (int.from_bytes(digest[:6], "big") % MAX_SHOWDOWN_SEED_BASE)
 
@@ -1484,6 +1630,7 @@ def build_hyperparameter_group_summary(
     *,
     stage: str,
     expected_seeds: list[int],
+    confirmation_opponent: str = "",
 ) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
     expected = sorted(set(expected_seeds))
@@ -1494,7 +1641,10 @@ def build_hyperparameter_group_summary(
         seed_results: list[dict[str, object]] = []
         evaluated_seeds: list[int] = []
         for trial in group:
-            result = trial.final_evaluation if stage == "final" else trial.screen_evaluation
+            if stage == "final" and confirmation_opponent:
+                result = trial.confirmation_evaluations.get(confirmation_opponent)
+            else:
+                result = trial.final_evaluation if stage == "final" else trial.screen_evaluation
             if result is None:
                 continue
             evaluated_seeds.append(trial.hyperparameters.shuffle_seed)
@@ -1548,6 +1698,133 @@ def hyperparameter_group_rank_key(summary: dict[str, object]) -> tuple[int, int,
         float(summary.get("valid_win_rate", 0.0) or 0.0),
         int(summary.get("valid_games", 0) or 0),
     )
+
+
+def robust_confirmation_group_rank_key(
+    summary: dict[str, object],
+) -> tuple[int, int, int, float, float, float, int]:
+    return (
+        1 if summary.get("complete_seed_group") else 0,
+        1 if not summary.get("collapse_flags") and int(summary.get("rejected_trials", 0) or 0) == 0 else 0,
+        1 if summary.get("all_opponents_non_regression") else 0,
+        float(summary.get("confidence_low", 0.0) or 0.0),
+        float(summary.get("worst_opponent_confidence_low", 0.0) or 0.0),
+        float(summary.get("valid_win_rate", 0.0) or 0.0),
+        int(summary.get("valid_games", 0) or 0),
+    )
+
+
+def build_robust_confirmation_group_summary(
+    trials: list[TrialResult],
+    *,
+    expected_seeds: list[int],
+    opponents: list[ConfirmationOpponent],
+    non_regression_threshold: float,
+    dominance_spread: float,
+) -> list[dict[str, object]]:
+    pooled_groups = build_hyperparameter_group_summary(
+        trials, stage="final", expected_seeds=expected_seeds,
+    )
+    opponent_groups = {
+        opponent.id: {
+            group_summary_setting_key(summary): summary
+            for summary in build_hyperparameter_group_summary(
+                trials,
+                stage="final",
+                expected_seeds=expected_seeds,
+                confirmation_opponent=opponent.id,
+            )
+        }
+        for opponent in opponents
+    }
+    enriched: list[dict[str, object]] = []
+    for pooled in pooled_groups:
+        key = group_summary_setting_key(pooled)
+        matchup_results: list[dict[str, object]] = []
+        rates: list[float] = []
+        regression_opponents: list[str] = []
+        for opponent in opponents:
+            summary = opponent_groups[opponent.id].get(key)
+            if summary is None:
+                regression_opponents.append(opponent.id)
+                continue
+            rate = float(summary.get("valid_win_rate", 0.0) or 0.0)
+            high = float(summary.get("confidence_high", 1.0) or 1.0)
+            rates.append(rate)
+            regression_detected = bool(
+                opponent.protected and high < non_regression_threshold
+            )
+            if regression_detected:
+                regression_opponents.append(opponent.id)
+            matchup_results.append({
+                "opponent_id": opponent.id,
+                "role": opponent.role,
+                "source": opponent.source,
+                "checkpoint_path": opponent.checkpoint_path,
+                "protected": opponent.protected,
+                "regression_detected": regression_detected,
+                "valid_games": int(summary.get("valid_games", 0) or 0),
+                "invalid_games": int(summary.get("invalid_games", 0) or 0),
+                "valid_win_rate": rate,
+                "confidence_low": float(summary.get("confidence_low", 0.0) or 0.0),
+                "confidence_high": high,
+                "collapse_flags": list(summary.get("collapse_flags", []) or []),
+                "complete_seed_group": bool(summary.get("complete_seed_group")),
+            })
+        spread = (max(rates) - min(rates)) if rates else 0.0
+        payload = dict(pooled)
+        payload.update({
+            "opponents": matchup_results,
+            "opponent_count": len(matchup_results),
+            "all_opponents_complete": len(matchup_results) == len(opponents) and all(
+                bool(item.get("complete_seed_group")) for item in matchup_results
+            ),
+            "all_opponents_non_regression": not regression_opponents,
+            "regression_opponents": regression_opponents,
+            "worst_opponent_confidence_low": min(
+                (float(item["confidence_low"]) for item in matchup_results),
+                default=0.0,
+            ),
+            "matchup_win_rate_spread": spread,
+            "favorable_matchup_dominance": spread >= dominance_spread,
+            "dominance_spread_threshold": dominance_spread,
+            "non_regression_threshold": non_regression_threshold,
+        })
+        enriched.append(payload)
+    return sorted(enriched, key=robust_confirmation_group_rank_key, reverse=True)
+
+
+def unresolved_confirmation_setting_opponents(
+    trials: list[TrialResult],
+    *,
+    expected_seeds: list[int],
+    opponents: list[ConfirmationOpponent],
+    requested_games_per_side: dict[
+        tuple[tuple[float, float, float, float, int], str], int
+    ],
+    threshold: float,
+    max_games_per_side: int,
+) -> set[tuple[tuple[float, float, float, float, int], str]]:
+    unresolved: set[tuple[tuple[float, float, float, float, int], str]] = set()
+    for opponent in opponents:
+        groups = build_hyperparameter_group_summary(
+            trials,
+            stage="final",
+            expected_seeds=expected_seeds,
+            confirmation_opponent=opponent.id,
+        )
+        for summary in groups:
+            key = group_summary_setting_key(summary)
+            requested = requested_games_per_side.get((key, opponent.id), 0)
+            if (
+                summary.get("complete_seed_group")
+                and not summary.get("collapse_flags")
+                and requested < max_games_per_side
+                and float(summary.get("confidence_low", 0.0) or 0.0) < threshold
+                <= float(summary.get("confidence_high", 1.0) or 1.0)
+            ):
+                unresolved.add((key, opponent.id))
+    return unresolved
 
 
 def group_summary_setting_key(
@@ -1906,6 +2183,73 @@ def grouped_promotion_assessment(
     }
 
 
+def robust_grouped_promotion_assessment(
+    ranked_groups: list[dict[str, object]],
+    minimum_win_rate: float,
+    confidence_threshold: float,
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    if not ranked_groups:
+        return None, {
+            "status": "no_finalist",
+            "selection_scope": "multi_opponent_pooled_hyperparameter_setting",
+            "promotion_confident": False,
+        }
+    top = ranked_groups[0]
+    complete = bool(top.get("complete_seed_group")) and bool(
+        top.get("all_opponents_complete")
+    )
+    collapse_free = not top.get("collapse_flags") and int(
+        top.get("rejected_trials", 0) or 0
+    ) == 0
+    non_regression = bool(top.get("all_opponents_non_regression"))
+    point = float(top.get("valid_win_rate", 0.0) or 0.0)
+    low = float(top.get("confidence_low", 0.0) or 0.0)
+    clears_point = point > minimum_win_rate
+    clears_confidence = low > confidence_threshold
+    winner = top if complete and collapse_free and non_regression and clears_point else None
+    if not complete:
+        status = "incomplete_opponent_evaluation"
+    elif not collapse_free:
+        status = "collapse_rejected"
+    elif not non_regression:
+        status = "opponent_regression"
+    elif not clears_point:
+        status = "no_winner"
+    elif clears_confidence:
+        status = "confident_winner"
+    else:
+        status = "tentative_winner"
+    return winner, {
+        "status": status,
+        "selection_scope": "multi_opponent_pooled_hyperparameter_setting",
+        "hyperparameters": top.get("hyperparameters"),
+        "configured_seeds": top.get("configured_seeds"),
+        "evaluated_seeds": top.get("evaluated_seeds"),
+        "minimum_win_rate": minimum_win_rate,
+        "confidence_threshold": confidence_threshold,
+        "non_regression_threshold": top.get("non_regression_threshold"),
+        "valid_win_rate": point,
+        "valid_games": int(top.get("valid_games", 0) or 0),
+        "invalid_games": int(top.get("invalid_games", 0) or 0),
+        "confidence_low": low,
+        "confidence_high": float(top.get("confidence_high", 1.0) or 1.0),
+        "worst_opponent_confidence_low": float(
+            top.get("worst_opponent_confidence_low", 0.0) or 0.0
+        ),
+        "all_opponents_complete": bool(top.get("all_opponents_complete")),
+        "all_opponents_non_regression": non_regression,
+        "regression_opponents": list(top.get("regression_opponents", []) or []),
+        "matchup_win_rate_spread": float(top.get("matchup_win_rate_spread", 0.0) or 0.0),
+        "favorable_matchup_dominance": bool(top.get("favorable_matchup_dominance")),
+        "opponents": list(top.get("opponents", []) or []),
+        "complete_seed_group": bool(top.get("complete_seed_group")),
+        "collapse_free": collapse_free,
+        "clears_point_gate": clears_point,
+        "clears_confidence_gate": clears_confidence,
+        "promotion_confident": bool(winner is not None and clears_confidence),
+    }
+
+
 def trial_payload(trial: TrialResult) -> dict[str, object]:
     return asdict(trial)
 
@@ -1918,6 +2262,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-batch", required=True)
     parser.add_argument("--anchor-checkpoint", default="")
     parser.add_argument("--eval-model-b", default="")
+    parser.add_argument("--confirmation-registry", default="", help="Optional league registry used to add champion/historical finalist opponents")
+    parser.add_argument("--confirmation-opponents", type=csv_strings, default=[], help="Additional comma-separated finalist opponent checkpoints")
+    parser.add_argument("--confirmation-historical-opponents", type=nonnegative_int, default=2)
+    parser.add_argument("--confirmation-max-opponents", type=positive_int, default=3)
+    parser.add_argument("--confirmation-non-regression-threshold", type=float, default=0.5)
+    parser.add_argument("--confirmation-dominance-spread", type=positive_float, default=0.10)
+    parser.add_argument("--confirmation-games-per-side", type=positive_int, default=100)
+    parser.add_argument("--confirmation-adaptive", type=parse_bool, default=True)
+    parser.add_argument("--confirmation-game-block-per-side", type=positive_int, default=100)
     parser.add_argument("--policy-tag-expected", default="")
     parser.add_argument("--learning-rates", type=csv_floats, default=[5e-6, 1e-5, 2.5e-5, 5e-5])
     parser.add_argument("--entropy-coefs", type=csv_floats, default=[1e-4, 3e-4, 1e-3])
@@ -1995,6 +2348,8 @@ def main() -> None:
     args = parse_search_args()
     if args.screen_max_games_per_side < args.screen_games_per_side:
         raise SystemExit("screen-max-games-per-side must be >= screen-games-per-side")
+    if args.final_games_per_side < args.confirmation_games_per_side:
+        raise SystemExit("final-games-per-side must be >= confirmation-games-per-side")
     if any(limit < 0 for limit in args.episode_limits):
         raise SystemExit("episode-limits values must be >= 0")
     if args.bayes_exploration < 0.0:
@@ -2043,6 +2398,7 @@ def main() -> None:
     for label, value in (
         ("promotion-min-win-rate", args.promotion_min_win_rate),
         ("promotion-confidence-threshold", args.promotion_confidence_threshold),
+        ("confirmation-non-regression-threshold", args.confirmation_non_regression_threshold),
     ):
         if not 0.0 <= value <= 1.0:
             raise SystemExit(f"{label} must be between 0 and 1")
@@ -2067,6 +2423,19 @@ def main() -> None:
             args.policy_tag_expected = inferred_policy_tag(repo_root, episode_batch, init_checkpoint)
         except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
             raise SystemExit(str(exc)) from exc
+    try:
+        confirmation_opponents, confirmation_discovery = discover_confirmation_opponents(
+            repo_root,
+            parent_checkpoint,
+            args.confirmation_registry,
+            args.confirmation_opponents,
+            args.confirmation_historical_opponents,
+            args.confirmation_max_opponents,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(str(exc)) from exc
+    if not confirmation_opponents:
+        raise SystemExit("no usable confirmation opponents")
 
     search_dir = (repo_root / DEFAULT_SEARCH_ROOT / args.run_prefix).resolve()
     search_dir.mkdir(parents=True, exist_ok=True)
@@ -2160,6 +2529,7 @@ def main() -> None:
             "policy_tag_expected": args.policy_tag_expected,
             "anchor_checkpoint": str(anchor_checkpoint),
             "evaluation_parent": str(parent_checkpoint),
+            "confirmation_opponents": [asdict(opponent) for opponent in confirmation_opponents],
         },
         "config_path": str(config_path),
         "search_space": {
@@ -2186,6 +2556,13 @@ def main() -> None:
             "replicate_substreams": evaluation_replicate_indices,
             "seed_suites": evaluation_seed_suites,
             "promotion_uses_held_out_confirmation_suite": True,
+            "multi_opponent_confirmation": len(confirmation_opponents) > 1,
+            "confirmation_discovery": confirmation_discovery,
+            "confirmation_non_regression_threshold": args.confirmation_non_regression_threshold,
+            "confirmation_dominance_spread": args.confirmation_dominance_spread,
+            "confirmation_games_per_side": args.confirmation_games_per_side,
+            "confirmation_adaptive": args.confirmation_adaptive,
+            "confirmation_game_block_per_side": args.confirmation_game_block_per_side,
             "screen_game_block_per_side": args.screen_game_block_per_side,
             "screen_max_games_per_side": args.screen_max_games_per_side,
             "final_games_per_side": args.final_games_per_side,
@@ -2628,42 +3005,152 @@ def main() -> None:
         state.phase = "held-out confirmation"
         state.final_planned_candidates = len(finalists)
         state.final_plan_finalized = True
-        state.final_games_planned = 2 * len(finalists) * args.final_games_per_side
+        state.final_games_planned = (
+            2 * len(finalists) * len(confirmation_opponents)
+            * args.confirmation_games_per_side
+        )
         reporter.notice(
             "held-out confirmation suite "
             f"{int(evaluation_seed_suites['confirmation'])}: "
-            f"evaluating {len(finalists)} finalist checkpoints"
+            f"evaluating {len(finalists)} finalist checkpoints against "
+            f"{len(confirmation_opponents)} opponents"
         )
+        for warning in confirmation_discovery.get("warnings", []) or []:
+            reporter.notice(str(warning))
         reporter.refresh()
+        requested_confirmation_games: dict[
+            tuple[tuple[float, float, float, float, int], str], int
+        ] = {}
         for trial in finalists:
-            trial.final_evaluation = run_balanced_evaluation(
-                args, repo_root, trial, parent_checkpoint, "final",
-                args.final_games_per_side,
-                paired_evaluation_seed(
-                    int(evaluation_seed_suites["confirmation"]),
-                    1,
-                    evaluation_replicate_indices[trial.hyperparameters.shuffle_seed],
-                ),
-                trial_indices[trial.run_name], reporter, state, logs_dir, block_index=1,
-            )
-            state.finalized_count += 1
-            state.trial_status[trial.run_name] = "finalized"
+            trial.final_evaluation = None
+            trial.confirmation_evaluations = {}
+            for opponent_index, opponent in enumerate(confirmation_opponents):
+                opponent_result = run_balanced_evaluation(
+                    args,
+                    repo_root,
+                    trial,
+                    Path(opponent.checkpoint_path),
+                    "final",
+                    args.confirmation_games_per_side,
+                    paired_evaluation_seed(
+                        int(evaluation_seed_suites["confirmation"]),
+                        1,
+                        evaluation_replicate_indices[trial.hyperparameters.shuffle_seed],
+                        opponent_index,
+                    ),
+                    trial_indices[trial.run_name],
+                    reporter,
+                    state,
+                    logs_dir,
+                    block_index=1,
+                    run_suffix=f"_vs_{opponent.id}",
+                )
+                trial.confirmation_evaluations[opponent.id] = opponent_result
+                trial.final_evaluation = merge_evaluation_results(
+                    trial.final_evaluation, opponent_result,
+                )
+                requested_confirmation_games[(
+                    hyperparameter_setting_key(trial.hyperparameters), opponent.id,
+                )] = args.confirmation_games_per_side
+            state.trial_status[trial.run_name] = "confirming"
             manifest["trials"] = [trial_payload(item) for item in trials]
             reporter.notice(
-                f"finalized {trial.run_name} valid_win_rate={trial.final_evaluation.valid_win_rate:.4f} "
+                f"confirmation initial {trial.run_name} "
+                f"valid_win_rate={trial.final_evaluation.valid_win_rate:.4f} "
                 f"valid={trial.final_evaluation.valid_games} invalid={trial.final_evaluation.invalid_games} "
-                f"lower95={trial.final_evaluation.confidence_low:.4f}"
+                f"lower95={trial.final_evaluation.confidence_low:.4f} "
+                f"opponents={len(trial.confirmation_evaluations)}"
             )
             progress_writer.update(force=True)
+
+        confirmation_block_index = 1
+        while args.confirmation_adaptive and replicated_mode:
+            unresolved_pairs = unresolved_confirmation_setting_opponents(
+                finalists,
+                expected_seeds=args.shuffle_seeds,
+                opponents=confirmation_opponents,
+                requested_games_per_side=requested_confirmation_games,
+                threshold=args.confirmation_non_regression_threshold,
+                max_games_per_side=args.final_games_per_side,
+            )
+            if not unresolved_pairs:
+                break
+            confirmation_block_index += 1
+            reporter.notice(
+                f"adaptive confirmation block {confirmation_block_index}: "
+                f"refining {len(unresolved_pairs)} unresolved setting/opponent matchups"
+            )
+            pair_block_games = {
+                pair: min(
+                    args.confirmation_game_block_per_side,
+                    args.final_games_per_side
+                    - requested_confirmation_games.get(pair, 0),
+                )
+                for pair in unresolved_pairs
+            }
+            for trial in finalists:
+                setting_key = hyperparameter_setting_key(trial.hyperparameters)
+                for opponent_index, opponent in enumerate(confirmation_opponents):
+                    pair = (setting_key, opponent.id)
+                    if pair not in unresolved_pairs:
+                        continue
+                    block_games = pair_block_games[pair]
+                    if block_games <= 0:
+                        continue
+                    state.final_games_planned += 2 * block_games
+                    addition = run_balanced_evaluation(
+                        args,
+                        repo_root,
+                        trial,
+                        Path(opponent.checkpoint_path),
+                        "final",
+                        block_games,
+                        paired_evaluation_seed(
+                            int(evaluation_seed_suites["confirmation"]),
+                            confirmation_block_index,
+                            evaluation_replicate_indices[
+                                trial.hyperparameters.shuffle_seed
+                            ],
+                            opponent_index,
+                        ),
+                        trial_indices[trial.run_name],
+                        reporter,
+                        state,
+                        logs_dir,
+                        block_index=confirmation_block_index,
+                        run_suffix=f"_vs_{opponent.id}",
+                    )
+                    trial.confirmation_evaluations[opponent.id] = merge_evaluation_results(
+                        trial.confirmation_evaluations.get(opponent.id), addition,
+                    )
+                    trial.final_evaluation = merge_evaluation_results(
+                        trial.final_evaluation, addition,
+                    )
+                    manifest["trials"] = [trial_payload(item) for item in trials]
+                    progress_writer.update(force=True)
+            for pair, block_games in pair_block_games.items():
+                requested_confirmation_games[pair] = (
+                    requested_confirmation_games.get(pair, 0) + block_games
+                )
+
+        for trial in finalists:
+            state.finalized_count += 1
+            state.trial_status[trial.run_name] = "finalized"
+        manifest["trials"] = [trial_payload(item) for item in trials]
+        progress_writer.update(force=True)
 
         ranked_final = sorted(finalists, key=lambda trial: evaluation_rank_key(trial, final=True), reverse=True)
         ranked_final_groups: list[dict[str, object]] = []
         best_hyperparameters: dict[str, object] | None = None
         if replicated_mode:
-            ranked_final_groups = build_hyperparameter_group_summary(
-                finalists, stage="final", expected_seeds=args.shuffle_seeds,
+            ranked_final_groups = build_robust_confirmation_group_summary(
+                finalists,
+                expected_seeds=args.shuffle_seeds,
+                opponents=confirmation_opponents,
+                non_regression_threshold=args.confirmation_non_regression_threshold,
+                dominance_spread=args.confirmation_dominance_spread,
             )
-            winning_group, assessment = grouped_promotion_assessment(
+            winning_group, assessment = robust_grouped_promotion_assessment(
                 ranked_final_groups,
                 args.promotion_min_win_rate,
                 args.promotion_confidence_threshold,
@@ -2691,6 +3178,37 @@ def main() -> None:
                     "ppo_clip_epsilon": winner.hyperparameters.ppo_clip_epsilon,
                     "episode_limit": winner.hyperparameters.episode_limit,
                 }
+            assessed_trial = winner or (ranked_final[0] if ranked_final else None)
+            if assessed_trial is not None:
+                opponent_results = []
+                regression_opponents = []
+                for opponent in confirmation_opponents:
+                    result = assessed_trial.confirmation_evaluations.get(opponent.id)
+                    if result is None:
+                        regression_opponents.append(opponent.id)
+                        continue
+                    regression = bool(
+                        opponent.protected
+                        and result.confidence_high
+                        < args.confirmation_non_regression_threshold
+                    )
+                    if regression:
+                        regression_opponents.append(opponent.id)
+                    opponent_results.append({
+                        "opponent_id": opponent.id,
+                        "valid_win_rate": result.valid_win_rate,
+                        "confidence_low": result.confidence_low,
+                        "confidence_high": result.confidence_high,
+                        "regression_detected": regression,
+                    })
+                assessment["opponents"] = opponent_results
+                assessment["regression_opponents"] = regression_opponents
+                assessment["all_opponents_non_regression"] = not regression_opponents
+                if winner is not None and regression_opponents:
+                    winner = None
+                    best_hyperparameters = None
+                    assessment["status"] = "opponent_regression"
+                    assessment["promotion_confident"] = False
         assessment["held_out_confirmation"] = True
         assessment["confirmation_seed_suite"] = int(
             evaluation_seed_suites["confirmation"]

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from ppo_search import (
     EvaluationResult,
     BaseSearchReporter,
+    ConfirmationOpponent,
     DEFAULT_TRAINER_EXE,
     Hyperparameters,
     ManifestProgressWriter,
@@ -19,9 +20,11 @@ from ppo_search import (
     adaptive_screen_group_contenders,
     build_data_scale_summary,
     build_hyperparameter_group_summary,
+    build_robust_confirmation_group_summary,
     build_eval_command,
     build_train_command,
     configured_boundary_diagnostics,
+    discover_confirmation_opponents,
     evaluation_artifacts_match,
     inferred_policy_tag,
     load_config_args,
@@ -31,6 +34,7 @@ from ppo_search import (
     parse_search_args,
     parse_training_progress,
     promotion_assessment,
+    robust_grouped_promotion_assessment,
     resolve_evaluation_seed_suites,
     grouped_promotion_assessment,
     generate_local_refinement_space,
@@ -40,6 +44,7 @@ from ppo_search import (
     suggest_bayesian_setting,
     training_safety_flags,
     training_artifacts_match,
+    unresolved_confirmation_setting_opponents,
     valid_outcome_counts,
     wilson_interval,
 )
@@ -159,6 +164,10 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(args.screen_candidates, 30)
         self.assertEqual(args.bayes_refine_settings, 4)
         self.assertEqual(args.bayes_refine_fraction, 0.5)
+        self.assertEqual(args.confirmation_historical_opponents, 2)
+        self.assertEqual(args.confirmation_max_opponents, 3)
+        self.assertEqual(args.confirmation_games_per_side, 100)
+        self.assertTrue(args.confirmation_adaptive)
 
     def test_trainer_executable_is_fixed_and_rejected_in_config(self) -> None:
         self.assertEqual(DEFAULT_TRAINER_EXE.as_posix(), "build-fresh/showdown_client.exe")
@@ -328,6 +337,10 @@ class PpoSearchTests(unittest.TestCase):
         )
         self.assertNotEqual(
             screen_seed,
+            paired_evaluation_seed(int(suites["screen"]), 2, 0, 1),
+        )
+        self.assertNotEqual(
+            screen_seed,
             paired_evaluation_seed(int(suites["confirmation"]), 2),
         )
 
@@ -491,6 +504,34 @@ class PpoSearchTests(unittest.TestCase):
             self.assertFalse(evaluation_artifacts_match(summary, candidate, parent, 250, 8))
             self.assertFalse(evaluation_artifacts_match(summary, parent, candidate, 250))
 
+    def test_confirmation_opponents_deduplicate_parent_champion_and_cap_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent = root / "parent.chk"
+            history_a = root / "history_a.chk"
+            history_b = root / "history_b.chk"
+            explicit = root / "explicit.chk"
+            for checkpoint in (parent, history_a, history_b, explicit):
+                checkpoint.write_bytes(b"checkpoint")
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({
+                "champion_id": "champion",
+                "members": [
+                    {"id": "champion", "path": str(parent), "role": "champion", "status": "active", "generation": 3, "opponent_stats": {"history_a": {"recent_win_rate": 0.7}, "history_b": {"recent_win_rate": 0.4}}},
+                    {"id": "history_a", "path": str(history_a), "role": "historical_snapshot", "status": "active", "generation": 2},
+                    {"id": "history_b", "path": str(history_b), "role": "historical_snapshot", "status": "active", "generation": 1},
+                ],
+            }), encoding="utf-8")
+            opponents, discovery = discover_confirmation_opponents(
+                root, parent, str(registry), [str(explicit)], 2, 3,
+            )
+            self.assertEqual([item.role for item in opponents], ["parent", "explicit", "historical"])
+            self.assertEqual(opponents[2].id, "history_b")
+            self.assertFalse(opponents[2].protected)
+            self.assertEqual(len(opponents), 3)
+            self.assertTrue(discovery["registry_loaded"])
+            self.assertEqual(discovery["duplicates"], [{"id": "champion", "same_as": "parent"}])
+
     def test_showdown_seed_patch_is_opt_in_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -590,6 +631,70 @@ class PpoSearchTests(unittest.TestCase):
         winner, assessment = grouped_promotion_assessment(summaries, 0.50, 0.50)
         self.assertIsNotNone(winner)
         self.assertEqual(assessment["selection_scope"], "pooled_hyperparameter_setting")
+
+    def test_multi_opponent_confirmation_detects_specific_regression(self) -> None:
+        opponents = [
+            ConfirmationOpponent("parent", "parent.chk", "test", "parent"),
+            ConfirmationOpponent("history", "history.chk", "test", "historical"),
+        ]
+        trials = []
+        for seed in (101, 202, 303):
+            parent_result = self.evaluation("final", 40, 100, 0.31, 0.49)
+            history_result = self.evaluation("final", 65, 100, 0.55, 0.74)
+            trials.append(SimpleNamespace(
+                run_name=f"seed-{seed}",
+                hyperparameters=Hyperparameters(5e-6, 1e-4, 0.03, 0.1, seed, 256),
+                safety_flags=[],
+                final_evaluation=merge_evaluation_results(parent_result, history_result),
+                screen_evaluation=None,
+                confirmation_evaluations={
+                    "parent": parent_result,
+                    "history": history_result,
+                },
+            ))
+        summaries = build_robust_confirmation_group_summary(
+            trials,
+            expected_seeds=[101, 202, 303],
+            opponents=opponents,
+            non_regression_threshold=0.5,
+            dominance_spread=0.10,
+        )
+        self.assertEqual(len(summaries), 1)
+        self.assertFalse(summaries[0]["all_opponents_non_regression"])
+        self.assertEqual(summaries[0]["regression_opponents"], ["parent"])
+        self.assertTrue(summaries[0]["favorable_matchup_dominance"])
+        winner, assessment = robust_grouped_promotion_assessment(summaries, 0.5, 0.5)
+        self.assertIsNone(winner)
+        self.assertEqual(assessment["status"], "opponent_regression")
+
+    def test_adaptive_confirmation_expands_only_unresolved_matchups(self) -> None:
+        opponents = [
+            ConfirmationOpponent("parent", "parent.chk", "test", "parent"),
+            ConfirmationOpponent("history", "history.chk", "test", "historical"),
+        ]
+        trials = []
+        for seed in (101, 202, 303):
+            trials.append(SimpleNamespace(
+                run_name=f"seed-{seed}",
+                hyperparameters=Hyperparameters(5e-6, 1e-4, 0.03, 0.1, seed, 256),
+                safety_flags=[],
+                final_evaluation=None,
+                screen_evaluation=None,
+                confirmation_evaluations={
+                    "parent": self.evaluation("final", 50, 100, 0.40, 0.60),
+                    "history": self.evaluation("final", 65, 100, 0.55, 0.74),
+                },
+            ))
+        setting = (5e-6, 1e-4, 0.03, 0.1, 256)
+        unresolved = unresolved_confirmation_setting_opponents(
+            trials,
+            expected_seeds=[101, 202, 303],
+            opponents=opponents,
+            requested_games_per_side={(setting, "parent"): 100, (setting, "history"): 100},
+            threshold=0.5,
+            max_games_per_side=300,
+        )
+        self.assertEqual(unresolved, {(setting, "parent")})
 
     def test_bayesian_suggestion_is_untried_and_records_acquisition(self) -> None:
         space = [
