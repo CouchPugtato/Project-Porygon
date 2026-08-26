@@ -30,6 +30,7 @@ from ppo_search import (
     parse_search_args,
     parse_training_progress,
     promotion_assessment,
+    resolve_evaluation_seed_suites,
     grouped_promotion_assessment,
     run_command,
     select_search_combinations,
@@ -293,10 +294,37 @@ class PpoSearchTests(unittest.TestCase):
         )
 
     def test_paired_evaluation_seed_is_shared_within_a_block(self) -> None:
-        screen_seed = paired_evaluation_seed(2026, "screen", 2)
-        self.assertEqual(screen_seed, paired_evaluation_seed(2026, "screen", 2))
-        self.assertNotEqual(screen_seed, paired_evaluation_seed(2026, "screen", 3))
-        self.assertNotEqual(screen_seed, paired_evaluation_seed(2026, "final", 2))
+        suites = resolve_evaluation_seed_suites("run-a", 2026, 0, 0)
+        repeated = resolve_evaluation_seed_suites("run-a", 2026, 0, 0)
+        rotated = resolve_evaluation_seed_suites("run-b", 2026, 0, 0)
+        self.assertEqual(suites, repeated)
+        self.assertNotEqual(suites["screen"], suites["confirmation"])
+        self.assertNotEqual(suites["screen"], rotated["screen"])
+        screen_seed = paired_evaluation_seed(int(suites["screen"]), 2)
+        self.assertEqual(
+            screen_seed,
+            paired_evaluation_seed(int(suites["screen"]), 2),
+        )
+        self.assertNotEqual(
+            screen_seed,
+            paired_evaluation_seed(int(suites["screen"]), 3),
+        )
+        self.assertNotEqual(
+            screen_seed,
+            paired_evaluation_seed(int(suites["screen"]), 2, 1),
+        )
+        self.assertNotEqual(
+            screen_seed,
+            paired_evaluation_seed(int(suites["confirmation"]), 2),
+        )
+
+    def test_explicit_confirmation_suite_must_be_held_out(self) -> None:
+        suites = resolve_evaluation_seed_suites("run-a", 2026, 11, 22)
+        self.assertEqual(suites["screen"], 11)
+        self.assertEqual(suites["confirmation"], 22)
+        self.assertEqual(suites["screen_source"], "explicit")
+        with self.assertRaisesRegex(ValueError, "must differ"):
+            resolve_evaluation_seed_suites("run-a", 2026, 11, 11)
 
     def test_promotion_gate_distinguishes_no_tentative_and_confident_winner(self) -> None:
         trial = SimpleNamespace(run_name="candidate", final_evaluation=self.evaluation("final", 49, 100, 0.39, 0.59))

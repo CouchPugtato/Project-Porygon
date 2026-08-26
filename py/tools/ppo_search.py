@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import math
@@ -40,6 +41,7 @@ SELFPLAY_PROGRESS_RE = re.compile(r"^\[selfplay\].*\bcompleted_games=(\d+)/(\d+)
 KEY_VALUE_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 POLICY_TAG_RE = re.compile(r'"policy_tag"\s*:\s*("(?:\\.|[^"\\])*")')
 FIXED_CONFIG_KEYS = {"trainer_exe"}
+MAX_SHOWDOWN_SEED_BASE = (1 << 48) - 1
 
 
 def load_config_args(path: Path) -> list[str]:
@@ -1333,10 +1335,51 @@ def adaptive_screen_group_contenders(
     ]
 
 
-def paired_evaluation_seed(search_seed: int, stage: str, block_index: int) -> int:
-    """Create a candidate-independent seed for one matched evaluation block."""
-    stage_offset = 100000000 if stage == "final" else 0
-    return abs(search_seed) * 1000000000 + stage_offset + block_index * 10000
+def derived_evaluation_seed_suite(run_prefix: str, search_seed: int, label: str) -> int:
+    digest = hashlib.sha256(
+        f"project-porygon:{run_prefix}:{search_seed}:{label}".encode("utf-8")
+    ).digest()
+    return 1 + (int.from_bytes(digest[:6], "big") % ((1 << 48) - 1))
+
+
+def resolve_evaluation_seed_suites(
+    run_prefix: str,
+    search_seed: int,
+    screen_override: int,
+    confirmation_override: int,
+) -> dict[str, object]:
+    screen = screen_override or derived_evaluation_seed_suite(
+        run_prefix, search_seed, "screen",
+    )
+    confirmation = confirmation_override or derived_evaluation_seed_suite(
+        run_prefix, search_seed, "confirmation",
+    )
+    for label, value in (("screen", screen), ("confirmation", confirmation)):
+        if not 0 < value <= MAX_SHOWDOWN_SEED_BASE:
+            raise ValueError(
+                f"{label} evaluation seed suite must be between 1 and "
+                f"{MAX_SHOWDOWN_SEED_BASE}"
+            )
+    if screen == confirmation:
+        raise ValueError("screen and confirmation evaluation seed suites must differ")
+    return {
+        "screen": screen,
+        "confirmation": confirmation,
+        "screen_source": "explicit" if screen_override else "derived_from_run",
+        "confirmation_source": "explicit" if confirmation_override else "derived_from_run",
+    }
+
+
+def paired_evaluation_seed(
+    seed_suite: int,
+    block_index: int,
+    replicate_index: int = 0,
+) -> int:
+    """Create a setting-independent seed for one replicate/block pair."""
+    digest = hashlib.sha256(
+        f"project-porygon-eval:{seed_suite}:{replicate_index}:{block_index}".encode("utf-8")
+    ).digest()
+    return 1 + (int.from_bytes(digest[:6], "big") % MAX_SHOWDOWN_SEED_BASE)
 
 
 def promotion_assessment(
@@ -1792,6 +1835,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--screen-candidates", type=positive_int, default=8)
     parser.add_argument("--finalists", type=positive_int, default=3)
     parser.add_argument("--search-seed", type=int, default=2026)
+    parser.add_argument("--screen-seed-suite", type=nonnegative_int, default=0, help="Matched screening seed suite; 0 derives a run-specific value")
+    parser.add_argument("--confirmation-seed-suite", type=nonnegative_int, default=0, help="Held-out finalist seed suite; 0 derives a separate run-specific value")
     parser.add_argument("--epochs", type=positive_int, default=1)
     parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
     parser.add_argument("--advantage-norm", type=parse_bool, default=bool_default("advantage_norm"))
@@ -1853,6 +1898,15 @@ def main() -> None:
         raise SystemExit("episode-limits values must be >= 0")
     if args.bayes_exploration < 0.0:
         raise SystemExit("bayes-exploration must be >= 0")
+    try:
+        evaluation_seed_suites = resolve_evaluation_seed_suites(
+            args.run_prefix,
+            args.search_seed,
+            args.screen_seed_suite,
+            args.confirmation_seed_suite,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     replicate_seed_count = len(set(args.shuffle_seeds))
     if args.replicate_ranking and replicate_seed_count > 1:
         if args.max_trials < replicate_seed_count or args.screen_candidates < replicate_seed_count:
@@ -1937,6 +1991,9 @@ def main() -> None:
     ):
         raise SystemExit("bayesian selection requires positive learning-rate, entropy, and anchor values")
     seed_values = sorted(set(args.shuffle_seeds))
+    evaluation_replicate_indices = {
+        shuffle_seed: index for index, shuffle_seed in enumerate(seed_values)
+    }
     setting_budget = min(len(full_setting_space), args.max_trials // len(seed_values))
     if bayesian_mode:
         initial_settings = select_space_filling_settings(
@@ -1998,7 +2055,10 @@ def main() -> None:
             "screen_games_per_side": args.screen_games_per_side,
             "adaptive_screen": args.adaptive_screen,
             "paired_evaluation_seeds": True,
-            "paired_seed_scope": "shared by every candidate, training replicate, and player side within each stage/block",
+            "paired_seed_scope": "shared by candidates with the same training replicate and by both player sides within each stage/block",
+            "replicate_substreams": evaluation_replicate_indices,
+            "seed_suites": evaluation_seed_suites,
+            "promotion_uses_held_out_confirmation_suite": True,
             "screen_game_block_per_side": args.screen_game_block_per_side,
             "screen_max_games_per_side": args.screen_max_games_per_side,
             "final_games_per_side": args.final_games_per_side,
@@ -2103,7 +2163,11 @@ def main() -> None:
             trial.screen_evaluation = run_balanced_evaluation(
                 args, repo_root, trial, parent_checkpoint, "screen",
                 args.screen_games_per_side,
-                paired_evaluation_seed(args.search_seed, "screen", 1),
+                paired_evaluation_seed(
+                    int(evaluation_seed_suites["screen"]),
+                    1,
+                    evaluation_replicate_indices[trial.hyperparameters.shuffle_seed],
+                ),
                 trial_index, reporter, state, logs_dir, block_index=1,
             )
             requested_screen_games[trial.run_name] = args.screen_games_per_side
@@ -2293,7 +2357,11 @@ def main() -> None:
                 addition = run_balanced_evaluation(
                     args, repo_root, trial, parent_checkpoint, "screen",
                     block_games,
-                    paired_evaluation_seed(args.search_seed, "screen", adaptive_block_index),
+                    paired_evaluation_seed(
+                        int(evaluation_seed_suites["screen"]),
+                        adaptive_block_index,
+                        evaluation_replicate_indices[trial.hyperparameters.shuffle_seed],
+                    ),
                     trial_indices[trial.run_name], reporter, state, logs_dir,
                     block_index=adaptive_block_index,
                 )
@@ -2330,15 +2398,25 @@ def main() -> None:
                 trial for trial in ranked_screen
                 if trial.screen_evaluation and not trial.screen_evaluation.collapse_flags
             ][: args.finalists]
-        state.phase = "final evaluation"
+        state.phase = "held-out confirmation"
         state.final_planned_candidates = len(finalists)
         state.final_plan_finalized = True
         state.final_games_planned = 2 * len(finalists) * args.final_games_per_side
+        reporter.notice(
+            "held-out confirmation suite "
+            f"{int(evaluation_seed_suites['confirmation'])}: "
+            f"evaluating {len(finalists)} finalist checkpoints"
+        )
         reporter.refresh()
         for trial in finalists:
             trial.final_evaluation = run_balanced_evaluation(
                 args, repo_root, trial, parent_checkpoint, "final",
-                args.final_games_per_side, paired_evaluation_seed(args.search_seed, "final", 1),
+                args.final_games_per_side,
+                paired_evaluation_seed(
+                    int(evaluation_seed_suites["confirmation"]),
+                    1,
+                    evaluation_replicate_indices[trial.hyperparameters.shuffle_seed],
+                ),
                 trial_indices[trial.run_name], reporter, state, logs_dir, block_index=1,
             )
             state.finalized_count += 1
@@ -2386,6 +2464,10 @@ def main() -> None:
                     "ppo_clip_epsilon": winner.hyperparameters.ppo_clip_epsilon,
                     "episode_limit": winner.hyperparameters.episode_limit,
                 }
+        assessment["held_out_confirmation"] = True
+        assessment["confirmation_seed_suite"] = int(
+            evaluation_seed_suites["confirmation"]
+        )
         state.phase = "completed"
         state.clear_operation()
         top_trial = ranked_final[0] if ranked_final else None

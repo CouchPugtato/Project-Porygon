@@ -18,6 +18,9 @@ bayes_exploration = 0.005
 episode_limits = "256"
 # 24 checkpoints / three seeds = an eight-setting optimization budget.
 search_seed = 2026
+# Zero derives separate run-specific matched suites from run_prefix + search_seed.
+screen_seed_suite = 0
+confirmation_seed_suite = 0
 max_trials = 24
 
 # Successive evaluation stages.
