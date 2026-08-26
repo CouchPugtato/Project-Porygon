@@ -395,18 +395,27 @@ def collect_recent_opponent_stats(
     return aggregate
 
 
-def build_live_command(args: argparse.Namespace, repo_root: Path, pool_path: Path, parent_checkpoint: Path) -> list[str]:
+def build_live_command(
+    args: argparse.Namespace,
+    repo_root: Path,
+    pool_path: Path,
+    parent_checkpoint: Path,
+    *,
+    run_name: str | None = None,
+    rounds: int | None = None,
+    pool_seed: int | None = None,
+) -> list[str]:
     command = [
         sys.executable,
         str((repo_root / "py" / "tools" / "live_rl_orchestrator.py").resolve()),
         "--run-name",
-        args.run_name,
+        run_name or args.run_name,
         "--training-mode",
         args.training_mode,
         "--init-checkpoint",
         str(parent_checkpoint),
         "--rounds",
-        str(args.rounds),
+        str(rounds if rounds is not None else args.rounds),
         "--games",
         str(args.games),
         "--concurrent-games",
@@ -420,11 +429,13 @@ def build_live_command(args: argparse.Namespace, repo_root: Path, pool_path: Pat
         "--model-b",
         "",
         "--pool-seed",
-        str(args.pool_seed),
+        str(pool_seed if pool_seed is not None else args.pool_seed),
         "--format",
         args.format,
         "--learning-rate",
         str(args.learning_rate),
+        "--episode-limit",
+        str(getattr(args, "episode_limit", 0)),
         "--gamma",
         str(args.gamma),
         "--entropy-coef",
@@ -838,6 +849,63 @@ def maybe_promote_candidate(
     return True
 
 
+def round_screen_should_expand(
+    eval_summary: dict[str, object],
+    collapse_flags: list[str],
+    minimum_win_rate: float,
+) -> bool:
+    return (
+        not collapse_flags
+        and float(eval_summary.get("valid_win_rate", 0.0) or 0.0) >= minimum_win_rate
+    )
+
+
+def round_candidate_rank(
+    eval_summary: dict[str, object],
+    collapse_flags: list[str],
+) -> tuple[int, float, float, int]:
+    """Prefer safe candidates, then evidence strength and sample size."""
+    return (
+        0 if collapse_flags else 1,
+        float(eval_summary.get("confidence_low", 0.0) or 0.0),
+        float(eval_summary.get("valid_win_rate", 0.0) or 0.0),
+        int(eval_summary.get("valid_games", 0) or 0),
+    )
+
+
+def evaluation_args_for_round(
+    args: argparse.Namespace,
+    run_name: str,
+    games_per_side: int,
+) -> argparse.Namespace:
+    values = dict(vars(args))
+    values["eval_run_name"] = run_name
+    values["eval_games"] = games_per_side
+    return argparse.Namespace(**values)
+
+
+class RoundMappedWorkflowReporter:
+    """Map a one-round child workflow onto the outer league round index."""
+
+    def __init__(self, reporter: BaseWorkflowReporter, round_index: int, rounds_total: int) -> None:
+        self.reporter = reporter
+        self.round_index = round_index
+        self.rounds_total = rounds_total
+        self.state = reporter.state
+
+    def command_started(self, command: list[str]) -> None:
+        self.reporter.command_started(command)
+
+    def child_line(self, line: str) -> None:
+        mapped = line.replace(
+            "round=1/1", f"round={self.round_index}/{self.rounds_total}",
+        ).replace(
+            "round_completed=1/1",
+            f"round_completed={self.round_index}/{self.rounds_total}",
+        )
+        self.reporter.child_line(mapped)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-name", required=True)
@@ -858,6 +926,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--training-mode", choices=["rl", "ppo"], default="ppo")
     parser.add_argument("--learning-rate", type=float, default=float_default("league_ppo_learning_rate"))
+    parser.add_argument("--episode-limit", type=nonnegative_int, default=256, help="Maximum episodes per PPO update; 0 uses the full collected batch")
     parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
     parser.add_argument("--entropy-coef", type=float, default=float_default("league_ppo_entropy_coef"))
     parser.add_argument("--advantage-norm", type=parse_bool, default=bool_default("advantage_norm"))
@@ -893,6 +962,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--matchup-confidence-games", type=positive_int, default=DEFAULT_MATCHUP_CONFIDENCE_GAMES)
     parser.add_argument("--min-category-starts", type=nonnegative_int, default=DEFAULT_MIN_CATEGORY_STARTS)
     parser.add_argument("--eval-games", type=positive_int, default=500, help="Required valid evaluation games per candidate side")
+    parser.add_argument("--round-gating", type=parse_bool, default=True, help="Evaluate each round before allowing its checkpoint to become the next parent")
+    parser.add_argument("--round-screen-games", type=positive_int, default=100, help="Valid screening games per side after each training round")
+    parser.add_argument("--round-expand-threshold", type=float, default=0.50, help="Minimum screening score that advances to full evaluation")
+    parser.add_argument("--round-early-stop-patience", type=positive_int, default=1, help="Stop after this many consecutive rejected rounds")
     parser.add_argument("--eval-concurrent-games", type=positive_int, default=40)
     parser.add_argument("--eval-worker-pairs", type=positive_int, default=120)
     parser.add_argument("--eval-max-replacement-attempts", type=positive_int, default=5)
@@ -912,6 +985,7 @@ def main() -> None:
         ("promote-threshold", args.promote_threshold),
         ("promotion-confidence-threshold", args.promotion_confidence_threshold),
         ("min-promotion-tera-ratio", args.min_promotion_tera_ratio),
+        ("round-expand-threshold", args.round_expand_threshold),
     ):
         if not 0.0 <= value <= 1.0:
             raise SystemExit(f"{label} must be between 0 and 1")
@@ -938,7 +1012,6 @@ def main() -> None:
     workflow_dir.mkdir(parents=True, exist_ok=True)
     workflow_manifest_path = workflow_dir / f"{args.run_name}_league_manifest.json"
     pool_path = workflow_dir / f"{args.run_name}_opponent_pool.json"
-    workflow_run_name = args.run_name
     args.eval_run_name = f"{args.run_name}_vs_champion_balanced_{args.eval_games}_per_side"
 
     pool_payload = build_weighted_pool(
@@ -983,10 +1056,15 @@ def main() -> None:
         "min_promotion_tera_ratio": args.min_promotion_tera_ratio,
         "champion_id": champion.id if champion is not None else "",
         "champion_checkpoint": str(champion_checkpoint) if champion_checkpoint is not None else "",
+        "round_gating": args.round_gating,
+        "round_screen_games_per_side": args.round_screen_games,
+        "round_expand_threshold": args.round_expand_threshold,
+        "round_early_stop_patience": args.round_early_stop_patience,
     }
     workflow_manifest["training_config"] = {
         "mode": args.training_mode,
         "learning_rate": args.learning_rate,
+        "episode_limit": args.episode_limit,
         "entropy_coef": args.entropy_coef,
         "gae_lambda": args.gae_lambda,
         "ppo_clip_epsilon": args.ppo_clip_epsilon,
@@ -1011,9 +1089,6 @@ def main() -> None:
     }
     write_json(workflow_manifest_path, workflow_manifest)
 
-    live_command = build_live_command(args, repo_root, pool_path, parent_checkpoint)
-    workflow_manifest["live_command"] = live_command
-    write_json(workflow_manifest_path, workflow_manifest)
     dashboard_state = WorkflowDashboardState(
         run_name=args.run_name,
         rounds_total=args.rounds,
@@ -1033,45 +1108,262 @@ def main() -> None:
     )
     logs_dir = workflow_dir / "logs"
     reporter.start()
-    run_reported_command(
-        live_command,
-        repo_root,
-        reporter,
-        logs_dir / f"{args.run_name}_live_rl.log" if args.dashboard_write_raw_logs else None,
+    accepted_parent_checkpoint = parent_checkpoint
+    round_manifests: list[Path] = []
+    round_records: list[dict[str, object]] = []
+    round_commands: list[list[str]] = []
+    best_round: dict[str, object] | None = None
+    consecutive_rejections = 0
+
+    for round_index in range(1, args.rounds + 1):
+        round_run_name = f"{args.run_name}_round{round_index:02d}"
+        round_parent_checkpoint = accepted_parent_checkpoint
+        live_command = build_live_command(
+            args,
+            repo_root,
+            pool_path,
+            round_parent_checkpoint,
+            run_name=round_run_name,
+            rounds=1,
+            pool_seed=args.pool_seed + round_index - 1,
+        )
+        round_commands.append(live_command)
+        workflow_manifest["round_commands"] = round_commands
+        workflow_manifest["active_round"] = round_index
+        write_json(workflow_manifest_path, workflow_manifest)
+        reporter.notice(
+            f"training gated round {round_index}/{args.rounds} from {round_parent_checkpoint.name}"
+        )
+        mapped_reporter = RoundMappedWorkflowReporter(reporter, round_index, args.rounds)
+        run_reported_command(
+            live_command,
+            repo_root,
+            mapped_reporter,
+            logs_dir / f"{round_run_name}_live_rl.log" if args.dashboard_write_raw_logs else None,
+        )
+
+        live_manifest_path = (
+            repo_root / DEFAULT_RUNS_ROOT / round_run_name / f"{round_run_name}_live_rl_manifest.json"
+        ).resolve()
+        live_manifest = load_json(live_manifest_path)
+        round_candidate_checkpoint = Path(str(live_manifest.get("latest_checkpoint", ""))).resolve()
+        if not round_candidate_checkpoint.exists():
+            raise SystemExit(
+                f"candidate checkpoint not found after round {round_index}: {round_candidate_checkpoint}"
+            )
+        child_round_manifests = [Path(path) for path in live_manifest.get("round_manifests", [])]
+        round_manifests.extend(child_round_manifests)
+        child_round_manifest = load_json(child_round_manifests[-1]) if child_round_manifests else {}
+        training_collapse_flags = [
+            str(flag) for flag in child_round_manifest.get("training_round_collapse_flags", [])
+        ]
+
+        screen_summary: dict[str, object] | None = None
+        screen_summary_path: Path | None = None
+        confirmation_summary: dict[str, object] | None = None
+        confirmation_summary_path: Path | None = None
+        comparison_summary: dict[str, object] | None = None
+        comparison_summary_path: Path | None = None
+        comparison_collapse_flags = list(training_collapse_flags)
+        gate_assessment: dict[str, object] | None = None
+        accepted = not args.round_gating or champion_checkpoint is None
+        expanded = False
+
+        if args.round_gating and champion_checkpoint is not None:
+            screen_run_name = (
+                f"{args.run_name}_round{round_index:02d}_screen_balanced_"
+                f"{args.round_screen_games}_per_side"
+            )
+            screen_args = evaluation_args_for_round(
+                args, screen_run_name, args.round_screen_games,
+            )
+            screen_summary_path, screen_summary = run_balanced_valid_evaluation(
+                screen_args,
+                repo_root,
+                round_candidate_checkpoint,
+                round_parent_checkpoint,
+                reporter,
+                logs_dir,
+            )
+            screen_flags = sorted(set(
+                training_collapse_flags
+                + [str(flag) for flag in (screen_summary.get("candidate_collapse_flags", []) or [])]
+            ))
+            comparison_summary = screen_summary
+            comparison_summary_path = screen_summary_path
+            comparison_collapse_flags = screen_flags
+            expanded = round_screen_should_expand(
+                screen_summary, screen_flags, args.round_expand_threshold,
+            )
+            if expanded:
+                confirmation_run_name = (
+                    f"{args.run_name}_round{round_index:02d}_confirm_balanced_"
+                    f"{args.eval_games}_per_side"
+                )
+                confirmation_args = evaluation_args_for_round(
+                    args, confirmation_run_name, args.eval_games,
+                )
+                confirmation_summary_path, confirmation_summary = run_balanced_valid_evaluation(
+                    confirmation_args,
+                    repo_root,
+                    round_candidate_checkpoint,
+                    round_parent_checkpoint,
+                    reporter,
+                    logs_dir,
+                )
+                confirmation_flags = sorted(set(
+                    training_collapse_flags
+                    + [str(flag) for flag in (
+                        confirmation_summary.get("candidate_collapse_flags", []) or []
+                    )]
+                ))
+                comparison_summary = confirmation_summary
+                comparison_summary_path = confirmation_summary_path
+                comparison_collapse_flags = confirmation_flags
+                gate_assessment = league_promotion_assessment(
+                    confirmation_args, confirmation_summary, confirmation_flags,
+                )
+                accepted = bool(gate_assessment["promotion_confident"])
+            else:
+                gate_assessment = league_promotion_assessment(
+                    screen_args, screen_summary, screen_flags,
+                )
+
+        if comparison_summary is None:
+            comparison_summary = {
+                "valid_win_rate": 1.0,
+                "confidence_low": 1.0,
+                "confidence_high": 1.0,
+                "valid_games": 0,
+                "invalid_games": 0,
+            }
+
+        round_record: dict[str, object] = {
+            "round": round_index,
+            "run_name": round_run_name,
+            "parent_checkpoint": str(round_parent_checkpoint),
+            "candidate_checkpoint": str(round_candidate_checkpoint),
+            "live_manifest_path": str(live_manifest_path),
+            "training_collapse_flags": training_collapse_flags,
+            "screen_summary_path": str(screen_summary_path) if screen_summary_path else "",
+            "confirmation_summary_path": (
+                str(confirmation_summary_path) if confirmation_summary_path else ""
+            ),
+            "screen_expanded": expanded,
+            "accepted_as_next_parent": accepted,
+            "gate_assessment": gate_assessment,
+            "comparison_valid_win_rate": float(
+                comparison_summary.get("valid_win_rate", 0.0) or 0.0
+            ),
+            "comparison_confidence_low": float(
+                comparison_summary.get("confidence_low", 0.0) or 0.0
+            ),
+            "comparison_collapse_flags": comparison_collapse_flags,
+        }
+        round_records.append(round_record)
+        workflow_manifest["round_records"] = round_records
+
+        ranked_round = {
+            "round": round_index,
+            "candidate_checkpoint": round_candidate_checkpoint,
+            "parent_checkpoint": round_parent_checkpoint,
+            "summary": comparison_summary,
+            "summary_path": comparison_summary_path,
+            "collapse_flags": comparison_collapse_flags,
+            "accepted": accepted,
+        }
+        if accepted or best_round is None or (
+            not bool(best_round.get("accepted"))
+            and round_candidate_rank(comparison_summary, comparison_collapse_flags)
+            > round_candidate_rank(
+                best_round["summary"], best_round["collapse_flags"],  # type: ignore[arg-type]
+            )
+        ):
+            best_round = ranked_round
+
+        if accepted:
+            accepted_parent_checkpoint = round_candidate_checkpoint
+            consecutive_rejections = 0
+            reporter.notice(f"round {round_index} accepted as the next parent")
+        else:
+            consecutive_rejections += 1
+            reporter.notice(
+                f"round {round_index} rejected; retaining {round_parent_checkpoint.name}"
+            )
+        reporter.state.rounds_completed = round_index
+        reporter.state.round_index = round_index
+        reporter.refresh()
+        workflow_manifest["accepted_parent_checkpoint"] = str(accepted_parent_checkpoint)
+        workflow_manifest["best_round"] = int(best_round["round"])
+        write_json(workflow_manifest_path, workflow_manifest)
+
+        if (
+            args.round_gating
+            and not accepted
+            and consecutive_rejections >= args.round_early_stop_patience
+        ):
+            workflow_manifest["early_stopped"] = True
+            workflow_manifest["early_stop_round"] = round_index
+            reporter.notice(
+                f"early stopping after {consecutive_rejections} consecutive rejected round(s)"
+            )
+            break
+
+    if best_round is None:
+        raise SystemExit("no training round completed")
+
+    candidate_checkpoint = Path(best_round["candidate_checkpoint"])
+    collapse_flags = [str(flag) for flag in best_round["collapse_flags"]]
+    eval_summary: dict[str, object] | None = best_round["summary"]  # type: ignore[assignment]
+    eval_summary_path = best_round["summary_path"]
+    promotion_assessment = None
+
+    # A later accepted parent was evaluated against its predecessor. Promotion
+    # still requires a direct, fully sized comparison with the registry champion.
+    best_baseline = Path(best_round["parent_checkpoint"]).resolve()
+    best_has_full_eval = (
+        eval_summary is not None
+        and int(eval_summary.get("target_valid_games_per_side", 0) or 0) == args.eval_games
     )
+    if champion is not None and champion_checkpoint is not None:
+        if not args.round_gating or (
+            best_baseline != champion_checkpoint.resolve() and best_has_full_eval
+        ):
+            final_args = evaluation_args_for_round(
+                args,
+                f"{args.run_name}_best_vs_champion_balanced_{args.eval_games}_per_side",
+                args.eval_games,
+            )
+            eval_summary_path, eval_summary = run_balanced_valid_evaluation(
+                final_args,
+                repo_root,
+                candidate_checkpoint,
+                champion_checkpoint,
+                reporter,
+                logs_dir,
+            )
+            collapse_flags = sorted(set(
+                collapse_flags
+                + [str(flag) for flag in (eval_summary.get("candidate_collapse_flags", []) or [])]
+            ))
+        assert eval_summary is not None
+        promotion_assessment = league_promotion_assessment(args, eval_summary, collapse_flags)
+        reporter.state.collapse_flags = list(collapse_flags)
+        reporter.state.set_promotion(promotion_assessment)
+        reporter.notice(f"promotion assessment: {promotion_assessment['status']}")
+    else:
+        eval_summary = None
+        eval_summary_path = None
 
-    live_manifest_path = (repo_root / DEFAULT_RUNS_ROOT / workflow_run_name / f"{workflow_run_name}_live_rl_manifest.json").resolve()
-    live_manifest = load_json(live_manifest_path)
-    candidate_checkpoint = Path(str(live_manifest.get("latest_checkpoint", ""))).resolve()
-    if not candidate_checkpoint.exists():
-        raise SystemExit(f"candidate checkpoint not found after live run: {candidate_checkpoint}")
-
-    round_manifests = [Path(path) for path in live_manifest.get("round_manifests", [])]
-    final_round_manifest = load_json(round_manifests[-1]) if round_manifests else {}
-    collapse_flags = [str(flag) for flag in final_round_manifest.get("training_round_collapse_flags", [])]
     recent_opponent_stats = collect_recent_opponent_stats(repo_root, round_manifests, args.run_name)
     if recent_opponent_stats:
         parent_member.opponent_stats = recent_opponent_stats
 
-    eval_summary = None
-    eval_summary_path = None
-    promotion_assessment = None
-    if champion is not None and champion_checkpoint is not None:
-        eval_summary_path, eval_summary = run_balanced_valid_evaluation(
-            args, repo_root, candidate_checkpoint, champion_checkpoint, reporter, logs_dir,
-        )
-        workflow_manifest["eval_run_names"] = list(eval_summary.get("run_names", []) or [])
-        write_json(workflow_manifest_path, workflow_manifest)
-        collapse_flags.extend([str(flag) for flag in (eval_summary.get("candidate_collapse_flags", []) or [])])
-        collapse_flags = sorted(set(collapse_flags))
-        reporter.state.collapse_flags = list(collapse_flags)
-        promotion_assessment = league_promotion_assessment(args, eval_summary, collapse_flags)
-        reporter.state.set_promotion(promotion_assessment)
-        reporter.notice(f"promotion assessment: {promotion_assessment['status']}")
-
     candidate_id = args.member_id or args.run_name
     if registry_has_member(registry, candidate_id):
         candidate = find_member(registry, candidate_id)
+        candidate.path = str(candidate_checkpoint)
+        candidate.parent_id = parent_member.id
         if recent_opponent_stats:
             candidate.opponent_stats = recent_opponent_stats
     else:
@@ -1092,7 +1384,7 @@ def main() -> None:
         candidate.eval.summary_path = str(eval_summary_path) if eval_summary_path else ""
         candidate.eval.collapse_flags = list(collapse_flags)
 
-    if args.learner_role == "main" and args.rounds >= args.snapshot_cadence:
+    if args.learner_role == "main" and len(round_records) >= args.snapshot_cadence:
         snapshot_member = LeagueMember(
             id=f"{candidate.id}_snapshot",
             path=str(candidate_checkpoint),
@@ -1123,6 +1415,9 @@ def main() -> None:
     workflow_manifest["completed_at_unix"] = utc_now_unix()
     workflow_manifest["candidate_id"] = candidate.id
     workflow_manifest["candidate_checkpoint"] = str(candidate_checkpoint)
+    workflow_manifest["best_round"] = int(best_round["round"])
+    workflow_manifest["rounds_completed"] = len(round_records)
+    workflow_manifest["accepted_parent_checkpoint"] = str(accepted_parent_checkpoint)
     workflow_manifest["eval_summary_path"] = str(eval_summary_path) if eval_summary_path else ""
     workflow_manifest["post_eval_collapse_flags"] = collapse_flags
     workflow_manifest["promotion_assessment"] = promotion_assessment

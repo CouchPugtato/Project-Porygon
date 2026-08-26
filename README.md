@@ -41,16 +41,17 @@ flowchart TB
         TRAINER --> CANDIDATE[("Child checkpoint")]
     end
 
-    CANDIDATE -.->|"next rollout round"| ACTOR
-
     subgraph EVALUATION["3 · Balanced evaluation and promotion"]
         direction LR
-        CANDIDATE -->|"after final round"| EVAL["Candidate vs champion<br/>candidate on both sides"]
-        LEAGUE -->|"current champion"| EVAL
+        CANDIDATE --> EVAL["Per-round balanced screen<br/>candidate on both sides"]
+        ACTOR -->|"accepted parent"| EVAL
         EVAL --> SUMMARY["Valid-game summary<br/>score · 95% Wilson CI · safety metrics"]
-        SUMMARY --> GATES{"Promotion gates<br/>score · confidence · Tera · collapse"}
-        GATES -->|"confident winner"| LEAGUE
-        GATES -->|"tentative / rejected"| ARCHIVE[("Candidate and artifacts retained")]
+        SUMMARY --> EXPAND{"Promising and safe?"}
+        EXPAND -->|"yes"| GATES{"Full evaluation gates<br/>score · confidence · Tera · collapse"}
+        EXPAND -->|"no · rollback"| ARCHIVE[("Candidate and artifacts retained")]
+        GATES -->|"accepted"| ACTOR
+        GATES -->|"champion promotion"| LEAGUE
+        GATES -->|"rejected · rollback / stop"| ARCHIVE
     end
 
     classDef checkpoint fill:#dbeafe,stroke:#2563eb,color:#172554
@@ -60,7 +61,7 @@ flowchart TB
     class ACTOR,ANCHOR,CANDIDATE,LEAGUE,ARCHIVE checkpoint
     class EPISODES data
     class POOL,ORCHESTRATOR,SHOWDOWN,GATEWAY,RUNTIME,TRAINER,EVAL,SUMMARY process
-    class GATES decision
+    class EXPAND,GATES decision
 ```
 
 The C runtime owns battle-state reconstruction, observation construction, legal-action mapping, GRU inference, training, and checkpoint serialization. Python owns Showdown connectivity, worker management, experiment orchestration, artifact manifests, dashboards, and league metadata.

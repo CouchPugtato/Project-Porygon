@@ -20,6 +20,9 @@ from league_rl_orchestrator import (
     league_promotion_assessment,
     matchup_difficulty_weight,
     maybe_promote_candidate,
+    round_candidate_rank,
+    round_screen_should_expand,
+    RoundMappedWorkflowReporter,
 )
 from live_rl_orchestrator import (
     BaseWorkflowReporter,
@@ -355,6 +358,21 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model-a-pool") + 1], "")
         self.assertEqual(command[command.index("--model-b-pool") + 1], "")
 
+    def test_round_gate_expands_promising_safe_candidate_and_ranks_evidence(self) -> None:
+        promising = {
+            "valid_win_rate": 0.53,
+            "confidence_low": 0.47,
+            "valid_games": 200,
+        }
+        weaker = {
+            "valid_win_rate": 0.51,
+            "confidence_low": 0.45,
+            "valid_games": 1000,
+        }
+        self.assertTrue(round_screen_should_expand(promising, [], 0.50))
+        self.assertFalse(round_screen_should_expand(promising, ["collapse"], 0.50))
+        self.assertGreater(round_candidate_rank(promising, []), round_candidate_rank(weaker, []))
+
     def test_balanced_eval_command_bounds_workers_for_small_replacement_batch(self) -> None:
         args = SimpleNamespace(
             eval_concurrent_games=70,
@@ -449,6 +467,9 @@ class PromotionTests(unittest.TestCase):
             "--run-name", "league-run", "--games", "10", "--concurrent-games", "2",
         ])
         self.assertEqual(args.format, "gen9randomdoublesbattle")
+        self.assertEqual(args.episode_limit, 256)
+        self.assertTrue(args.round_gating)
+        self.assertEqual(args.round_screen_games, 100)
         live_command = build_league_live_command(
             args, Path("repo"), Path("pool.json"), Path("parent.chk"),
         )
@@ -457,10 +478,21 @@ class PromotionTests(unittest.TestCase):
             Path("champion.chk"), "a", 10, 12,
         )
         self.assertEqual(live_command[live_command.index("--format") + 1], args.format)
+        self.assertEqual(live_command[live_command.index("--episode-limit") + 1], "256")
         self.assertEqual(eval_command[eval_command.index("--format") + 1], args.format)
 
 
 class WorkflowDashboardTests(unittest.TestCase):
+    def test_gated_child_round_maps_to_outer_dashboard_round(self) -> None:
+        state = WorkflowDashboardState("league-run", 4, 500, 100, "League PPO")
+        base = BaseWorkflowReporter(state)
+        mapped = RoundMappedWorkflowReporter(base, 3, 4)
+        mapped.child_line("[live-rl] dashboard phase=collection round=1/1 total=500\n")
+        self.assertEqual(state.round_index, 3)
+        self.assertEqual(state.rounds_total, 4)
+        mapped.child_line("[live-rl] dashboard round_completed=1/1\n")
+        self.assertEqual(state.rounds_completed, 3)
+
     def test_reporter_tracks_nested_collection_training_and_round_progress(self) -> None:
         state = WorkflowDashboardState("league-run", 4, 500, 500, "League PPO")
         reporter = BaseWorkflowReporter(state)

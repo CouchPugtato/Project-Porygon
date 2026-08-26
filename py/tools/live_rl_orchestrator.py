@@ -758,6 +758,8 @@ def build_train_command(args: argparse.Namespace, trainer_exe: Path, episode_bat
         str(args.current_policy_tag),
         "--epochs",
         str(args.epochs),
+        "--episode-limit",
+        str(getattr(args, "episode_limit", 0)),
         "--learning-rate",
         str(args.learning_rate),
         "--gamma",
@@ -891,6 +893,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-prefix", default="live_rl")
     parser.add_argument("--episode-side", choices=["a", "b"], default="a")
     parser.add_argument("--epochs", type=positive_int, default=1)
+    parser.add_argument("--episode-limit", type=nonnegative_int, default=0, help="Maximum episodes used by each update; 0 uses the full batch")
     parser.add_argument("--learning-rate", type=float, default=float_default("live_ppo_learning_rate"))
     parser.add_argument("--gamma", type=float, default=float_default("ppo_gamma"))
     parser.add_argument("--entropy-coef", type=float, default=float_default("ppo_entropy_coef"))
@@ -995,6 +998,7 @@ def main() -> None:
             "min_available_pagefile_gb": args.min_available_pagefile_gb,
             "ensure_shard_count": args.ensure_shard_count,
             "reward_mode": args.reward_mode,
+            "episode_limit": args.episode_limit,
             "dense_additive_hp_swing_weight": args.dense_additive_hp_swing_weight,
             "dense_additive_faint_swing_weight": args.dense_additive_faint_swing_weight,
             "dense_additive_reward_clip": args.dense_additive_reward_clip,

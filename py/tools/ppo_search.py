@@ -191,6 +191,57 @@ class Hyperparameters:
     episode_limit: int = 0
 
 
+def hyperparameter_setting_key(params: Hyperparameters) -> tuple[float, float, float, float, int]:
+    """Identify a setting independently of its deterministic training seed."""
+    return (
+        params.learning_rate,
+        params.entropy_coef,
+        params.anchor_kl_coef,
+        params.ppo_clip_epsilon,
+        params.episode_limit,
+    )
+
+
+def select_search_combinations(
+    learning_rates: list[float],
+    entropy_coefs: list[float],
+    anchor_kl_coefs: list[float],
+    ppo_clip_epsilons: list[float],
+    shuffle_seeds: list[int],
+    episode_limits: list[int],
+    max_trials: int,
+    search_seed: int,
+    replicate_ranking: bool,
+) -> list[Hyperparameters]:
+    if not replicate_ranking:
+        combinations = [
+            Hyperparameters(lr, entropy, anchor, clip, seed, episode_limit)
+            for lr, entropy, anchor, clip, seed, episode_limit in itertools.product(
+                learning_rates, entropy_coefs, anchor_kl_coefs,
+                ppo_clip_epsilons, shuffle_seeds, episode_limits,
+            )
+        ]
+        random.Random(search_seed).shuffle(combinations)
+        return combinations[:max_trials]
+
+    seeds = sorted(set(shuffle_seeds))
+    if max_trials < len(seeds):
+        raise ValueError(
+            f"max-trials must be at least the replicate seed count ({len(seeds)})"
+        )
+    settings = list(itertools.product(
+        learning_rates, entropy_coefs, anchor_kl_coefs,
+        ppo_clip_epsilons, episode_limits,
+    ))
+    random.Random(search_seed).shuffle(settings)
+    setting_count = min(len(settings), max_trials // len(seeds))
+    return [
+        Hyperparameters(lr, entropy, anchor, clip, seed, episode_limit)
+        for lr, entropy, anchor, clip, episode_limit in settings[:setting_count]
+        for seed in seeds
+    ]
+
+
 @dataclass
 class EvaluationResult:
     stage: str
@@ -1049,6 +1100,21 @@ def training_screen_key(trial: TrialResult, target_kl: float) -> tuple[int, floa
     return (safe, -abs(trial.approx_kl - target_kl * 0.5), trial.labels, -trial.anchor_kl_mean)
 
 
+def replicated_training_group_key(
+    trials: list[TrialResult],
+    target_kl: float,
+) -> tuple[int, float, int, float]:
+    if not trials:
+        return (0, float("-inf"), 0, float("-inf"))
+    all_safe = 1 if all(not trial.safety_flags for trial in trials) else 0
+    mean_kl_distance = sum(
+        abs(trial.approx_kl - target_kl * 0.5) for trial in trials
+    ) / len(trials)
+    min_labels = min(trial.labels for trial in trials)
+    max_anchor_kl = max(trial.anchor_kl_mean for trial in trials)
+    return (all_safe, -mean_kl_distance, min_labels, -max_anchor_kl)
+
+
 def evaluation_summary_path(repo_root: Path, run_name: str) -> Path:
     return repo_root / DEFAULT_MATCH_RUNS_ROOT / run_name / f"{run_name}_summary.json"
 
@@ -1314,6 +1380,149 @@ def build_data_scale_summary(trials: list[TrialResult]) -> list[dict[str, object
     return summaries
 
 
+def group_trials_by_setting(
+    trials: list[TrialResult],
+) -> dict[tuple[float, float, float, float, int], list[TrialResult]]:
+    grouped: dict[tuple[float, float, float, float, int], list[TrialResult]] = {}
+    for trial in trials:
+        grouped.setdefault(hyperparameter_setting_key(trial.hyperparameters), []).append(trial)
+    return grouped
+
+
+def build_hyperparameter_group_summary(
+    trials: list[TrialResult],
+    *,
+    stage: str,
+    expected_seeds: list[int],
+) -> list[dict[str, object]]:
+    summaries: list[dict[str, object]] = []
+    expected = sorted(set(expected_seeds))
+    for key, group in group_trials_by_setting(trials).items():
+        candidate_stats: dict[str, object] = {}
+        baseline_stats: dict[str, object] = {}
+        collapse_flags: set[str] = set()
+        seed_results: list[dict[str, object]] = []
+        evaluated_seeds: list[int] = []
+        for trial in group:
+            result = trial.final_evaluation if stage == "final" else trial.screen_evaluation
+            if result is None:
+                continue
+            evaluated_seeds.append(trial.hyperparameters.shuffle_seed)
+            candidate_stats = aggregate_group_stats(candidate_stats, result.candidate_stats)
+            baseline_stats = aggregate_group_stats(baseline_stats, result.baseline_stats)
+            collapse_flags.update(result.collapse_flags)
+            seed_results.append({
+                "shuffle_seed": trial.hyperparameters.shuffle_seed,
+                "run_name": trial.run_name,
+                "valid_games": result.valid_games,
+                "invalid_games": result.invalid_games,
+                "valid_win_rate": result.valid_win_rate,
+                "confidence_low": result.confidence_low,
+                "confidence_high": result.confidence_high,
+            })
+        valid = valid_outcome_counts(candidate_stats, baseline_stats)
+        low, high = wilson_interval(float(valid["valid_score"]), int(valid["valid_games"]))
+        lr, entropy, anchor, clip, episode_limit = key
+        summaries.append({
+            "stage": stage,
+            "hyperparameters": {
+                "learning_rate": lr,
+                "entropy_coef": entropy,
+                "anchor_kl_coef": anchor,
+                "ppo_clip_epsilon": clip,
+                "episode_limit": episode_limit,
+            },
+            "configured_seeds": expected,
+            "evaluated_seeds": sorted(evaluated_seeds),
+            "complete_seed_group": sorted(evaluated_seeds) == expected,
+            "safe_trials": sum(1 for trial in group if not trial.safety_flags),
+            "rejected_trials": sum(1 for trial in group if trial.safety_flags),
+            "collapse_flags": sorted(collapse_flags),
+            "raw_games": int(valid["raw_games"]),
+            "valid_games": int(valid["valid_games"]),
+            "invalid_games": int(valid["invalid_games"]),
+            "valid_score": float(valid["valid_score"]),
+            "valid_win_rate": float(valid["valid_win_rate"]),
+            "confidence_low": low,
+            "confidence_high": high,
+            "seed_results": sorted(seed_results, key=lambda item: int(item["shuffle_seed"])),
+        })
+    return sorted(summaries, key=hyperparameter_group_rank_key, reverse=True)
+
+
+def hyperparameter_group_rank_key(summary: dict[str, object]) -> tuple[int, int, float, float, int]:
+    return (
+        1 if summary.get("complete_seed_group") else 0,
+        1 if not summary.get("collapse_flags") and int(summary.get("rejected_trials", 0) or 0) == 0 else 0,
+        float(summary.get("confidence_low", 0.0) or 0.0),
+        float(summary.get("valid_win_rate", 0.0) or 0.0),
+        int(summary.get("valid_games", 0) or 0),
+    )
+
+
+def group_summary_setting_key(
+    summary: dict[str, object],
+) -> tuple[float, float, float, float, int]:
+    params = summary.get("hyperparameters", {}) or {}
+    return (
+        float(params.get("learning_rate", 0.0) or 0.0),
+        float(params.get("entropy_coef", 0.0) or 0.0),
+        float(params.get("anchor_kl_coef", 0.0) or 0.0),
+        float(params.get("ppo_clip_epsilon", 0.0) or 0.0),
+        int(params.get("episode_limit", 0) or 0),
+    )
+
+
+def grouped_promotion_assessment(
+    ranked_groups: list[dict[str, object]],
+    minimum_win_rate: float,
+    confidence_threshold: float,
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    if not ranked_groups:
+        return None, {
+            "status": "no_finalist",
+            "selection_scope": "pooled_hyperparameter_setting",
+            "promotion_confident": False,
+        }
+    top = ranked_groups[0]
+    collapse_free = not top.get("collapse_flags") and int(top.get("rejected_trials", 0) or 0) == 0
+    complete = bool(top.get("complete_seed_group"))
+    point = float(top.get("valid_win_rate", 0.0) or 0.0)
+    low = float(top.get("confidence_low", 0.0) or 0.0)
+    clears_point = point > minimum_win_rate
+    clears_confidence = low > confidence_threshold
+    winner = top if complete and collapse_free and clears_point else None
+    if not complete:
+        status = "incomplete_seed_group"
+    elif not collapse_free:
+        status = "collapse_rejected"
+    elif not clears_point:
+        status = "no_winner"
+    elif clears_confidence:
+        status = "confident_winner"
+    else:
+        status = "tentative_winner"
+    return winner, {
+        "status": status,
+        "selection_scope": "pooled_hyperparameter_setting",
+        "hyperparameters": top.get("hyperparameters"),
+        "configured_seeds": top.get("configured_seeds"),
+        "evaluated_seeds": top.get("evaluated_seeds"),
+        "minimum_win_rate": minimum_win_rate,
+        "confidence_threshold": confidence_threshold,
+        "valid_win_rate": point,
+        "valid_games": int(top.get("valid_games", 0) or 0),
+        "invalid_games": int(top.get("invalid_games", 0) or 0),
+        "confidence_low": low,
+        "confidence_high": float(top.get("confidence_high", 1.0) or 1.0),
+        "complete_seed_group": complete,
+        "collapse_free": collapse_free,
+        "clears_point_gate": clears_point,
+        "clears_confidence_gate": clears_confidence,
+        "promotion_confident": bool(winner is not None and clears_confidence),
+    }
+
+
 def trial_payload(trial: TrialResult) -> dict[str, object]:
     return asdict(trial)
 
@@ -1332,6 +1541,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anchor-kl-coefs", type=csv_floats, default=[0.003, 0.01, 0.03])
     parser.add_argument("--ppo-clip-epsilons", type=csv_floats, default=[0.2])
     parser.add_argument("--shuffle-seeds", type=csv_ints, default=[101])
+    parser.add_argument("--replicate-ranking", type=parse_bool, default=True, help="Rank each setting from pooled results across every configured shuffle seed")
     parser.add_argument("--episode-limits", type=csv_ints, default=[0], help="Nested deterministic PPO data sizes; 0 uses every episode")
     parser.add_argument("--ppo-minibatch-episodes", type=positive_int, default=int_default("ppo_minibatch_episodes"))
     parser.add_argument("--max-trials", type=positive_int, default=18)
@@ -1397,6 +1607,18 @@ def main() -> None:
         raise SystemExit("screen-max-games-per-side must be >= screen-games-per-side")
     if any(limit < 0 for limit in args.episode_limits):
         raise SystemExit("episode-limits values must be >= 0")
+    replicate_seed_count = len(set(args.shuffle_seeds))
+    if args.replicate_ranking and replicate_seed_count > 1:
+        if args.adaptive_screen:
+            raise SystemExit(
+                "replicate-ranking with multiple seeds requires adaptive-screen=false "
+                "so every seed receives an equal evaluation budget"
+            )
+        if args.max_trials < replicate_seed_count or args.screen_candidates < replicate_seed_count:
+            raise SystemExit(
+                "replicate-ranking must train and screen at least one complete seed group; "
+                f"set max-trials and screen-candidates to at least {replicate_seed_count}"
+            )
     if len(set(args.episode_limits)) > 1:
         varying_training_axes = [
             name for name, values in (
@@ -1451,15 +1673,20 @@ def main() -> None:
     search_dir = (repo_root / DEFAULT_SEARCH_ROOT / args.run_prefix).resolve()
     search_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = search_dir / f"{args.run_prefix}_search_manifest.json"
-    combinations = [
-        Hyperparameters(lr, entropy, anchor, clip, shuffle_seed, episode_limit)
-        for lr, entropy, anchor, clip, shuffle_seed, episode_limit in itertools.product(
-            args.learning_rates, args.entropy_coefs, args.anchor_kl_coefs,
-            args.ppo_clip_epsilons, args.shuffle_seeds, args.episode_limits,
+    try:
+        combinations = select_search_combinations(
+            args.learning_rates,
+            args.entropy_coefs,
+            args.anchor_kl_coefs,
+            args.ppo_clip_epsilons,
+            args.shuffle_seeds,
+            args.episode_limits,
+            args.max_trials,
+            args.search_seed,
+            args.replicate_ranking,
         )
-    ]
-    random.Random(args.search_seed).shuffle(combinations)
-    combinations = combinations[: args.max_trials]
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     manifest: dict[str, object] = {
         "status": "running",
         "run_prefix": args.run_prefix,
@@ -1479,6 +1706,7 @@ def main() -> None:
             "anchor_kl_coefs": args.anchor_kl_coefs,
             "ppo_clip_epsilons": args.ppo_clip_epsilons,
             "shuffle_seeds": args.shuffle_seeds,
+            "replicate_ranking": args.replicate_ranking,
             "episode_limits": args.episode_limits,
             "max_trials": args.max_trials,
         },
@@ -1568,7 +1796,26 @@ def main() -> None:
 
         safe_trials = [trial for trial in trials if not trial.safety_flags]
         safe_trials.sort(key=lambda trial: training_screen_key(trial, args.target_kl), reverse=True)
-        screen_trials = safe_trials[: args.screen_candidates]
+        replicated_mode = args.replicate_ranking and len(set(args.shuffle_seeds)) > 1
+        if replicated_mode:
+            complete_groups = [
+                group for group in group_trials_by_setting(trials).values()
+                if len({trial.hyperparameters.shuffle_seed for trial in group})
+                == len(set(args.shuffle_seeds))
+                and all(not trial.safety_flags for trial in group)
+            ]
+            complete_groups.sort(
+                key=lambda group: replicated_training_group_key(group, args.target_kl),
+                reverse=True,
+            )
+            screen_group_count = args.screen_candidates // len(set(args.shuffle_seeds))
+            screen_trials = [
+                trial
+                for group in complete_groups[:screen_group_count]
+                for trial in sorted(group, key=lambda item: item.hyperparameters.shuffle_seed)
+            ]
+        else:
+            screen_trials = safe_trials[: args.screen_candidates]
         state.phase = "screening"
         state.screen_planned_candidates = len(screen_trials)
         state.screen_plan_finalized = True
@@ -1629,10 +1876,29 @@ def main() -> None:
                 progress_writer.update(force=True)
             ranked_screen = sorted(screen_trials, key=evaluation_rank_key, reverse=True)
 
-        finalists = [
-            trial for trial in ranked_screen
-            if trial.screen_evaluation and not trial.screen_evaluation.collapse_flags
-        ][: args.finalists]
+        ranked_screen_groups: list[dict[str, object]] = []
+        if replicated_mode:
+            ranked_screen_groups = build_hyperparameter_group_summary(
+                screen_trials, stage="screen", expected_seeds=args.shuffle_seeds,
+            )
+            qualifying_groups = [
+                summary for summary in ranked_screen_groups
+                if summary.get("complete_seed_group")
+                and not summary.get("collapse_flags")
+                and int(summary.get("rejected_trials", 0) or 0) == 0
+            ][: args.finalists]
+            finalist_setting_keys = {
+                group_summary_setting_key(summary) for summary in qualifying_groups
+            }
+            finalists = [
+                trial for trial in screen_trials
+                if hyperparameter_setting_key(trial.hyperparameters) in finalist_setting_keys
+            ]
+        else:
+            finalists = [
+                trial for trial in ranked_screen
+                if trial.screen_evaluation and not trial.screen_evaluation.collapse_flags
+            ][: args.finalists]
         state.phase = "final evaluation"
         state.final_planned_candidates = len(finalists)
         state.final_plan_finalized = True
@@ -1655,37 +1921,82 @@ def main() -> None:
             progress_writer.update(force=True)
 
         ranked_final = sorted(finalists, key=lambda trial: evaluation_rank_key(trial, final=True), reverse=True)
-        winner, assessment = promotion_assessment(
-            ranked_final,
-            args.promotion_min_win_rate,
-            args.promotion_confidence_threshold,
-        )
+        ranked_final_groups: list[dict[str, object]] = []
+        best_hyperparameters: dict[str, object] | None = None
+        if replicated_mode:
+            ranked_final_groups = build_hyperparameter_group_summary(
+                finalists, stage="final", expected_seeds=args.shuffle_seeds,
+            )
+            winning_group, assessment = grouped_promotion_assessment(
+                ranked_final_groups,
+                args.promotion_min_win_rate,
+                args.promotion_confidence_threshold,
+            )
+            winner = None
+            if winning_group is not None:
+                best_hyperparameters = dict(winning_group.get("hyperparameters", {}) or {})
+                winning_key = group_summary_setting_key(winning_group)
+                winning_trials = [
+                    trial for trial in ranked_final
+                    if hyperparameter_setting_key(trial.hyperparameters) == winning_key
+                ]
+                winner = winning_trials[0] if winning_trials else None
+        else:
+            winner, assessment = promotion_assessment(
+                ranked_final,
+                args.promotion_min_win_rate,
+                args.promotion_confidence_threshold,
+            )
+            if winner is not None:
+                best_hyperparameters = {
+                    "learning_rate": winner.hyperparameters.learning_rate,
+                    "entropy_coef": winner.hyperparameters.entropy_coef,
+                    "anchor_kl_coef": winner.hyperparameters.anchor_kl_coef,
+                    "ppo_clip_epsilon": winner.hyperparameters.ppo_clip_epsilon,
+                    "episode_limit": winner.hyperparameters.episode_limit,
+                }
         state.phase = "completed"
         state.clear_operation()
+        top_trial = ranked_final[0] if ranked_final else None
+        if ranked_final_groups:
+            top_group_key = group_summary_setting_key(ranked_final_groups[0])
+            top_group_trials = [
+                trial for trial in ranked_final
+                if hyperparameter_setting_key(trial.hyperparameters) == top_group_key
+            ]
+            if top_group_trials:
+                top_trial = top_group_trials[0]
         manifest["status"] = "completed"
         manifest["completed_at_unix"] = time.time()
         manifest["ranked_screen_results"] = [trial_payload(trial) for trial in ranked_screen]
         manifest["ranked_final_results"] = [trial_payload(trial) for trial in ranked_final]
-        manifest["top_result"] = trial_payload(ranked_final[0]) if ranked_final else None
+        manifest["ranked_screen_hyperparameter_groups"] = ranked_screen_groups
+        manifest["ranked_final_hyperparameter_groups"] = ranked_final_groups
+        manifest["top_result"] = trial_payload(top_trial) if top_trial else None
         manifest["best_result"] = trial_payload(winner) if winner else None
+        manifest["best_hyperparameters"] = best_hyperparameters
         manifest["promotion_assessment"] = assessment
         if len(set(args.episode_limits)) > 1:
             manifest["data_scale_summary"] = build_data_scale_summary(trials)
         if winner:
             assert winner.final_evaluation is not None
+            reported_win_rate = float(assessment.get("valid_win_rate", winner.final_evaluation.valid_win_rate))
+            reported_lower = float(assessment.get("confidence_low", winner.final_evaluation.confidence_low))
             reporter.notice(
                 f"winner run={winner.run_name} lr={winner.hyperparameters.learning_rate:g} "
                 f"entropy={winner.hyperparameters.entropy_coef:g} anchor={winner.hyperparameters.anchor_kl_coef:g} "
-                f"valid_win_rate={winner.final_evaluation.valid_win_rate:.4f} "
-                f"lower95={winner.final_evaluation.confidence_low:.4f} "
+                f"valid_win_rate={reported_win_rate:.4f} "
+                f"lower95={reported_lower:.4f} "
                 f"promotion_confident={assessment['promotion_confident']}"
             )
-        elif ranked_final:
-            top = ranked_final[0]
+        elif top_trial:
+            top = top_trial
             assert top.final_evaluation is not None
+            reported_win_rate = float(assessment.get("valid_win_rate", top.final_evaluation.valid_win_rate))
+            reported_lower = float(assessment.get("confidence_low", top.final_evaluation.confidence_low))
             reporter.notice(
-                f"no winner; top run={top.run_name} valid_win_rate={top.final_evaluation.valid_win_rate:.4f} "
-                f"lower95={top.final_evaluation.confidence_low:.4f}"
+                f"no winner; top run={top.run_name} valid_win_rate={reported_win_rate:.4f} "
+                f"lower95={reported_lower:.4f}"
             )
         else:
             reporter.notice("no safe finalist completed")

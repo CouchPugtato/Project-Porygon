@@ -17,6 +17,7 @@ from ppo_search import (
     aggregate_group_stats,
     adaptive_screen_contenders,
     build_data_scale_summary,
+    build_hyperparameter_group_summary,
     build_eval_command,
     build_train_command,
     evaluation_artifacts_match,
@@ -27,7 +28,9 @@ from ppo_search import (
     parse_search_args,
     parse_training_progress,
     promotion_assessment,
+    grouped_promotion_assessment,
     run_command,
+    select_search_combinations,
     training_safety_flags,
     training_artifacts_match,
     valid_outcome_counts,
@@ -419,6 +422,43 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(summary[0]["configured_seeds"], [101, 202])
         self.assertEqual(summary[0]["valid_games"], 200)
         self.assertAlmostEqual(float(summary[0]["pooled_valid_win_rate"]), 0.5)
+
+    def test_replicated_search_selection_keeps_complete_seed_groups(self) -> None:
+        combinations = select_search_combinations(
+            [2.5e-6, 5e-6, 1e-5], [1e-4], [0.01, 0.03], [0.1, 0.2],
+            [101, 202, 303], [256], 7, 2026, True,
+        )
+        self.assertEqual(len(combinations), 6)
+        grouped: dict[tuple[float, float, float, float, int], set[int]] = {}
+        for params in combinations:
+            key = (
+                params.learning_rate, params.entropy_coef, params.anchor_kl_coef,
+                params.ppo_clip_epsilon, params.episode_limit,
+            )
+            grouped.setdefault(key, set()).add(params.shuffle_seed)
+        self.assertEqual(len(grouped), 2)
+        self.assertTrue(all(seeds == {101, 202, 303} for seeds in grouped.values()))
+
+    def test_hyperparameter_group_ranking_pools_all_seed_results(self) -> None:
+        trials = []
+        for seed, wins in ((101, 54), (202, 53), (303, 52)):
+            trials.append(SimpleNamespace(
+                run_name=f"seed-{seed}",
+                hyperparameters=Hyperparameters(5e-6, 1e-4, 0.03, 0.1, seed, 256),
+                safety_flags=[],
+                screen_evaluation=self.evaluation("screen", wins, 100, 0.4, 0.6),
+                final_evaluation=None,
+            ))
+        summaries = build_hyperparameter_group_summary(
+            trials, stage="screen", expected_seeds=[101, 202, 303],
+        )
+        self.assertEqual(len(summaries), 1)
+        self.assertTrue(summaries[0]["complete_seed_group"])
+        self.assertEqual(summaries[0]["valid_games"], 300)
+        self.assertAlmostEqual(float(summaries[0]["valid_win_rate"]), 0.53)
+        winner, assessment = grouped_promotion_assessment(summaries, 0.50, 0.50)
+        self.assertIsNotNone(winner)
+        self.assertEqual(assessment["selection_scope"], "pooled_hyperparameter_setting")
 
 
 if __name__ == "__main__":
