@@ -366,6 +366,12 @@ class RichWorkflowReporter(BaseWorkflowReporter):
         atexit.register(self.close)
         self.refresh()
 
+    def command_started(self, command: list[str]) -> None:
+        # The dashboard already shows the active phase. Avoid dedicating a
+        # persistent bottom panel to an uninformative "running python.exe".
+        self.state.last_notice = ""
+        self.refresh()
+
     def close(self) -> None:
         super().close()
         if self.started:
@@ -420,7 +426,11 @@ class RichWorkflowReporter(BaseWorkflowReporter):
                 ("PPO training", state.training_current, state.training_total, f"{state.training_current}/{state.training_total} episodes"),
             ))
         if state.evaluation_games_per_side:
-            if state.phase == "evaluation" and state.evaluation_workers_total:
+            if (
+                state.phase == "evaluation"
+                and state.evaluation_workers_total
+                and state.evaluation_workers_started < state.evaluation_workers_total
+            ):
                 rows.append((
                     "Worker startup",
                     state.evaluation_workers_started,
@@ -430,10 +440,26 @@ class RichWorkflowReporter(BaseWorkflowReporter):
             for side in ("a", "b"):
                 valid = state.evaluation_valid[side]
                 invalid = state.evaluation_invalid[side]
-                detail = f"{valid}/{state.evaluation_games_per_side} valid; {invalid} invalid"
-                if state.phase == "evaluation" and state.evaluation_side == side and state.evaluation_attempt_total:
-                    detail += f"; attempt {state.evaluation_attempt_current}/{state.evaluation_attempt_total} raw"
-                rows.append((f"Evaluation {side.upper()}", valid, state.evaluation_games_per_side, detail))
+                is_active_attempt = (
+                    state.phase == "evaluation"
+                    and state.evaluation_side == side
+                    and state.evaluation_attempt_total > 0
+                )
+                if is_active_attempt:
+                    rows.append((
+                        f"Evaluation {side.upper()} raw",
+                        state.evaluation_attempt_current,
+                        state.evaluation_attempt_total,
+                        f"{state.evaluation_attempt_current}/{state.evaluation_attempt_total} raw; "
+                        f"{valid}/{state.evaluation_games_per_side} valid; {invalid} invalid",
+                    ))
+                else:
+                    rows.append((
+                        f"Evaluation {side.upper()}",
+                        valid,
+                        state.evaluation_games_per_side,
+                        f"{valid}/{state.evaluation_games_per_side} valid; {invalid} invalid",
+                    ))
         for label, current, total, detail in rows:
             style = "green" if total > 0 and current >= total else "cyan"
             table.add_row(f"[bold]{label}[/]", self._bar(current, total, style=style), detail)
