@@ -465,6 +465,7 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model-b") + 1], "candidate.chk")
         self.assertEqual(command[command.index("--pool-seed") + 1], "7")
         self.assertEqual(command[command.index("--battle-seed-base") + 1], "7")
+        self.assertEqual(command[command.index("--serve-client") + 1], "0")
 
     def test_safety_flags_reject_hard_stop_and_inactive_anchor(self) -> None:
         flags = training_safety_flags({

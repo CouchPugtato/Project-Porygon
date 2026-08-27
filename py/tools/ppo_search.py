@@ -1129,7 +1129,7 @@ def build_eval_command(
         "--battle-seed-base", str(paired_seed_base),
         "--format", args.format,
         "--worker-think-mode", "live",
-        "--serve-client", "1",
+        "--serve-client", "0",
         "--worker-log-stdout", "0",
         "--launch-stagger-seconds", str(args.launch_stagger_seconds),
         "--resource-check-seconds", str(args.resource_check_seconds),
