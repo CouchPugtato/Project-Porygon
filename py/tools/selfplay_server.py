@@ -21,6 +21,7 @@ from typing import Literal, TextIO
 
 import websockets
 
+from artifact_io import write_json_atomically
 from rl_defaults import float_default, int_default
 from showdown_determinism import apply_deterministic_battle_seed_patch
 
@@ -1723,8 +1724,8 @@ class PoolOrchestrator:
                 summary["model_a_pool_path"] = str(Path(self.args.model_a_pool).resolve())
             if self.args.model_b_pool:
                 summary["model_b_pool_path"] = str(Path(self.args.model_b_pool).resolve())
-        self.summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-        self.manifest_path.write_text(json.dumps(self._build_run_manifest(summary), indent=2) + "\n", encoding="utf-8")
+        write_json_atomically(self.manifest_path, self._build_run_manifest(summary))
+        write_json_atomically(self.summary_path, summary)
 
     async def run(self) -> int:
         self.run_dir.mkdir(parents=True, exist_ok=True)

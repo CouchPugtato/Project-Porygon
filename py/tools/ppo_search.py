@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TextIO
 
+from artifact_io import write_json_atomically
 from rl_defaults import bool_default, float_default, int_default
 from eval_collapse_check import collapse_flags_for_group
 
@@ -297,11 +298,6 @@ def inferred_policy_tag(repo_root: Path, episode_batch: Path, init_checkpoint: P
             f"tag={tag} init_checkpoint={init_checkpoint}"
         )
     return tag
-
-
-def write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def wilson_interval(wins: int | float, games: int, z: float = 1.959963984540054) -> tuple[float, float]:
@@ -748,7 +744,7 @@ class ManifestProgressWriter:
         if not force and now - self.last_write < 1.0:
             return
         self.manifest["progress"] = self.state.progress_payload()
-        write_json(self.path, self.manifest)
+        write_json_atomically(self.path, self.manifest)
         self.last_write = now
 
 
