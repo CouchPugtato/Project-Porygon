@@ -1,41 +1,24 @@
-# Controlled anchored PPO hyperparameter-search defaults.
-# Run-specific paths and names remain required command-line arguments.
-# Any command-line flag overrides the value in this file.
-
-# Conservative candidate region following the run_0100/0101 scale results.
 learning_rates = "0.0000025,0.000005,0.00001"
 entropy_coefs = "0.0001,0.0003"
 anchor_kl_coefs = "0.01,0.03,0.05"
 ppo_clip_epsilons = "0.1,0.2"
 shuffle_seeds = "101,202,303"
 replicate_ranking = true
-# Four space-filling settings bootstrap a Gaussian-process surrogate. Remaining
-# settings are selected sequentially by expected improvement.
 selection_strategy = "bayesian"
 bayes_initial_settings = 4
 bayes_exploration = 0.005
-# Reserve four settings for a half-step local search around the safe coarse leader.
 bayes_refine_settings = 4
 bayes_refine_fraction = 0.5
-# 256 was the strongest pooled scale; larger single updates degraded performance.
 episode_limits = "256"
-# 30 checkpoints / three seeds = six coarse settings plus four refined settings.
 search_seed = 2026
-# Zero derives separate run-specific matched suites from run_prefix + search_seed.
 screen_seed_suite = 0
 confirmation_seed_suite = 0
-# A fresh retrain uses a third independent matchup suite. Supply
-# fresh_confirmation_episode_batch on the command line to enable this stage.
 fresh_confirmation_seed_suite = 0
 max_trials = 30
 
-# Retrain only the selected setting on separately collected episodes. This is
-# intentionally empty by default because a search batch must not double as its
-# own reproduction batch.
 fresh_confirmation_episode_batch = ""
 fresh_confirmation_shuffle_seeds = "404,505,606"
 
-# Finalist robustness suite: parent/champion plus two distinct active histories.
 confirmation_registry = "models/league/current_arch/league_registry.json"
 confirmation_opponents = ""
 confirmation_historical_opponents = 2
@@ -43,12 +26,9 @@ confirmation_max_opponents = 3
 confirmation_non_regression_threshold = 0.50
 confirmation_dominance_spread = 0.10
 
-# Successive evaluation stages.
 screen_candidates = 30
-# In replicated mode finalists counts parameter settings, so this evaluates six checkpoints.
 finalists = 2
 screen_games_per_side = 100
-# Expand only pooled settings whose confidence intervals still overlap the finalist cutoff.
 adaptive_screen = true
 screen_game_block_per_side = 100
 screen_max_games_per_side = 200
@@ -57,18 +37,15 @@ confirmation_games_per_side = 100
 confirmation_adaptive = true
 confirmation_game_block_per_side = 100
 
-# A top-ranked result is only a winner above 50%; confidence is reported separately.
 promotion_min_win_rate = 0.50
 promotion_confidence_threshold = 0.50
 
-# Training and safety screening.
 epochs = 1
 reward_mode = "terminal"
 max_anchor_kl_mean = 0.05
 max_anchor_kl_max = 0.20
 max_clip_fraction = 0.25
 
-# Evaluation worker and resource controls.
 eval_concurrent_games = 30
 eval_worker_pairs = 40
 eval_max_replacement_attempts = 5
@@ -81,7 +58,6 @@ startup_timeout_seconds = 120
 omp_threads = 8
 resume = true
 
-# Terminal progress dashboard. Raw subprocess logs are stored under the search run.
 dashboard = true
 dashboard_refresh_per_second = 8
 dashboard_visible_trials = 10

@@ -19,7 +19,6 @@ episode_side = "a"
 epochs = 1
 reward_mode = "terminal"
 
-# Terminal workflow dashboard. Raw subprocess output is retained per round.
 dashboard = true
 dashboard_refresh_per_second = 8
 dashboard_write_raw_logs = true
