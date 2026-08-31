@@ -141,6 +141,22 @@ def resolve_path(repo_root: Path, value: str | Path) -> Path:
     return (repo_root / path).resolve()
 
 
+def resolve_search_episode_batches(
+    repo_root: Path,
+    primary_batch: str | Path,
+    additional_batches: list[str],
+) -> list[tuple[str, Path]]:
+    paths = [resolve_path(repo_root, primary_batch)] + [
+        resolve_path(repo_root, value) for value in additional_batches
+    ]
+    if len(set(paths)) != len(paths):
+        raise ValueError("search episode batches must be distinct")
+    return [
+        (f"batch{index:02d}", path)
+        for index, path in enumerate(paths, start=1)
+    ]
+
+
 def safe_name_token(value: str) -> str:
     token = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
     return token or "opponent"
@@ -557,10 +573,28 @@ class TrialResult:
     episode_count: int
     available_episode_count: int
     training_reused: bool
+    training_batch_id: str = "batch01"
+    training_batch_path: str = ""
     screen_evaluation: EvaluationResult | None = None
     final_evaluation: EvaluationResult | None = None
     confirmation_evaluations: dict[str, EvaluationResult] = field(default_factory=dict)
     phase: str = "search"
+
+
+def trial_replicate_key(trial: TrialResult) -> tuple[str, int]:
+    return getattr(trial, "training_batch_id", "batch01"), trial.hyperparameters.shuffle_seed
+
+
+def expected_replicate_keys(
+    expected_seeds: list[int],
+    expected_batch_ids: list[str] | None = None,
+) -> list[tuple[str, int]]:
+    batch_ids = expected_batch_ids or ["batch01"]
+    return sorted(
+        (batch_id, seed)
+        for batch_id in sorted(set(batch_ids))
+        for seed in sorted(set(expected_seeds))
+    )
 
 
 def format_duration(seconds: float | None) -> str:
@@ -1049,13 +1083,19 @@ def safe_float_token(value: float) -> str:
     return f"{value:g}".replace("-", "m").replace(".", "p")
 
 
-def trial_run_name(prefix: str, index: int, params: Hyperparameters) -> str:
+def trial_run_name(
+    prefix: str,
+    index: int,
+    params: Hyperparameters,
+    training_batch_id: str = "",
+) -> str:
+    batch_token = f"_{training_batch_id}" if training_batch_id else ""
     base = (
         f"{prefix}_{index:02d}_lr{safe_float_token(params.learning_rate)}"
         f"_ent{safe_float_token(params.entropy_coef)}"
         f"_anchor{safe_float_token(params.anchor_kl_coef)}"
         f"_clip{safe_float_token(params.ppo_clip_epsilon)}"
-        f"_seed{params.shuffle_seed}"
+        f"{batch_token}_seed{params.shuffle_seed}"
     )
     return f"{base}_eps{params.episode_limit}" if params.episode_limit > 0 else base
 
@@ -1180,6 +1220,8 @@ def collect_training_result(
     summary_path: Path,
     args: argparse.Namespace,
     training_reused: bool = False,
+    training_batch_id: str = "batch01",
+    training_batch_path: str = "",
 ) -> TrialResult:
     summary = load_json(summary_path)
     return TrialResult(
@@ -1201,6 +1243,8 @@ def collect_training_result(
         episode_count=int(summary.get("episode_count", 0) or 0),
         available_episode_count=int(summary.get("available_episode_count", 0) or 0),
         training_reused=training_reused,
+        training_batch_id=training_batch_id,
+        training_batch_path=training_batch_path,
     )
 
 
@@ -1467,10 +1511,20 @@ def adaptive_screen_group_contenders(
     if finalist_count <= 0 or len(usable) <= finalist_count:
         return []
     provisional = usable[:finalist_count]
-    cutoff_low = float(provisional[-1].get("confidence_low", 0.0) or 0.0)
+    cutoff_low = float(
+        provisional[-1].get(
+            "worst_batch_confidence_low",
+            provisional[-1].get("confidence_low", 0.0),
+        ) or 0.0
+    )
     challengers = [
         summary for summary in usable[finalist_count:]
-        if float(summary.get("confidence_high", 1.0) or 1.0) >= cutoff_low
+        if float(
+            summary.get(
+                "worst_batch_confidence_high",
+                summary.get("confidence_high", 1.0),
+            )
+        ) >= cutoff_low
     ]
     if not challengers:
         return []
@@ -1616,8 +1670,14 @@ def build_data_scale_summary(trials: list[TrialResult]) -> list[dict[str, object
         summaries.append({
             "episode_limit": episode_limit,
             "episode_limit_label": str(episode_limit) if episode_limit > 0 else "all",
-            "configured_seeds": sorted(trial.hyperparameters.shuffle_seed for trial in group),
-            "evaluated_seeds": sorted(trial.hyperparameters.shuffle_seed for trial in evaluated),
+            "configured_seeds": sorted({trial.hyperparameters.shuffle_seed for trial in group}),
+            "evaluated_seeds": sorted({trial.hyperparameters.shuffle_seed for trial in evaluated}),
+            "configured_batches": sorted({
+                getattr(trial, "training_batch_id", "batch01") for trial in group
+            }),
+            "evaluated_batches": sorted({
+                getattr(trial, "training_batch_id", "batch01") for trial in evaluated
+            }),
             "safe_trials": sum(1 for trial in group if not trial.safety_flags),
             "rejected_trials": sum(1 for trial in group if trial.safety_flags),
             "evaluation_stages": stages,
@@ -1629,6 +1689,7 @@ def build_data_scale_summary(trials: list[TrialResult]) -> list[dict[str, object
             "confidence_low": low,
             "confidence_high": high,
             "mean_seed_valid_win_rate": (sum(rates) / len(rates)) if rates else 0.0,
+            "mean_replicate_valid_win_rate": (sum(rates) / len(rates)) if rates else 0.0,
         })
     return summaries
 
@@ -1647,16 +1708,19 @@ def build_hyperparameter_group_summary(
     *,
     stage: str,
     expected_seeds: list[int],
+    expected_batch_ids: list[str] | None = None,
     confirmation_opponent: str = "",
 ) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
-    expected = sorted(set(expected_seeds))
+    expected = expected_replicate_keys(expected_seeds, expected_batch_ids)
     for key, group in group_trials_by_setting(trials).items():
         candidate_stats: dict[str, object] = {}
         baseline_stats: dict[str, object] = {}
         collapse_flags: set[str] = set()
         seed_results: list[dict[str, object]] = []
-        evaluated_seeds: list[int] = []
+        evaluated_replicates: list[tuple[str, int]] = []
+        batch_candidate_stats: dict[str, dict[str, object]] = {}
+        batch_baseline_stats: dict[str, dict[str, object]] = {}
         for trial in group:
             if stage == "final" and confirmation_opponent:
                 result = trial.confirmation_evaluations.get(confirmation_opponent)
@@ -1664,12 +1728,21 @@ def build_hyperparameter_group_summary(
                 result = trial.final_evaluation if stage == "final" else trial.screen_evaluation
             if result is None:
                 continue
-            evaluated_seeds.append(trial.hyperparameters.shuffle_seed)
+            evaluated_replicates.append(trial_replicate_key(trial))
             candidate_stats = aggregate_group_stats(candidate_stats, result.candidate_stats)
             baseline_stats = aggregate_group_stats(baseline_stats, result.baseline_stats)
+            batch_id = trial_replicate_key(trial)[0]
+            batch_candidate_stats[batch_id] = aggregate_group_stats(
+                batch_candidate_stats.get(batch_id, {}), result.candidate_stats,
+            )
+            batch_baseline_stats[batch_id] = aggregate_group_stats(
+                batch_baseline_stats.get(batch_id, {}), result.baseline_stats,
+            )
             collapse_flags.update(result.collapse_flags)
             seed_results.append({
                 "shuffle_seed": trial.hyperparameters.shuffle_seed,
+                "training_batch_id": getattr(trial, "training_batch_id", "batch01"),
+                "training_batch_path": getattr(trial, "training_batch_path", ""),
                 "run_name": trial.run_name,
                 "valid_games": result.valid_games,
                 "invalid_games": result.invalid_games,
@@ -1679,6 +1752,22 @@ def build_hyperparameter_group_summary(
             })
         valid = valid_outcome_counts(candidate_stats, baseline_stats)
         low, high = wilson_interval(float(valid["valid_score"]), int(valid["valid_games"]))
+        batch_results: list[dict[str, object]] = []
+        for batch_id in sorted(batch_candidate_stats):
+            batch_valid = valid_outcome_counts(
+                batch_candidate_stats[batch_id], batch_baseline_stats[batch_id],
+            )
+            batch_low, batch_high = wilson_interval(
+                float(batch_valid["valid_score"]), int(batch_valid["valid_games"]),
+            )
+            batch_results.append({
+                "training_batch_id": batch_id,
+                "valid_games": int(batch_valid["valid_games"]),
+                "invalid_games": int(batch_valid["invalid_games"]),
+                "valid_win_rate": float(batch_valid["valid_win_rate"]),
+                "confidence_low": batch_low,
+                "confidence_high": batch_high,
+            })
         lr, entropy, anchor, clip, episode_limit = key
         summaries.append({
             "stage": stage,
@@ -1689,9 +1778,20 @@ def build_hyperparameter_group_summary(
                 "ppo_clip_epsilon": clip,
                 "episode_limit": episode_limit,
             },
-            "configured_seeds": expected,
-            "evaluated_seeds": sorted(evaluated_seeds),
-            "complete_seed_group": sorted(evaluated_seeds) == expected,
+            "configured_seeds": sorted(set(expected_seeds)),
+            "evaluated_seeds": sorted({seed for _, seed in evaluated_replicates}),
+            "configured_batches": sorted({batch_id for batch_id, _ in expected}),
+            "evaluated_batches": sorted({batch_id for batch_id, _ in evaluated_replicates}),
+            "configured_replicates": [
+                {"training_batch_id": batch_id, "shuffle_seed": seed}
+                for batch_id, seed in expected
+            ],
+            "evaluated_replicates": [
+                {"training_batch_id": batch_id, "shuffle_seed": seed}
+                for batch_id, seed in sorted(evaluated_replicates)
+            ],
+            "complete_replicate_group": sorted(evaluated_replicates) == expected,
+            "complete_seed_group": sorted(evaluated_replicates) == expected,
             "safe_trials": sum(1 for trial in group if not trial.safety_flags),
             "rejected_trials": sum(1 for trial in group if trial.safety_flags),
             "collapse_flags": sorted(collapse_flags),
@@ -1702,15 +1802,35 @@ def build_hyperparameter_group_summary(
             "valid_win_rate": float(valid["valid_win_rate"]),
             "confidence_low": low,
             "confidence_high": high,
-            "seed_results": sorted(seed_results, key=lambda item: int(item["shuffle_seed"])),
+            "batch_results": batch_results,
+            "worst_batch_valid_win_rate": min(
+                (float(item["valid_win_rate"]) for item in batch_results),
+                default=0.0,
+            ),
+            "worst_batch_confidence_low": min(
+                (float(item["confidence_low"]) for item in batch_results),
+                default=0.0,
+            ),
+            "worst_batch_confidence_high": min(
+                (float(item["confidence_high"]) for item in batch_results),
+                default=1.0,
+            ),
+            "seed_results": sorted(
+                seed_results,
+                key=lambda item: (str(item["training_batch_id"]), int(item["shuffle_seed"])),
+            ),
         })
     return sorted(summaries, key=hyperparameter_group_rank_key, reverse=True)
 
 
-def hyperparameter_group_rank_key(summary: dict[str, object]) -> tuple[int, int, float, float, int]:
+def hyperparameter_group_rank_key(
+    summary: dict[str, object],
+) -> tuple[int, int, float, float, float, float, int]:
     return (
         1 if summary.get("complete_seed_group") else 0,
         1 if not summary.get("collapse_flags") and int(summary.get("rejected_trials", 0) or 0) == 0 else 0,
+        float(summary.get("worst_batch_confidence_low", 0.0) or 0.0),
+        float(summary.get("worst_batch_valid_win_rate", 0.0) or 0.0),
         float(summary.get("confidence_low", 0.0) or 0.0),
         float(summary.get("valid_win_rate", 0.0) or 0.0),
         int(summary.get("valid_games", 0) or 0),
@@ -1719,12 +1839,14 @@ def hyperparameter_group_rank_key(summary: dict[str, object]) -> tuple[int, int,
 
 def robust_confirmation_group_rank_key(
     summary: dict[str, object],
-) -> tuple[int, int, int, int, float, float, float, float, int]:
+) -> tuple[int, int, int, int, float, float, float, float, float, float, int]:
     return (
         1 if summary.get("complete_seed_group") else 0,
         1 if not summary.get("collapse_flags") and int(summary.get("rejected_trials", 0) or 0) == 0 else 0,
         1 if summary.get("all_opponents_non_regression") else 0,
         1 if summary.get("primary_opponent_complete") else 0,
+        float(summary.get("primary_worst_batch_confidence_low", 0.0) or 0.0),
+        float(summary.get("primary_worst_batch_valid_win_rate", 0.0) or 0.0),
         float(summary.get("primary_confidence_low", 0.0) or 0.0),
         float(summary.get("primary_valid_win_rate", 0.0) or 0.0),
         float(summary.get("worst_opponent_confidence_low", 0.0) or 0.0),
@@ -1737,12 +1859,16 @@ def build_robust_confirmation_group_summary(
     trials: list[TrialResult],
     *,
     expected_seeds: list[int],
+    expected_batch_ids: list[str] | None = None,
     opponents: list[ConfirmationOpponent],
     non_regression_threshold: float,
     dominance_spread: float,
 ) -> list[dict[str, object]]:
     pooled_groups = build_hyperparameter_group_summary(
-        trials, stage="final", expected_seeds=expected_seeds,
+        trials,
+        stage="final",
+        expected_seeds=expected_seeds,
+        expected_batch_ids=expected_batch_ids,
     )
     opponent_groups = {
         opponent.id: {
@@ -1751,6 +1877,7 @@ def build_robust_confirmation_group_summary(
                 trials,
                 stage="final",
                 expected_seeds=expected_seeds,
+                expected_batch_ids=expected_batch_ids,
                 confirmation_opponent=opponent.id,
             )
         }
@@ -1769,9 +1896,12 @@ def build_robust_confirmation_group_summary(
                 continue
             rate = float(summary.get("valid_win_rate", 0.0) or 0.0)
             high = float(summary.get("confidence_high", 1.0) or 1.0)
+            worst_batch_high = float(
+                summary.get("worst_batch_confidence_high", high)
+            )
             rates.append(rate)
             regression_detected = bool(
-                opponent.protected and high < non_regression_threshold
+                opponent.protected and worst_batch_high < non_regression_threshold
             )
             if regression_detected:
                 regression_opponents.append(opponent.id)
@@ -1787,6 +1917,14 @@ def build_robust_confirmation_group_summary(
                 "valid_win_rate": rate,
                 "confidence_low": float(summary.get("confidence_low", 0.0) or 0.0),
                 "confidence_high": high,
+                "batch_results": list(summary.get("batch_results", []) or []),
+                "worst_batch_valid_win_rate": float(
+                    summary.get("worst_batch_valid_win_rate", rate)
+                ),
+                "worst_batch_confidence_low": float(
+                    summary.get("worst_batch_confidence_low", 0.0) or 0.0
+                ),
+                "worst_batch_confidence_high": worst_batch_high,
                 "collapse_flags": list(summary.get("collapse_flags", []) or []),
                 "complete_seed_group": bool(summary.get("complete_seed_group")),
             })
@@ -1811,7 +1949,13 @@ def build_robust_confirmation_group_summary(
             "primary_valid_games": int(primary["valid_games"]) if primary else 0,
             "primary_invalid_games": int(primary["invalid_games"]) if primary else 0,
             "primary_valid_win_rate": float(primary["valid_win_rate"]) if primary else 0.0,
+            "primary_worst_batch_valid_win_rate": float(
+                primary["worst_batch_valid_win_rate"]
+            ) if primary else 0.0,
             "primary_confidence_low": float(primary["confidence_low"]) if primary else 0.0,
+            "primary_worst_batch_confidence_low": float(
+                primary["worst_batch_confidence_low"]
+            ) if primary else 0.0,
             "primary_confidence_high": float(primary["confidence_high"]) if primary else 1.0,
             "worst_opponent_confidence_low": min(
                 (float(item["confidence_low"]) for item in matchup_results),
@@ -1830,6 +1974,7 @@ def unresolved_confirmation_setting_opponents(
     trials: list[TrialResult],
     *,
     expected_seeds: list[int],
+    expected_batch_ids: list[str] | None = None,
     opponents: list[ConfirmationOpponent],
     requested_games_per_side: dict[
         tuple[tuple[float, float, float, float, int], str], int
@@ -1843,6 +1988,7 @@ def unresolved_confirmation_setting_opponents(
             trials,
             stage="final",
             expected_seeds=expected_seeds,
+            expected_batch_ids=expected_batch_ids,
             confirmation_opponent=opponent.id,
         )
         for summary in groups:
@@ -2117,11 +2263,22 @@ def suggest_bayesian_setting(
 
     observed_keys = [group_summary_setting_key(summary) for summary in usable]
     observed_x = [features[key] for key in observed_keys]
-    observed_y = [float(summary.get("valid_win_rate", 0.0) or 0.0) - 0.5 for summary in usable]
+    observed_y = [
+        float(summary.get("worst_batch_valid_win_rate", summary.get("valid_win_rate", 0.0)) or 0.0) - 0.5
+        for summary in usable
+    ]
     noise = []
     for summary in usable:
-        games = int(summary.get("valid_games", 0) or 0)
-        rate = float(summary.get("valid_win_rate", 0.5) or 0.5)
+        batch_results = list(summary.get("batch_results", []) or [])
+        weakest_batch = min(
+            batch_results,
+            key=lambda item: float(item.get("valid_win_rate", 0.0) or 0.0),
+            default={},
+        )
+        games = int(weakest_batch.get("valid_games", summary.get("valid_games", 0)) or 0)
+        rate = float(weakest_batch.get(
+            "valid_win_rate", summary.get("valid_win_rate", 0.5),
+        ))
         binomial_noise = rate * (1.0 - rate) / max(1, games)
         seed_rates = [
             float(item.get("valid_win_rate", 0.0) or 0.0)
@@ -2242,8 +2399,14 @@ def robust_grouped_promotion_assessment(
         top.get("rejected_trials", 0) or 0
     ) == 0
     non_regression = bool(top.get("all_opponents_non_regression"))
-    point = float(top.get("primary_valid_win_rate", 0.0) or 0.0)
-    low = float(top.get("primary_confidence_low", 0.0) or 0.0)
+    primary_point = float(top.get("primary_valid_win_rate", 0.0) or 0.0)
+    primary_low = float(top.get("primary_confidence_low", 0.0) or 0.0)
+    point = float(
+        top.get("primary_worst_batch_valid_win_rate", primary_point)
+    )
+    low = float(
+        top.get("primary_worst_batch_confidence_low", primary_low)
+    )
     clears_point = point > minimum_win_rate
     clears_confidence = low > confidence_threshold
     winner = top if complete and collapse_free and non_regression and clears_point else None
@@ -2262,7 +2425,7 @@ def robust_grouped_promotion_assessment(
     return winner, {
         "status": status,
         "selection_scope": "parent_primary_multi_opponent_robustness",
-        "selection_metric": "parent_valid_win_rate",
+        "selection_metric": "worst_training_batch_parent_valid_win_rate",
         "hyperparameters": top.get("hyperparameters"),
         "configured_seeds": top.get("configured_seeds"),
         "evaluated_seeds": top.get("evaluated_seeds"),
@@ -2275,10 +2438,12 @@ def robust_grouped_promotion_assessment(
         "confidence_low": float(top.get("confidence_low", 0.0) or 0.0),
         "confidence_high": float(top.get("confidence_high", 1.0) or 1.0),
         "primary_opponent_id": top.get("primary_opponent_id"),
-        "primary_valid_win_rate": point,
+        "primary_valid_win_rate": primary_point,
+        "primary_worst_batch_valid_win_rate": point,
         "primary_valid_games": int(top.get("primary_valid_games", 0) or 0),
         "primary_invalid_games": int(top.get("primary_invalid_games", 0) or 0),
-        "primary_confidence_low": low,
+        "primary_confidence_low": primary_low,
+        "primary_worst_batch_confidence_low": low,
         "primary_confidence_high": float(
             top.get("primary_confidence_high", 1.0) or 1.0
         ),
@@ -2304,10 +2469,16 @@ def fresh_confirmation_comparison(
     fresh: dict[str, object],
 ) -> dict[str, object]:
     preliminary_rate = float(
-        preliminary.get("primary_valid_win_rate", preliminary.get("valid_win_rate", 0.0)) or 0.0
+        preliminary.get(
+            "primary_worst_batch_valid_win_rate",
+            preliminary.get("primary_valid_win_rate", preliminary.get("valid_win_rate", 0.0)),
+        ) or 0.0
     )
     fresh_rate = float(
-        fresh.get("primary_valid_win_rate", fresh.get("valid_win_rate", 0.0)) or 0.0
+        fresh.get(
+            "primary_worst_batch_valid_win_rate",
+            fresh.get("primary_valid_win_rate", fresh.get("valid_win_rate", 0.0)),
+        ) or 0.0
     )
     fresh_passed = bool(
         fresh.get("clears_point_gate")
@@ -2324,7 +2495,7 @@ def fresh_confirmation_comparison(
         outcome = "reproduced"
     return {
         "outcome": outcome,
-        "comparison_metric": "parent_valid_win_rate",
+        "comparison_metric": "worst_training_batch_parent_valid_win_rate",
         "preliminary_valid_win_rate": preliminary_rate,
         "fresh_valid_win_rate": fresh_rate,
         "valid_win_rate_delta": fresh_rate - preliminary_rate,
@@ -2343,6 +2514,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-prefix", required=True)
     parser.add_argument("--init-checkpoint", required=True)
     parser.add_argument("--episode-batch", required=True)
+    parser.add_argument(
+        "--additional-episode-batches",
+        type=csv_strings,
+        default=[],
+        help="Additional comma-separated episode batches crossed with every search shuffle seed",
+    )
     parser.add_argument("--fresh-confirmation-episode-batch", default="", help="Separate episode batch used to retrain the selected setting before promotion")
     parser.add_argument("--fresh-confirmation-shuffle-seeds", type=csv_ints, default=[404, 505, 606], help="New training-order seeds used only for fresh-data confirmation")
     parser.add_argument("--anchor-checkpoint", default="")
@@ -2453,19 +2630,12 @@ def main() -> None:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    replicate_seed_count = len(set(args.shuffle_seeds))
     fresh_confirmation_enabled = bool(args.fresh_confirmation_episode_batch.strip())
     fresh_seed_values = sorted(set(args.fresh_confirmation_shuffle_seeds))
     if fresh_confirmation_enabled and set(fresh_seed_values) & set(args.shuffle_seeds):
         raise SystemExit(
             "fresh-confirmation-shuffle-seeds must not reuse search shuffle-seeds"
         )
-    if args.replicate_ranking and replicate_seed_count > 1:
-        if args.max_trials < replicate_seed_count or args.screen_candidates < replicate_seed_count:
-            raise SystemExit(
-                "replicate-ranking must train and screen at least one complete seed group; "
-                f"set max-trials and screen-candidates to at least {replicate_seed_count}"
-            )
     if len(set(args.episode_limits)) > 1:
         varying_training_axes = [
             name for name, values in (
@@ -2481,12 +2651,6 @@ def main() -> None:
                 "data-scale sweeps require fixed PPO hyperparameters; provide one value for "
                 + ", ".join(varying_training_axes)
             )
-        scale_trial_count = len(set(args.episode_limits)) * len(set(args.shuffle_seeds))
-        if args.max_trials < scale_trial_count or args.screen_candidates < scale_trial_count:
-            raise SystemExit(
-                "data-scale sweeps must include and screen every scale/seed trial; "
-                f"set max-trials and screen-candidates to at least {scale_trial_count}"
-            )
         if args.adaptive_screen:
             raise SystemExit("data-scale sweeps require adaptive-screen=false for equal evaluation budgets")
     for label, value in (
@@ -2499,17 +2663,42 @@ def main() -> None:
     repo_root = resolve_repo_root()
     trainer_exe = resolve_path(repo_root, DEFAULT_TRAINER_EXE)
     init_checkpoint = resolve_path(repo_root, args.init_checkpoint)
-    episode_batch = resolve_path(repo_root, args.episode_batch)
+    try:
+        search_episode_batches = resolve_search_episode_batches(
+            repo_root, args.episode_batch, args.additional_episode_batches,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    episode_batch = search_episode_batches[0][1]
+    search_batch_ids = [batch_id for batch_id, _ in search_episode_batches]
+    search_batch_paths = [path for _, path in search_episode_batches]
+    seed_values = sorted(set(args.shuffle_seeds))
+    search_replicate_count = len(search_episode_batches) * len(seed_values)
+    if len(search_episode_batches) > 1 and not args.replicate_ranking:
+        raise SystemExit("multiple search episode batches require replicate-ranking=true")
+    if args.replicate_ranking and search_replicate_count > 1:
+        if args.max_trials < search_replicate_count or args.screen_candidates < search_replicate_count:
+            raise SystemExit(
+                "replicate-ranking must train and screen at least one complete batch/seed group; "
+                f"set max-trials and screen-candidates to at least {search_replicate_count}"
+            )
+    if len(set(args.episode_limits)) > 1:
+        scale_trial_count = len(set(args.episode_limits)) * search_replicate_count
+        if args.max_trials < scale_trial_count or args.screen_candidates < scale_trial_count:
+            raise SystemExit(
+                "data-scale sweeps must include and screen every scale/batch/seed trial; "
+                f"set max-trials and screen-candidates to at least {scale_trial_count}"
+            )
     fresh_confirmation_episode_batch = (
         resolve_path(repo_root, args.fresh_confirmation_episode_batch)
         if fresh_confirmation_enabled else None
     )
     if (
         fresh_confirmation_episode_batch is not None
-        and fresh_confirmation_episode_batch == episode_batch
+        and fresh_confirmation_episode_batch in search_batch_paths
     ):
         raise SystemExit(
-            "fresh-confirmation-episode-batch must differ from episode-batch"
+            "fresh-confirmation-episode-batch must differ from every search episode batch"
         )
     anchor_checkpoint = resolve_path(repo_root, args.anchor_checkpoint) if args.anchor_checkpoint else init_checkpoint
     parent_checkpoint = resolve_path(repo_root, args.eval_model_b) if args.eval_model_b else init_checkpoint
@@ -2517,12 +2706,14 @@ def main() -> None:
     for label, path in (
         ("trainer executable", trainer_exe),
         ("initial checkpoint", init_checkpoint),
-        ("episode batch", episode_batch),
         ("anchor checkpoint", anchor_checkpoint),
         ("evaluation parent", parent_checkpoint),
     ):
         if not path.exists():
             raise SystemExit(f"{label} not found: {path}")
+    for batch_id, path in search_episode_batches:
+        if not path.exists():
+            raise SystemExit(f"search episode batch {batch_id} not found: {path}")
     if (
         fresh_confirmation_episode_batch is not None
         and not fresh_confirmation_episode_batch.exists()
@@ -2530,9 +2721,20 @@ def main() -> None:
         raise SystemExit(
             f"fresh confirmation episode batch not found: {fresh_confirmation_episode_batch}"
         )
-    if not args.policy_tag_expected:
+    explicit_policy_tag = bool(args.policy_tag_expected)
+    if not explicit_policy_tag:
         try:
             args.policy_tag_expected = inferred_policy_tag(repo_root, episode_batch, init_checkpoint)
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from exc
+    search_policy_tags: dict[str, str] = {}
+    for batch_id, batch_path in search_episode_batches:
+        try:
+            search_policy_tags[batch_id] = (
+                args.policy_tag_expected
+                if explicit_policy_tag or batch_path == episode_batch
+                else inferred_policy_tag(repo_root, batch_path, init_checkpoint)
+            )
         except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
             raise SystemExit(str(exc)) from exc
     fresh_policy_tag_expected = ""
@@ -2571,11 +2773,11 @@ def main() -> None:
     bayesian_mode = (
         args.selection_strategy == "bayesian"
         and args.replicate_ranking
-        and len(set(args.shuffle_seeds)) > 1
+        and search_replicate_count > 1
     )
     if args.selection_strategy == "bayesian" and not bayesian_mode:
         raise SystemExit(
-            "bayesian selection requires replicate-ranking=true and at least two shuffle seeds"
+            "bayesian selection requires replicate-ranking=true and at least two batch/seed replicates"
         )
     if bayesian_mode and any(
         value <= 0.0
@@ -2583,11 +2785,13 @@ def main() -> None:
         for value in values
     ):
         raise SystemExit("bayesian selection requires positive learning-rate, entropy, and anchor values")
-    seed_values = sorted(set(args.shuffle_seeds))
     evaluation_replicate_indices = {
-        shuffle_seed: index for index, shuffle_seed in enumerate(seed_values)
+        (batch_id, shuffle_seed): index
+        for index, (batch_id, shuffle_seed) in enumerate(
+            expected_replicate_keys(seed_values, search_batch_ids)
+        )
     }
-    requested_setting_budget = args.max_trials // len(seed_values)
+    requested_setting_budget = args.max_trials // search_replicate_count
     coarse_setting_budget = min(len(full_setting_space), requested_setting_budget)
     refinement_setting_budget = 0
     if bayesian_mode:
@@ -2615,28 +2819,38 @@ def main() -> None:
             min(args.bayes_initial_settings, coarse_setting_budget),
             args.search_seed,
         )
-        combinations = [
+        initial_combinations = [
             Hyperparameters(lr, entropy, anchor, clip, seed, episode_limit)
             for lr, entropy, anchor, clip, episode_limit in initial_settings
             for seed in seed_values
         ]
-        planned_trial_count = setting_budget * len(seed_values)
+        combinations = [
+            (params, batch_id, batch_path, search_policy_tags[batch_id])
+            for params in initial_combinations
+            for batch_id, batch_path in search_episode_batches
+        ]
+        planned_trial_count = setting_budget * search_replicate_count
     else:
         setting_budget = coarse_setting_budget
         try:
-            combinations = select_search_combinations(
+            base_combinations = select_search_combinations(
                 args.learning_rates,
                 args.entropy_coefs,
                 args.anchor_kl_coefs,
                 args.ppo_clip_epsilons,
                 args.shuffle_seeds,
                 args.episode_limits,
-                args.max_trials,
+                requested_setting_budget * len(seed_values),
                 args.search_seed,
                 args.replicate_ranking,
             )
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
+        combinations = [
+            (params, batch_id, batch_path, search_policy_tags[batch_id])
+            for params in base_combinations
+            for batch_id, batch_path in search_episode_batches
+        ]
         initial_settings = []
         planned_trial_count = len(combinations)
     manifest: dict[str, object] = {
@@ -2647,6 +2861,14 @@ def main() -> None:
             "trainer_executable": str(trainer_exe),
             "init_checkpoint": str(init_checkpoint),
             "episode_batch": str(episode_batch),
+            "search_episode_batches": [
+                {
+                    "id": batch_id,
+                    "path": str(batch_path),
+                    "policy_tag_expected": search_policy_tags[batch_id],
+                }
+                for batch_id, batch_path in search_episode_batches
+            ],
             "policy_tag_expected": args.policy_tag_expected,
             "fresh_confirmation_episode_batch": (
                 str(fresh_confirmation_episode_batch)
@@ -2666,6 +2888,8 @@ def main() -> None:
             "anchor_kl_coefs": args.anchor_kl_coefs,
             "ppo_clip_epsilons": args.ppo_clip_epsilons,
             "shuffle_seeds": args.shuffle_seeds,
+            "training_batch_ids": search_batch_ids,
+            "replicates_per_setting": search_replicate_count,
             "replicate_ranking": args.replicate_ranking,
             "episode_limits": args.episode_limits,
             "max_trials": args.max_trials,
@@ -2681,7 +2905,10 @@ def main() -> None:
             "adaptive_screen": args.adaptive_screen,
             "paired_evaluation_seeds": True,
             "paired_seed_scope": "shared by candidates with the same training replicate and by both player sides within each stage/block",
-            "replicate_substreams": evaluation_replicate_indices,
+            "replicate_substreams": {
+                f"{batch_id}:seed{shuffle_seed}": index
+                for (batch_id, shuffle_seed), index in evaluation_replicate_indices.items()
+            },
             "seed_suites": evaluation_seed_suites,
             "promotion_uses_held_out_confirmation_suite": True,
             "fresh_data_confirmation_enabled": fresh_confirmation_enabled,
@@ -2746,7 +2973,7 @@ def main() -> None:
     progress_writer.update(force=True)
     reporter.start()
     try:
-        replicated_mode = args.replicate_ranking and len(set(args.shuffle_seeds)) > 1
+        replicated_mode = args.replicate_ranking and search_replicate_count > 1
         screen_trials: list[TrialResult] = []
         requested_screen_games: dict[str, int] = {}
         requested_group_screen_games: dict[tuple[float, float, float, float, int], int] = {}
@@ -2758,9 +2985,15 @@ def main() -> None:
             policy_tag_expected: str = args.policy_tag_expected,
             run_prefix: str = args.run_prefix,
             phase: str = "search",
+            training_batch_id: str = "batch01",
         ) -> TrialResult:
             index = len(trials) + 1
-            run_name = trial_run_name(run_prefix, index, params)
+            run_name = trial_run_name(
+                run_prefix,
+                index,
+                params,
+                training_batch_id if phase == "search" and len(search_episode_batches) > 1 else "",
+            )
             run_dir = (repo_root / DEFAULT_RUNS_ROOT / run_name).resolve()
             checkpoint_path = run_dir / "candidate.chk"
             summary_path = run_dir / "training_summary.json"
@@ -2793,6 +3026,8 @@ def main() -> None:
             trial = collect_training_result(
                 run_name, params, checkpoint_path, summary_path, phase_args,
                 training_reused=can_resume,
+                training_batch_id=training_batch_id,
+                training_batch_path=str(training_batch),
             )
             trial.phase = phase
             state.active_total = trial.available_episode_count or trial.episode_count
@@ -2821,7 +3056,7 @@ def main() -> None:
                 paired_evaluation_seed(
                     int(evaluation_seed_suites["screen"]),
                     1,
-                    evaluation_replicate_indices[trial.hyperparameters.shuffle_seed],
+                    evaluation_replicate_indices[trial_replicate_key(trial)],
                 ),
                 trial_index, reporter, state, logs_dir, block_index=1,
             )
@@ -2862,6 +3097,7 @@ def main() -> None:
                         screen_trials,
                         stage="screen",
                         expected_seeds=seed_values,
+                        expected_batch_ids=search_batch_ids,
                     )
                     if (
                         not refinement_started
@@ -2982,12 +3218,18 @@ def main() -> None:
                 state.phase = f"{setting_phase} training"
                 reporter.refresh()
                 lr, entropy, anchor, clip, episode_limit = setting
-                setting_trials = [
-                    train_one(Hyperparameters(
+                setting_trials = []
+                for seed in seed_values:
+                    params = Hyperparameters(
                         lr, entropy, anchor, clip, seed, episode_limit,
-                    ))
-                    for seed in seed_values
-                ]
+                    )
+                    for batch_id, batch_path in search_episode_batches:
+                        setting_trials.append(train_one(
+                            params,
+                            training_batch=batch_path,
+                            policy_tag_expected=search_policy_tags[batch_id],
+                            training_batch_id=batch_id,
+                        ))
                 if all(not trial.safety_flags for trial in setting_trials):
                     state.phase = f"{setting_phase} screening"
                     reporter.refresh()
@@ -3025,27 +3267,32 @@ def main() -> None:
         else:
             state.phase = "training"
             reporter.refresh()
-            for params in combinations:
-                train_one(params)
+            for params, batch_id, batch_path, policy_tag_expected in combinations:
+                train_one(
+                    params,
+                    training_batch=batch_path,
+                    policy_tag_expected=policy_tag_expected,
+                    training_batch_id=batch_id,
+                )
 
             safe_trials = [trial for trial in trials if not trial.safety_flags]
             safe_trials.sort(key=lambda trial: training_screen_key(trial, args.target_kl), reverse=True)
             if replicated_mode:
                 complete_groups = [
                     group for group in group_trials_by_setting(trials).values()
-                    if len({trial.hyperparameters.shuffle_seed for trial in group})
-                    == len(set(args.shuffle_seeds))
+                    if sorted(trial_replicate_key(trial) for trial in group)
+                    == expected_replicate_keys(seed_values, search_batch_ids)
                     and all(not trial.safety_flags for trial in group)
                 ]
                 complete_groups.sort(
                     key=lambda group: replicated_training_group_key(group, args.target_kl),
                     reverse=True,
                 )
-                screen_group_count = args.screen_candidates // len(set(args.shuffle_seeds))
+                screen_group_count = args.screen_candidates // search_replicate_count
                 selected_screen_trials = [
                     trial
                     for group in complete_groups[:screen_group_count]
-                    for trial in sorted(group, key=lambda item: item.hyperparameters.shuffle_seed)
+                    for trial in sorted(group, key=trial_replicate_key)
                 ]
             else:
                 selected_screen_trials = safe_trials[: args.screen_candidates]
@@ -3065,7 +3312,10 @@ def main() -> None:
         while args.adaptive_screen:
             if replicated_mode:
                 adaptive_groups = build_hyperparameter_group_summary(
-                    screen_trials, stage="screen", expected_seeds=args.shuffle_seeds,
+                    screen_trials,
+                    stage="screen",
+                    expected_seeds=seed_values,
+                    expected_batch_ids=search_batch_ids,
                 )
                 contender_keys = set(adaptive_screen_group_contenders(
                     adaptive_groups,
@@ -3106,7 +3356,7 @@ def main() -> None:
                     paired_evaluation_seed(
                         int(evaluation_seed_suites["screen"]),
                         adaptive_block_index,
-                        evaluation_replicate_indices[trial.hyperparameters.shuffle_seed],
+                        evaluation_replicate_indices[trial_replicate_key(trial)],
                     ),
                     trial_indices[trial.run_name], reporter, state, logs_dir,
                     block_index=adaptive_block_index,
@@ -3124,7 +3374,10 @@ def main() -> None:
         ranked_screen_groups: list[dict[str, object]] = []
         if replicated_mode:
             ranked_screen_groups = build_hyperparameter_group_summary(
-                screen_trials, stage="screen", expected_seeds=args.shuffle_seeds,
+                screen_trials,
+                stage="screen",
+                expected_seeds=seed_values,
+                expected_batch_ids=search_batch_ids,
             )
             qualifying_groups = [
                 summary for summary in ranked_screen_groups
@@ -3148,11 +3401,15 @@ def main() -> None:
             phase_trials: list[TrialResult],
             *,
             expected_seeds: list[int],
+            expected_batch_ids: list[str],
             seed_suite: int,
             phase_label: str,
         ) -> None:
             replicate_indices = {
-                seed: index for index, seed in enumerate(sorted(set(expected_seeds)))
+                key: index
+                for index, key in enumerate(
+                    expected_replicate_keys(expected_seeds, expected_batch_ids)
+                )
             }
             state.phase = phase_label
             state.final_planned_candidates += len(phase_trials)
@@ -3178,7 +3435,7 @@ def main() -> None:
                         args.confirmation_games_per_side,
                         paired_evaluation_seed(
                             seed_suite, 1,
-                            replicate_indices[trial.hyperparameters.shuffle_seed],
+                            replicate_indices[trial_replicate_key(trial)],
                             opponent_index,
                         ),
                         trials.index(trial) + 1, reporter, state, logs_dir,
@@ -3206,11 +3463,12 @@ def main() -> None:
                 progress_writer.update(force=True)
 
             block_index = 1
-            replicated_confirmation = len(set(expected_seeds)) > 1
+            replicated_confirmation = len(replicate_indices) > 1
             while args.confirmation_adaptive and replicated_confirmation:
                 unresolved_pairs = unresolved_confirmation_setting_opponents(
                     phase_trials,
                     expected_seeds=expected_seeds,
+                    expected_batch_ids=expected_batch_ids,
                     opponents=confirmation_opponents,
                     requested_games_per_side=requested_games,
                     threshold=args.confirmation_non_regression_threshold,
@@ -3245,7 +3503,7 @@ def main() -> None:
                             block_games,
                             paired_evaluation_seed(
                                 seed_suite, block_index,
-                                replicate_indices[trial.hyperparameters.shuffle_seed],
+                                replicate_indices[trial_replicate_key(trial)],
                                 opponent_index,
                             ),
                             trials.index(trial) + 1, reporter, state, logs_dir,
@@ -3273,7 +3531,8 @@ def main() -> None:
             reporter.notice(str(warning))
         run_confirmation_phase(
             finalists,
-            expected_seeds=args.shuffle_seeds,
+            expected_seeds=seed_values,
+            expected_batch_ids=search_batch_ids,
             seed_suite=int(evaluation_seed_suites["confirmation"]),
             phase_label="held-out confirmation",
         )
@@ -3282,7 +3541,8 @@ def main() -> None:
         if replicated_mode:
             ranked_final_groups = build_robust_confirmation_group_summary(
                 finalists,
-                expected_seeds=args.shuffle_seeds,
+                expected_seeds=seed_values,
+                expected_batch_ids=search_batch_ids,
                 opponents=confirmation_opponents,
                 non_regression_threshold=args.confirmation_non_regression_threshold,
                 dominance_spread=args.confirmation_dominance_spread,
@@ -3293,6 +3553,7 @@ def main() -> None:
                 ranked_final_groups.extend(build_robust_confirmation_group_summary(
                     [trial],
                     expected_seeds=[trial.hyperparameters.shuffle_seed],
+                    expected_batch_ids=[trial.training_batch_id],
                     opponents=confirmation_opponents,
                     non_regression_threshold=args.confirmation_non_regression_threshold,
                     dominance_spread=args.confirmation_dominance_spread,
@@ -3373,17 +3634,20 @@ def main() -> None:
                     policy_tag_expected=fresh_policy_tag_expected,
                     run_prefix=f"{args.run_prefix}_fresh",
                     phase="fresh_confirmation",
+                    training_batch_id="fresh",
                 ))
             safe_fresh_trials = [trial for trial in fresh_trials if not trial.safety_flags]
             run_confirmation_phase(
                 safe_fresh_trials,
                 expected_seeds=fresh_seed_values,
+                expected_batch_ids=["fresh"],
                 seed_suite=int(evaluation_seed_suites["fresh_confirmation"]),
                 phase_label="fresh-data confirmation",
             )
             ranked_fresh_groups = build_robust_confirmation_group_summary(
                 fresh_trials,
                 expected_seeds=fresh_seed_values,
+                expected_batch_ids=["fresh"],
                 opponents=confirmation_opponents,
                 non_regression_threshold=args.confirmation_non_regression_threshold,
                 dominance_spread=args.confirmation_dominance_spread,
@@ -3435,7 +3699,7 @@ def main() -> None:
             reporter.notice(
                 "fresh-data confirmation "
                 f"outcome={comparison['outcome']} "
-                f"parent_win_rate={float(fresh_assessment.get('primary_valid_win_rate', 0.0)):.4f} "
+                f"worst_batch_parent_win_rate={float(fresh_assessment.get('primary_worst_batch_valid_win_rate', 0.0)):.4f} "
                 f"promotion_confident={fresh_assessment['promotion_confident']}"
             )
         elif fresh_confirmation_enabled:
@@ -3496,22 +3760,22 @@ def main() -> None:
             )
         if winner:
             assert winner.final_evaluation is not None
-            reported_win_rate = float(assessment.get("primary_valid_win_rate", 0.0))
+            reported_win_rate = float(assessment.get("primary_worst_batch_valid_win_rate", 0.0))
             reported_lower = float(assessment.get("primary_confidence_low", 0.0))
             reporter.notice(
                 f"winner run={winner.run_name} lr={winner.hyperparameters.learning_rate:g} "
                 f"entropy={winner.hyperparameters.entropy_coef:g} anchor={winner.hyperparameters.anchor_kl_coef:g} "
-                f"parent_win_rate={reported_win_rate:.4f} "
+                f"worst_batch_parent_win_rate={reported_win_rate:.4f} "
                 f"parent_lower95={reported_lower:.4f} "
                 f"promotion_confident={assessment['promotion_confident']}"
             )
         elif top_trial:
             top = top_trial
             assert top.final_evaluation is not None
-            reported_win_rate = float(assessment.get("primary_valid_win_rate", 0.0))
+            reported_win_rate = float(assessment.get("primary_worst_batch_valid_win_rate", 0.0))
             reported_lower = float(assessment.get("primary_confidence_low", 0.0))
             reporter.notice(
-                f"no winner; top run={top.run_name} parent_win_rate={reported_win_rate:.4f} "
+                f"no winner; top run={top.run_name} worst_batch_parent_win_rate={reported_win_rate:.4f} "
                 f"parent_lower95={reported_lower:.4f}"
             )
         else:

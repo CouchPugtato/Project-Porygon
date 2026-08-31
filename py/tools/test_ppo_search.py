@@ -36,6 +36,7 @@ from ppo_search import (
     parse_training_progress,
     promotion_assessment,
     robust_grouped_promotion_assessment,
+    resolve_search_episode_batches,
     resolve_evaluation_seed_suites,
     grouped_promotion_assessment,
     generate_local_refinement_space,
@@ -45,6 +46,7 @@ from ppo_search import (
     suggest_bayesian_setting,
     training_safety_flags,
     training_artifacts_match,
+    trial_run_name,
     unresolved_confirmation_setting_opponents,
     valid_outcome_counts,
     wilson_interval,
@@ -154,6 +156,7 @@ class PpoSearchTests(unittest.TestCase):
             self.assertFalse(args.resume)
             self.assertTrue(args.dashboard)
             self.assertEqual(args.episode_limits, [0])
+            self.assertEqual(args.additional_episode_batches, [])
 
     def test_default_search_reserves_a_local_refinement_budget(self) -> None:
         args = parse_search_args([
@@ -171,6 +174,7 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(args.confirmation_games_per_side, 100)
         self.assertTrue(args.confirmation_adaptive)
         self.assertEqual(args.fresh_confirmation_episode_batch, "")
+        self.assertEqual(args.additional_episode_batches, [])
         self.assertEqual(args.fresh_confirmation_shuffle_seeds, [404, 505, 606])
         self.assertEqual(args.eval_concurrent_games, 30)
         self.assertEqual(args.eval_worker_pairs, 40)
@@ -386,7 +390,10 @@ class PpoSearchTests(unittest.TestCase):
         preliminary["primary_valid_win_rate"] = 0.51
         passing["primary_valid_win_rate"] = 0.52
         comparison = fresh_confirmation_comparison(preliminary, passing)
-        self.assertEqual(comparison["comparison_metric"], "parent_valid_win_rate")
+        self.assertEqual(
+            comparison["comparison_metric"],
+            "worst_training_batch_parent_valid_win_rate",
+        )
         self.assertAlmostEqual(float(comparison["valid_win_rate_delta"]), 0.01)
         passing["valid_win_rate"] = 0.52
         passing.pop("primary_valid_win_rate")
@@ -694,6 +701,59 @@ class PpoSearchTests(unittest.TestCase):
         self.assertIsNotNone(winner)
         self.assertEqual(assessment["selection_scope"], "pooled_hyperparameter_setting")
 
+    def test_multi_batch_group_requires_every_batch_seed_replicate(self) -> None:
+        trials = []
+        for batch_id in ("batch01", "batch02"):
+            for seed in (101, 202):
+                trials.append(SimpleNamespace(
+                    run_name=f"{batch_id}-seed-{seed}",
+                    training_batch_id=batch_id,
+                    training_batch_path=f"{batch_id}.jsonl",
+                    hyperparameters=Hyperparameters(5e-6, 1e-4, 0.03, 0.1, seed, 256),
+                    safety_flags=[],
+                    screen_evaluation=self.evaluation("screen", 52, 100, 0.4, 0.6),
+                    final_evaluation=None,
+                ))
+        complete = build_hyperparameter_group_summary(
+            trials,
+            stage="screen",
+            expected_seeds=[101, 202],
+            expected_batch_ids=["batch01", "batch02"],
+        )[0]
+        self.assertTrue(complete["complete_replicate_group"])
+        self.assertEqual(len(complete["evaluated_replicates"]), 4)
+
+        incomplete = build_hyperparameter_group_summary(
+            trials[:-1],
+            stage="screen",
+            expected_seeds=[101, 202],
+            expected_batch_ids=["batch01", "batch02"],
+        )[0]
+        self.assertFalse(incomplete["complete_replicate_group"])
+        self.assertFalse(incomplete["complete_seed_group"])
+
+    def test_search_batch_resolution_assigns_stable_ids_and_rejects_duplicates(self) -> None:
+        root = Path("C:/repo")
+        batches = resolve_search_episode_batches(
+            root, "matches/a.jsonl", ["matches/b.jsonl"],
+        )
+        self.assertEqual([batch_id for batch_id, _ in batches], ["batch01", "batch02"])
+        self.assertNotEqual(batches[0][1], batches[1][1])
+        with self.assertRaisesRegex(ValueError, "must be distinct"):
+            resolve_search_episode_batches(
+                root, "matches/a.jsonl", ["matches/a.jsonl"],
+            )
+
+    def test_multi_batch_run_names_are_unique_without_changing_legacy_names(self) -> None:
+        params = Hyperparameters(5e-6, 1e-4, 0.03, 0.1, 101, 256)
+        legacy = trial_run_name("search", 1, params)
+        first = trial_run_name("search", 1, params, "batch01")
+        second = trial_run_name("search", 1, params, "batch02")
+        self.assertNotIn("batch01", legacy)
+        self.assertIn("batch01", first)
+        self.assertIn("batch02", second)
+        self.assertNotEqual(first, second)
+
     def test_multi_opponent_confirmation_detects_specific_regression(self) -> None:
         opponents = [
             ConfirmationOpponent("parent", "parent.chk", "test", "parent"),
@@ -764,7 +824,40 @@ class PpoSearchTests(unittest.TestCase):
         winner, assessment = robust_grouped_promotion_assessment(summaries, 0.5, 0.5)
         self.assertIsNone(winner)
         self.assertEqual(assessment["status"], "no_winner")
-        self.assertEqual(assessment["selection_metric"], "parent_valid_win_rate")
+        self.assertEqual(
+            assessment["selection_metric"],
+            "worst_training_batch_parent_valid_win_rate",
+        )
+
+    def test_strong_batch_cannot_hide_weak_batch_at_promotion(self) -> None:
+        opponent = ConfirmationOpponent("parent", "parent.chk", "test", "parent")
+        trials = []
+        for batch_id, wins in (("batch01", 60), ("batch02", 49)):
+            result = self.evaluation("final", wins, 100, 0.35, 0.65)
+            trials.append(SimpleNamespace(
+                run_name=batch_id,
+                training_batch_id=batch_id,
+                training_batch_path=f"{batch_id}.jsonl",
+                hyperparameters=Hyperparameters(5e-6, 1e-4, 0.03, 0.1, 101, 256),
+                safety_flags=[],
+                final_evaluation=result,
+                screen_evaluation=None,
+                confirmation_evaluations={"parent": result},
+            ))
+        summaries = build_robust_confirmation_group_summary(
+            trials,
+            expected_seeds=[101],
+            expected_batch_ids=["batch01", "batch02"],
+            opponents=[opponent],
+            non_regression_threshold=0.5,
+            dominance_spread=0.1,
+        )
+        winner, assessment = robust_grouped_promotion_assessment(
+            summaries, 0.5, 0.5,
+        )
+        self.assertGreater(assessment["primary_valid_win_rate"], 0.5)
+        self.assertEqual(assessment["primary_worst_batch_valid_win_rate"], 0.49)
+        self.assertIsNone(winner)
         self.assertFalse(assessment["clears_point_gate"])
 
     def test_adaptive_confirmation_expands_only_unresolved_matchups(self) -> None:

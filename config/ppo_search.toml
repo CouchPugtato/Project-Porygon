@@ -15,6 +15,7 @@ screen_seed_suite = 0
 confirmation_seed_suite = 0
 fresh_confirmation_seed_suite = 0
 max_trials = 30
+additional_episode_batches = ""
 
 fresh_confirmation_episode_batch = ""
 fresh_confirmation_shuffle_seeds = "404,505,606"
