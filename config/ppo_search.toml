@@ -69,9 +69,8 @@ max_anchor_kl_max = 0.20
 max_clip_fraction = 0.25
 
 # Evaluation worker and resource controls.
-eval_concurrent_games = 70
-eval_worker_pairs = 125
-# Re-run only the valid-game shortfall when disconnects or forfeits occur.
+eval_concurrent_games = 30
+eval_worker_pairs = 40
 eval_max_replacement_attempts = 5
 format = "gen9randomdoublesbattle"
 launch_stagger_seconds = 0.25

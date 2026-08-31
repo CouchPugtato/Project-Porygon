@@ -1113,12 +1113,13 @@ def build_eval_command(
 ) -> list[str]:
     model_a = candidate_checkpoint if candidate_side == "a" else parent_checkpoint
     model_b = parent_checkpoint if candidate_side == "a" else candidate_checkpoint
+    worker_pairs = min(args.eval_worker_pairs, games)
     return [
         sys.executable, str((repo_root / "py" / "tools" / "selfplay_server.py").resolve()),
         "--run-name", run_name,
         "--games", str(games),
         "--concurrent-games", str(args.eval_concurrent_games),
-        "--worker-pairs", str(args.eval_worker_pairs),
+        "--worker-pairs", str(worker_pairs),
         "--worker-games", "0",
         "--ensure-shard-count", "true",
         "--model-a-pool", "",

@@ -171,6 +171,8 @@ class PpoSearchTests(unittest.TestCase):
         self.assertTrue(args.confirmation_adaptive)
         self.assertEqual(args.fresh_confirmation_episode_batch, "")
         self.assertEqual(args.fresh_confirmation_shuffle_seeds, [404, 505, 606])
+        self.assertEqual(args.eval_concurrent_games, 30)
+        self.assertEqual(args.eval_worker_pairs, 40)
 
     def test_trainer_executable_is_fixed_and_rejected_in_config(self) -> None:
         self.assertEqual(DEFAULT_TRAINER_EXE.as_posix(), "build-fresh/showdown_client.exe")
@@ -466,6 +468,13 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(command[command.index("--pool-seed") + 1], "7")
         self.assertEqual(command[command.index("--battle-seed-base") + 1], "7")
         self.assertEqual(command[command.index("--serve-client") + 1], "0")
+
+    def test_eval_command_does_not_create_more_worker_pairs_than_games(self) -> None:
+        command = build_eval_command(
+            eval_args(), Path("repo"), "small-eval", Path("candidate.chk"),
+            Path("parent.chk"), "a", 40, 7,
+        )
+        self.assertEqual(command[command.index("--worker-pairs") + 1], "40")
 
     def test_safety_flags_reject_hard_stop_and_inactive_anchor(self) -> None:
         flags = training_safety_flags({
