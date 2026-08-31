@@ -22,6 +22,7 @@ fresh_confirmation_shuffle_seeds = "404,505,606"
 confirmation_registry = "models/league/current_arch/league_registry.json"
 confirmation_opponents = ""
 confirmation_historical_opponents = 2
+confirmation_protected_historical_opponents = 1
 confirmation_max_opponents = 3
 confirmation_non_regression_threshold = 0.50
 confirmation_dominance_spread = 0.10

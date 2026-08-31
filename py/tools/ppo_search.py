@@ -153,6 +153,7 @@ def discover_confirmation_opponents(
     explicit_paths: list[str],
     historical_limit: int,
     max_opponents: int,
+    protected_historical_limit: int = 1,
 ) -> tuple[list[ConfirmationOpponent], dict[str, object]]:
     candidates: list[ConfirmationOpponent] = [ConfirmationOpponent(
         id="parent",
@@ -229,6 +230,7 @@ def discover_confirmation_opponents(
     seen_paths: dict[str, str] = {}
     duplicates: list[dict[str, str]] = []
     used_ids: set[str] = set()
+    selected_historical_count = 0
     for candidate in candidates:
         checkpoint = Path(candidate.checkpoint_path).resolve()
         if not checkpoint.is_file():
@@ -248,12 +250,16 @@ def discover_confirmation_opponents(
         while opponent_id in used_ids:
             opponent_id = f"{base_id}_{suffix}"
             suffix += 1
+        protected = candidate.protected
+        if candidate.role == "historical":
+            protected = selected_historical_count < protected_historical_limit
+            selected_historical_count += 1
         selected.append(ConfirmationOpponent(
             id=opponent_id,
             checkpoint_path=str(checkpoint),
             source=candidate.source,
             role=candidate.role,
-            protected=candidate.protected,
+            protected=protected,
         ))
         used_ids.add(opponent_id)
         seen_paths[path_key] = opponent_id
@@ -261,6 +267,7 @@ def discover_confirmation_opponents(
         "registry_path": str(registry_path) if registry_path is not None else "",
         "registry_loaded": registry_loaded,
         "historical_limit": historical_limit,
+        "protected_historical_limit": protected_historical_limit,
         "historical_selection": "hardest recorded champion matchups, then recency",
         "max_opponents": max_opponents,
         "duplicates": duplicates,
@@ -1712,12 +1719,14 @@ def hyperparameter_group_rank_key(summary: dict[str, object]) -> tuple[int, int,
 
 def robust_confirmation_group_rank_key(
     summary: dict[str, object],
-) -> tuple[int, int, int, float, float, float, int]:
+) -> tuple[int, int, int, int, float, float, float, float, int]:
     return (
         1 if summary.get("complete_seed_group") else 0,
         1 if not summary.get("collapse_flags") and int(summary.get("rejected_trials", 0) or 0) == 0 else 0,
         1 if summary.get("all_opponents_non_regression") else 0,
-        float(summary.get("confidence_low", 0.0) or 0.0),
+        1 if summary.get("primary_opponent_complete") else 0,
+        float(summary.get("primary_confidence_low", 0.0) or 0.0),
+        float(summary.get("primary_valid_win_rate", 0.0) or 0.0),
         float(summary.get("worst_opponent_confidence_low", 0.0) or 0.0),
         float(summary.get("valid_win_rate", 0.0) or 0.0),
         int(summary.get("valid_games", 0) or 0),
@@ -1781,6 +1790,10 @@ def build_robust_confirmation_group_summary(
                 "collapse_flags": list(summary.get("collapse_flags", []) or []),
                 "complete_seed_group": bool(summary.get("complete_seed_group")),
             })
+        primary = next(
+            (item for item in matchup_results if item["role"] == "parent"),
+            None,
+        )
         spread = (max(rates) - min(rates)) if rates else 0.0
         payload = dict(pooled)
         payload.update({
@@ -1791,6 +1804,15 @@ def build_robust_confirmation_group_summary(
             ),
             "all_opponents_non_regression": not regression_opponents,
             "regression_opponents": regression_opponents,
+            "primary_opponent_id": primary["opponent_id"] if primary else None,
+            "primary_opponent_complete": bool(
+                primary and primary["complete_seed_group"]
+            ),
+            "primary_valid_games": int(primary["valid_games"]) if primary else 0,
+            "primary_invalid_games": int(primary["invalid_games"]) if primary else 0,
+            "primary_valid_win_rate": float(primary["valid_win_rate"]) if primary else 0.0,
+            "primary_confidence_low": float(primary["confidence_low"]) if primary else 0.0,
+            "primary_confidence_high": float(primary["confidence_high"]) if primary else 1.0,
             "worst_opponent_confidence_low": min(
                 (float(item["confidence_low"]) for item in matchup_results),
                 default=0.0,
@@ -1848,6 +1870,14 @@ def group_summary_setting_key(
         float(params.get("ppo_clip_epsilon", 0.0) or 0.0),
         int(params.get("episode_limit", 0) or 0),
     )
+
+
+def group_summary_run_names(summary: dict[str, object]) -> set[str]:
+    return {
+        str(result.get("run_name", ""))
+        for result in (summary.get("seed_results", []) or [])
+        if isinstance(result, dict) and result.get("run_name")
+    }
 
 
 def hyperparameter_setting_space(
@@ -2201,19 +2231,19 @@ def robust_grouped_promotion_assessment(
     if not ranked_groups:
         return None, {
             "status": "no_finalist",
-            "selection_scope": "multi_opponent_pooled_hyperparameter_setting",
+            "selection_scope": "parent_primary_multi_opponent_robustness",
             "promotion_confident": False,
         }
     top = ranked_groups[0]
     complete = bool(top.get("complete_seed_group")) and bool(
         top.get("all_opponents_complete")
-    )
+    ) and bool(top.get("primary_opponent_complete"))
     collapse_free = not top.get("collapse_flags") and int(
         top.get("rejected_trials", 0) or 0
     ) == 0
     non_regression = bool(top.get("all_opponents_non_regression"))
-    point = float(top.get("valid_win_rate", 0.0) or 0.0)
-    low = float(top.get("confidence_low", 0.0) or 0.0)
+    point = float(top.get("primary_valid_win_rate", 0.0) or 0.0)
+    low = float(top.get("primary_confidence_low", 0.0) or 0.0)
     clears_point = point > minimum_win_rate
     clears_confidence = low > confidence_threshold
     winner = top if complete and collapse_free and non_regression and clears_point else None
@@ -2231,18 +2261,27 @@ def robust_grouped_promotion_assessment(
         status = "tentative_winner"
     return winner, {
         "status": status,
-        "selection_scope": "multi_opponent_pooled_hyperparameter_setting",
+        "selection_scope": "parent_primary_multi_opponent_robustness",
+        "selection_metric": "parent_valid_win_rate",
         "hyperparameters": top.get("hyperparameters"),
         "configured_seeds": top.get("configured_seeds"),
         "evaluated_seeds": top.get("evaluated_seeds"),
         "minimum_win_rate": minimum_win_rate,
         "confidence_threshold": confidence_threshold,
         "non_regression_threshold": top.get("non_regression_threshold"),
-        "valid_win_rate": point,
+        "valid_win_rate": float(top.get("valid_win_rate", 0.0) or 0.0),
         "valid_games": int(top.get("valid_games", 0) or 0),
         "invalid_games": int(top.get("invalid_games", 0) or 0),
-        "confidence_low": low,
+        "confidence_low": float(top.get("confidence_low", 0.0) or 0.0),
         "confidence_high": float(top.get("confidence_high", 1.0) or 1.0),
+        "primary_opponent_id": top.get("primary_opponent_id"),
+        "primary_valid_win_rate": point,
+        "primary_valid_games": int(top.get("primary_valid_games", 0) or 0),
+        "primary_invalid_games": int(top.get("primary_invalid_games", 0) or 0),
+        "primary_confidence_low": low,
+        "primary_confidence_high": float(
+            top.get("primary_confidence_high", 1.0) or 1.0
+        ),
         "worst_opponent_confidence_low": float(
             top.get("worst_opponent_confidence_low", 0.0) or 0.0
         ),
@@ -2264,8 +2303,12 @@ def fresh_confirmation_comparison(
     preliminary: dict[str, object],
     fresh: dict[str, object],
 ) -> dict[str, object]:
-    preliminary_rate = float(preliminary.get("valid_win_rate", 0.0) or 0.0)
-    fresh_rate = float(fresh.get("valid_win_rate", 0.0) or 0.0)
+    preliminary_rate = float(
+        preliminary.get("primary_valid_win_rate", preliminary.get("valid_win_rate", 0.0)) or 0.0
+    )
+    fresh_rate = float(
+        fresh.get("primary_valid_win_rate", fresh.get("valid_win_rate", 0.0)) or 0.0
+    )
     fresh_passed = bool(
         fresh.get("clears_point_gate")
         and fresh.get("collapse_free")
@@ -2281,6 +2324,7 @@ def fresh_confirmation_comparison(
         outcome = "reproduced"
     return {
         "outcome": outcome,
+        "comparison_metric": "parent_valid_win_rate",
         "preliminary_valid_win_rate": preliminary_rate,
         "fresh_valid_win_rate": fresh_rate,
         "valid_win_rate_delta": fresh_rate - preliminary_rate,
@@ -2306,6 +2350,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirmation-registry", default="", help="Optional league registry used to add champion/historical finalist opponents")
     parser.add_argument("--confirmation-opponents", type=csv_strings, default=[], help="Additional comma-separated finalist opponent checkpoints")
     parser.add_argument("--confirmation-historical-opponents", type=nonnegative_int, default=2)
+    parser.add_argument("--confirmation-protected-historical-opponents", type=nonnegative_int, default=1)
     parser.add_argument("--confirmation-max-opponents", type=positive_int, default=3)
     parser.add_argument("--confirmation-non-regression-threshold", type=float, default=0.5)
     parser.add_argument("--confirmation-dominance-spread", type=positive_float, default=0.10)
@@ -2506,6 +2551,7 @@ def main() -> None:
             args.confirmation_opponents,
             args.confirmation_historical_opponents,
             args.confirmation_max_opponents,
+            args.confirmation_protected_historical_opponents,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -2651,6 +2697,7 @@ def main() -> None:
             "screen_game_block_per_side": args.screen_game_block_per_side,
             "screen_max_games_per_side": args.screen_max_games_per_side,
             "final_games_per_side": args.final_games_per_side,
+            "promotion_metric": "parent_valid_win_rate",
             "promotion_min_win_rate": args.promotion_min_win_rate,
             "promotion_confidence_threshold": args.promotion_confidence_threshold,
             "valid_games_required": True,
@@ -3232,8 +3279,6 @@ def main() -> None:
         )
 
         ranked_final = sorted(finalists, key=lambda trial: evaluation_rank_key(trial, final=True), reverse=True)
-        ranked_final_groups: list[dict[str, object]] = []
-        best_hyperparameters: dict[str, object] | None = None
         if replicated_mode:
             ranked_final_groups = build_robust_confirmation_group_summary(
                 finalists,
@@ -3242,65 +3287,32 @@ def main() -> None:
                 non_regression_threshold=args.confirmation_non_regression_threshold,
                 dominance_spread=args.confirmation_dominance_spread,
             )
-            winning_group, assessment = robust_grouped_promotion_assessment(
-                ranked_final_groups,
-                args.promotion_min_win_rate,
-                args.promotion_confidence_threshold,
-            )
-            winner = None
-            if winning_group is not None:
-                best_hyperparameters = dict(winning_group.get("hyperparameters", {}) or {})
-                winning_key = group_summary_setting_key(winning_group)
-                winning_trials = [
-                    trial for trial in ranked_final
-                    if hyperparameter_setting_key(trial.hyperparameters) == winning_key
-                ]
-                winner = winning_trials[0] if winning_trials else None
         else:
-            winner, assessment = promotion_assessment(
-                ranked_final,
-                args.promotion_min_win_rate,
-                args.promotion_confidence_threshold,
-            )
-            if winner is not None:
-                best_hyperparameters = {
-                    "learning_rate": winner.hyperparameters.learning_rate,
-                    "entropy_coef": winner.hyperparameters.entropy_coef,
-                    "anchor_kl_coef": winner.hyperparameters.anchor_kl_coef,
-                    "ppo_clip_epsilon": winner.hyperparameters.ppo_clip_epsilon,
-                    "episode_limit": winner.hyperparameters.episode_limit,
-                }
-            assessed_trial = winner or (ranked_final[0] if ranked_final else None)
-            if assessed_trial is not None:
-                opponent_results = []
-                regression_opponents = []
-                for opponent in confirmation_opponents:
-                    result = assessed_trial.confirmation_evaluations.get(opponent.id)
-                    if result is None:
-                        regression_opponents.append(opponent.id)
-                        continue
-                    regression = bool(
-                        opponent.protected
-                        and result.confidence_high
-                        < args.confirmation_non_regression_threshold
-                    )
-                    if regression:
-                        regression_opponents.append(opponent.id)
-                    opponent_results.append({
-                        "opponent_id": opponent.id,
-                        "valid_win_rate": result.valid_win_rate,
-                        "confidence_low": result.confidence_low,
-                        "confidence_high": result.confidence_high,
-                        "regression_detected": regression,
-                    })
-                assessment["opponents"] = opponent_results
-                assessment["regression_opponents"] = regression_opponents
-                assessment["all_opponents_non_regression"] = not regression_opponents
-                if winner is not None and regression_opponents:
-                    winner = None
-                    best_hyperparameters = None
-                    assessment["status"] = "opponent_regression"
-                    assessment["promotion_confident"] = False
+            ranked_final_groups = []
+            for trial in finalists:
+                ranked_final_groups.extend(build_robust_confirmation_group_summary(
+                    [trial],
+                    expected_seeds=[trial.hyperparameters.shuffle_seed],
+                    opponents=confirmation_opponents,
+                    non_regression_threshold=args.confirmation_non_regression_threshold,
+                    dominance_spread=args.confirmation_dominance_spread,
+                ))
+            ranked_final_groups.sort(key=robust_confirmation_group_rank_key, reverse=True)
+        winning_group, assessment = robust_grouped_promotion_assessment(
+            ranked_final_groups,
+            args.promotion_min_win_rate,
+            args.promotion_confidence_threshold,
+        )
+        winner = None
+        best_hyperparameters: dict[str, object] | None = None
+        if winning_group is not None:
+            best_hyperparameters = dict(winning_group.get("hyperparameters", {}) or {})
+            winning_run_names = group_summary_run_names(winning_group)
+            winning_trials = [
+                trial for trial in ranked_final
+                if trial.run_name in winning_run_names
+            ]
+            winner = winning_trials[0] if winning_trials else None
         assessment["held_out_confirmation"] = True
         assessment["confirmation_seed_suite"] = int(
             evaluation_seed_suites["confirmation"]
@@ -3312,10 +3324,10 @@ def main() -> None:
         )
         top_trial = ranked_final[0] if ranked_final else None
         if ranked_final_groups:
-            top_group_key = group_summary_setting_key(ranked_final_groups[0])
+            top_group_run_names = group_summary_run_names(ranked_final_groups[0])
             top_group_trials = [
                 trial for trial in ranked_final
-                if hyperparameter_setting_key(trial.hyperparameters) == top_group_key
+                if trial.run_name in top_group_run_names
             ]
             if top_group_trials:
                 top_trial = top_group_trials[0]
@@ -3388,11 +3400,11 @@ def main() -> None:
             )
             fresh_winner = None
             if fresh_winning_group is not None:
-                winning_key = group_summary_setting_key(fresh_winning_group)
+                fresh_winning_run_names = group_summary_run_names(fresh_winning_group)
                 fresh_winner = next(
                     (
                         trial for trial in fresh_trials
-                        if hyperparameter_setting_key(trial.hyperparameters) == winning_key
+                        if trial.run_name in fresh_winning_run_names
                         and trial.final_evaluation is not None
                     ),
                     None,
@@ -3423,7 +3435,7 @@ def main() -> None:
             reporter.notice(
                 "fresh-data confirmation "
                 f"outcome={comparison['outcome']} "
-                f"valid_win_rate={float(fresh_assessment.get('valid_win_rate', 0.0)):.4f} "
+                f"parent_win_rate={float(fresh_assessment.get('primary_valid_win_rate', 0.0)):.4f} "
                 f"promotion_confident={fresh_assessment['promotion_confident']}"
             )
         elif fresh_confirmation_enabled:
@@ -3484,23 +3496,23 @@ def main() -> None:
             )
         if winner:
             assert winner.final_evaluation is not None
-            reported_win_rate = float(assessment.get("valid_win_rate", winner.final_evaluation.valid_win_rate))
-            reported_lower = float(assessment.get("confidence_low", winner.final_evaluation.confidence_low))
+            reported_win_rate = float(assessment.get("primary_valid_win_rate", 0.0))
+            reported_lower = float(assessment.get("primary_confidence_low", 0.0))
             reporter.notice(
                 f"winner run={winner.run_name} lr={winner.hyperparameters.learning_rate:g} "
                 f"entropy={winner.hyperparameters.entropy_coef:g} anchor={winner.hyperparameters.anchor_kl_coef:g} "
-                f"valid_win_rate={reported_win_rate:.4f} "
-                f"lower95={reported_lower:.4f} "
+                f"parent_win_rate={reported_win_rate:.4f} "
+                f"parent_lower95={reported_lower:.4f} "
                 f"promotion_confident={assessment['promotion_confident']}"
             )
         elif top_trial:
             top = top_trial
             assert top.final_evaluation is not None
-            reported_win_rate = float(assessment.get("valid_win_rate", top.final_evaluation.valid_win_rate))
-            reported_lower = float(assessment.get("confidence_low", top.final_evaluation.confidence_low))
+            reported_win_rate = float(assessment.get("primary_valid_win_rate", 0.0))
+            reported_lower = float(assessment.get("primary_confidence_low", 0.0))
             reporter.notice(
-                f"no winner; top run={top.run_name} valid_win_rate={reported_win_rate:.4f} "
-                f"lower95={reported_lower:.4f}"
+                f"no winner; top run={top.run_name} parent_win_rate={reported_win_rate:.4f} "
+                f"parent_lower95={reported_lower:.4f}"
             )
         else:
             reporter.notice("no safe finalist completed")

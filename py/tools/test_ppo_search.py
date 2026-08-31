@@ -166,6 +166,7 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(args.bayes_refine_settings, 4)
         self.assertEqual(args.bayes_refine_fraction, 0.5)
         self.assertEqual(args.confirmation_historical_opponents, 2)
+        self.assertEqual(args.confirmation_protected_historical_opponents, 1)
         self.assertEqual(args.confirmation_max_opponents, 3)
         self.assertEqual(args.confirmation_games_per_side, 100)
         self.assertTrue(args.confirmation_adaptive)
@@ -382,7 +383,14 @@ class PpoSearchTests(unittest.TestCase):
             fresh_confirmation_comparison(preliminary, passing)["outcome"],
             "reproduced",
         )
+        preliminary["primary_valid_win_rate"] = 0.51
+        passing["primary_valid_win_rate"] = 0.52
+        comparison = fresh_confirmation_comparison(preliminary, passing)
+        self.assertEqual(comparison["comparison_metric"], "parent_valid_win_rate")
+        self.assertAlmostEqual(float(comparison["valid_win_rate_delta"]), 0.01)
         passing["valid_win_rate"] = 0.52
+        passing.pop("primary_valid_win_rate")
+        preliminary.pop("primary_valid_win_rate")
         self.assertEqual(
             fresh_confirmation_comparison(preliminary, passing)["outcome"],
             "weakened",
@@ -572,13 +580,18 @@ class PpoSearchTests(unittest.TestCase):
                 ],
             }), encoding="utf-8")
             opponents, discovery = discover_confirmation_opponents(
-                root, parent, str(registry), [str(explicit)], 2, 3,
+                root, parent, str(registry), [str(explicit)], 2, 4,
             )
-            self.assertEqual([item.role for item in opponents], ["parent", "explicit", "historical"])
+            self.assertEqual(
+                [item.role for item in opponents],
+                ["parent", "explicit", "historical", "historical"],
+            )
             self.assertEqual(opponents[2].id, "history_b")
-            self.assertFalse(opponents[2].protected)
-            self.assertEqual(len(opponents), 3)
+            self.assertTrue(opponents[2].protected)
+            self.assertEqual(opponents[3].id, "history_a")
+            self.assertFalse(opponents[3].protected)
             self.assertTrue(discovery["registry_loaded"])
+            self.assertEqual(discovery["protected_historical_limit"], 1)
             self.assertEqual(discovery["duplicates"], [{"id": "champion", "same_as": "parent"}])
 
     def test_showdown_seed_patch_is_opt_in_and_idempotent(self) -> None:
@@ -715,6 +728,44 @@ class PpoSearchTests(unittest.TestCase):
         winner, assessment = robust_grouped_promotion_assessment(summaries, 0.5, 0.5)
         self.assertIsNone(winner)
         self.assertEqual(assessment["status"], "opponent_regression")
+
+    def test_history_win_cannot_offset_a_parent_loss(self) -> None:
+        opponents = [
+            ConfirmationOpponent("parent", "parent.chk", "test", "parent"),
+            ConfirmationOpponent("history", "history.chk", "test", "historical", False),
+        ]
+        trials = []
+        for seed in (101, 202, 303):
+            parent_result = self.evaluation("final", 49, 100, 0.39, 0.59)
+            history_result = self.evaluation("final", 65, 100, 0.55, 0.74)
+            trials.append(SimpleNamespace(
+                run_name=f"seed-{seed}",
+                hyperparameters=Hyperparameters(5e-6, 3e-4, 0.03, 0.2, seed, 256),
+                safety_flags=[],
+                final_evaluation=merge_evaluation_results(parent_result, history_result),
+                screen_evaluation=None,
+                confirmation_evaluations={
+                    "parent": parent_result,
+                    "history": history_result,
+                },
+            ))
+
+        summaries = build_robust_confirmation_group_summary(
+            trials,
+            expected_seeds=[101, 202, 303],
+            opponents=opponents,
+            non_regression_threshold=0.5,
+            dominance_spread=0.10,
+        )
+        summary = summaries[0]
+        self.assertGreater(float(summary["valid_win_rate"]), 0.5)
+        self.assertAlmostEqual(float(summary["primary_valid_win_rate"]), 0.49)
+
+        winner, assessment = robust_grouped_promotion_assessment(summaries, 0.5, 0.5)
+        self.assertIsNone(winner)
+        self.assertEqual(assessment["status"], "no_winner")
+        self.assertEqual(assessment["selection_metric"], "parent_valid_win_rate")
+        self.assertFalse(assessment["clears_point_gate"])
 
     def test_adaptive_confirmation_expands_only_unresolved_matchups(self) -> None:
         opponents = [
