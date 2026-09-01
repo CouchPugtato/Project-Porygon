@@ -31,6 +31,7 @@ from live_rl_orchestrator import (
     build_selfplay_command,
     build_train_command,
     collapse_flags_from_training_summary,
+    extract_episode_batch,
     round_manifest_completed,
     run_reported_command,
 )
@@ -576,6 +577,31 @@ class WorkflowDashboardTests(unittest.TestCase):
             saved = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["progress"]["collection"], {"current": 10, "total": 10})
             self.assertIn("completed_games=10/10", raw_log_path.read_text(encoding="utf-8"))
+
+    def test_episode_batch_extraction_copies_episode_records_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            episode = '{"type":"episode_complete","battle_id":"battle-1","values":[1,2,3]}'
+            (run_dir / "worker_001_a_raw.jsonl").write_text(
+                '{"type":"battle_start","battle_id":"battle-1"}\n'
+                + episode + "\n"
+                + '{"type":"battle_end","battle_id":"battle-1"}\n',
+                encoding="utf-8",
+            )
+            (run_dir / "worker_002_b_raw.jsonl").write_text(
+                '{"type":"episode_complete","battle_id":"wrong-side"}\n',
+                encoding="utf-8",
+            )
+            output = run_dir / "episode_batch_a.jsonl"
+
+            stats = extract_episode_batch(run_dir, "a", output)
+
+            self.assertEqual(stats, {
+                "source_files": 1,
+                "scanned_lines": 3,
+                "written_episodes": 1,
+            })
+            self.assertEqual(output.read_text(encoding="utf-8"), episode + "\n")
 
 
 class BalancedCheckpointEvalTests(unittest.TestCase):

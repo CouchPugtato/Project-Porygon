@@ -1996,7 +1996,9 @@ def build_robust_confirmation_group_summary(
             )
             rates.append(rate)
             regression_detected = bool(
-                opponent.protected and worst_batch_high < non_regression_threshold
+                opponent.role != "parent"
+                and opponent.protected
+                and worst_batch_high < non_regression_threshold
             )
             if regression_detected:
                 regression_opponents.append(opponent.id)

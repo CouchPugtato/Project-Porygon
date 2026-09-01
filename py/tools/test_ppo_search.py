@@ -791,8 +791,8 @@ class PpoSearchTests(unittest.TestCase):
         ]
         trials = []
         for seed in (101, 202, 303):
-            parent_result = self.evaluation("final", 40, 100, 0.31, 0.49)
-            history_result = self.evaluation("final", 65, 100, 0.55, 0.74)
+            parent_result = self.evaluation("final", 65, 100, 0.55, 0.74)
+            history_result = self.evaluation("final", 40, 100, 0.31, 0.49)
             trials.append(SimpleNamespace(
                 run_name=f"seed-{seed}",
                 hyperparameters=Hyperparameters(5e-6, 1e-4, 0.03, 0.1, seed, 256),
@@ -813,7 +813,7 @@ class PpoSearchTests(unittest.TestCase):
         )
         self.assertEqual(len(summaries), 1)
         self.assertFalse(summaries[0]["all_opponents_non_regression"])
-        self.assertEqual(summaries[0]["regression_opponents"], ["parent"])
+        self.assertEqual(summaries[0]["regression_opponents"], ["history"])
         self.assertTrue(summaries[0]["favorable_matchup_dominance"])
         winner, assessment = robust_grouped_promotion_assessment(summaries, 0.5, 0.5)
         self.assertIsNone(winner)
@@ -850,6 +850,8 @@ class PpoSearchTests(unittest.TestCase):
         summary = summaries[0]
         self.assertGreater(float(summary["valid_win_rate"]), 0.5)
         self.assertAlmostEqual(float(summary["primary_valid_win_rate"]), 0.49)
+        self.assertTrue(summary["all_opponents_non_regression"])
+        self.assertEqual(summary["regression_opponents"], [])
 
         winner, assessment = robust_grouped_promotion_assessment(summaries, 0.5, 0.5)
         self.assertIsNone(winner)

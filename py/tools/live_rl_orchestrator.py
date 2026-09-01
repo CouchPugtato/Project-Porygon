@@ -669,17 +669,13 @@ def extract_episode_batch(run_dir: Path, side: str, output_path: Path) -> dict[s
             source_files += 1
             with worker_path.open("r", encoding="utf-8") as in_handle:
                 for raw_line in in_handle:
-                    line = raw_line.strip()
-                    if not line:
+                    if not raw_line.strip():
                         continue
                     scanned += 1
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
+                    line = raw_line.lstrip()
+                    if not line.startswith('{"type":"episode_complete"'):
                         continue
-                    if not isinstance(payload, dict) or payload.get("type") != "episode_complete":
-                        continue
-                    out_handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                    out_handle.write(line.rstrip("\r\n") + "\n")
                     written += 1
     return {
         "source_files": source_files,
