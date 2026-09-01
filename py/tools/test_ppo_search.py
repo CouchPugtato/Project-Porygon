@@ -244,6 +244,12 @@ class PpoSearchTests(unittest.TestCase):
             initial_evaluation_seconds_per_game=2.0,
         )
         self.assertEqual(state.estimated_remaining_seconds(), 540.0)
+        progress = state.progress_payload()
+        self.assertEqual(progress["remaining_seconds"], progress["eta_seconds"])
+        self.assertAlmostEqual(
+            float(progress["projected_total_seconds"]),
+            float(progress["elapsed_seconds"]) + float(progress["remaining_seconds"]),
+        )
 
         state.training_durations = [50.0]
         state.evaluation_seconds = 20.0

@@ -812,11 +812,15 @@ class SearchDisplayState:
         return estimate
 
     def progress_payload(self) -> dict[str, object]:
+        elapsed_seconds = time.monotonic() - self.started_at
+        remaining_seconds = self.estimated_remaining_seconds()
         return {
             "phase": self.phase,
             "dashboard_mode": self.dashboard_mode,
-            "elapsed_seconds": time.monotonic() - self.started_at,
-            "eta_seconds": self.estimated_remaining_seconds(),
+            "elapsed_seconds": elapsed_seconds,
+            "eta_seconds": remaining_seconds,
+            "remaining_seconds": remaining_seconds,
+            "projected_total_seconds": elapsed_seconds + remaining_seconds,
             "eta_basis": {
                 "training": (
                     "measured" if self.training_durations
@@ -983,26 +987,33 @@ class RichSearchReporter(BaseSearchReporter):
         return f"[{style}]" + "=" * filled + f"[/{style}][grey27]" + "-" * (width - filled) + "[/grey27]"
 
     def _summary(self) -> Panel:
+        elapsed = time.monotonic() - self.state.started_at
+        remaining = self.state.estimated_remaining_seconds()
         table = Table.grid(expand=True)
         for _ in range(4):
             table.add_column()
         table.add_row(
             f"[bold]Search[/]: {self.state.run_prefix}",
             f"[bold]Phase[/]: {self.state.phase}",
-            f"[bold]Elapsed[/]: {format_duration(time.monotonic() - self.state.started_at)}",
-            f"[bold]ETA[/]: {format_duration(self.state.estimated_remaining_seconds())}",
+            f"[bold]Elapsed[/]: {format_duration(elapsed)}",
+            f"[bold]Remaining[/]: {format_duration(remaining)}",
         )
         table.add_row(
+            f"[bold]Projected total[/]: {format_duration(elapsed + remaining)}",
             f"[bold]Trained[/]: {self.state.trained_count}/{self.state.max_trials}",
             f"[green]Safe[/]: {self.state.safe_count}",
             f"[red]Rejected[/]: {self.state.rejected_count}",
-            f"[bold]Screened/Final[/]: {self.state.screened_count}/{self.state.finalized_count}",
         )
         active = self.state.active_run_name or "-"
         detail = self.state.active_kind
         if self.state.active_side:
             detail += f" {self.state.active_stage} side {self.state.active_side.upper()}"
-        table.add_row(f"[bold]Active[/]: {active}", f"[bold]Operation[/]: {detail or '-'}", "", "")
+        table.add_row(
+            f"[bold]Screened/Final[/]: {self.state.screened_count}/{self.state.finalized_count}",
+            f"[bold]Active[/]: {active}",
+            f"[bold]Operation[/]: {detail or '-'}",
+            "",
+        )
         return Panel(table, title="PPO Search", border_style="cyan")
 
     def _progress(self) -> Panel:
@@ -1014,9 +1025,9 @@ class RichSearchReporter(BaseSearchReporter):
         final_total = self.state.final_games_total_for_estimate()
         screen_current = self.state.screen_games_completed
         final_current = self.state.final_games_completed
-        if self.state.active_kind == "evaluation" and self.state.active_stage == "screen":
+        if self.state.active_kind == "evaluation" and self.state.active_stage.startswith("screen"):
             screen_current += self.state.active_current
-        elif self.state.active_kind == "evaluation" and self.state.active_stage == "final":
+        elif self.state.active_kind == "evaluation" and self.state.active_stage.startswith("final"):
             final_current += self.state.active_current
         active_label = "idle"
         if self.state.active_kind:
