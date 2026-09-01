@@ -252,11 +252,20 @@ class PpoSearchTests(unittest.TestCase):
             initial_evaluation_seconds_per_game=2.0,
         )
         self.assertEqual(state.estimated_remaining_seconds(), 540.0)
+        self.assertEqual(state.estimated_scheduled_remaining_seconds(), 420.0)
+        self.assertEqual(state.estimated_adaptive_remaining_seconds(), 540.0)
         progress = state.progress_payload()
         self.assertEqual(progress["remaining_seconds"], progress["eta_seconds"])
+        self.assertEqual(progress["scheduled_remaining_seconds"], 420.0)
+        self.assertEqual(progress["adaptive_remaining_seconds"], 540.0)
         self.assertAlmostEqual(
             float(progress["projected_total_seconds"]),
             float(progress["elapsed_seconds"]) + float(progress["remaining_seconds"]),
+        )
+        self.assertAlmostEqual(
+            float(progress["scheduled_projected_total_seconds"]),
+            float(progress["elapsed_seconds"])
+            + float(progress["scheduled_remaining_seconds"]),
         )
 
         state.training_durations = [50.0]
@@ -271,11 +280,27 @@ class PpoSearchTests(unittest.TestCase):
         state.screen_estimate_complete = True
         state.final_estimate_complete = True
         self.assertEqual(state.estimated_remaining_seconds(), 60.0)
+        self.assertEqual(state.estimated_scheduled_remaining_seconds(), 60.0)
 
     def test_initial_eta_budgets_one_adaptive_extension(self) -> None:
         self.assertEqual(initial_adaptive_game_budget(100, 100, 1000, True), 200)
         self.assertEqual(initial_adaptive_game_budget(100, 100, 150, True), 150)
         self.assertEqual(initial_adaptive_game_budget(100, 100, 1000, False), 100)
+
+    def test_scheduled_eta_keeps_conditional_confirmation_until_decided(self) -> None:
+        state = SearchDisplayState(
+            "search", 1, 1, 1, 10, 100,
+            final_games_scheduled=200,
+            conditional_final_games=100,
+            final_games_budget=600,
+        )
+        self.assertEqual(state.scheduled_final_games_total(), 300)
+        self.assertEqual(state.final_games_total_for_estimate(), 600)
+        state.final_plan_finalized = True
+        state.final_games_planned = 200
+        self.assertEqual(state.scheduled_final_games_total(), 300)
+        state.conditional_final_games = 0
+        self.assertEqual(state.scheduled_final_games_total(), 200)
 
     def test_evaluation_blocks_merge_counts_and_recompute_confidence(self) -> None:
         first = self.evaluation("screen", 55, 100, 0.45, 0.64)

@@ -661,6 +661,10 @@ class SearchDisplayState:
     final_games_per_side: int
     screen_games_budget: int = 0
     final_games_budget: int = 0
+    screen_games_scheduled: int = 0
+    final_games_scheduled: int = 0
+    conditional_final_games: int = 0
+    conditional_final_games_budget: int = 0
     conditional_training_trials: int = 0
     initial_training_seconds_per_trial: float = INITIAL_TRAINING_SECONDS_PER_TRIAL
     initial_evaluation_seconds_per_game: float = INITIAL_EVALUATION_SECONDS_PER_GAME
@@ -747,27 +751,45 @@ class SearchDisplayState:
         self.active_eta_seconds = None
         self.active_metrics = {}
 
-    def screen_games_total_for_estimate(self) -> int:
+    def scheduled_screen_games_total(self) -> int:
         candidates = (
             self.screen_planned_candidates
             if self.screen_plan_finalized else self.configured_screen_candidates
         )
-        planned = self.screen_games_planned or (
+        if self.screen_plan_finalized:
+            return self.screen_games_planned
+        return self.screen_games_scheduled or (
             2 * candidates * self.screen_games_per_side
         )
-        return planned if self.screen_estimate_complete else max(planned, self.screen_games_budget)
 
-    def final_games_total_for_estimate(self) -> int:
+    def scheduled_final_games_total(self) -> int:
         candidates = (
             self.final_planned_candidates
             if self.final_plan_finalized else self.configured_finalists
         )
-        planned = self.final_games_planned or (
-            2 * candidates * self.final_games_per_side
-        )
-        return planned if self.final_estimate_complete else max(planned, self.final_games_budget)
+        if self.final_plan_finalized:
+            planned = self.final_games_planned
+        else:
+            planned = self.final_games_scheduled or (
+                2 * candidates * self.final_games_per_side
+            )
+        return planned + self.conditional_final_games
 
-    def estimated_remaining_seconds(self) -> float:
+    def screen_games_total_for_estimate(self) -> int:
+        scheduled = self.scheduled_screen_games_total()
+        return (
+            scheduled if self.screen_estimate_complete
+            else max(scheduled, self.screen_games_budget)
+        )
+
+    def final_games_total_for_estimate(self) -> int:
+        scheduled = self.scheduled_final_games_total()
+        return (
+            scheduled if self.final_estimate_complete
+            else max(scheduled, self.final_games_budget)
+        )
+
+    def estimated_training_remaining_seconds(self) -> float:
         if self.training_durations:
             training_seconds = sum(self.training_durations) / len(self.training_durations)
         elif self.active_kind == "training" and self.active_eta_seconds is not None:
@@ -794,22 +816,26 @@ class SearchDisplayState:
                     if self.active_started_at is not None else 0.0
                 )
                 estimate += max(0.0, training_seconds - elapsed)
+        return estimate
 
+    def estimated_evaluation_seconds_per_game(self) -> float:
         if self.evaluation_games > 0:
-            evaluation_seconds = self.evaluation_seconds / self.evaluation_games
-        elif (
+            return self.evaluation_seconds / self.evaluation_games
+        if (
             self.active_kind == "evaluation"
             and self.active_current > 0
             and self.active_started_at is not None
         ):
-            evaluation_seconds = (
+            return (
                 time.monotonic() - self.active_started_at
             ) / self.active_current
-        else:
-            evaluation_seconds = self.initial_evaluation_seconds_per_game
+        return self.initial_evaluation_seconds_per_game
 
-        screen_total = self.screen_games_total_for_estimate()
-        final_total = self.final_games_total_for_estimate()
+    def estimated_evaluation_remaining_seconds(
+        self,
+        screen_total: int,
+        final_total: int,
+    ) -> float:
         active_screen = self.active_kind == "evaluation" and self.active_stage.startswith("screen")
         active_final = self.active_kind == "evaluation" and self.active_stage.startswith("final")
         active_completed = self.active_total if self.active_eta_seconds is not None else self.active_current
@@ -821,21 +847,47 @@ class SearchDisplayState:
             0,
             final_total - self.final_games_completed - (active_completed if active_final else 0),
         )
-        estimate += remaining_games * evaluation_seconds
+        estimate = remaining_games * self.estimated_evaluation_seconds_per_game()
         if (active_screen or active_final) and self.active_eta_seconds is not None:
             estimate += self.active_eta_seconds
         return estimate
 
+    def estimated_scheduled_remaining_seconds(self) -> float:
+        return (
+            self.estimated_training_remaining_seconds()
+            + self.estimated_evaluation_remaining_seconds(
+                self.scheduled_screen_games_total(),
+                self.scheduled_final_games_total(),
+            )
+        )
+
+    def estimated_adaptive_remaining_seconds(self) -> float:
+        return (
+            self.estimated_training_remaining_seconds()
+            + self.estimated_evaluation_remaining_seconds(
+                self.screen_games_total_for_estimate(),
+                self.final_games_total_for_estimate(),
+            )
+        )
+
+    def estimated_remaining_seconds(self) -> float:
+        return self.estimated_adaptive_remaining_seconds()
+
     def progress_payload(self) -> dict[str, object]:
         elapsed_seconds = time.monotonic() - self.started_at
-        remaining_seconds = self.estimated_remaining_seconds()
+        scheduled_remaining = self.estimated_scheduled_remaining_seconds()
+        adaptive_remaining = self.estimated_adaptive_remaining_seconds()
         return {
             "phase": self.phase,
             "dashboard_mode": self.dashboard_mode,
             "elapsed_seconds": elapsed_seconds,
-            "eta_seconds": remaining_seconds,
-            "remaining_seconds": remaining_seconds,
-            "projected_total_seconds": elapsed_seconds + remaining_seconds,
+            "eta_seconds": adaptive_remaining,
+            "remaining_seconds": adaptive_remaining,
+            "projected_total_seconds": elapsed_seconds + adaptive_remaining,
+            "scheduled_remaining_seconds": scheduled_remaining,
+            "adaptive_remaining_seconds": adaptive_remaining,
+            "scheduled_projected_total_seconds": elapsed_seconds + scheduled_remaining,
+            "adaptive_projected_total_seconds": elapsed_seconds + adaptive_remaining,
             "eta_basis": {
                 "training": (
                     "measured" if self.training_durations
@@ -851,8 +903,10 @@ class SearchDisplayState:
                 ),
                 "initial_training_seconds_per_trial": self.initial_training_seconds_per_trial,
                 "initial_evaluation_seconds_per_game": self.initial_evaluation_seconds_per_game,
-                "screen_games_budget": self.screen_games_total_for_estimate(),
-                "final_games_budget": self.final_games_total_for_estimate(),
+                "scheduled_screen_games": self.scheduled_screen_games_total(),
+                "scheduled_final_games": self.scheduled_final_games_total(),
+                "adaptive_screen_games_budget": self.screen_games_total_for_estimate(),
+                "adaptive_final_games_budget": self.final_games_total_for_estimate(),
                 "conditional_training_trials": self.conditional_training_trials,
             },
             "trained_candidates": self.trained_count,
@@ -1003,7 +1057,8 @@ class RichSearchReporter(BaseSearchReporter):
 
     def _summary(self) -> Panel:
         elapsed = time.monotonic() - self.state.started_at
-        remaining = self.state.estimated_remaining_seconds()
+        scheduled_remaining = self.state.estimated_scheduled_remaining_seconds()
+        adaptive_remaining = self.state.estimated_adaptive_remaining_seconds()
         table = Table.grid(expand=True)
         for _ in range(4):
             table.add_column()
@@ -1011,24 +1066,25 @@ class RichSearchReporter(BaseSearchReporter):
             f"[bold]Search[/]: {self.state.run_prefix}",
             f"[bold]Phase[/]: {self.state.phase}",
             f"[bold]Elapsed[/]: {format_duration(elapsed)}",
-            f"[bold]Remaining[/]: {format_duration(remaining)}",
+            f"[bold]Scheduled remaining[/]: {format_duration(scheduled_remaining)}",
         )
         table.add_row(
-            f"[bold]Projected total[/]: {format_duration(elapsed + remaining)}",
+            f"[bold]Scheduled total[/]: {format_duration(elapsed + scheduled_remaining)}",
+            f"[bold]Adaptive remaining[/]: {format_duration(adaptive_remaining)}",
+            f"[bold]Adaptive total[/]: {format_duration(elapsed + adaptive_remaining)}",
             f"[bold]Trained[/]: {self.state.trained_count}/{self.state.max_trials}",
-            f"[green]Safe[/]: {self.state.safe_count}",
-            f"[red]Rejected[/]: {self.state.rejected_count}",
         )
         active = self.state.active_run_name or "-"
         detail = self.state.active_kind
         if self.state.active_side:
             detail += f" {self.state.active_stage} side {self.state.active_side.upper()}"
         table.add_row(
+            f"[green]Safe[/]: {self.state.safe_count}",
+            f"[red]Rejected[/]: {self.state.rejected_count}",
             f"[bold]Screened/Final[/]: {self.state.screened_count}/{self.state.finalized_count}",
             f"[bold]Active[/]: {active}",
-            f"[bold]Operation[/]: {detail or '-'}",
-            "",
         )
+        table.add_row(f"[bold]Operation[/]: {detail or '-'}", "", "", "")
         return Panel(table, title="PPO Search", border_style="cyan")
 
     def _progress(self) -> Panel:
@@ -1036,8 +1092,8 @@ class RichSearchReporter(BaseSearchReporter):
         table.add_column(width=18)
         table.add_column(ratio=1)
         table.add_column(width=20, justify="right")
-        screen_total = self.state.screen_games_total_for_estimate()
-        final_total = self.state.final_games_total_for_estimate()
+        screen_total = self.state.scheduled_screen_games_total()
+        final_total = self.state.scheduled_final_games_total()
         screen_current = self.state.screen_games_completed
         final_current = self.state.final_games_completed
         if self.state.active_kind == "evaluation" and self.state.active_stage.startswith("screen"):
@@ -3096,6 +3152,21 @@ def main() -> None:
         args.final_games_per_side,
         args.confirmation_adaptive,
     )
+    scheduled_screen_games = (
+        2 * configured_screen_candidates * args.screen_games_per_side
+    )
+    scheduled_final_games = (
+        2 * configured_finalists * len(confirmation_opponents)
+        * args.confirmation_games_per_side
+    )
+    conditional_final_games = (
+        2 * conditional_finalists * len(confirmation_opponents)
+        * args.confirmation_games_per_side
+    )
+    conditional_final_games_budget = (
+        2 * conditional_finalists * len(confirmation_opponents)
+        * confirmation_budget_per_side
+    )
     state = SearchDisplayState(
         run_prefix=args.run_prefix,
         max_trials=planned_trial_count,
@@ -3110,6 +3181,10 @@ def main() -> None:
             2 * (configured_finalists + conditional_finalists)
             * len(confirmation_opponents) * confirmation_budget_per_side
         ),
+        screen_games_scheduled=scheduled_screen_games,
+        final_games_scheduled=scheduled_final_games,
+        conditional_final_games=conditional_final_games,
+        conditional_final_games_budget=conditional_final_games_budget,
         conditional_training_trials=conditional_finalists,
     )
     progress_writer = ManifestProgressWriter(manifest_path, manifest, state)
@@ -3763,6 +3838,8 @@ def main() -> None:
             assert fresh_confirmation_episode_batch is not None
             selected = top_trial.hyperparameters
             state.conditional_training_trials = 0
+            state.conditional_final_games = 0
+            state.conditional_final_games_budget = 0
             state.max_trials += len(fresh_seed_values)
             reporter.notice(
                 "fresh-data confirmation: retraining the held-out top setting "
@@ -3852,6 +3929,12 @@ def main() -> None:
             )
         elif fresh_confirmation_enabled:
             state.conditional_training_trials = 0
+            state.conditional_final_games = 0
+            state.final_games_budget = max(
+                0,
+                state.final_games_budget - state.conditional_final_games_budget,
+            )
+            state.conditional_final_games_budget = 0
             fresh_confirmation_payload["status"] = "preliminary_result_did_not_pass"
             assessment = {
                 "status": "no_fresh_confirmation_candidate",
