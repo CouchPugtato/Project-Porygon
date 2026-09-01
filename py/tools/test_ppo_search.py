@@ -27,6 +27,7 @@ from ppo_search import (
     discover_confirmation_opponents,
     evaluation_artifacts_match,
     fresh_confirmation_comparison,
+    format_duration,
     inferred_policy_tag,
     initial_adaptive_game_budget,
     load_config_args,
@@ -234,6 +235,12 @@ class PpoSearchTests(unittest.TestCase):
         assert isinstance(active, dict)
         self.assertEqual(active["current"], 24)
         self.assertEqual(active["total"], 128)
+
+    def test_dashboard_durations_always_include_units(self) -> None:
+        self.assertEqual(format_duration(0), "0s")
+        self.assertEqual(format_duration(59), "59s")
+        self.assertEqual(format_duration(61), "1m 01s")
+        self.assertEqual(format_duration(3661), "1h 01m 01s")
 
     def test_total_eta_starts_conservative_then_uses_measured_rates(self) -> None:
         state = SearchDisplayState(

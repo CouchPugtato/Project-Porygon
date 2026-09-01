@@ -616,7 +616,11 @@ def format_duration(seconds: float | None) -> str:
     total = max(0, int(seconds))
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
-    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:d}:{secs:02d}"
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def parse_key_values(line: str) -> dict[str, int | float | str]:
