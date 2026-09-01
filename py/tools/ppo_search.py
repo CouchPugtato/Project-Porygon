@@ -114,6 +114,17 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def initial_adaptive_game_budget(
+    initial_games: int,
+    block_games: int,
+    maximum_games: int,
+    adaptive: bool,
+) -> int:
+    if not adaptive:
+        return initial_games
+    return min(maximum_games, initial_games + block_games)
+
+
 def csv_floats(value: str) -> list[float]:
     values = [float(part.strip()) for part in value.split(",") if part.strip()]
     if not values:
@@ -3069,9 +3080,17 @@ def main() -> None:
             args.finalists, configured_screen_candidates, planned_trial_count,
         )
     conditional_finalists = len(fresh_seed_values) if fresh_confirmation_enabled else 0
-    screen_budget_per_side = (
-        args.screen_max_games_per_side if args.adaptive_screen
-        else args.screen_games_per_side
+    screen_budget_per_side = initial_adaptive_game_budget(
+        args.screen_games_per_side,
+        args.screen_game_block_per_side,
+        args.screen_max_games_per_side,
+        args.adaptive_screen,
+    )
+    confirmation_budget_per_side = initial_adaptive_game_budget(
+        args.confirmation_games_per_side,
+        args.confirmation_game_block_per_side,
+        args.final_games_per_side,
+        args.confirmation_adaptive,
     )
     state = SearchDisplayState(
         run_prefix=args.run_prefix,
@@ -3085,7 +3104,7 @@ def main() -> None:
         ),
         final_games_budget=(
             2 * (configured_finalists + conditional_finalists)
-            * len(confirmation_opponents) * args.final_games_per_side
+            * len(confirmation_opponents) * confirmation_budget_per_side
         ),
         conditional_training_trials=conditional_finalists,
     )

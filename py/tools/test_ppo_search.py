@@ -28,6 +28,7 @@ from ppo_search import (
     evaluation_artifacts_match,
     fresh_confirmation_comparison,
     inferred_policy_tag,
+    initial_adaptive_game_budget,
     load_config_args,
     merge_evaluation_results,
     parse_evaluation_progress,
@@ -263,6 +264,11 @@ class PpoSearchTests(unittest.TestCase):
         state.screen_estimate_complete = True
         state.final_estimate_complete = True
         self.assertEqual(state.estimated_remaining_seconds(), 60.0)
+
+    def test_initial_eta_budgets_one_adaptive_extension(self) -> None:
+        self.assertEqual(initial_adaptive_game_budget(100, 100, 1000, True), 200)
+        self.assertEqual(initial_adaptive_game_budget(100, 100, 150, True), 150)
+        self.assertEqual(initial_adaptive_game_budget(100, 100, 1000, False), 100)
 
     def test_evaluation_blocks_merge_counts_and_recompute_confidence(self) -> None:
         first = self.evaluation("screen", 55, 100, 0.45, 0.64)
