@@ -234,6 +234,30 @@ class PpoSearchTests(unittest.TestCase):
         self.assertEqual(active["current"], 24)
         self.assertEqual(active["total"], 128)
 
+    def test_total_eta_starts_conservative_then_uses_measured_rates(self) -> None:
+        state = SearchDisplayState(
+            "search", 2, 1, 1, 10, 20,
+            screen_games_budget=40,
+            final_games_budget=80,
+            conditional_training_trials=1,
+            initial_training_seconds_per_trial=100.0,
+            initial_evaluation_seconds_per_game=2.0,
+        )
+        self.assertEqual(state.estimated_remaining_seconds(), 540.0)
+
+        state.training_durations = [50.0]
+        state.evaluation_seconds = 20.0
+        state.evaluation_games = 20
+        self.assertEqual(state.estimated_remaining_seconds(), 270.0)
+
+        state.trained_count = 2
+        state.conditional_training_trials = 0
+        state.screen_games_planned = 20
+        state.final_games_planned = 40
+        state.screen_estimate_complete = True
+        state.final_estimate_complete = True
+        self.assertEqual(state.estimated_remaining_seconds(), 60.0)
+
     def test_evaluation_blocks_merge_counts_and_recompute_confidence(self) -> None:
         first = self.evaluation("screen", 55, 100, 0.45, 0.64)
         second = self.evaluation("screen", 50, 100, 0.40, 0.60)

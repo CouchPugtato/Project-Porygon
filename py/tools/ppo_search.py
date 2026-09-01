@@ -43,6 +43,8 @@ KEY_VALUE_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 POLICY_TAG_RE = re.compile(r'"policy_tag"\s*:\s*("(?:\\.|[^"\\])*")')
 FIXED_CONFIG_KEYS = {"trainer_exe"}
 MAX_SHOWDOWN_SEED_BASE = (1 << 48) - 1
+INITIAL_TRAINING_SECONDS_PER_TRIAL = 1200.0
+INITIAL_EVALUATION_SECONDS_PER_GAME = 2.5
 
 
 def load_config_args(path: Path) -> list[str]:
@@ -642,6 +644,11 @@ class SearchDisplayState:
     configured_finalists: int
     screen_games_per_side: int
     final_games_per_side: int
+    screen_games_budget: int = 0
+    final_games_budget: int = 0
+    conditional_training_trials: int = 0
+    initial_training_seconds_per_trial: float = INITIAL_TRAINING_SECONDS_PER_TRIAL
+    initial_evaluation_seconds_per_game: float = INITIAL_EVALUATION_SECONDS_PER_GAME
     started_at: float = field(default_factory=time.monotonic)
     phase: str = "starting"
     trained_count: int = 0
@@ -657,6 +664,8 @@ class SearchDisplayState:
     final_planned_candidates: int = 0
     screen_plan_finalized: bool = False
     final_plan_finalized: bool = False
+    screen_estimate_complete: bool = False
+    final_estimate_complete: bool = False
     active_trial_index: int = 0
     active_run_name: str = ""
     active_params: Hyperparameters | None = None
@@ -723,26 +732,84 @@ class SearchDisplayState:
         self.active_eta_seconds = None
         self.active_metrics = {}
 
-    def estimated_remaining_seconds(self) -> float | None:
-        estimate = self.active_eta_seconds or 0.0
-        has_estimate = self.active_eta_seconds is not None
+    def screen_games_total_for_estimate(self) -> int:
+        candidates = (
+            self.screen_planned_candidates
+            if self.screen_plan_finalized else self.configured_screen_candidates
+        )
+        planned = self.screen_games_planned or (
+            2 * candidates * self.screen_games_per_side
+        )
+        return planned if self.screen_estimate_complete else max(planned, self.screen_games_budget)
+
+    def final_games_total_for_estimate(self) -> int:
+        candidates = (
+            self.final_planned_candidates
+            if self.final_plan_finalized else self.configured_finalists
+        )
+        planned = self.final_games_planned or (
+            2 * candidates * self.final_games_per_side
+        )
+        return planned if self.final_estimate_complete else max(planned, self.final_games_budget)
+
+    def estimated_remaining_seconds(self) -> float:
         if self.training_durations:
-            remaining_trials = max(0, self.max_trials - self.trained_count - (1 if self.active_kind == "training" else 0))
-            estimate += remaining_trials * (sum(self.training_durations) / len(self.training_durations))
-            has_estimate = True
+            training_seconds = sum(self.training_durations) / len(self.training_durations)
+        elif self.active_kind == "training" and self.active_eta_seconds is not None:
+            elapsed = (
+                time.monotonic() - self.active_started_at
+                if self.active_started_at is not None else 0.0
+            )
+            training_seconds = elapsed + self.active_eta_seconds
+        else:
+            training_seconds = self.initial_training_seconds_per_trial
+
+        active_training = self.active_kind == "training"
+        future_trials = max(
+            0,
+            self.max_trials - self.trained_count - (1 if active_training else 0),
+        ) + self.conditional_training_trials
+        estimate = future_trials * training_seconds
+        if active_training:
+            if self.active_eta_seconds is not None:
+                estimate += self.active_eta_seconds
+            else:
+                elapsed = (
+                    time.monotonic() - self.active_started_at
+                    if self.active_started_at is not None else 0.0
+                )
+                estimate += max(0.0, training_seconds - elapsed)
+
         if self.evaluation_games > 0:
-            seconds_per_game = self.evaluation_seconds / self.evaluation_games
-            screen_candidates = self.screen_planned_candidates if self.screen_plan_finalized else self.configured_screen_candidates
-            final_candidates = self.final_planned_candidates if self.final_plan_finalized else self.configured_finalists
-            screen_total = self.screen_games_planned or (2 * screen_candidates * self.screen_games_per_side)
-            final_total = self.final_games_planned or (2 * final_candidates * self.final_games_per_side)
-            active_screen = self.active_current if self.active_kind == "evaluation" and self.active_stage == "screen" else 0
-            active_final = self.active_current if self.active_kind == "evaluation" and self.active_stage == "final" else 0
-            remaining_games = max(0, screen_total - self.screen_games_completed - active_screen)
-            remaining_games += max(0, final_total - self.final_games_completed - active_final)
-            estimate += remaining_games * seconds_per_game
-            has_estimate = True
-        return estimate if has_estimate else None
+            evaluation_seconds = self.evaluation_seconds / self.evaluation_games
+        elif (
+            self.active_kind == "evaluation"
+            and self.active_current > 0
+            and self.active_started_at is not None
+        ):
+            evaluation_seconds = (
+                time.monotonic() - self.active_started_at
+            ) / self.active_current
+        else:
+            evaluation_seconds = self.initial_evaluation_seconds_per_game
+
+        screen_total = self.screen_games_total_for_estimate()
+        final_total = self.final_games_total_for_estimate()
+        active_screen = self.active_kind == "evaluation" and self.active_stage.startswith("screen")
+        active_final = self.active_kind == "evaluation" and self.active_stage.startswith("final")
+        active_completed = self.active_total if self.active_eta_seconds is not None else self.active_current
+        remaining_games = max(
+            0,
+            screen_total - self.screen_games_completed - (active_completed if active_screen else 0),
+        )
+        remaining_games += max(
+            0,
+            final_total - self.final_games_completed - (active_completed if active_final else 0),
+        )
+        estimate += remaining_games * evaluation_seconds
+        if (active_screen or active_final) and self.active_eta_seconds is not None:
+            estimate += self.active_eta_seconds
+        return estimate
 
     def progress_payload(self) -> dict[str, object]:
         return {
@@ -750,6 +817,25 @@ class SearchDisplayState:
             "dashboard_mode": self.dashboard_mode,
             "elapsed_seconds": time.monotonic() - self.started_at,
             "eta_seconds": self.estimated_remaining_seconds(),
+            "eta_basis": {
+                "training": (
+                    "measured" if self.training_durations
+                    else "active_projection"
+                    if self.active_kind == "training" and self.active_eta_seconds is not None
+                    else "initial_conservative"
+                ),
+                "evaluation": (
+                    "measured" if self.evaluation_games > 0
+                    else "active_projection"
+                    if self.active_kind == "evaluation" and self.active_current > 0
+                    else "initial_conservative"
+                ),
+                "initial_training_seconds_per_trial": self.initial_training_seconds_per_trial,
+                "initial_evaluation_seconds_per_game": self.initial_evaluation_seconds_per_game,
+                "screen_games_budget": self.screen_games_total_for_estimate(),
+                "final_games_budget": self.final_games_total_for_estimate(),
+                "conditional_training_trials": self.conditional_training_trials,
+            },
             "trained_candidates": self.trained_count,
             "safe_candidates": self.safe_count,
             "rejected_candidates": self.rejected_count,
@@ -924,10 +1010,8 @@ class RichSearchReporter(BaseSearchReporter):
         table.add_column(width=18)
         table.add_column(ratio=1)
         table.add_column(width=20, justify="right")
-        screen_candidates = self.state.screen_planned_candidates if self.state.screen_plan_finalized else self.state.configured_screen_candidates
-        final_candidates = self.state.final_planned_candidates if self.state.final_plan_finalized else self.state.configured_finalists
-        screen_total = self.state.screen_games_planned or (2 * screen_candidates * self.state.screen_games_per_side)
-        final_total = self.state.final_games_planned or (2 * final_candidates * self.state.final_games_per_side)
+        screen_total = self.state.screen_games_total_for_estimate()
+        final_total = self.state.final_games_total_for_estimate()
         screen_current = self.state.screen_games_completed
         final_current = self.state.final_games_completed
         if self.state.active_kind == "evaluation" and self.state.active_stage == "screen":
@@ -1411,7 +1495,7 @@ def run_balanced_evaluation(
             after = valid_outcome_counts(side_candidate_stats, side_baseline_stats)
             added_valid = max(0, int(after["valid_games"]) - int(before["valid_games"]))
             raw_games = int(group.get("matches_played", 0) or 0)
-            state.finish_operation(raw_games, record_duration=not can_resume)
+            state.finish_operation(added_valid, record_duration=not can_resume)
             if stage == "screen":
                 state.screen_games_completed += min(added_valid, valid_shortfall)
             else:
@@ -2924,7 +3008,7 @@ def main() -> None:
             "screen_game_block_per_side": args.screen_game_block_per_side,
             "screen_max_games_per_side": args.screen_max_games_per_side,
             "final_games_per_side": args.final_games_per_side,
-            "promotion_metric": "parent_valid_win_rate",
+            "promotion_metric": "worst_training_batch_parent_valid_win_rate",
             "promotion_min_win_rate": args.promotion_min_win_rate,
             "promotion_confidence_threshold": args.promotion_confidence_threshold,
             "valid_games_required": True,
@@ -2957,13 +3041,40 @@ def main() -> None:
         },
         "trials": [],
     }
+    replicated_mode = args.replicate_ranking and search_replicate_count > 1
+    configured_screen_candidates = min(args.screen_candidates, planned_trial_count)
+    if replicated_mode:
+        configured_finalists = (
+            min(
+                args.finalists,
+                setting_budget,
+                configured_screen_candidates // search_replicate_count,
+            ) * search_replicate_count
+        )
+    else:
+        configured_finalists = min(
+            args.finalists, configured_screen_candidates, planned_trial_count,
+        )
+    conditional_finalists = len(fresh_seed_values) if fresh_confirmation_enabled else 0
+    screen_budget_per_side = (
+        args.screen_max_games_per_side if args.adaptive_screen
+        else args.screen_games_per_side
+    )
     state = SearchDisplayState(
         run_prefix=args.run_prefix,
         max_trials=planned_trial_count,
-        configured_screen_candidates=min(args.screen_candidates, planned_trial_count),
-        configured_finalists=min(args.finalists, args.screen_candidates, planned_trial_count),
+        configured_screen_candidates=configured_screen_candidates,
+        configured_finalists=configured_finalists,
         screen_games_per_side=args.screen_games_per_side,
         final_games_per_side=args.final_games_per_side,
+        screen_games_budget=(
+            2 * configured_screen_candidates * screen_budget_per_side
+        ),
+        final_games_budget=(
+            2 * (configured_finalists + conditional_finalists)
+            * len(confirmation_opponents) * args.final_games_per_side
+        ),
+        conditional_training_trials=conditional_finalists,
     )
     progress_writer = ManifestProgressWriter(manifest_path, manifest, state)
     reporter = select_search_reporter(args, state, progress_writer)
@@ -2973,7 +3084,6 @@ def main() -> None:
     progress_writer.update(force=True)
     reporter.start()
     try:
-        replicated_mode = args.replicate_ranking and search_replicate_count > 1
         screen_trials: list[TrialResult] = []
         requested_screen_games: dict[str, int] = {}
         requested_group_screen_games: dict[tuple[float, float, float, float, int], int] = {}
@@ -3371,6 +3481,7 @@ def main() -> None:
                 progress_writer.update(force=True)
             ranked_screen = sorted(screen_trials, key=evaluation_rank_key, reverse=True)
 
+        state.screen_estimate_complete = True
         ranked_screen_groups: list[dict[str, object]] = []
         if replicated_mode:
             ranked_screen_groups = build_hyperparameter_group_summary(
@@ -3615,6 +3726,7 @@ def main() -> None:
         ):
             assert fresh_confirmation_episode_batch is not None
             selected = top_trial.hyperparameters
+            state.conditional_training_trials = 0
             state.max_trials += len(fresh_seed_values)
             reporter.notice(
                 "fresh-data confirmation: retraining the held-out top setting "
@@ -3703,6 +3815,7 @@ def main() -> None:
                 f"promotion_confident={fresh_assessment['promotion_confident']}"
             )
         elif fresh_confirmation_enabled:
+            state.conditional_training_trials = 0
             fresh_confirmation_payload["status"] = "preliminary_result_did_not_pass"
             assessment = {
                 "status": "no_fresh_confirmation_candidate",
@@ -3712,6 +3825,7 @@ def main() -> None:
             winner = None
             best_hyperparameters = None
 
+        state.final_estimate_complete = True
         state.phase = "completed"
         state.clear_operation()
         top_setting = (
