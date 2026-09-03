@@ -2,7 +2,7 @@
 
 Checkpoint compatibility has three independent requirements:
 
-1. The stored observation input dimension must match `observation_flat_size()` in the current runtime.
+1. The stored observation input dimension must match `observation_flat_size()` in the current runtime, apart from the one explicitly supported pre-active-slot migration described below.
 2. The stored action count and flat action layout must match `OBS_NUM_ACTIONS` and `enum ObsAction`.
 3. The serialized parameter count must match the current model layout, the pre-entity or pre-joint factorized layouts, the earlier factorized layout without move-target heads, or the supported legacy flat-head layout.
 
@@ -46,7 +46,7 @@ Factorized checkpoints created before joint-action scoring also remain loadable.
 
 Checkpoints created before the shared entity encoder remain loadable. Both sides of the residual entity path initialize to zero, preserving the checkpoint's existing GRU input behavior exactly while allowing later training to activate the shared path.
 
-The later addition of explicit non-active/left/right role features changes `observation_flat_size()`. Checkpoints produced before those features are rejected with an observation-dimension mismatch; parameter-layout migration does not override an incompatible input schema.
+The later addition of explicit non-active/left/right role features added three inputs to each of the 12 Pokémon blocks. A checkpoint from the older legacy flat-head layout can be migrated across that exact 36-input schema transition. The loader inserts zero-weight columns at the known locations, so the old policy and value outputs are unchanged until later training learns from the new inputs. This exception requires the exact old input size, action count, and legacy parameter count; other observation-dimension mismatches are still rejected.
 
 This supports migration, but does not make every old checkpoint a valid baseline. Reconstruction semantics and observation contents may have changed even when the numeric input dimension happens to match.
 
@@ -65,11 +65,11 @@ The loader validates:
 - magic header and complete header length
 - supported format version (v1 or v2)
 - nonzero, bounded dimensions
-- observation dimension against `observation_flat_size()`
+- observation dimension against `observation_flat_size()`, with an exact-layout exception for pre-active-slot legacy checkpoints
 - action count against `OBS_NUM_ACTIONS`
 - exact current-factorized, pre-entity-factorized, pre-joint-factorized, pre-target-factorized, or legacy-flat parameter count
 - exact file length, rejecting truncation and trailing data
 - complete and matching CRC-32 footer for v2 checkpoints
 - successful parameter import
 
-Failures report a specific reason plus stored and expected metadata, including stored and computed checksums when integrity verification fails. Successful loads report their format version and `checksum=verified` or `checksum=unverified`; legacy parameter-layout loads also report `layout=legacy_flat migrated_factorized_heads=1`.
+Failures report a specific reason plus stored and expected metadata, including stored and computed checksums when integrity verification fails. Successful loads report their format version and `checksum=verified` or `checksum=unverified`; legacy parameter-layout loads also report `layout=legacy_flat migrated_factorized_heads=1`. A migrated observation layout additionally reports `migrated_active_slot_inputs=1`.

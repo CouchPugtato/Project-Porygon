@@ -215,7 +215,10 @@ Use this path to screen intermediate checkpoints or perform an independent compa
 `py/tools/strength_baseline_benchmark.py` runs the recovery audit defined in
 `config/strength_baseline_benchmark.toml`. Before launching games, it requires a
 passing supervised-overfit report and reruns the reconstruction test executable,
-which contains the deterministic PPO-direction test.
+which contains the deterministic PPO-direction test. It then starts every named
+checkpoint in the fixed `build-fresh/showdown_client.exe` runtime and requires a
+ready message. A missing or incompatible checkpoint therefore fails before any
+evaluation workers are launched.
 
 The benchmark screens g4, the current-architecture final checkpoint, the two
 labelled legacy epoch artifacts, run_0096 anchored PPO, and the top observed

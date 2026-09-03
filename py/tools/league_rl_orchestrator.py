@@ -620,6 +620,26 @@ def balanced_evaluation_artifacts_match(
         return False
 
 
+def group_action_count(stats: dict[str, object]) -> int:
+    return (
+        int(stats.get("total_moves", 0) or 0)
+        + int(stats.get("total_passes", 0) or 0)
+        + sum(int(stats.get(f"total_switch_slot_{slot}", 0) or 0) for slot in range(1, 7))
+    )
+
+
+def candidate_runtime_appears_broken(
+    block_stats: dict[str, object],
+    valid_games_before: int,
+    valid_games_after: int,
+) -> bool:
+    return (
+        int(block_stats.get("matches_played", 0) or 0) >= 10
+        and valid_games_after == valid_games_before
+        and group_action_count(block_stats) == 0
+    )
+
+
 def run_balanced_valid_evaluation(
     args: argparse.Namespace,
     repo_root: Path,
@@ -726,6 +746,15 @@ def run_balanced_valid_evaluation(
                 f"evaluation side={candidate_side} valid={int(after['valid_games'])}/{args.eval_games} "
                 f"invalid={int(after['invalid_games'])} raw={int(after['raw_games'])}"
             )
+            if candidate_runtime_appears_broken(
+                candidate_group,
+                int(before["valid_games"]),
+                int(after["valid_games"]),
+            ):
+                raise SystemExit(
+                    f"candidate produced no actions in {run_name}; likely runtime or checkpoint "
+                    "failure. Inspect that run's worker stderr logs before retrying."
+                )
         side_outcomes = valid_outcome_counts(side_candidate_stats, side_champion_stats)
         if int(side_outcomes["valid_games"]) < args.eval_games:
             raise SystemExit(

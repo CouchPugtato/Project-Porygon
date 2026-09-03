@@ -30,6 +30,7 @@ from strength_baseline_audit import (
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "strength_baseline_benchmark.toml"
 DEFAULT_BENCHMARK_ROOT = Path("models") / "benchmarks"
 DEFAULT_MATCH_ROOT = Path("matches") / "runs"
+DEFAULT_CLIENT_EXE = Path("build-fresh") / "showdown_client.exe"
 
 
 def resolve_repo_root() -> Path:
@@ -191,6 +192,79 @@ def run_trainer_preflight(
     return results
 
 
+def runtime_reported_ready(stdout: str) -> bool:
+    for line in stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(message, dict) and message.get("type") == "ready":
+            return True
+    return False
+
+
+def run_checkpoint_preflight(
+    repo_root: Path,
+    models: list[BenchmarkModel],
+    timeout_seconds: int,
+) -> dict[str, object]:
+    client_exe = (repo_root / DEFAULT_CLIENT_EXE).resolve()
+    if not client_exe.exists():
+        raise SystemExit(f"runtime client not found: {client_exe}")
+
+    model_results: dict[str, object] = {}
+    all_passed = True
+    for model in models:
+        try:
+            completed = subprocess.run(
+                [str(client_exe), "--battle-agent", model.checkpoint],
+                cwd=repo_root,
+                input="",
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            ready = runtime_reported_ready(completed.stdout)
+            passed = completed.returncode == 0 and ready
+            details: dict[str, object] = {
+                "passed": passed,
+                "checkpoint": model.checkpoint,
+                "exit_code": completed.returncode,
+                "ready": ready,
+                "stderr_tail": completed.stderr.strip()[-2000:],
+            }
+        except subprocess.TimeoutExpired as exc:
+            passed = False
+            details = {
+                "passed": False,
+                "checkpoint": model.checkpoint,
+                "exit_code": None,
+                "ready": False,
+                "failure": f"runtime load probe exceeded {timeout_seconds}s",
+                "stderr_tail": str(exc.stderr or "")[-2000:],
+            }
+        except OSError as exc:
+            passed = False
+            details = {
+                "passed": False,
+                "checkpoint": model.checkpoint,
+                "exit_code": None,
+                "ready": False,
+                "failure": str(exc),
+                "stderr_tail": "",
+            }
+        model_results[model.id] = details
+        all_passed = all_passed and passed
+
+    return {
+        "passed": all_passed,
+        "client_exe": str(client_exe),
+        "models": model_results,
+    }
+
+
 def safe_run_token(value: str) -> str:
     return "".join(character if character.isalnum() else "_" for character in value).strip("_").lower()
 
@@ -319,8 +393,19 @@ def main() -> None:
     overfit_report = resolve_path(repo_root, args.supervised_overfit_report)
     reconstruction_tests = resolve_path(repo_root, args.reconstruction_tests_exe)
     trainer_tests = run_trainer_preflight(repo_root, overfit_report, reconstruction_tests)
+    checkpoint_loading = run_checkpoint_preflight(
+        repo_root, models, args.startup_timeout_seconds,
+    )
+    trainer_tests["checkpoint_loading"] = checkpoint_loading
+    trainer_tests["passed"] = bool(trainer_tests["passed"]) and bool(checkpoint_loading["passed"])
     if not trainer_tests["passed"]:
-        raise SystemExit("learnability preflight failed; benchmark was not started")
+        failed_models = [
+            model_id
+            for model_id, result in checkpoint_loading["models"].items()
+            if not bool(result.get("passed"))
+        ]
+        suffix = f"; checkpoint load failed for: {', '.join(failed_models)}" if failed_models else ""
+        raise SystemExit(f"learnability preflight failed; benchmark was not started{suffix}")
 
     benchmark_dir = (repo_root / DEFAULT_BENCHMARK_ROOT / args.run_name).resolve()
     manifest_path = benchmark_dir / f"{args.run_name}_manifest.json"

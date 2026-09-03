@@ -1,4 +1,5 @@
 #include "checkpoint.h"
+#include "observation.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -11,6 +12,146 @@
 #define CHECKPOINT_MAX_HIDDEN_DIM 4096u
 #define CHECKPOINT_MAX_ACTIONS 100000u
 
+typedef struct {
+    char magic[8];
+    unsigned int version;
+    size_t input_dim;
+    size_t hidden_dim;
+    size_t num_actions;
+    size_t parameter_count;
+    TrainerCheckpointState trainer;
+} CheckpointHeader;
+
+static int legacy_parameter_count_for_dimensions(
+    size_t input_dim,
+    size_t hidden_dim,
+    size_t num_actions,
+    size_t* count_out
+) {
+    size_t input_weights;
+    size_t recurrent_weights;
+    size_t policy_weights;
+    size_t count;
+
+    if (!count_out || hidden_dim == 0 || input_dim > SIZE_MAX / hidden_dim ||
+            hidden_dim > SIZE_MAX / hidden_dim || num_actions > SIZE_MAX / hidden_dim) {
+        return 0;
+    }
+    input_weights = input_dim * hidden_dim;
+    recurrent_weights = hidden_dim * hidden_dim;
+    policy_weights = num_actions * hidden_dim;
+    if (input_weights > SIZE_MAX / 3u || recurrent_weights > SIZE_MAX / 3u) {
+        return 0;
+    }
+    count = 3u * input_weights;
+    if (3u * recurrent_weights > SIZE_MAX - count) return 0;
+    count += 3u * recurrent_weights;
+    if (hidden_dim > (SIZE_MAX - count) / 4u) return 0;
+    count += 4u * hidden_dim;
+    if (policy_weights > SIZE_MAX - count) return 0;
+    count += policy_weights;
+    if (count == SIZE_MAX || num_actions > SIZE_MAX - count - 1u) return 0;
+    *count_out = count + num_actions + 1u;
+    return 1;
+}
+
+static int is_pre_active_slot_legacy_checkpoint(
+    const CheckpointHeader* header,
+    size_t expected_input_dim,
+    size_t expected_num_actions
+) {
+    size_t removed_inputs = 2u * OBS_TEAM_SIZE * OBS_ACTIVE_SLOT_CLASSES;
+    size_t legacy_count = 0;
+
+    return header && expected_input_dim == OBSERVATION_FLAT_SIZE &&
+        expected_num_actions == OBS_NUM_ACTIONS &&
+        header->input_dim + removed_inputs == expected_input_dim &&
+        header->num_actions == expected_num_actions &&
+        legacy_parameter_count_for_dimensions(
+            header->input_dim, header->hidden_dim, header->num_actions, &legacy_count) &&
+        header->parameter_count == legacy_count;
+}
+
+static int expand_input_matrix(
+    float* destination,
+    const float* source,
+    size_t rows,
+    size_t old_input_dim,
+    size_t new_input_dim
+) {
+    const size_t pokemon_count = 2u * OBS_TEAM_SIZE;
+    const size_t old_pokemon_features = OBS_POKEMON_FEATURES - OBS_ACTIVE_SLOT_CLASSES;
+    const size_t prefix = OBS_GLOBAL_FEATURES + 2u * OBS_SIDE_FEATURES;
+    size_t row;
+
+    if (!destination || !source ||
+            old_input_dim + pokemon_count * OBS_ACTIVE_SLOT_CLASSES != new_input_dim) {
+        return 0;
+    }
+    for (row = 0; row < rows; ++row) {
+        const float* old_row = source + row * old_input_dim;
+        float* new_row = destination + row * new_input_dim;
+        size_t old_index = prefix;
+        size_t new_index = prefix;
+        size_t pokemon;
+
+        memcpy(new_row, old_row, prefix * sizeof(float));
+        for (pokemon = 0; pokemon < pokemon_count; ++pokemon) {
+            memcpy(new_row + new_index, old_row + old_index,
+                OBS_POKEMON_ACTIVE_SLOT_OFFSET * sizeof(float));
+            old_index += OBS_POKEMON_ACTIVE_SLOT_OFFSET;
+            new_index += OBS_POKEMON_ACTIVE_SLOT_OFFSET + OBS_ACTIVE_SLOT_CLASSES;
+            memcpy(new_row + new_index, old_row + old_index,
+                (old_pokemon_features - OBS_POKEMON_ACTIVE_SLOT_OFFSET) * sizeof(float));
+            old_index += old_pokemon_features - OBS_POKEMON_ACTIVE_SLOT_OFFSET;
+            new_index += old_pokemon_features - OBS_POKEMON_ACTIVE_SLOT_OFFSET;
+        }
+        memcpy(new_row + new_index, old_row + old_index,
+            (old_input_dim - old_index) * sizeof(float));
+        new_index += old_input_dim - old_index;
+        if (new_index != new_input_dim) return 0;
+    }
+    return 1;
+}
+
+static int expand_pre_active_slot_legacy_parameters(
+    float* destination,
+    size_t destination_count,
+    const float* source,
+    size_t source_count,
+    size_t old_input_dim,
+    size_t new_input_dim,
+    size_t hidden_dim,
+    size_t num_actions
+) {
+    size_t source_index = 0;
+    size_t destination_index = 0;
+    size_t gate;
+    size_t recurrent_and_bias = hidden_dim * hidden_dim + hidden_dim;
+    size_t tail = num_actions * hidden_dim + num_actions + hidden_dim + 1u;
+
+    for (gate = 0; gate < 3u; ++gate) {
+        if (!expand_input_matrix(
+                destination + destination_index,
+                source + source_index,
+                hidden_dim,
+                old_input_dim,
+                new_input_dim)) {
+            return 0;
+        }
+        source_index += hidden_dim * old_input_dim;
+        destination_index += hidden_dim * new_input_dim;
+        memcpy(destination + destination_index, source + source_index,
+            recurrent_and_bias * sizeof(float));
+        source_index += recurrent_and_bias;
+        destination_index += recurrent_and_bias;
+    }
+    memcpy(destination + destination_index, source + source_index, tail * sizeof(float));
+    source_index += tail;
+    destination_index += tail;
+    return source_index == source_count && destination_index == destination_count;
+}
+
 #ifdef _WIN32
 #include <direct.h>
 #include <io.h>
@@ -22,16 +163,6 @@
 #include <unistd.h>
 #define MKDIR(path) mkdir(path, 0777)
 #endif
-
-typedef struct {
-    char magic[8];
-    unsigned int version;
-    size_t input_dim;
-    size_t hidden_dim;
-    size_t num_actions;
-    size_t parameter_count;
-    TrainerCheckpointState trainer;
-} CheckpointHeader;
 
 static void crc32_build_table(uint32_t table[256]) {
     uint32_t i;
@@ -272,6 +403,7 @@ GruModel* checkpoint_load_compatible(
     CheckpointHeader header;
     GruModel* model = NULL;
     float* params = NULL;
+    float* expanded_params = NULL;
     size_t current_parameter_count;
     size_t pre_entity_parameter_count;
     size_t pre_joint_parameter_count;
@@ -282,6 +414,7 @@ GruModel* checkpoint_load_compatible(
     long actual_file_size;
     uint32_t stored_checksum = 0;
     uint32_t computed_checksum = 0;
+    int migrate_active_slot_inputs = 0;
     CheckpointLoadResult local_result;
     CheckpointLoadResult* result = result_out ? result_out : &local_result;
 
@@ -324,16 +457,23 @@ GruModel* checkpoint_load_compatible(
         return NULL;
     }
     if (expected_input_dim > 0 && header.input_dim != expected_input_dim) {
-        result->status = CHECKPOINT_LOAD_INPUT_DIM_MISMATCH;
-        fclose(f);
-        return NULL;
+        migrate_active_slot_inputs = is_pre_active_slot_legacy_checkpoint(
+            &header, expected_input_dim, expected_num_actions);
+        if (!migrate_active_slot_inputs) {
+            result->status = CHECKPOINT_LOAD_INPUT_DIM_MISMATCH;
+            fclose(f);
+            return NULL;
+        }
     }
     if (expected_num_actions > 0 && header.num_actions != expected_num_actions) {
         result->status = CHECKPOINT_LOAD_ACTION_COUNT_MISMATCH;
         fclose(f);
         return NULL;
     }
-    model = gru_model_create(header.input_dim, header.hidden_dim, header.num_actions);
+    model = gru_model_create(
+        migrate_active_slot_inputs ? expected_input_dim : header.input_dim,
+        header.hidden_dim,
+        header.num_actions);
     if (!model) {
         result->status = CHECKPOINT_LOAD_MODEL_CREATE_FAILED;
         fclose(f);
@@ -344,7 +484,9 @@ GruModel* checkpoint_load_compatible(
     pre_joint_parameter_count = gru_model_pre_joint_parameter_count(model);
     pre_target_parameter_count = gru_model_pre_target_parameter_count(model);
     legacy_parameter_count = gru_model_legacy_parameter_count(model);
-    if (header.parameter_count == current_parameter_count) {
+    if (migrate_active_slot_inputs) {
+        result->parameter_layout = CHECKPOINT_LAYOUT_LEGACY_FLAT;
+    } else if (header.parameter_count == current_parameter_count) {
         result->parameter_layout = CHECKPOINT_LAYOUT_FACTORIZED;
     } else if (header.parameter_count == pre_entity_parameter_count) {
         result->parameter_layout = CHECKPOINT_LAYOUT_FACTORIZED;
@@ -446,8 +588,38 @@ GruModel* checkpoint_load_compatible(
         }
         result->checksum_verified = 1;
     }
-    if (!gru_model_import_parameters(model, params, header.parameter_count)) {
+    if (migrate_active_slot_inputs) {
+        expanded_params = (float*)calloc(legacy_parameter_count, sizeof(float));
+        if (!expanded_params) {
+            result->status = CHECKPOINT_LOAD_ALLOCATION_FAILED;
+            free(params);
+            gru_model_destroy(model);
+            fclose(f);
+            return NULL;
+        }
+        if (!expand_pre_active_slot_legacy_parameters(
+                expanded_params,
+                legacy_parameter_count,
+                params,
+                header.parameter_count,
+                header.input_dim,
+                expected_input_dim,
+                header.hidden_dim,
+                header.num_actions)) {
+            result->status = CHECKPOINT_LOAD_PARAMETER_IMPORT_FAILED;
+            free(expanded_params);
+            free(params);
+            gru_model_destroy(model);
+            fclose(f);
+            return NULL;
+        }
+    }
+    if (!gru_model_import_parameters(
+            model,
+            expanded_params ? expanded_params : params,
+            expanded_params ? legacy_parameter_count : header.parameter_count)) {
         result->status = CHECKPOINT_LOAD_PARAMETER_IMPORT_FAILED;
+        free(expanded_params);
         free(params);
         gru_model_destroy(model);
         fclose(f);
@@ -456,10 +628,12 @@ GruModel* checkpoint_load_compatible(
     if (state_out) {
         *state_out = header.trainer;
     }
+    free(expanded_params);
     free(params);
     fclose(f);
     result->status = CHECKPOINT_LOAD_OK;
     result->migrated_legacy_heads = result->parameter_layout == CHECKPOINT_LAYOUT_LEGACY_FLAT;
+    result->migrated_active_slot_inputs = migrate_active_slot_inputs;
     return model;
 }
 

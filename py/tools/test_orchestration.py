@@ -25,6 +25,7 @@ from league_rl_orchestrator import (
     build_live_command as build_league_live_command,
     build_parser as build_league_parser,
     build_weighted_pool,
+    candidate_runtime_appears_broken,
     choose_parent_member,
     collect_recent_opponent_stats,
     league_promotion_assessment,
@@ -665,6 +666,23 @@ class WorkflowDashboardTests(unittest.TestCase):
 
 
 class BalancedCheckpointEvalTests(unittest.TestCase):
+    def test_balanced_eval_detects_a_nonacting_candidate_runtime(self) -> None:
+        self.assertTrue(
+            candidate_runtime_appears_broken(
+                {"matches_played": 250, "total_moves": 0}, 0, 0,
+            )
+        )
+        self.assertFalse(
+            candidate_runtime_appears_broken(
+                {"matches_played": 250, "total_moves": 1}, 0, 0,
+            )
+        )
+        self.assertFalse(
+            candidate_runtime_appears_broken(
+                {"matches_played": 250, "total_moves": 0}, 0, 1,
+            )
+        )
+
     def test_cli_maps_to_shared_balanced_evaluation_arguments(self) -> None:
         args = prepare_shared_args(build_balanced_eval_parser().parse_args([
             "--run-name", "round03-eval",

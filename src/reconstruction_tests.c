@@ -3436,7 +3436,7 @@ cleanup:
     return ok;
 }
 
-static int test_active_slot_schema_rejects_older_checkpoint(void) {
+static int test_active_slot_schema_migrates_legacy_checkpoint(void) {
     const char* path = "checkpoint_test_pre_active_slot_schema.bin";
     size_t old_input_dim = observation_flat_size() -
         2u * OBS_TEAM_SIZE * OBS_ACTIVE_SLOT_CLASSES;
@@ -3444,21 +3444,111 @@ static int test_active_slot_schema_rejects_older_checkpoint(void) {
     GruModel* loaded = NULL;
     TrainerCheckpointState state;
     CheckpointLoadResult result;
+    TestCheckpointHeader header;
+    float* full_parameters = NULL;
+    float* legacy_parameters = NULL;
+    float* old_input = NULL;
+    float* current_input = NULL;
+    float old_policy[OBS_NUM_ACTIONS] = {0};
+    float current_policy[OBS_NUM_ACTIONS] = {0};
+    float old_hidden[4] = {0};
+    float current_hidden[4] = {0};
+    float old_value = 0.0f;
+    float current_value = 0.0f;
+    size_t full_count = 0;
+    size_t legacy_count = 0;
+    size_t value_count = 5u;
+    size_t prefix_count = 0;
+    size_t old_index;
+    size_t current_index;
+    size_t pokemon;
+    size_t i;
     int ok = 1;
     memset(&state, 0, sizeof(state));
+    memset(&header, 0, sizeof(header));
     remove(path);
     ok &= assert_true(old_model != NULL, "active-slot schema test creates prior-dimension model");
     if (old_model) {
-        ok &= assert_true(checkpoint_save(path, old_model, &state),
-            "active-slot schema test writes prior-dimension checkpoint");
+        full_count = gru_model_parameter_count(old_model);
+        legacy_count = gru_model_legacy_parameter_count(old_model);
+        prefix_count = legacy_count - value_count;
+        full_parameters = (float*)malloc(full_count * sizeof(float));
+        legacy_parameters = (float*)malloc(legacy_count * sizeof(float));
+        old_input = (float*)malloc(old_input_dim * sizeof(float));
+        current_input = (float*)calloc(observation_flat_size(), sizeof(float));
+        ok &= assert_true(full_parameters && legacy_parameters && old_input && current_input,
+            "active-slot schema test allocates migration buffers");
+        if (!full_parameters || !legacy_parameters || !old_input || !current_input) goto cleanup;
+        ok &= assert_true(gru_model_export_parameters(old_model, full_parameters, full_count),
+            "active-slot schema test exports prior parameters");
+        memcpy(legacy_parameters, full_parameters, prefix_count * sizeof(float));
+        memcpy(legacy_parameters + prefix_count, full_parameters + full_count - value_count,
+            value_count * sizeof(float));
+        ok &= assert_true(gru_model_import_parameters(old_model, legacy_parameters, legacy_count),
+            "active-slot schema test restores the exact legacy model layout");
+        memcpy(header.magic, "PORYCHK", 7);
+        header.version = CHECKPOINT_MIN_SUPPORTED_VERSION;
+        header.input_dim = old_input_dim;
+        header.hidden_dim = 4u;
+        header.num_actions = OBS_NUM_ACTIONS;
+        header.parameter_count = legacy_count;
+        header.trainer = state;
+        ok &= assert_true(write_test_checkpoint(path, &header, legacy_parameters),
+            "active-slot schema test writes legacy prior-dimension checkpoint");
         loaded = checkpoint_load_compatible(path, NULL,
             observation_flat_size(), OBS_NUM_ACTIONS, &result);
-        ok &= assert_true(loaded == NULL && result.status == CHECKPOINT_LOAD_INPUT_DIM_MISMATCH &&
-                result.stored_input_dim == old_input_dim,
-            "checkpoint loader rejects schema without explicit active-slot features");
+        ok &= assert_true(loaded != NULL && result.status == CHECKPOINT_LOAD_OK &&
+                result.stored_input_dim == old_input_dim &&
+                result.parameter_layout == CHECKPOINT_LAYOUT_LEGACY_FLAT &&
+                result.migrated_legacy_heads && result.migrated_active_slot_inputs &&
+                gru_model_input_dim(loaded) == observation_flat_size(),
+            "checkpoint loader safely migrates the known active-slot schema transition");
+        for (i = 0; i < old_input_dim; ++i) {
+            old_input[i] = (float)((int)(i % 19u) - 9) / 10.0f;
+        }
+        old_index = 0;
+        current_index = 0;
+        i = OBS_GLOBAL_FEATURES + 2u * OBS_SIDE_FEATURES;
+        memcpy(current_input, old_input, i * sizeof(float));
+        old_index += i;
+        current_index += i;
+        for (pokemon = 0; pokemon < 2u * OBS_TEAM_SIZE; ++pokemon) {
+            size_t remaining = OBS_POKEMON_FEATURES - OBS_ACTIVE_SLOT_CLASSES -
+                OBS_POKEMON_ACTIVE_SLOT_OFFSET;
+            memcpy(current_input + current_index, old_input + old_index,
+                OBS_POKEMON_ACTIVE_SLOT_OFFSET * sizeof(float));
+            old_index += OBS_POKEMON_ACTIVE_SLOT_OFFSET;
+            current_index += OBS_POKEMON_ACTIVE_SLOT_OFFSET + OBS_ACTIVE_SLOT_CLASSES;
+            memcpy(current_input + current_index, old_input + old_index,
+                remaining * sizeof(float));
+            old_index += remaining;
+            current_index += remaining;
+        }
+        memcpy(current_input + current_index, old_input + old_index,
+            (old_input_dim - old_index) * sizeof(float));
+        if (loaded) {
+            gru_model_forward_step(old_model, old_input, old_hidden, old_hidden, old_policy, &old_value);
+            gru_model_forward_step(loaded, current_input, current_hidden, current_hidden,
+                current_policy, &current_value);
+            for (i = 0; i < 4u; ++i) {
+                ok &= assert_true(nearly_equal(old_hidden[i], current_hidden[i], 1.0e-6),
+                    "active-slot migration preserves recurrent output with neutral new inputs");
+            }
+            for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
+                ok &= assert_true(nearly_equal(old_policy[i], current_policy[i], 1.0e-6),
+                    "active-slot migration preserves flat policy output");
+            }
+            ok &= assert_true(nearly_equal(old_value, current_value, 1.0e-6),
+                "active-slot migration preserves value output");
+        }
     }
+cleanup:
     gru_model_destroy(loaded);
     gru_model_destroy(old_model);
+    free(full_parameters);
+    free(legacy_parameters);
+    free(old_input);
+    free(current_input);
     remove(path);
     return ok;
 }
@@ -4123,7 +4213,7 @@ int main(int argc, char** argv) {
     if (!test_ppo_hard_kl_requires_consecutive_breaches()) return 1;
     if (!test_symmetric_joint_action_training()) return 1;
     if (!test_shared_entity_encoder_training_and_migration()) return 1;
-    if (!test_active_slot_schema_rejects_older_checkpoint()) return 1;
+    if (!test_active_slot_schema_migrates_legacy_checkpoint()) return 1;
     if (!test_checkpoint_compatibility_validation()) return 1;
     if (!test_policy_evaluation_matches_legal_runtime_policy()) return 1;
     if (!test_supervised_overfit_diagnostic_learns()) return 1;

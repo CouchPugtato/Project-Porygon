@@ -21,6 +21,7 @@ from strength_baseline_benchmark import (
     evaluation_record,
     load_config_args,
     rank_evaluations,
+    runtime_reported_ready,
 )
 
 
@@ -46,6 +47,12 @@ def evaluation(model_id: str, low: float, point: float) -> dict[str, object]:
 
 
 class RandomBaselineTests(unittest.TestCase):
+    def test_runtime_probe_requires_ready_json(self) -> None:
+        self.assertTrue(runtime_reported_ready('{"type":"ready","version":1}\n'))
+        self.assertTrue(runtime_reported_ready('noise\n{"type":"ready"}\n'))
+        self.assertFalse(runtime_reported_ready('{"type":"error"}\n'))
+        self.assertFalse(runtime_reported_ready('[runtime] failed to load\n'))
+
     def test_canonical_config_names_all_six_models(self) -> None:
         args = build_parser().parse_args(load_config_args(DEFAULT_CONFIG_PATH))
 

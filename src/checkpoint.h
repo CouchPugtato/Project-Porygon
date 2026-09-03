@@ -56,6 +56,7 @@ typedef struct {
     size_t expected_num_actions;
     CheckpointParameterLayout parameter_layout;
     int migrated_legacy_heads;
+    int migrated_active_slot_inputs;
     int checksum_verified;
     uint32_t stored_checksum;
     uint32_t computed_checksum;

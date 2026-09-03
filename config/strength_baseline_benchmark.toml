@@ -1,4 +1,4 @@
-run_name = "run_0112_model_learning_audit"
+run_name = "run_0113_model_learning_audit"
 
 g4_checkpoint = "models/runs/run_0056_g4_teacher_sup_pool_collect_200shards_wins/g4_teacher_sup_pool_wins_sup/g4_teacher_sup_pool_wins_sup.chk"
 g4_provenance = "run_0056 supervised g4 checkpoint"

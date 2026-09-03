@@ -1752,11 +1752,17 @@ async def live_mode(
         seq += 1
 
     async def action_loop() -> None:
+        nonlocal stop_requested
         while True:
             msg = await learner.read_message()
             if not msg:
-                print("[live] learner exited")
-                return
+                if learner_stopping.is_set():
+                    print("[live] learner stopped")
+                    return
+                stop_requested = True
+                if gateway is not None:
+                    await gateway.close()
+                raise RuntimeError("learner exited unexpectedly")
             if msg.get("type") == "ready":
                 print(f"[live] learner ready: {msg}")
             elif msg.get("type") == "episode_complete":

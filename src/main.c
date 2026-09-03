@@ -143,14 +143,15 @@ static void report_checkpoint_load_success(
     const TrainerCheckpointState* state,
     const CheckpointLoadResult* result
 ) {
-    fprintf(stderr, "%s checkpoint='%s' step=%zu version=%u checksum=%s layout=%s%s\n",
+    fprintf(stderr, "%s checkpoint='%s' step=%zu version=%u checksum=%s layout=%s%s%s\n",
         context ? context : "loaded checkpoint",
         path ? path : "",
         state ? state->step : 0u,
         result ? result->stored_version : 0u,
         result && result->checksum_verified ? "verified" : "unverified",
         result && result->parameter_layout == CHECKPOINT_LAYOUT_LEGACY_FLAT ? "legacy_flat" : "factorized",
-        result && result->migrated_legacy_heads ? " migrated_factorized_heads=1" : "");
+        result && result->migrated_legacy_heads ? " migrated_factorized_heads=1" : "",
+        result && result->migrated_active_slot_inputs ? " migrated_active_slot_inputs=1" : "");
 }
 
 static void rl_training_summary_init(RlTrainingSummary* summary) {
