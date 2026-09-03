@@ -314,17 +314,18 @@ void env_runtime_free(EnvRuntime* runtime) {
 }
 
 static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
-    float slot0_kind_policy[FACTORIZED_KIND_DIM];
-    float slot0_move_policy[FACTORIZED_MOVE_DIM];
-    float slot0_switch_policy[FACTORIZED_SWITCH_DIM];
-    float slot0_tera_policy[FACTORIZED_TERA_DIM];
-    float slot0_target_policy[FACTORIZED_TARGET_DIM];
-    float slot1_kind_policy[FACTORIZED_KIND_DIM];
-    float slot1_move_policy[FACTORIZED_MOVE_DIM];
-    float slot1_switch_policy[FACTORIZED_SWITCH_DIM];
-    float slot1_tera_policy[FACTORIZED_TERA_DIM];
-    float slot1_target_policy[FACTORIZED_TARGET_DIM];
-    float joint_policy[FACTORIZED_JOINT_DIM];
+    FactorizedPolicySnapshot policy;
+    float* slot0_kind_policy = policy.slot0_kind_policy;
+    float* slot0_move_policy = policy.slot0_move_policy;
+    float* slot0_switch_policy = policy.slot0_switch_policy;
+    float* slot0_tera_policy = policy.slot0_tera_policy;
+    float* slot0_target_policy = policy.slot0_target_policy;
+    float* slot1_kind_policy = policy.slot1_kind_policy;
+    float* slot1_move_policy = policy.slot1_move_policy;
+    float* slot1_switch_policy = policy.slot1_switch_policy;
+    float* slot1_tera_policy = policy.slot1_tera_policy;
+    float* slot1_target_policy = policy.slot1_target_policy;
+    float* joint_policy = policy.joint_policy;
     unsigned char joint_mask[FACTORIZED_JOINT_DIM];
     float* pair_policy;
     float value;
@@ -377,30 +378,17 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     build_runtime_factor_masks(session->observation.legal_mask, 1, slot1_kind_mask, slot1_move_mask, slot1_switch_mask);
     factorized_action_choice_init(&sampled_choice);
     gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, NULL, &value);
-    if (!gru_model_evaluate_factorized_hidden(
+    if (!gru_model_evaluate_policy_snapshot(
             runtime->model,
             session->hidden_state,
             session->observation.legal_mask,
-            slot0_kind_policy,
-            slot0_move_policy,
-            slot0_switch_policy,
-            slot0_tera_policy,
-            slot0_target_policy,
-            slot1_kind_policy,
-            slot1_move_policy,
-            slot1_switch_policy,
-            slot1_tera_policy,
-            slot1_target_policy,
+            use_joint_policy,
+            &policy,
             &value)) {
         free(pair_policy);
         return 0;
     }
     if (use_joint_policy) {
-        if (!gru_model_evaluate_joint_hidden(runtime->model, session->hidden_state,
-                session->observation.legal_mask, joint_policy, NULL)) {
-            free(pair_policy);
-            return 0;
-        }
         for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) {
             joint_mask[i] = joint_policy[i] > 0.0f ? 1 : 0;
         }

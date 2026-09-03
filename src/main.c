@@ -2,6 +2,7 @@
 #include "env_session.h"
 #include "gru_model.h"
 #include "gru_trainer.h"
+#include "policy_evaluation.h"
 #include "id_tables.h"
 #include "observation.h"
 #include "runtime_protocol.h"
@@ -957,209 +958,27 @@ static void filter_labeled_train_indices(
     *train_count_io = write_i;
 }
 
-static int evaluate_supervised_episode(
-    const GruTrainer* trainer,
-    const GruModel* model,
-    const Episode* episode,
-    float* action_loss_out,
-    float* value_loss_out,
-    float* accuracy_out,
-    size_t* labels_out,
-    float* top3_accuracy_out,
-    float* action1_accuracy_out,
-    float* action2_accuracy_out,
-    size_t* action1_labels_out,
-    size_t* action2_labels_out,
-    size_t* skipped_steps_out
-) {
-    size_t t;
-    size_t trained = 0;
-    float action_loss_sum = 0.0f;
-    float value_loss_sum = 0.0f;
-    float accuracy_sum = 0.0f;
-    float top3_accuracy_sum = 0.0f;
-    float action1_accuracy_sum = 0.0f;
-    float action2_accuracy_sum = 0.0f;
-    size_t action1_labels = 0;
-    size_t action2_labels = 0;
-    size_t skipped_steps = 0;
-    size_t hidden_dim;
-    size_t action_dim;
-    float* hidden;
-    float* policy;
-
-    if (!trainer || !model || !episode) {
-        return 0;
-    }
-    hidden_dim = gru_model_hidden_dim(model);
-    action_dim = gru_model_num_actions(model);
-    hidden = (float*)malloc(hidden_dim * sizeof(float));
-    policy = (float*)malloc(action_dim * sizeof(float));
-    if (!hidden || !policy) {
-        free(hidden);
-        free(policy);
-        return 0;
-    }
-
-    for (t = 0; t < episode->count; ++t) {
-        size_t start = (t + 1 > trainer->bptt_window) ? (t + 1 - trainer->bptt_window) : 0;
-        size_t steps = (t - start) + 1;
-        float value = 0.0f;
-        int predicted_action;
-        int labels[2];
-        int li;
-
-        labels[0] = episode->actions[t];
-        labels[1] = episode->actions2[t];
-
-        if (labels[0] < 0 && labels[1] < 0) {
-            ++skipped_steps;
-            continue;
-        }
-
-        gru_model_zero_state(model, hidden);
-        gru_model_forward_sequence(model, episode->observations + (start * episode->obs_dim), steps, hidden, policy, &value);
-        predicted_action = gru_model_select_action(policy, NULL, action_dim);
-
-        for (li = 0; li < 2; ++li) {
-            int label = labels[li];
-            float prob;
-            float err;
-            int top_hits = 0;
-            size_t k;
-            if (label < 0) {
-                continue;
-            }
-            prob = policy[label] > 1.0e-8f ? policy[label] : 1.0e-8f;
-            action_loss_sum += -logf(prob);
-            err = value - episode->rewards[t];
-            value_loss_sum += 0.5f * err * err;
-            accuracy_sum += (predicted_action == label) ? 1.0f : 0.0f;
-            for (k = 0; k < action_dim; ++k) {
-                if (policy[k] > prob) {
-                    ++top_hits;
-                    if (top_hits >= 3) {
-                        break;
-                    }
-                }
-            }
-            top3_accuracy_sum += (top_hits < 3) ? 1.0f : 0.0f;
-            if (li == 0) {
-                action1_accuracy_sum += (predicted_action == label) ? 1.0f : 0.0f;
-                ++action1_labels;
-            } else {
-                action2_accuracy_sum += (predicted_action == label) ? 1.0f : 0.0f;
-                ++action2_labels;
-            }
-            ++trained;
-        }
-    }
-
-    free(hidden);
-    free(policy);
-
-    if (trained == 0) {
-        if (action_loss_out) *action_loss_out = 0.0f;
-        if (value_loss_out) *value_loss_out = 0.0f;
-        if (accuracy_out) *accuracy_out = 0.0f;
-        if (labels_out) *labels_out = 0;
-        if (top3_accuracy_out) *top3_accuracy_out = 0.0f;
-        if (action1_accuracy_out) *action1_accuracy_out = 0.0f;
-        if (action2_accuracy_out) *action2_accuracy_out = 0.0f;
-        if (action1_labels_out) *action1_labels_out = 0;
-        if (action2_labels_out) *action2_labels_out = 0;
-        if (skipped_steps_out) *skipped_steps_out = skipped_steps;
-        return 1;
-    }
-    if (action_loss_out) *action_loss_out = action_loss_sum / (float)trained;
-    if (value_loss_out) *value_loss_out = value_loss_sum / (float)trained;
-    if (accuracy_out) *accuracy_out = accuracy_sum / (float)trained;
-    if (labels_out) *labels_out = trained;
-    if (top3_accuracy_out) *top3_accuracy_out = top3_accuracy_sum / (float)trained;
-    if (action1_accuracy_out) *action1_accuracy_out = action1_labels > 0 ? action1_accuracy_sum / (float)action1_labels : 0.0f;
-    if (action2_accuracy_out) *action2_accuracy_out = action2_labels > 0 ? action2_accuracy_sum / (float)action2_labels : 0.0f;
-    if (action1_labels_out) *action1_labels_out = action1_labels;
-    if (action2_labels_out) *action2_labels_out = action2_labels;
-    if (skipped_steps_out) *skipped_steps_out = skipped_steps;
-    return 1;
-}
-
 static int evaluate_supervised_split(
     const GruTrainer* trainer,
     const GruModel* model,
     const EnvRuntime* runtime,
     const size_t* indices,
     size_t index_count,
-    float* action_loss_out,
-    float* value_loss_out,
-    float* accuracy_out,
-    size_t* labels_out,
-    size_t* sessions_out,
-    float* top3_accuracy_out,
-    float* action1_accuracy_out,
-    float* action2_accuracy_out,
-    size_t* action1_labels_out,
-    size_t* action2_labels_out,
-    size_t* skipped_steps_out
+    PolicyEvaluationMetrics* metrics_out
 ) {
     size_t i;
-    float action_loss_sum = 0.0f;
-    float value_loss_sum = 0.0f;
-    float accuracy_sum = 0.0f;
-    float top3_accuracy_sum = 0.0f;
-    float action1_accuracy_sum = 0.0f;
-    float action2_accuracy_sum = 0.0f;
-    size_t total_labels = 0;
-    size_t total_sessions = 0;
-    size_t total_action1_labels = 0;
-    size_t total_action2_labels = 0;
-    size_t total_skipped_steps = 0;
-
-    if (!trainer || !model || !runtime) {
+    if (!trainer || !model || !runtime || !metrics_out) {
         return 0;
     }
+    policy_evaluation_init(metrics_out);
     for (i = 0; i < index_count; ++i) {
-        float action_loss = 0.0f;
-        float value_loss = 0.0f;
-        float accuracy = 0.0f;
-        float top3_accuracy = 0.0f;
-        float action1_accuracy = 0.0f;
-        float action2_accuracy = 0.0f;
-        size_t labels = 0;
-        size_t action1_labels = 0;
-        size_t action2_labels = 0;
-        size_t skipped_steps = 0;
         size_t session_index = indices[i];
-        ++total_sessions;
-        if (!evaluate_supervised_episode(trainer, model, &runtime->sessions[session_index].episode,
-                &action_loss, &value_loss, &accuracy, &labels,
-                &top3_accuracy, &action1_accuracy, &action2_accuracy,
-                &action1_labels, &action2_labels, &skipped_steps)) {
+        if (session_index >= runtime->count ||
+                !policy_evaluation_add_episode(model, trainer->bptt_window,
+                    &runtime->sessions[session_index].episode, metrics_out)) {
             return 0;
         }
-        action_loss_sum += action_loss * (float)labels;
-        value_loss_sum += value_loss * (float)labels;
-        accuracy_sum += accuracy * (float)labels;
-        top3_accuracy_sum += top3_accuracy * (float)labels;
-        action1_accuracy_sum += action1_accuracy * (float)action1_labels;
-        action2_accuracy_sum += action2_accuracy * (float)action2_labels;
-        total_labels += labels;
-        total_action1_labels += action1_labels;
-        total_action2_labels += action2_labels;
-        total_skipped_steps += skipped_steps;
     }
-
-    if (action_loss_out) *action_loss_out = total_labels > 0 ? action_loss_sum / (float)total_labels : 0.0f;
-    if (value_loss_out) *value_loss_out = total_labels > 0 ? value_loss_sum / (float)total_labels : 0.0f;
-    if (accuracy_out) *accuracy_out = total_labels > 0 ? accuracy_sum / (float)total_labels : 0.0f;
-    if (labels_out) *labels_out = total_labels;
-    if (sessions_out) *sessions_out = total_sessions;
-    if (top3_accuracy_out) *top3_accuracy_out = total_labels > 0 ? top3_accuracy_sum / (float)total_labels : 0.0f;
-    if (action1_accuracy_out) *action1_accuracy_out = total_action1_labels > 0 ? action1_accuracy_sum / (float)total_action1_labels : 0.0f;
-    if (action2_accuracy_out) *action2_accuracy_out = total_action2_labels > 0 ? action2_accuracy_sum / (float)total_action2_labels : 0.0f;
-    if (action1_labels_out) *action1_labels_out = total_action1_labels;
-    if (action2_labels_out) *action2_labels_out = total_action2_labels;
-    if (skipped_steps_out) *skipped_steps_out = total_skipped_steps;
     return 1;
 }
 
@@ -2114,17 +1933,7 @@ static int evaluate_checkpoint_on_replay_file(
     size_t* val_indices = NULL;
     size_t train_sessions = 0;
     size_t val_sessions = 0;
-    float val_action_loss = 0.0f;
-    float val_value_loss = 0.0f;
-    float val_accuracy = 0.0f;
-    float val_top3_accuracy = 0.0f;
-    float val_action1_accuracy = 0.0f;
-    float val_action2_accuracy = 0.0f;
-    size_t val_labels = 0;
-    size_t evaluated_sessions = 0;
-    size_t val_action1_labels = 0;
-    size_t val_action2_labels = 0;
-    size_t val_skipped_steps = 0;
+    PolicyEvaluationMetrics metrics;
     clock_t eval_start_clock;
 
     if (!replay_path || !checkpoint_path) {
@@ -2181,10 +1990,7 @@ static int evaluate_checkpoint_on_replay_file(
         double sessions_per_sec;
         double labels_per_sec;
         eval_start_clock = clock();
-        if (!evaluate_supervised_split(&trainer, model, &runtime, val_indices, val_sessions,
-                &val_action_loss, &val_value_loss, &val_accuracy, &val_labels, &evaluated_sessions,
-                &val_top3_accuracy, &val_action1_accuracy, &val_action2_accuracy,
-                &val_action1_labels, &val_action2_labels, &val_skipped_steps)) {
+        if (!evaluate_supervised_split(&trainer, model, &runtime, val_indices, val_sessions, &metrics)) {
         fprintf(stderr, "Failed to evaluate held-out split\n");
         free(train_indices);
         free(val_indices);
@@ -2194,13 +2000,38 @@ static int evaluate_checkpoint_on_replay_file(
         return 1;
         }
         elapsed = elapsed_seconds_since(eval_start_clock);
-        sessions_per_sec = elapsed > 0.0 ? (double)evaluated_sessions / elapsed : 0.0;
-        labels_per_sec = elapsed > 0.0 ? (double)val_labels / elapsed : 0.0;
+        sessions_per_sec = elapsed > 0.0 ? (double)metrics.sessions / elapsed : 0.0;
+        labels_per_sec = elapsed > 0.0 ? (double)metrics.action_labels / elapsed : 0.0;
         printf("[eval] validation action_loss=%.4f value_loss=%.4f accuracy=%.4f labels=%zu sessions=%zu\n",
-            val_action_loss, val_value_loss, val_accuracy, val_labels, evaluated_sessions);
+            policy_evaluation_full_turn_nll(&metrics),
+            policy_evaluation_value_loss(&metrics),
+            policy_evaluation_full_turn_accuracy(&metrics),
+            metrics.action_labels,
+            metrics.sessions);
         printf("[eval] validation top3_accuracy=%.4f action1_accuracy=%.4f action2_accuracy=%.4f action1_labels=%zu action2_labels=%zu skipped_steps=%zu\n",
-            val_top3_accuracy, val_action1_accuracy, val_action2_accuracy,
-            val_action1_labels, val_action2_labels, val_skipped_steps);
+            policy_evaluation_top3_accuracy(&metrics),
+            policy_evaluation_slot0_accuracy(&metrics),
+            policy_evaluation_slot1_accuracy(&metrics),
+            metrics.slot0_labels,
+            metrics.slot1_labels,
+            metrics.skipped_turns);
+        printf("[eval] validation metrics_version=%d action_nll=%.4f target_nll=%.4f full_turn_nll=%.4f full_turn_accuracy=%.4f joint_pair_accuracy=%.4f kind_accuracy=%.4f move_accuracy=%.4f switch_accuracy=%.4f tera_accuracy=%.4f target_accuracy=%.4f turns=%zu joint_pairs=%zu target_labels=%zu illegal_predictions=%zu nonfinite_values=%zu\n",
+            POLICY_EVALUATION_METRICS_VERSION,
+            policy_evaluation_action_nll(&metrics),
+            policy_evaluation_target_nll(&metrics),
+            policy_evaluation_full_turn_nll(&metrics),
+            policy_evaluation_full_turn_accuracy(&metrics),
+            policy_evaluation_joint_pair_accuracy(&metrics),
+            policy_evaluation_kind_accuracy(&metrics),
+            policy_evaluation_move_accuracy(&metrics),
+            policy_evaluation_switch_accuracy(&metrics),
+            policy_evaluation_tera_accuracy(&metrics),
+            policy_evaluation_target_accuracy(&metrics),
+            metrics.decision_turns,
+            metrics.joint_pair_labels,
+            metrics.target_labels,
+            metrics.illegal_predictions,
+            metrics.nonfinite_values);
         printf("[eval] elapsed=%.1fs sessions_per_sec=%.2f labels_per_sec=%.2f\n",
             elapsed, sessions_per_sec, labels_per_sec);
     }
@@ -2583,17 +2414,7 @@ static int train_from_input_file(
         size_t trained_in_epoch = 0;
         int ppo_early_stop = 0;
         int consecutive_hard_kl_updates = 0;
-        float val_action_loss = 0.0f;
-        float val_value_loss = 0.0f;
-        float val_accuracy = 0.0f;
-        float val_top3_accuracy = 0.0f;
-        float val_action1_accuracy = 0.0f;
-        float val_action2_accuracy = 0.0f;
-        size_t val_labels = 0;
-        size_t evaluated_sessions = 0;
-        size_t val_action1_labels = 0;
-        size_t val_action2_labels = 0;
-        size_t val_skipped_steps = 0;
+        PolicyEvaluationMetrics val_metrics;
         clock_t val_eval_start_clock = 0;
 
         printf("[train] epoch %d/%d start\n", epoch, epochs);
@@ -2788,10 +2609,8 @@ static int train_from_input_file(
             double val_sessions_per_sec;
             double val_labels_per_sec;
             val_eval_start_clock = clock();
-            if (!evaluate_supervised_split(&trainer, model, &runtime, val_indices, val_sessions,
-                    &val_action_loss, &val_value_loss, &val_accuracy, &val_labels, &evaluated_sessions,
-                    &val_top3_accuracy, &val_action1_accuracy, &val_action2_accuracy,
-                    &val_action1_labels, &val_action2_labels, &val_skipped_steps)) {
+            if (!evaluate_supervised_split(
+                    &trainer, model, &runtime, val_indices, val_sessions, &val_metrics)) {
                 fprintf(stderr, "Failed held-out validation evaluation\n");
                 free(train_indices);
                 free(val_indices);
@@ -2801,31 +2620,49 @@ static int train_from_input_file(
                 return 1;
             }
             val_elapsed = elapsed_seconds_since(val_eval_start_clock);
-            val_sessions_per_sec = val_elapsed > 0.0 ? (double)evaluated_sessions / val_elapsed : 0.0;
-            val_labels_per_sec = val_elapsed > 0.0 ? (double)val_labels / val_elapsed : 0.0;
-            if (val_labels > 0) {
+            val_sessions_per_sec = val_elapsed > 0.0 ? (double)val_metrics.sessions / val_elapsed : 0.0;
+            val_labels_per_sec = val_elapsed > 0.0 ? (double)val_metrics.action_labels / val_elapsed : 0.0;
+            if (val_metrics.action_labels > 0) {
                 printf("[train] epoch=%d validation action_loss=%.4f value_loss=%.4f accuracy=%.4f labels=%zu\n",
                     epoch,
-                    val_action_loss,
-                    val_value_loss,
-                    val_accuracy,
-                    val_labels);
+                    policy_evaluation_full_turn_nll(&val_metrics),
+                    policy_evaluation_value_loss(&val_metrics),
+                    policy_evaluation_full_turn_accuracy(&val_metrics),
+                    val_metrics.action_labels);
                 printf("[train] epoch=%d validation top3_accuracy=%.4f action1_accuracy=%.4f action2_accuracy=%.4f action1_labels=%zu action2_labels=%zu skipped_steps=%zu\n",
                     epoch,
-                    val_top3_accuracy,
-                    val_action1_accuracy,
-                    val_action2_accuracy,
-                    val_action1_labels,
-                    val_action2_labels,
-                    val_skipped_steps);
+                    policy_evaluation_top3_accuracy(&val_metrics),
+                    policy_evaluation_slot0_accuracy(&val_metrics),
+                    policy_evaluation_slot1_accuracy(&val_metrics),
+                    val_metrics.slot0_labels,
+                    val_metrics.slot1_labels,
+                    val_metrics.skipped_turns);
+                printf("[train] epoch=%d validation metrics_version=%d action_nll=%.4f target_nll=%.4f full_turn_nll=%.4f full_turn_accuracy=%.4f joint_pair_accuracy=%.4f kind_accuracy=%.4f move_accuracy=%.4f switch_accuracy=%.4f tera_accuracy=%.4f target_accuracy=%.4f turns=%zu joint_pairs=%zu target_labels=%zu illegal_predictions=%zu nonfinite_values=%zu\n",
+                    epoch,
+                    POLICY_EVALUATION_METRICS_VERSION,
+                    policy_evaluation_action_nll(&val_metrics),
+                    policy_evaluation_target_nll(&val_metrics),
+                    policy_evaluation_full_turn_nll(&val_metrics),
+                    policy_evaluation_full_turn_accuracy(&val_metrics),
+                    policy_evaluation_joint_pair_accuracy(&val_metrics),
+                    policy_evaluation_kind_accuracy(&val_metrics),
+                    policy_evaluation_move_accuracy(&val_metrics),
+                    policy_evaluation_switch_accuracy(&val_metrics),
+                    policy_evaluation_tera_accuracy(&val_metrics),
+                    policy_evaluation_target_accuracy(&val_metrics),
+                    val_metrics.decision_turns,
+                    val_metrics.joint_pair_labels,
+                    val_metrics.target_labels,
+                    val_metrics.illegal_predictions,
+                    val_metrics.nonfinite_values);
                 printf("[train] epoch=%d validation elapsed=%.1fs sessions_per_sec=%.2f labels_per_sec=%.2f\n",
                     epoch,
                     val_elapsed,
                     val_sessions_per_sec,
                     val_labels_per_sec);
-                if (!has_best_val || val_action_loss < best_val_action_loss) {
+                if (!has_best_val || policy_evaluation_full_turn_nll(&val_metrics) < best_val_action_loss) {
                     has_best_val = 1;
-                    best_val_action_loss = val_action_loss;
+                    best_val_action_loss = (float)policy_evaluation_full_turn_nll(&val_metrics);
                     best_state = gru_trainer_checkpoint_state(&trainer);
                     best_path = make_best_checkpoint_path(resolved_checkpoint_path);
                     if (best_path) {

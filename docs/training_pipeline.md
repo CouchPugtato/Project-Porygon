@@ -12,6 +12,15 @@ The trainable path is staged:
 8. Checkpoints serialize model weights and trainer state.
 9. RL can either reuse reconstructed episodes offline or consume live-exported `episode_complete` batches directly.
 
+Supervised validation reports `metrics_version=2`. Doubles turns are scored from the
+legal 196-way joint policy used during live play, while single-action turns are scored
+only against legal actions for their active slot. Slot accuracy comes from the joint
+policy marginals, and target accuracy counts only decisions where a target choice
+exists. The older `accuracy`, `top3_accuracy`, `action1_accuracy`, and
+`action2_accuracy` fields remain as aliases for full-turn, legal decision top-3,
+slot-0, and slot-1 accuracy respectively. The legacy `action_loss` field is the
+full-turn negative log-likelihood, including any required target decisions.
+
 Current implementation notes:
 
 - The repository now includes the protocol/session/raw-state/trainer/checkpoint path.

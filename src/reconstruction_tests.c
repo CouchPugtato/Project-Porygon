@@ -3,6 +3,7 @@
 #include "observation_builder.h"
 #include "checkpoint.h"
 #include "gru_trainer.h"
+#include "policy_evaluation.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -30,6 +31,10 @@ static int assert_true(int condition, const char* message) {
         return 0;
     }
     return 1;
+}
+
+static int nearly_equal(double actual, double expected, double tolerance) {
+    return fabs(actual - expected) <= tolerance;
 }
 
 static RawPokemon* find_self(RawBattleState* state, const char* ident) {
@@ -3775,6 +3780,133 @@ cleanup:
     return ok;
 }
 
+static int test_policy_evaluation_matches_legal_runtime_policy(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode dual_episode;
+    Episode single_episode;
+    PolicyEvaluationMetrics dual_metrics;
+    PolicyEvaluationMetrics single_metrics;
+    PolicyEvaluationMetrics combined_metrics;
+    FactorizedPolicySnapshot snapshot;
+    float observation[4] = {0.25f, -0.5f, 0.75f, 0.1f};
+    float hidden[8] = {0};
+    uint8_t dual_legal[OBS_NUM_ACTIONS] = {0};
+    uint8_t single_legal[OBS_NUM_ACTIONS] = {0};
+    float* parameters = NULL;
+    float* after = NULL;
+    size_t parameter_count;
+    float value = 0.0f;
+    float joint_sum = 0.0f;
+    int ok = 1;
+    int i;
+
+    memset(&dual_episode, 0, sizeof(dual_episode));
+    memset(&single_episode, 0, sizeof(single_episode));
+    if (!assert_true(model != NULL, "create model for policy evaluation")) return 0;
+    parameter_count = gru_model_parameter_count(model);
+    parameters = (float*)calloc(parameter_count, sizeof(float));
+    after = (float*)malloc(parameter_count * sizeof(float));
+    if (!parameters || !after ||
+            !gru_model_import_parameters(model, parameters, parameter_count) ||
+            !episode_init(&dual_episode, 2u, 4u) ||
+            !episode_init(&single_episode, 1u, 4u)) {
+        ok = assert_true(0, "initialize policy evaluation fixture");
+        goto cleanup;
+    }
+
+    dual_legal[OBS_A1_MOVE1] = 1;
+    dual_legal[OBS_A1_MOVE2] = 1;
+    dual_legal[OBS_A2_MOVE1] = 1;
+    dual_legal[OBS_A2_MOVE2] = 1;
+    ok &= assert_true(gru_model_evaluate_policy_snapshot(
+        model, hidden, dual_legal, 1, &snapshot, &value), "evaluate shared joint policy snapshot");
+    ok &= assert_true(snapshot.has_joint_policy, "joint policy snapshot records joint mode");
+    for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) joint_sum += snapshot.joint_policy[i];
+    ok &= assert_true(nearly_equal(joint_sum, 1.0, 1.0e-5), "joint policy is normalized");
+    ok &= assert_true(snapshot.joint_policy[0] > 0.0f && snapshot.joint_policy[1] > 0.0f,
+        "legal joint pairs receive probability");
+    ok &= assert_true(snapshot.joint_policy[2] == 0.0f &&
+        snapshot.joint_policy[FACTORIZED_LOCAL_ACTION_DIM * 2] == 0.0f,
+        "illegal joint pairs have zero probability");
+
+    ok &= assert_true(episode_append(&dual_episode, observation, dual_legal, OBS_A1_MOVE1, 0.0f, 0),
+        "append dual policy evaluation turn");
+    dual_episode.actions2[0] = OBS_A2_MOVE1;
+    factorized_action_choice_from_flat_actions(
+        &dual_episode.factorized_actions[0], OBS_A1_MOVE1, OBS_A2_MOVE1);
+    dual_episode.factorized_actions[0].slot0_target_mask =
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+    dual_episode.factorized_actions[0].slot1_target_mask =
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+    dual_episode.factorized_actions[0].slot0_target_index = FACTORIZED_TARGET_FOE_LEFT;
+    dual_episode.factorized_actions[0].slot1_target_index = FACTORIZED_TARGET_FOE_LEFT;
+    ok &= assert_true(episode_append(&dual_episode, observation, dual_legal, OBS_A1_MOVE1, 0.0f, 1),
+        "append dual turn with a missed target");
+    dual_episode.actions2[1] = OBS_A2_MOVE1;
+    factorized_action_choice_from_flat_actions(
+        &dual_episode.factorized_actions[1], OBS_A1_MOVE1, OBS_A2_MOVE1);
+    dual_episode.factorized_actions[1].slot0_target_mask =
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+    dual_episode.factorized_actions[1].slot1_target_mask =
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+    dual_episode.factorized_actions[1].slot0_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    dual_episode.factorized_actions[1].slot1_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    policy_evaluation_init(&dual_metrics);
+    ok &= assert_true(policy_evaluation_add_episode(model, 16u, &dual_episode, &dual_metrics),
+        "evaluate dual action episode");
+    ok &= assert_true(dual_metrics.decision_turns == 2u && dual_metrics.action_labels == 4u,
+        "dual action metrics count turns separately from slot actions");
+    ok &= assert_true(dual_metrics.joint_pair_hits == 2u && dual_metrics.full_turn_hits == 1u,
+        "a missed target lowers full-turn accuracy without changing pair accuracy");
+    ok &= assert_true(dual_metrics.slot0_hits == 2u && dual_metrics.slot1_hits == 2u,
+        "joint marginals score each active slot");
+    ok &= assert_true(dual_metrics.target_hits == 2u && dual_metrics.target_labels == 4u,
+        "target metrics include only targetable moves");
+    ok &= assert_true(dual_metrics.top3_hits == 2u && dual_metrics.kind_hits == 4u &&
+        dual_metrics.move_hits == 4u && dual_metrics.tera_hits == 4u,
+        "legal top-three and factorized component metrics use their own denominators");
+    ok &= assert_true(nearly_equal(policy_evaluation_action_nll(&dual_metrics), log(4.0), 1.0e-5),
+        "joint negative log likelihood uses the legal pair distribution");
+    ok &= assert_true(dual_metrics.illegal_predictions == 0u && dual_metrics.nonfinite_values == 0u,
+        "dual evaluation stays legal and finite");
+
+    single_legal[OBS_A2_SWITCH3] = 1;
+    ok &= assert_true(episode_append(&single_episode, observation, single_legal, OBS_A2_SWITCH3, 0.0f, 1),
+        "append single slot policy evaluation turn");
+    single_episode.actions[0] = -1;
+    single_episode.actions2[0] = OBS_A2_SWITCH3;
+    factorized_action_choice_from_flat_actions(
+        &single_episode.factorized_actions[0], -1, OBS_A2_SWITCH3);
+    policy_evaluation_init(&single_metrics);
+    ok &= assert_true(policy_evaluation_add_episode(model, 16u, &single_episode, &single_metrics),
+        "evaluate single slot episode");
+    ok &= assert_true(single_metrics.joint_pair_labels == 0u && single_metrics.slot1_hits == 1u,
+        "single slot evaluation does not invent a joint decision");
+    ok &= assert_true(single_metrics.full_turn_hits == 1u && single_metrics.switch_hits == 1u,
+        "single legal switch scores as a correct full turn");
+
+    policy_evaluation_init(&combined_metrics);
+    policy_evaluation_merge(&combined_metrics, &dual_metrics);
+    policy_evaluation_merge(&combined_metrics, &single_metrics);
+    ok &= assert_true(combined_metrics.sessions == 2u && combined_metrics.decision_turns == 3u &&
+        combined_metrics.action_labels == 5u, "policy evaluation metrics merge without losing denominators");
+    ok &= assert_true(gru_model_export_parameters(model, after, parameter_count) &&
+        memcmp(parameters, after, parameter_count * sizeof(float)) == 0,
+        "policy evaluation does not mutate model parameters");
+
+cleanup:
+    episode_free(&single_episode);
+    episode_free(&dual_episode);
+    free(after);
+    free(parameters);
+    gru_model_destroy(model);
+    return ok;
+}
+
 int main(int argc, char** argv) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
@@ -3798,6 +3930,7 @@ int main(int argc, char** argv) {
     if (!test_shared_entity_encoder_training_and_migration()) return 1;
     if (!test_active_slot_schema_rejects_older_checkpoint()) return 1;
     if (!test_checkpoint_compatibility_validation()) return 1;
+    if (!test_policy_evaluation_matches_legal_runtime_policy()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;
     if (!test_observation_exports_active_slot_identity()) return 1;

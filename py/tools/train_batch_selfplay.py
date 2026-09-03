@@ -182,6 +182,8 @@ def collect_training_stats(lines: list[str]) -> dict[str, object]:
             stats["validation_summary"] = parse_key_values(line)
         elif line.startswith("[train] epoch=") and " validation top3_accuracy=" in line:
             stats["validation_breakdown"] = parse_key_values(line)
+        elif line.startswith("[train] epoch=") and " validation metrics_version=" in line:
+            stats["validation_policy_metrics"] = parse_key_values(line)
         elif line.startswith("[train] epoch=") and " validation elapsed=" in line:
             stats["validation_timing"] = parse_key_values(line)
         elif line.startswith("trained mode="):

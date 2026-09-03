@@ -2237,6 +2237,45 @@ int gru_model_evaluate_factorized_hidden(
     return 1;
 }
 
+int gru_model_evaluate_policy_snapshot(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    int include_joint_policy,
+    FactorizedPolicySnapshot* snapshot_out,
+    float* value_out
+) {
+    if (!snapshot_out) {
+        return 0;
+    }
+    memset(snapshot_out, 0, sizeof(*snapshot_out));
+    if (!gru_model_evaluate_factorized_hidden(
+            model,
+            hidden_state,
+            legal_mask,
+            snapshot_out->slot0_kind_policy,
+            snapshot_out->slot0_move_policy,
+            snapshot_out->slot0_switch_policy,
+            snapshot_out->slot0_tera_policy,
+            snapshot_out->slot0_target_policy,
+            snapshot_out->slot1_kind_policy,
+            snapshot_out->slot1_move_policy,
+            snapshot_out->slot1_switch_policy,
+            snapshot_out->slot1_tera_policy,
+            snapshot_out->slot1_target_policy,
+            value_out)) {
+        return 0;
+    }
+    if (include_joint_policy) {
+        if (!gru_model_evaluate_joint_hidden(
+                model, hidden_state, legal_mask, snapshot_out->joint_policy, NULL)) {
+            return 0;
+        }
+        snapshot_out->has_joint_policy = 1;
+    }
+    return 1;
+}
+
 int gru_model_evaluate_joint_hidden(
     const GruModel* model,
     const float* hidden_state,

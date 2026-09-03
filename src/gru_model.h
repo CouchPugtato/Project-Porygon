@@ -105,6 +105,14 @@ int gru_model_evaluate_factorized_hidden(
     float* slot1_target_policy,
     float* value_out
 );
+int gru_model_evaluate_policy_snapshot(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    int include_joint_policy,
+    FactorizedPolicySnapshot* snapshot_out,
+    float* value_out
+);
 int gru_model_evaluate_joint_hidden(
     const GruModel* model,
     const float* hidden_state,
