@@ -21,6 +21,33 @@ exists. The older `accuracy`, `top3_accuracy`, `action1_accuracy`, and
 slot-0, and slot-1 accuracy respectively. The legacy `action_loss` field is the
 full-turn negative log-likelihood, including any required target decisions.
 
+## Trainer learnability checks
+
+Supervised training uses SGD by default for checkpoint compatibility. Pass
+`--supervised-optimizer adam` to either the C trainer or
+`py/tools/train_batch_selfplay.py` when an experiment explicitly calls for it.
+
+Before another full supervised run or PPO search, run the isolated overfit
+diagnostic on an existing replay collection:
+
+```powershell
+.\build-fresh\showdown_client.exe --check-supervised-overfit .\matches\runs\collection\worker_1_a_raw.jsonl .\models\diagnostics\supervised_overfit.json
+```
+
+The command starts a fresh current-architecture model, deterministically chooses
+two labelled battles with target decisions, and trains only those battles. It
+does not load or publish a checkpoint. Adam, 200 epochs, a fixed seed, and a
+0.001 learning rate are the diagnostic defaults; each can be overridden. The
+JSON report includes before/after losses, accuracies, demonstrated action and
+target probabilities, optimizer settings, and explicit failure reasons. A
+failed criterion produces a nonzero exit code and blocks the remaining recovery
+benchmark work.
+
+The reconstruction test executable also contains a deterministic PPO direction
+check. It verifies that one update raises a positive-advantage joint-action
+probability, lowers a negative-advantage probability, and moves both value
+predictions toward their returns.
+
 Current implementation notes:
 
 - The repository now includes the protocol/session/raw-state/trainer/checkpoint path.

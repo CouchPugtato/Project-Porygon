@@ -5,6 +5,11 @@
 #include "episode.h"
 #include "gru_model.h"
 
+typedef enum {
+    GRU_SUPERVISED_OPTIMIZER_SGD = 0,
+    GRU_SUPERVISED_OPTIMIZER_ADAM = 1
+} GruSupervisedOptimizer;
+
 typedef struct {
     size_t step;
     float learning_rate;
@@ -30,6 +35,7 @@ typedef struct {
     float last_clip_fraction;
     size_t last_rl_labels;
     size_t supervised_minibatch_size;
+    GruSupervisedOptimizer supervised_optimizer;
     int supervised_profile_enabled;
     double last_supervised_cache_seconds;
     double last_supervised_update_seconds;
@@ -63,5 +69,6 @@ int gru_trainer_ppo_hard_kl_stop_update(
     float hard_multiplier,
     int required_consecutive_updates,
     int* consecutive_breaches);
+const char* gru_supervised_optimizer_name(GruSupervisedOptimizer optimizer);
 
 #endif

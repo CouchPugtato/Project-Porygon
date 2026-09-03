@@ -34,7 +34,25 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
     trainer->adam_beta2 = 0.999f;
     trainer->adam_epsilon = 1.0e-8f;
     trainer->supervised_minibatch_size = 8;
+    trainer->supervised_optimizer = GRU_SUPERVISED_OPTIMIZER_SGD;
     trainer->supervised_profile_enabled = 1;
+}
+
+const char* gru_supervised_optimizer_name(GruSupervisedOptimizer optimizer) {
+    return optimizer == GRU_SUPERVISED_OPTIMIZER_ADAM ? "adam" : "sgd";
+}
+
+static int apply_supervised_updates(GruTrainer* trainer, GruModel* model) {
+    if (trainer->supervised_optimizer == GRU_SUPERVISED_OPTIMIZER_ADAM) {
+        return gru_model_apply_accumulated_adam_updates(
+            model,
+            trainer->learning_rate,
+            trainer->adam_beta1,
+            trainer->adam_beta2,
+            trainer->adam_epsilon,
+            trainer->gradient_clip);
+    }
+    return gru_model_apply_accumulated_supervised_updates(model, trainer->learning_rate);
 }
 
 static float masked_action_log_prob(const float* policy, int action) {
@@ -173,17 +191,18 @@ static int evaluate_joint_step(
     unsigned char move_mask[FACTORIZED_MOVE_DIM];
     unsigned char switch_mask[FACTORIZED_SWITCH_DIM];
     unsigned char tera_mask[FACTORIZED_TERA_DIM];
-    float slot0_kind_policy[FACTORIZED_KIND_DIM];
-    float slot0_move_policy[FACTORIZED_MOVE_DIM];
-    float slot0_switch_policy[FACTORIZED_SWITCH_DIM];
-    float slot0_tera_policy[FACTORIZED_TERA_DIM];
-    float slot0_target_policy[FACTORIZED_TARGET_DIM];
-    float slot1_kind_policy[FACTORIZED_KIND_DIM];
-    float slot1_move_policy[FACTORIZED_MOVE_DIM];
-    float slot1_switch_policy[FACTORIZED_SWITCH_DIM];
-    float slot1_tera_policy[FACTORIZED_TERA_DIM];
-    float slot1_target_policy[FACTORIZED_TARGET_DIM];
-    float joint_policy[FACTORIZED_JOINT_DIM];
+    FactorizedPolicySnapshot snapshot;
+    float* slot0_kind_policy = snapshot.slot0_kind_policy;
+    float* slot0_move_policy = snapshot.slot0_move_policy;
+    float* slot0_switch_policy = snapshot.slot0_switch_policy;
+    float* slot0_tera_policy = snapshot.slot0_tera_policy;
+    float* slot0_target_policy = snapshot.slot0_target_policy;
+    float* slot1_kind_policy = snapshot.slot1_kind_policy;
+    float* slot1_move_policy = snapshot.slot1_move_policy;
+    float* slot1_switch_policy = snapshot.slot1_switch_policy;
+    float* slot1_tera_policy = snapshot.slot1_tera_policy;
+    float* slot1_target_policy = snapshot.slot1_target_policy;
+    float* joint_policy = snapshot.joint_policy;
     unsigned char target_mask[FACTORIZED_TARGET_DIM];
     float joint_log_prob = 0.0f;
     float entropy = 0.0f;
@@ -192,54 +211,26 @@ static int evaluate_joint_step(
     if (!model || !hidden_state || !episode || step_index >= episode->count) {
         return 0;
     }
-    if (snapshot_out) {
-        memset(snapshot_out, 0, sizeof(*snapshot_out));
-    }
-    if (!gru_model_evaluate_factorized_hidden(
+    choice = &episode->factorized_actions[step_index];
+    if (!gru_model_evaluate_policy_snapshot(
             model,
             hidden_state,
             episode->legal_masks + (step_index * OBS_NUM_ACTIONS),
-            slot0_kind_policy,
-            slot0_move_policy,
-            slot0_switch_policy,
-            slot0_tera_policy,
-            slot0_target_policy,
-            slot1_kind_policy,
-            slot1_move_policy,
-            slot1_switch_policy,
-            slot1_tera_policy,
-            slot1_target_policy,
+            choice->slot0_has_action && choice->slot1_has_action,
+            &snapshot,
             &value)) {
         return 0;
     }
-    if (snapshot_out) {
-        memcpy(snapshot_out->slot0_kind_policy, slot0_kind_policy, sizeof(slot0_kind_policy));
-        memcpy(snapshot_out->slot0_move_policy, slot0_move_policy, sizeof(slot0_move_policy));
-        memcpy(snapshot_out->slot0_switch_policy, slot0_switch_policy, sizeof(slot0_switch_policy));
-        memcpy(snapshot_out->slot0_tera_policy, slot0_tera_policy, sizeof(slot0_tera_policy));
-        memcpy(snapshot_out->slot0_target_policy, slot0_target_policy, sizeof(slot0_target_policy));
-        memcpy(snapshot_out->slot1_kind_policy, slot1_kind_policy, sizeof(slot1_kind_policy));
-        memcpy(snapshot_out->slot1_move_policy, slot1_move_policy, sizeof(slot1_move_policy));
-        memcpy(snapshot_out->slot1_switch_policy, slot1_switch_policy, sizeof(slot1_switch_policy));
-        memcpy(snapshot_out->slot1_tera_policy, slot1_tera_policy, sizeof(slot1_tera_policy));
-        memcpy(snapshot_out->slot1_target_policy, slot1_target_policy, sizeof(slot1_target_policy));
-    }
-    choice = &episode->factorized_actions[step_index];
+    if (snapshot_out) *snapshot_out = snapshot;
     if (choice->slot0_has_action && choice->slot1_has_action) {
         int flat0 = -1;
         int flat1 = -1;
         int selected;
         int i;
-        if (!factorized_action_choice_to_flat_actions(choice, &flat0, &flat1) || flat0 < 0 || flat1 < 14 ||
-                !gru_model_evaluate_joint_hidden(model, hidden_state,
-                    episode->legal_masks + (step_index * OBS_NUM_ACTIONS), joint_policy, &value)) {
+        if (!factorized_action_choice_to_flat_actions(choice, &flat0, &flat1) || flat0 < 0 || flat1 < 14) {
             return 0;
         }
         selected = flat0 * FACTORIZED_LOCAL_ACTION_DIM + (flat1 - 14);
-        if (snapshot_out) {
-            memcpy(snapshot_out->joint_policy, joint_policy, sizeof(joint_policy));
-            snapshot_out->has_joint_policy = 1;
-        }
         joint_log_prob += masked_action_log_prob(joint_policy, selected);
         for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) {
             if (joint_policy[i] > 0.0f) {
@@ -527,7 +518,7 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
         window_count += 1;
         if (accumulated && trainer->supervised_minibatch_size > 0 &&
                 (window_count % trainer->supervised_minibatch_size) == 0) {
-            if (!gru_model_apply_accumulated_supervised_updates(model, trainer->learning_rate)) {
+            if (!apply_supervised_updates(trainer, model)) {
                 free(hidden);
                 free(next_hidden);
                 free(hidden_after);
@@ -537,7 +528,7 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
             batch_flushes += 1;
         }
     }
-    if (!gru_model_apply_accumulated_supervised_updates(model, trainer->learning_rate)) {
+    if (!apply_supervised_updates(trainer, model)) {
         free(hidden);
         free(next_hidden);
         free(hidden_after);

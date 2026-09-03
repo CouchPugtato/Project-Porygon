@@ -124,6 +124,30 @@ static void build_joint_marginals(const float* joint_policy, float* slot0, float
     }
 }
 
+static int probabilities_are_finite(const float* probabilities, size_t count) {
+    size_t i;
+    for (i = 0; i < count; ++i) {
+        if (!isfinite(probabilities[i])) return 0;
+    }
+    return 1;
+}
+
+static int snapshot_is_finite(const FactorizedPolicySnapshot* snapshot) {
+    if (!snapshot) return 0;
+    return probabilities_are_finite(snapshot->slot0_kind_policy, FACTORIZED_KIND_DIM) &&
+        probabilities_are_finite(snapshot->slot0_move_policy, FACTORIZED_MOVE_DIM) &&
+        probabilities_are_finite(snapshot->slot0_switch_policy, FACTORIZED_SWITCH_DIM) &&
+        probabilities_are_finite(snapshot->slot0_tera_policy, FACTORIZED_TERA_DIM) &&
+        probabilities_are_finite(snapshot->slot0_target_policy, FACTORIZED_TARGET_DIM) &&
+        probabilities_are_finite(snapshot->slot1_kind_policy, FACTORIZED_KIND_DIM) &&
+        probabilities_are_finite(snapshot->slot1_move_policy, FACTORIZED_MOVE_DIM) &&
+        probabilities_are_finite(snapshot->slot1_switch_policy, FACTORIZED_SWITCH_DIM) &&
+        probabilities_are_finite(snapshot->slot1_tera_policy, FACTORIZED_TERA_DIM) &&
+        probabilities_are_finite(snapshot->slot1_target_policy, FACTORIZED_TARGET_DIM) &&
+        (!snapshot->has_joint_policy ||
+            probabilities_are_finite(snapshot->joint_policy, FACTORIZED_JOINT_DIM));
+}
+
 static int record_component_metrics(
     const FactorizedPolicySnapshot* snapshot,
     const unsigned char* legal_mask,
@@ -183,6 +207,8 @@ static int record_component_metrics(
             }
             metrics->target_nll_sum += negative_log_probability(
                 masked_probability(target, target_mask, FACTORIZED_TARGET_DIM, (size_t)target_index));
+            metrics->target_probability_sum +=
+                masked_probability(target, target_mask, FACTORIZED_TARGET_DIM, (size_t)target_index);
         }
     } else {
         ++metrics->switch_labels;
@@ -248,6 +274,10 @@ int policy_evaluation_add_episode(
             ++metrics->slot1_labels;
             ++metrics->action_labels;
         }
+        if (!isfinite(value) || !snapshot_is_finite(&snapshot)) {
+            ++metrics->nonfinite_values;
+            continue;
+        }
 
         if (snapshot.has_joint_policy) {
             float slot0_marginal[FACTORIZED_LOCAL_ACTION_DIM];
@@ -298,14 +328,13 @@ int policy_evaluation_add_episode(
         slot1_targets_correct = record_component_metrics(&snapshot, legal_mask, choice, 1, metrics);
         components_correct = slot0_targets_correct && slot1_targets_correct;
         metrics->action_nll_sum += negative_log_probability(action_probability);
+        metrics->action_probability_sum += action_probability;
         metrics->full_turn_nll_sum += negative_log_probability(action_probability) +
             (metrics->target_nll_sum - target_nll_before);
         if (decision_correct && components_correct) ++metrics->full_turn_hits;
-        if (isfinite(value)) {
+        {
             double error = (double)value - (double)episode->rewards[t];
             metrics->value_loss_sum += 0.5 * error * error;
-        } else {
-            ++metrics->nonfinite_values;
         }
     }
     free(hidden);
@@ -342,6 +371,8 @@ void policy_evaluation_merge(PolicyEvaluationMetrics* total, const PolicyEvaluat
     total->target_nll_sum += part->target_nll_sum;
     total->full_turn_nll_sum += part->full_turn_nll_sum;
     total->value_loss_sum += part->value_loss_sum;
+    total->action_probability_sum += part->action_probability_sum;
+    total->target_probability_sum += part->target_probability_sum;
 }
 
 static double ratio(size_t numerator, size_t denominator) {
@@ -352,6 +383,8 @@ double policy_evaluation_action_nll(const PolicyEvaluationMetrics* m) { return m
 double policy_evaluation_target_nll(const PolicyEvaluationMetrics* m) { return m && m->target_labels ? m->target_nll_sum / m->target_labels : 0.0; }
 double policy_evaluation_full_turn_nll(const PolicyEvaluationMetrics* m) { return m && m->decision_turns ? m->full_turn_nll_sum / m->decision_turns : 0.0; }
 double policy_evaluation_value_loss(const PolicyEvaluationMetrics* m) { return m && m->decision_turns ? m->value_loss_sum / m->decision_turns : 0.0; }
+double policy_evaluation_action_probability(const PolicyEvaluationMetrics* m) { return m && m->decision_turns ? m->action_probability_sum / m->decision_turns : 0.0; }
+double policy_evaluation_target_probability(const PolicyEvaluationMetrics* m) { return m && m->target_labels ? m->target_probability_sum / m->target_labels : 0.0; }
 double policy_evaluation_full_turn_accuracy(const PolicyEvaluationMetrics* m) { return m ? ratio(m->full_turn_hits, m->decision_turns) : 0.0; }
 double policy_evaluation_top3_accuracy(const PolicyEvaluationMetrics* m) { return m ? ratio(m->top3_hits, m->decision_turns) : 0.0; }
 double policy_evaluation_slot0_accuracy(const PolicyEvaluationMetrics* m) { return m ? ratio(m->slot0_hits, m->slot0_labels) : 0.0; }

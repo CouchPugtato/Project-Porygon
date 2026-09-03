@@ -736,6 +736,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trainer-exe", default=str(DEFAULT_TRAINER_EXE))
     parser.add_argument("--shuffle", type=parse_bool01, default=True, help="Shuffle shard order each epoch")
     parser.add_argument("--supervised-profile", type=parse_bool01, default=True, help="Enable per-episode supervised profiling output")
+    parser.add_argument("--supervised-optimizer", choices=["sgd", "adam"], default="sgd")
     parser.add_argument("--dashboard", type=parse_bool01, default=True, help="Enable Rich dashboard output")
     parser.add_argument("--dashboard-visible-shards", type=positive_int, default=5, help="Number of shard rows to show in the dashboard")
     parser.add_argument("--dashboard-show-top-stats", type=parse_bool01, default=True, help="Show the dashboard top summary")
@@ -764,7 +765,16 @@ def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> lis
         str(args.epochs_per_file),
     ]
     if args.mode == "supervised":
-        command.extend(["--supervised-profile", "1" if args.supervised_profile else "0"])
+        command.extend(
+            [
+                "--supervised-profile",
+                "1" if args.supervised_profile else "0",
+                "--supervised-optimizer",
+                args.supervised_optimizer,
+            ]
+        )
+        if args.learning_rate > 0.0:
+            command.extend(["--learning-rate", str(args.learning_rate)])
     if args.mode == "rl":
         command.extend(
             [

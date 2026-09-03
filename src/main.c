@@ -2,6 +2,7 @@
 #include "env_session.h"
 #include "gru_model.h"
 #include "gru_trainer.h"
+#include "learning_diagnostics.h"
 #include "policy_evaluation.h"
 #include "id_tables.h"
 #include "observation.h"
@@ -827,6 +828,22 @@ static const char* parse_string_flag(int argc, char** argv, const char* name, co
         }
     }
     return default_value;
+}
+
+static int parse_supervised_optimizer(
+    const char* name,
+    GruSupervisedOptimizer* optimizer_out
+) {
+    if (!name || !optimizer_out) return 0;
+    if (strcmp(name, "sgd") == 0) {
+        *optimizer_out = GRU_SUPERVISED_OPTIMIZER_SGD;
+        return 1;
+    }
+    if (strcmp(name, "adam") == 0) {
+        *optimizer_out = GRU_SUPERVISED_OPTIMIZER_ADAM;
+        return 1;
+    }
+    return 0;
 }
 
 static int is_validation_session(size_t index, size_t total_sessions) {
@@ -2212,6 +2229,7 @@ static int train_from_input_file(
     float adam_beta2,
     float adam_epsilon,
     int supervised_profile,
+    GruSupervisedOptimizer supervised_optimizer,
     const char* rl_reward_mode,
     const RewardConfig* reward_config,
     const char* expected_policy_tag,
@@ -2340,6 +2358,7 @@ static int train_from_input_file(
         trainer.anchor_kl_coef = anchor_kl_coef;
     } else {
         trainer.supervised_profile_enabled = supervised_profile;
+        trainer.supervised_optimizer = supervised_optimizer;
     }
 
     if (!(input_is_episode_batch
@@ -2408,6 +2427,9 @@ static int train_from_input_file(
             trainer.entropy_coef,
             trainer.advantage_norm,
             rl_reward_mode);
+    } else {
+        printf("[train] supervised optimizer=%s\n",
+            gru_supervised_optimizer_name(trainer.supervised_optimizer));
     }
 
     for (epoch = 1; epoch <= epochs; ++epoch) {
@@ -2757,6 +2779,129 @@ static int train_from_input_file(
     return 0;
 }
 
+static int episode_has_target_choice(const Episode* episode) {
+    size_t i;
+    if (!episode) return 0;
+    for (i = 0; i < episode->count; ++i) {
+        const FactorizedActionChoice* choice = &episode->factorized_actions[i];
+        if ((choice->slot0_has_action && choice->slot0_kind == FACTORIZED_ACTION_MOVE &&
+                choice->slot0_target_mask != 0u) ||
+                (choice->slot1_has_action && choice->slot1_kind == FACTORIZED_ACTION_MOVE &&
+                choice->slot1_target_mask != 0u)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int select_overfit_sessions(const EnvRuntime* runtime, size_t selected[2]) {
+    size_t found = 0;
+    size_t i;
+    if (!runtime || !selected) return 0;
+    for (i = 0; i < runtime->count; ++i) {
+        const EnvSession* session = &runtime->sessions[i];
+        size_t position;
+        if (!episode_has_labels(&session->episode) ||
+                !episode_has_target_choice(&session->episode)) {
+            continue;
+        }
+        for (position = 0; position < found; ++position) {
+            if (strcmp(session->battle_id, runtime->sessions[selected[position]].battle_id) < 0) {
+                break;
+            }
+        }
+        if (position >= 2) continue;
+        if (found < 2) ++found;
+        if (found == 2 && position == 0) selected[1] = selected[0];
+        selected[position] = i;
+    }
+    return found == 2;
+}
+
+static int run_supervised_overfit_check(
+    const char* replay_path,
+    const char* report_path,
+    size_t epochs,
+    float learning_rate,
+    unsigned int seed,
+    GruSupervisedOptimizer optimizer,
+    float adam_beta1,
+    float adam_beta2,
+    float adam_epsilon,
+    const RewardConfig* reward_config
+) {
+    GruModel* model = NULL;
+    GruTrainer trainer;
+    EnvRuntime runtime;
+    size_t selected[2];
+    const Episode* episodes[2];
+    SupervisedOverfitResult result;
+    int rc = 1;
+
+    if (!replay_path || !report_path || epochs == 0) return 1;
+    srand(seed);
+    model = create_default_model();
+    if (!model) {
+        fprintf(stderr, "[overfit] failed to create fresh current-architecture model\n");
+        return 1;
+    }
+    if (!load_runtime_from_replay_file(
+            replay_path,
+            model,
+            &runtime,
+            ENV_REWARD_TERMINAL,
+            reward_config ? &reward_config->dense_additive : NULL)) {
+        gru_model_destroy(model);
+        return 1;
+    }
+    if (!select_overfit_sessions(&runtime, selected)) {
+        fprintf(stderr,
+            "[overfit] replay needs at least two labelled sessions with explicit target choices\n");
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 1;
+    }
+
+    gru_trainer_init(&trainer, learning_rate, 16u, 1.0f, seed);
+    trainer.supervised_optimizer = optimizer;
+    trainer.supervised_profile_enabled = 0;
+    trainer.adam_beta1 = adam_beta1;
+    trainer.adam_beta2 = adam_beta2;
+    trainer.adam_epsilon = adam_epsilon;
+    episodes[0] = &runtime.sessions[selected[0]].episode;
+    episodes[1] = &runtime.sessions[selected[1]].episode;
+    printf("[overfit] sessions=%s,%s epochs=%zu optimizer=%s learning_rate=%.9g\n",
+        runtime.sessions[selected[0]].battle_id,
+        runtime.sessions[selected[1]].battle_id,
+        epochs,
+        gru_supervised_optimizer_name(optimizer),
+        learning_rate);
+    if (!learning_diagnostic_run_supervised_overfit(
+            &trainer, model, episodes, 2u, epochs, &result)) {
+        fprintf(stderr, "[overfit] diagnostic execution failed\n");
+    } else if (!learning_diagnostic_write_supervised_report(
+            report_path,
+            replay_path,
+            runtime.sessions[selected[0]].battle_id,
+            runtime.sessions[selected[1]].battle_id,
+            seed,
+            epochs,
+            &trainer,
+            &result)) {
+        fprintf(stderr, "[overfit] failed to write report '%s': %s\n", report_path, strerror(errno));
+    } else {
+        printf("[overfit] passed=%d action_loss_reduction=%.4f full_turn_accuracy=%.4f report=%s\n",
+            result.passed,
+            result.action_loss_reduction,
+            policy_evaluation_full_turn_accuracy(&result.after),
+            report_path);
+        rc = result.passed ? 0 : 1;
+    }
+    env_runtime_free(&runtime);
+    gru_model_destroy(model);
+    return rc;
+}
+
 static int clean_replay_file(const char* input_path, const char* output_path) {
     FILE* in;
     FILE* out;
@@ -2806,6 +2951,9 @@ static int clean_replay_file(const char* input_path, const char* output_path) {
 
 static int showdown_client_main(int argc, char** argv) {
     int epochs = parse_epochs_arg(argc, argv, 1);
+    int overfit_command = argc >= 2 && strcmp(argv[1], "--check-supervised-overfit") == 0;
+    int overfit_epochs = parse_int_flag(argc, argv, "--epochs", 200);
+    int overfit_seed = parse_int_flag(argc, argv, "--seed", 20260902);
     float learning_rate_override;
     const char* expected_policy_tag = parse_string_flag(argc, argv, "--policy-tag-expected", "");
     const char* training_summary_path = parse_string_flag(argc, argv, "--training-summary-path", "");
@@ -2830,6 +2978,9 @@ static int showdown_client_main(int argc, char** argv) {
     float adam_beta2;
     float adam_epsilon;
     int supervised_profile = parse_bool01_flag(argc, argv, "--supervised-profile", 1);
+    GruSupervisedOptimizer supervised_optimizer;
+    const char* supervised_optimizer_name = parse_string_flag(
+        argc, argv, "--supervised-optimizer", overfit_command ? "adam" : "sgd");
     const char* rl_reward_mode = parse_string_flag(argc, argv, "--reward-mode", "terminal");
     RewardConfig reward_config;
     RlDefaultsConfig rl_defaults;
@@ -2864,6 +3015,16 @@ static int showdown_client_main(int argc, char** argv) {
     adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", rl_defaults.adam_beta1);
     adam_beta2 = parse_float_flag(argc, argv, "--adam-beta2", rl_defaults.adam_beta2);
     adam_epsilon = parse_float_flag(argc, argv, "--adam-epsilon", rl_defaults.adam_epsilon);
+    if (!parse_supervised_optimizer(supervised_optimizer_name, &supervised_optimizer)) {
+        fprintf(stderr,
+            "Unsupported --supervised-optimizer '%s'. Supported optimizers: sgd, adam.\n",
+            supervised_optimizer_name);
+        return 1;
+    }
+    if (overfit_command && (overfit_epochs <= 0 || overfit_seed < 0)) {
+        fprintf(stderr, "--check-supervised-overfit requires --epochs > 0 and --seed >= 0\n");
+        return 1;
+    }
     {
         float override_value;
         override_value = parse_float_flag(argc, argv, "--dense-additive-hp-swing-weight", NAN);
@@ -2891,6 +3052,7 @@ static int showdown_client_main(int argc, char** argv) {
              strcmp(argv[1], "--train-rl") == 0 ||
             strcmp(argv[1], "--train-live-rl") == 0 ||
             strcmp(argv[1], "--train-live-ppo") == 0 ||
+            strcmp(argv[1], "--check-supervised-overfit") == 0 ||
             strcmp(argv[1], "--eval-supervised") == 0)) {
         training_or_eval_mode = 1;
     }
@@ -2915,6 +3077,19 @@ static int showdown_client_main(int argc, char** argv) {
 #endif
     if (argc >= 2 && (strcmp(argv[1], "--battle-agent") == 0 || strcmp(argv[1], "--runtime") == 0)) {
         return run_runtime_mode(argc >= 3 ? argv[2] : NULL);
+    }
+    if (argc >= 4 && overfit_command) {
+        return run_supervised_overfit_check(
+            argv[2],
+            argv[3],
+            (size_t)overfit_epochs,
+            learning_rate_override > 0.0f ? learning_rate_override : 0.001f,
+            (unsigned int)overfit_seed,
+            supervised_optimizer,
+            adam_beta1,
+            adam_beta2,
+            adam_epsilon,
+            &reward_config);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-supervised") == 0) {
         return train_from_input_file(
@@ -2943,6 +3118,7 @@ static int showdown_client_main(int argc, char** argv) {
             adam_beta2,
             adam_epsilon,
             supervised_profile,
+            supervised_optimizer,
             rl_reward_mode,
             &reward_config,
             expected_policy_tag,
@@ -2978,6 +3154,7 @@ static int showdown_client_main(int argc, char** argv) {
             adam_beta2,
             adam_epsilon,
             supervised_profile,
+            supervised_optimizer,
             rl_reward_mode,
             &reward_config,
             expected_policy_tag,
@@ -3013,6 +3190,7 @@ static int showdown_client_main(int argc, char** argv) {
             adam_beta2,
             adam_epsilon,
             supervised_profile,
+            supervised_optimizer,
             rl_reward_mode,
             &reward_config,
             expected_policy_tag,
@@ -3048,6 +3226,7 @@ static int showdown_client_main(int argc, char** argv) {
             adam_beta2,
             adam_epsilon,
             supervised_profile,
+            supervised_optimizer,
             rl_reward_mode,
             &reward_config,
             expected_policy_tag,
@@ -3084,7 +3263,8 @@ static int showdown_client_main(int argc, char** argv) {
         fprintf(stderr,
         "Usage:\n"
         "  showdown_client --battle-agent [checkpoint]\n"
-        "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-profile 0|1]\n"
+        "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--supervised-profile 0|1]\n"
+        "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--ppo-minibatch-episodes N] [--target-kl F] [--shuffle-seed N] [--episode-limit N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"

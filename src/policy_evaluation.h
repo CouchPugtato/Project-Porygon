@@ -39,6 +39,8 @@ typedef struct {
     double target_nll_sum;
     double full_turn_nll_sum;
     double value_loss_sum;
+    double action_probability_sum;
+    double target_probability_sum;
 } PolicyEvaluationMetrics;
 
 void policy_evaluation_init(PolicyEvaluationMetrics* metrics);
@@ -54,6 +56,8 @@ double policy_evaluation_action_nll(const PolicyEvaluationMetrics* metrics);
 double policy_evaluation_target_nll(const PolicyEvaluationMetrics* metrics);
 double policy_evaluation_full_turn_nll(const PolicyEvaluationMetrics* metrics);
 double policy_evaluation_value_loss(const PolicyEvaluationMetrics* metrics);
+double policy_evaluation_action_probability(const PolicyEvaluationMetrics* metrics);
+double policy_evaluation_target_probability(const PolicyEvaluationMetrics* metrics);
 double policy_evaluation_full_turn_accuracy(const PolicyEvaluationMetrics* metrics);
 double policy_evaluation_top3_accuracy(const PolicyEvaluationMetrics* metrics);
 double policy_evaluation_slot0_accuracy(const PolicyEvaluationMetrics* metrics);

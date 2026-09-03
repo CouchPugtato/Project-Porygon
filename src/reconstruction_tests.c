@@ -3,6 +3,7 @@
 #include "observation_builder.h"
 #include "checkpoint.h"
 #include "gru_trainer.h"
+#include "learning_diagnostics.h"
 #include "policy_evaluation.h"
 
 #include <math.h>
@@ -3907,6 +3908,186 @@ cleanup:
     return ok;
 }
 
+static int initialize_learning_episode(Episode* episode, float observation_scale, float reward, int include_targets) {
+    float observation[4] = {
+        0.25f * observation_scale,
+        -0.5f * observation_scale,
+        0.75f * observation_scale,
+        0.1f * observation_scale
+    };
+    uint8_t legal[OBS_NUM_ACTIONS] = {0};
+    FactorizedActionChoice* choice;
+
+    legal[OBS_A1_MOVE1] = 1;
+    legal[OBS_A1_MOVE2] = 1;
+    legal[OBS_A2_MOVE1] = 1;
+    legal[OBS_A2_MOVE2] = 1;
+    if (!episode_init(episode, 1u, 4u) ||
+            !episode_append(episode, observation, legal, OBS_A1_MOVE2, reward, 1)) {
+        return 0;
+    }
+    episode->actions2[0] = OBS_A2_MOVE2;
+    choice = &episode->factorized_actions[0];
+    factorized_action_choice_from_flat_actions(choice, OBS_A1_MOVE2, OBS_A2_MOVE2);
+    if (include_targets) {
+        choice->slot0_target_mask = FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+            FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+        choice->slot1_target_mask = FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+            FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+        choice->slot0_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+        choice->slot1_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    }
+    return 1;
+}
+
+static int zero_model_parameters(GruModel* model) {
+    size_t count;
+    float* parameters;
+    int ok;
+    if (!model) return 0;
+    count = gru_model_parameter_count(model);
+    parameters = (float*)calloc(count, sizeof(float));
+    if (!parameters) return 0;
+    ok = gru_model_import_parameters(model, parameters, count);
+    free(parameters);
+    return ok;
+}
+
+static int test_supervised_overfit_diagnostic_learns(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruTrainer trainer;
+    Episode first;
+    Episode second;
+    const Episode* episodes[2];
+    SupervisedOverfitResult result;
+    int ok = 1;
+
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+    if (!assert_true(model != NULL && zero_model_parameters(model) &&
+            initialize_learning_episode(&first, 1.0f, 1.0f, 1) &&
+            initialize_learning_episode(&second, -1.0f, 1.0f, 1),
+            "initialize deterministic supervised overfit fixture")) {
+        episode_free(&second);
+        episode_free(&first);
+        gru_model_destroy(model);
+        return 0;
+    }
+    gru_trainer_init(&trainer, 0.03f, 16u, 1.0f, 17u);
+    trainer.supervised_optimizer = GRU_SUPERVISED_OPTIMIZER_ADAM;
+    trainer.supervised_profile_enabled = 0;
+    episodes[0] = &first;
+    episodes[1] = &second;
+    ok &= assert_true(learning_diagnostic_run_supervised_overfit(
+        &trainer, model, episodes, 2u, 40u, &result), "run deterministic supervised overfit check");
+    ok &= assert_true(result.passed, "supervised optimizer satisfies all learnability criteria");
+    ok &= assert_true(result.action_loss_reduction >= 0.5,
+        "supervised demonstrated-action loss falls by at least half");
+    ok &= assert_true(policy_evaluation_full_turn_accuracy(&result.after) >= 0.8,
+        "supervised full-turn accuracy reaches the diagnostic threshold");
+
+    episode_free(&second);
+    episode_free(&first);
+    gru_model_destroy(model);
+    return ok;
+}
+
+static int selected_joint_probability_and_value(
+    const GruModel* model,
+    const Episode* episode,
+    float* probability_out,
+    float* value_out
+) {
+    float hidden[8] = {0};
+    float flat_policy[OBS_NUM_ACTIONS];
+    FactorizedPolicySnapshot snapshot;
+    int action0;
+    int action1;
+    size_t pair_index;
+    if (!model || !episode || episode->count != 1u || !probability_out || !value_out) return 0;
+    gru_model_forward_sequence(model, episode->observations, 1u, hidden, flat_policy, value_out);
+    if (!gru_model_evaluate_policy_snapshot(
+            model, hidden, episode->legal_masks, 1, &snapshot, value_out) ||
+            !factorized_action_choice_to_flat_actions(
+                &episode->factorized_actions[0], &action0, &action1)) {
+        return 0;
+    }
+    pair_index = (size_t)action0 * FACTORIZED_LOCAL_ACTION_DIM +
+        (size_t)(action1 - FACTORIZED_LOCAL_ACTION_DIM);
+    *probability_out = snapshot.joint_policy[pair_index];
+    return 1;
+}
+
+static int test_ppo_update_moves_policy_and_value_in_expected_directions(void) {
+    GruModel* positive_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* negative_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode positive_episode;
+    Episode negative_episode;
+    GruTrainer positive_trainer;
+    GruTrainer negative_trainer;
+    float positive_probability_before;
+    float positive_probability_after;
+    float negative_probability_before;
+    float negative_probability_after;
+    float positive_value_before;
+    float positive_value_after;
+    float negative_value_before;
+    float negative_value_after;
+    int ok = 1;
+
+    memset(&positive_episode, 0, sizeof(positive_episode));
+    memset(&negative_episode, 0, sizeof(negative_episode));
+    if (!assert_true(positive_model && negative_model &&
+            zero_model_parameters(positive_model) && zero_model_parameters(negative_model) &&
+            initialize_learning_episode(&positive_episode, 1.0f, 1.0f, 0) &&
+            initialize_learning_episode(&negative_episode, 1.0f, -1.0f, 0),
+            "initialize deterministic PPO direction fixtures")) {
+        ok = 0;
+        goto cleanup;
+    }
+    ok &= assert_true(selected_joint_probability_and_value(
+        positive_model, &positive_episode, &positive_probability_before, &positive_value_before),
+        "evaluate positive-advantage PPO fixture before update");
+    ok &= assert_true(selected_joint_probability_and_value(
+        negative_model, &negative_episode, &negative_probability_before, &negative_value_before),
+        "evaluate negative-advantage PPO fixture before update");
+    positive_episode.old_log_probs[0] = logf(positive_probability_before);
+    positive_episode.old_values[0] = positive_value_before;
+    negative_episode.old_log_probs[0] = logf(negative_probability_before);
+    negative_episode.old_values[0] = negative_value_before;
+
+    gru_trainer_init(&positive_trainer, 0.01f, 16u, 0.0f, 23u);
+    gru_trainer_init(&negative_trainer, 0.01f, 16u, 0.0f, 23u);
+    positive_trainer.advantage_norm = 0;
+    negative_trainer.advantage_norm = 0;
+    positive_trainer.entropy_coef = 0.0f;
+    negative_trainer.entropy_coef = 0.0f;
+    ok &= assert_true(gru_trainer_ppo_episode(&positive_trainer, positive_model, &positive_episode),
+        "apply positive-advantage PPO update");
+    ok &= assert_true(gru_trainer_ppo_episode(&negative_trainer, negative_model, &negative_episode),
+        "apply negative-advantage PPO update");
+    ok &= assert_true(selected_joint_probability_and_value(
+        positive_model, &positive_episode, &positive_probability_after, &positive_value_after),
+        "evaluate positive-advantage PPO fixture after update");
+    ok &= assert_true(selected_joint_probability_and_value(
+        negative_model, &negative_episode, &negative_probability_after, &negative_value_after),
+        "evaluate negative-advantage PPO fixture after update");
+    ok &= assert_true(positive_probability_after > positive_probability_before,
+        "positive advantage raises the demonstrated joint-action probability");
+    ok &= assert_true(negative_probability_after < negative_probability_before,
+        "negative advantage lowers the demonstrated joint-action probability");
+    ok &= assert_true(fabsf(1.0f - positive_value_after) < fabsf(1.0f - positive_value_before) &&
+        fabsf(-1.0f - negative_value_after) < fabsf(-1.0f - negative_value_before),
+        "PPO value predictions move toward their returns");
+
+cleanup:
+    episode_free(&negative_episode);
+    episode_free(&positive_episode);
+    gru_model_destroy(negative_model);
+    gru_model_destroy(positive_model);
+    return ok;
+}
+
 int main(int argc, char** argv) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
@@ -3931,6 +4112,8 @@ int main(int argc, char** argv) {
     if (!test_active_slot_schema_rejects_older_checkpoint()) return 1;
     if (!test_checkpoint_compatibility_validation()) return 1;
     if (!test_policy_evaluation_matches_legal_runtime_policy()) return 1;
+    if (!test_supervised_overfit_diagnostic_learns()) return 1;
+    if (!test_ppo_update_moves_policy_and_value_in_expected_directions()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;
     if (!test_observation_exports_active_slot_identity()) return 1;

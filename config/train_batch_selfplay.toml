@@ -8,6 +8,7 @@ epochs_per_file = 1
 shuffle = true
 sample_files = 200
 supervised_profile = false
+supervised_optimizer = "sgd"
 dashboard = true
 dashboard_visible_shards = 10
 dashboard_show_top_stats = true
