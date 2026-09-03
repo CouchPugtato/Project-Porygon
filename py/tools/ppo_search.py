@@ -18,6 +18,7 @@ from typing import TextIO
 
 from artifact_io import write_json_atomically
 from league_manage import is_untrusted_legacy_checkpoint
+from model_spec import recorded_model_spec_matches
 from rl_defaults import bool_default, float_default, int_default
 from eval_collapse_check import collapse_flags_for_group
 
@@ -1484,23 +1485,19 @@ def evaluation_summary_path(repo_root: Path, run_name: str) -> Path:
 
 def evaluation_artifacts_match(
     summary_path: Path,
-    model_a: Path,
-    model_b: Path,
+    model_a: str | Path,
+    model_b: str | Path,
     requested_games: int,
     paired_seed_base: int | None = None,
 ) -> bool:
     try:
         summary = load_json(summary_path)
         specs = summary.get("model_specs", {}) or {}
-        recorded_a = str((specs.get("a", {}) or {}).get("path", "")).strip()
-        recorded_b = str((specs.get("b", {}) or {}).get("path", "")).strip()
         return (
             summary.get("status") == "completed"
             and int(summary.get("target_games", 0) or 0) == requested_games
-            and bool(recorded_a)
-            and bool(recorded_b)
-            and resolve_path(resolve_repo_root(), recorded_a) == model_a.resolve()
-            and resolve_path(resolve_repo_root(), recorded_b) == model_b.resolve()
+            and recorded_model_spec_matches(specs.get("a"), model_a, resolve_repo_root())
+            and recorded_model_spec_matches(specs.get("b"), model_b, resolve_repo_root())
             and (
                 paired_seed_base is None
                 or int(summary.get("battle_seed_base", -1)) == paired_seed_base

@@ -446,11 +446,12 @@ class PromotionTests(unittest.TestCase):
         )
         command = build_league_eval_command(
             args, Path("repo"), "replacement", Path("candidate.chk"),
-            Path("champion.chk"), "a", 16, 78,
+            Path("champion.chk"), "a", 16, 78, 9001,
         )
         self.assertEqual(command[command.index("--games") + 1], "16")
         self.assertEqual(command[command.index("--worker-pairs") + 1], "16")
         self.assertEqual(command[command.index("--concurrent-games") + 1], "16")
+        self.assertEqual(command[command.index("--battle-seed-base") + 1], "9001")
 
     def test_balanced_eval_resume_checks_models_and_valid_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

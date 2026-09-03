@@ -51,6 +51,11 @@ Files:
   - renders training, active-operation, screening, and final-evaluation progress bars when `dashboard = true`
   - writes live progress into the search manifest and optional raw subprocess logs under `models/search/<run_prefix>/logs/`
   - always uses `build-fresh/showdown_client.exe`; the trainer path is intentionally not configurable
+- `strength_baseline_benchmark.toml`
+  - defines the six recovery-audit checkpoints and their provenance labels
+  - requires the supervised-overfit report and reconstruction/PPO-direction tests before games start
+  - screens every checkpoint against random with matched battle seeds, then advances two finalists
+  - writes a resumable benchmark manifest and final learning audit under `models/benchmarks/`
 - `reward_weights.toml`
   - runtime-loaded by both `showdown_client` and `py/communicator/main.py`
 - `experimental/*.toml`

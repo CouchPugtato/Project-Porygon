@@ -1,0 +1,39 @@
+run_name = "run_0112_model_learning_audit"
+
+g4_checkpoint = "models/runs/run_0056_g4_teacher_sup_pool_collect_200shards_wins/g4_teacher_sup_pool_wins_sup/g4_teacher_sup_pool_wins_sup.chk"
+g4_provenance = "run_0056 supervised g4 checkpoint"
+current_arch_checkpoint = "models/runs/run_0093_current_arch_full/current_arch_full.chk"
+current_arch_provenance = "run_0093 current-architecture final checkpoint"
+legacy_ep10_checkpoint = "models/runs/run_0093_current_arch_full/current_arch_full_ep10.chk"
+legacy_ep10_provenance = "run_0093 legacy shard-overwritten ep10 artifact"
+legacy_ep20_checkpoint = "models/runs/run_0093_current_arch_full/current_arch_full_ep20.chk"
+legacy_ep20_provenance = "run_0093 legacy shard-overwritten ep20 artifact"
+run_0096_checkpoint = "models/runs/run_0096_current_arch_ppo_anchor/current_arch_ppo_anchor.chk"
+run_0096_provenance = "run_0096 anchored PPO checkpoint"
+run_0111_checkpoint = "models/runs/run_0111_ppo_search_multi_batch_full_03_lr5em06_ent0p0003_anchor0p03_clip0p2_batch01_seed202_eps256/candidate.chk"
+run_0111_provenance = "top observed result in completed run_0111 search manifest"
+
+supervised_overfit_report = "models/diagnostics/supervised_overfit.json"
+reconstruction_tests_exe = "build-local/model-recovery/showdown_reconstruction_tests.exe"
+
+screen_games_per_side = 250
+final_games_per_side = 1000
+head_to_head_games_per_side = 1000
+finalist_count = 2
+screen_pool_seed = 12001
+final_pool_seed = 12002
+head_to_head_pool_seed = 12003
+
+concurrent_games = 50
+worker_pairs = 50
+max_replacement_attempts = 5
+format = "gen9randomdoublesbattle"
+launch_stagger_seconds = 0.25
+resource_check_seconds = 2.0
+min_available_memory_gb = 2.0
+min_available_pagefile_gb = 4.0
+startup_timeout_seconds = 120
+dashboard = true
+dashboard_refresh_per_second = 8
+dashboard_write_raw_logs = true
+resume = true

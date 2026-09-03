@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -10,6 +9,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from artifact_io import write_json_atomically
 from league_rl_orchestrator import (
     DEFAULT_PROMOTION_CONFIDENCE_THRESHOLD,
     league_promotion_assessment,
@@ -61,8 +61,7 @@ def resolve_path(repo_root: Path, value: str | Path) -> Path:
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    write_json_atomically(path, payload)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,12 +70,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--candidate-checkpoint", required=True)
-    parser.add_argument("--baseline-checkpoint", "--champion-checkpoint", dest="baseline_checkpoint", required=True)
+    parser.add_argument(
+        "--baseline",
+        "--baseline-checkpoint",
+        "--champion-checkpoint",
+        dest="baseline_checkpoint",
+        required=True,
+        help="Checkpoint path or 'random'",
+    )
     parser.add_argument("--games-per-side", type=positive_int, default=250)
     parser.add_argument("--concurrent-games", type=positive_int, default=70)
     parser.add_argument("--worker-pairs", type=positive_int, default=125)
     parser.add_argument("--max-replacement-attempts", type=positive_int, default=5)
     parser.add_argument("--pool-seed", type=int, default=1)
+    parser.add_argument("--battle-seed-base", type=int, default=None)
     parser.add_argument("--format", default="gen9randomdoublesbattle")
     parser.add_argument("--launch-stagger-seconds", type=float, default=0.25)
     parser.add_argument("--resource-check-seconds", type=float, default=2.0)
@@ -108,6 +115,7 @@ def prepare_shared_args(args: argparse.Namespace) -> argparse.Namespace:
     args.eval_concurrent_games = args.concurrent_games
     args.eval_worker_pairs = args.worker_pairs
     args.eval_max_replacement_attempts = args.max_replacement_attempts
+    args.eval_battle_seed_base = args.battle_seed_base
     args.promote_threshold = args.promotion_min_win_rate
     return args
 
@@ -126,10 +134,14 @@ def main() -> None:
 
     repo_root = resolve_repo_root()
     candidate_checkpoint = resolve_path(repo_root, args.candidate_checkpoint)
-    baseline_checkpoint = resolve_path(repo_root, args.baseline_checkpoint)
+    baseline_checkpoint: str | Path
+    if args.baseline_checkpoint.strip().lower() == "random":
+        baseline_checkpoint = "random"
+    else:
+        baseline_checkpoint = resolve_path(repo_root, args.baseline_checkpoint)
     if not candidate_checkpoint.exists():
         raise SystemExit(f"candidate checkpoint not found: {candidate_checkpoint}")
-    if not baseline_checkpoint.exists():
+    if isinstance(baseline_checkpoint, Path) and not baseline_checkpoint.exists():
         raise SystemExit(f"baseline checkpoint not found: {baseline_checkpoint}")
 
     run_dir = (repo_root / DEFAULT_MATCH_RUNS_ROOT / args.run_name).resolve()
@@ -148,6 +160,7 @@ def main() -> None:
         "valid_games_per_side": args.games_per_side,
         "max_replacement_attempts": args.max_replacement_attempts,
         "pool_seed": args.pool_seed,
+        "battle_seed_base": args.battle_seed_base,
         "format": args.format,
         "worker_config": {
             "concurrent_games": args.concurrent_games,

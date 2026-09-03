@@ -23,6 +23,7 @@ from league_manage import (
     save_registry,
 )
 from opponent_sampling import ADAPTIVE_STRATEGY, matchup_difficulty_weight as calculate_matchup_difficulty_weight
+from model_spec import model_spec_payload, recorded_model_spec_matches
 from live_rl_orchestrator import (
     BaseWorkflowReporter,
     DashboardProgressWriter,
@@ -529,10 +530,11 @@ def build_eval_command(
     repo_root: Path,
     run_name: str,
     candidate_checkpoint: Path,
-    champion_checkpoint: Path,
+    champion_checkpoint: str | Path,
     candidate_side: str,
     games: int,
     pool_seed: int,
+    battle_seed_base: int | None = None,
 ) -> list[str]:
     model_a = candidate_checkpoint if candidate_side == "a" else champion_checkpoint
     model_b = champion_checkpoint if candidate_side == "a" else candidate_checkpoint
@@ -541,7 +543,7 @@ def build_eval_command(
     # and allows a small shortfall to overshoot substantially during draining.
     worker_pairs = min(args.eval_worker_pairs, max(1, games))
     concurrent_games = min(args.eval_concurrent_games, worker_pairs)
-    return [
+    command = [
         sys.executable,
         str((repo_root / "py" / "tools" / "selfplay_server.py").resolve()),
         "--run-name",
@@ -585,26 +587,34 @@ def build_eval_command(
         "--startup-timeout-seconds",
         str(args.startup_timeout_seconds),
     ]
+    if battle_seed_base is not None:
+        command.extend(["--battle-seed-base", str(battle_seed_base)])
+    return command
 
 
 def balanced_evaluation_artifacts_match(
     summary: dict[str, object],
     candidate_checkpoint: Path,
-    champion_checkpoint: Path,
+    champion_checkpoint: str | Path,
     valid_games_per_side: int,
+    battle_seed_base: int | None = None,
 ) -> bool:
     models = summary.get("model_specs", {}) or {}
-    candidate_path = str((models.get("candidate", {}) or {}).get("path", "")).strip()
-    champion_path = str((models.get("champion", {}) or {}).get("path", "")).strip()
     try:
         return (
             summary.get("status") == "completed"
             and summary.get("evaluation_mode") == "balanced_valid_games"
             and int(summary.get("target_valid_games_per_side", 0) or 0) == valid_games_per_side
-            and bool(candidate_path)
-            and bool(champion_path)
-            and resolve_path(resolve_repo_root(), candidate_path) == candidate_checkpoint.resolve()
-            and resolve_path(resolve_repo_root(), champion_path) == champion_checkpoint.resolve()
+            and recorded_model_spec_matches(
+                models.get("candidate"), candidate_checkpoint, resolve_repo_root()
+            )
+            and recorded_model_spec_matches(
+                models.get("champion"), champion_checkpoint, resolve_repo_root()
+            )
+            and (
+                battle_seed_base is None
+                or int(summary.get("battle_seed_base", -1)) == battle_seed_base
+            )
         )
     except (OSError, TypeError, ValueError):
         return False
@@ -614,15 +624,20 @@ def run_balanced_valid_evaluation(
     args: argparse.Namespace,
     repo_root: Path,
     candidate_checkpoint: Path,
-    champion_checkpoint: Path,
+    champion_checkpoint: str | Path,
     reporter: BaseWorkflowReporter,
     logs_dir: Path,
 ) -> tuple[Path, dict[str, object]]:
     combined_path = evaluation_summary_path(repo_root, args.eval_run_name)
+    paired_seed_base = getattr(args, "eval_battle_seed_base", None)
     if args.resume and combined_path.exists():
         existing = load_json(combined_path)
         if balanced_evaluation_artifacts_match(
-            existing, candidate_checkpoint, champion_checkpoint, args.eval_games,
+            existing,
+            candidate_checkpoint,
+            champion_checkpoint,
+            args.eval_games,
+            paired_seed_base,
         ):
             for side in ("a", "b"):
                 side_result = ((existing.get("side_results", {}) or {}).get(side, {}) or {})
@@ -655,7 +670,13 @@ def run_balanced_valid_evaluation(
             can_resume = (
                 args.resume
                 and summary_path.exists()
-                and evaluation_artifacts_match(summary_path, model_a, model_b, shortfall)
+                and evaluation_artifacts_match(
+                    summary_path,
+                    model_a,
+                    model_b,
+                    shortfall,
+                    None if paired_seed_base is None else paired_seed_base + (attempt - 1) * 1000000,
+                )
             )
             reporter.state.begin_evaluation(
                 candidate_side,
@@ -680,6 +701,7 @@ def run_balanced_valid_evaluation(
                         candidate_side,
                         shortfall,
                         args.pool_seed + 100000 + side_index * 1000 + attempt,
+                        None if paired_seed_base is None else paired_seed_base + (attempt - 1) * 1000000,
                     ),
                     repo_root,
                     reporter,
@@ -737,6 +759,8 @@ def run_balanced_valid_evaluation(
         "confidence_low": confidence_low,
         "confidence_high": confidence_high,
         "confidence_level": 0.95,
+        "battle_seed_base": paired_seed_base,
+        "deterministic_battle_pairing": paired_seed_base is not None,
         "run_names": run_names,
         "side_results": side_results,
         "group_stats": {
@@ -745,8 +769,8 @@ def run_balanced_valid_evaluation(
         },
         "candidate_collapse_flags": collapse_flags,
         "model_specs": {
-            "candidate": {"kind": "checkpoint", "path": str(candidate_checkpoint)},
-            "champion": {"kind": "checkpoint", "path": str(champion_checkpoint)},
+            "candidate": model_spec_payload(candidate_checkpoint),
+            "champion": model_spec_payload(champion_checkpoint),
         },
         "metric_definitions": {
             "valid_game": "normal earned decision or draw; disconnect/forfeit outcomes excluded",

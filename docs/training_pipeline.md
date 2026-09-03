@@ -191,7 +191,14 @@ Use `py/tools/eval_collapse_check.py` to re-run those checks from an existing su
 
 ## Standalone balanced checkpoint evaluation
 
-`py/tools/balanced_checkpoint_eval.py` compares any existing candidate and baseline checkpoints without training, changing the league registry, or creating a temporary league member. It reuses the league evaluator's side balancing, valid-outcome rules, replacement blocks, Wilson interval, collapse checks, resume provenance, dashboard, and promotion assessment.
+`py/tools/balanced_checkpoint_eval.py` compares any existing candidate against a
+checkpoint or `random` baseline without training, changing the league registry,
+or creating a temporary league member. `--baseline-checkpoint` remains available
+for compatibility; `--baseline random` is the clearer spelling for a random
+baseline. It reuses the league evaluator's side balancing, valid-outcome rules,
+replacement blocks, Wilson interval, collapse checks, resume provenance,
+dashboard, and promotion assessment. Pass `--battle-seed-base` to reuse the same
+random teams when the candidate changes sides.
 
 The combined summary and manifest are written under `matches/runs/<run-name>/`. Raw self-play logs are retained in that run's `logs/` directory by default. `--games-per-side` is a valid-game target: disconnect and forfeit outcomes remain visible as invalid but do not satisfy it.
 
@@ -202,6 +209,30 @@ python .\py\tools\balanced_checkpoint_eval.py --run-name eval_round03_vs_champio
 ```
 
 Use this path to screen intermediate checkpoints or perform an independent comparison. Automatic league promotion remains the responsibility of `league_rl_orchestrator.py`; the standalone evaluator reports what the configured gates would decide but does not mutate registry state.
+
+## Canonical strength baseline
+
+`py/tools/strength_baseline_benchmark.py` runs the recovery audit defined in
+`config/strength_baseline_benchmark.toml`. Before launching games, it requires a
+passing supervised-overfit report and reruns the reconstruction test executable,
+which contains the deterministic PPO-direction test.
+
+The benchmark screens g4, the current-architecture final checkpoint, the two
+labelled legacy epoch artifacts, run_0096 anchored PPO, and the top observed
+run_0111 candidate against random. Every screen uses the same battle seed suite.
+The two highest lower bounds from the 95% Wilson intervals advance to the larger
+random evaluation and head-to-head comparison.
+
+Child evaluations are ordinary resumable balanced-evaluation runs under
+`matches/runs/`. The benchmark manifest and final learning audit are written to
+`models/benchmarks/<run-name>/`. They retain side splits, invalid games, Tera
+rates, collapse flags, checkpoint provenance, trainer checks, and confidence
+intervals. The audit marks `strength_baseline_verified` only when the strongest
+finalist's lower 95% bound against random is strictly above 50%.
+
+```powershell
+python .\py\tools\strength_baseline_benchmark.py
+```
 
 ## Controlled PPO hyperparameter search
 
