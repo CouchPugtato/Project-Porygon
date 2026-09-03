@@ -16,6 +16,7 @@ from league_manage import (
     LeagueRegistry,
     OpponentStats,
     find_member,
+    is_untrusted_legacy_checkpoint,
     league_member_from_json,
     load_registry,
     member_to_json_dict,
@@ -181,17 +182,30 @@ def sort_recent(members: list[LeagueMember]) -> list[LeagueMember]:
     return sorted(members, key=lambda item: (item.generation, item.promoted_at or item.created_at, item.id), reverse=True)
 
 
+def automatically_eligible(member: LeagueMember) -> bool:
+    return member.snapshot_eligible and not is_untrusted_legacy_checkpoint(member.path)
+
+
 def choose_parent_member(registry: LeagueRegistry, parent_id: str, learner_role: str) -> LeagueMember:
     if parent_id:
         return find_member(registry, parent_id)
     if learner_role == "main":
         if registry.champion_id:
-            return find_member(registry, registry.champion_id)
-    candidates = [member for member in registry.members if member.role == learner_role and member.status in {"active", "candidate"}]
+            champion = find_member(registry, registry.champion_id)
+            if automatically_eligible(champion):
+                return champion
+    candidates = [
+        member for member in registry.members
+        if member.role == learner_role
+        and member.status in {"active", "candidate"}
+        and automatically_eligible(member)
+    ]
     if candidates:
         return sort_recent(candidates)[0]
     if registry.champion_id:
-        return find_member(registry, registry.champion_id)
+        champion = find_member(registry, registry.champion_id)
+        if automatically_eligible(champion):
+            return champion
     raise SystemExit("could not infer parent member; provide --parent-id or initialize the registry with a champion")
 
 
@@ -209,15 +223,25 @@ def build_weighted_pool(
     members: list[dict[str, object]] = []
     parent_member = find_member(registry, parent_id)
     champion = find_member(registry, registry.champion_id) if registry.champion_id else None
-    historical = [m for m in registry.members if m.role == "historical_snapshot" and m.status == "active"]
+    historical = [
+        m for m in registry.members
+        if m.role == "historical_snapshot" and m.status == "active" and automatically_eligible(m)
+    ]
     recent_main = [
         m for m in registry.members
         if m.role == "main"
         and m.status in {"active", "candidate"}
         and m.id not in {parent_id, registry.champion_id}
+        and automatically_eligible(m)
     ]
-    main_exploiters = [m for m in registry.members if m.role == "main_exploiter" and m.status in {"active", "candidate"}]
-    league_exploiters = [m for m in registry.members if m.role == "league_exploiter" and m.status in {"active", "candidate"}]
+    main_exploiters = [
+        m for m in registry.members
+        if m.role == "main_exploiter" and m.status in {"active", "candidate"} and automatically_eligible(m)
+    ]
+    league_exploiters = [
+        m for m in registry.members
+        if m.role == "league_exploiter" and m.status in {"active", "candidate"} and automatically_eligible(m)
+    ]
 
     bucket_members: list[tuple[float, list[LeagueMember], str]] = []
     if learner_role == "main":
@@ -840,7 +864,7 @@ def maybe_promote_candidate(
     collapse_flags: list[str],
 ) -> bool:
     assessment = league_promotion_assessment(args, eval_summary, collapse_flags)
-    if not assessment["promotion_confident"]:
+    if not assessment["promotion_confident"] or not automatically_eligible(candidate):
         return False
     candidate.status = "active"
     candidate.role = "champion" if args.learner_role == "main" else candidate.role

@@ -91,6 +91,32 @@ The wrapper also writes a training manifest beside the checkpoint by default. Th
 - configured environment variables
 - shard completion progress
 
+Supervised validation uses a fixed holdout selected by a stable hash of battle ID
+and `--validation-seed` (default `1337`). The same battle stays in the holdout
+regardless of shard ordering. After every complete outer dataset epoch, the wrapper
+evaluates the resulting model over the holdout in every source shard and writes one
+label-count-weighted summary.
+
+Sharded supervised runs pass `--aux-checkpoints 0` to the C trainer so individual
+shards cannot overwrite `_epN`, `_epochN`, or `_best` files. The C trainer retains
+its compatible `--aux-checkpoints 1` default when invoked directly. The wrapper
+instead atomically publishes dataset-level artifacts:
+
+- `<checkpoint>_dataset_epochNNN.chk`
+- `<checkpoint>_dataset_epochNNN_validation.json`
+
+Each manifest epoch record includes the exact training shard list, source shard
+count, accepted label count, validation seed, and collection manifest path. With
+`--resume true`, the wrapper persists each epoch's shuffled shard plan before
+training and records each successful shard by epoch, index, and resolved path. An
+interrupted run resumes that exact plan and evaluates or publishes an epoch only
+after all of its shards are complete.
+
+`current_arch_full_ep10.chk` and `current_arch_full_ep20.chk` predate this artifact
+contract. They remain loadable legacy files, but automatic league pool selection,
+historical-opponent selection, and promotion do not treat them as trustworthy
+milestones.
+
 ## Live self-play RL
 
 The repository now has a first round-based actor -> learner path for live RL:

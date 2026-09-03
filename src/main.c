@@ -7,6 +7,7 @@
 #include "id_tables.h"
 #include "observation.h"
 #include "runtime_protocol.h"
+#include "validation_split.h"
 #include <errno.h>
 #include <math.h>
 #include <stdlib.h>
@@ -846,13 +847,6 @@ static int parse_supervised_optimizer(
     return 0;
 }
 
-static int is_validation_session(size_t index, size_t total_sessions) {
-    if (total_sessions < 10) {
-        return 0;
-    }
-    return (index % 10u) == 0u;
-}
-
 static void shuffle_indices(size_t* indices, size_t count) {
     size_t i;
     if (!indices || count < 2) {
@@ -867,7 +861,8 @@ static void shuffle_indices(size_t* indices, size_t count) {
 }
 
 static int build_split_indices(
-    size_t total_sessions,
+    const EnvRuntime* runtime,
+    unsigned int validation_seed,
     size_t** train_indices_out,
     size_t* train_count_out,
     size_t** val_indices_out,
@@ -877,11 +872,13 @@ static int build_split_indices(
     size_t* val_indices = NULL;
     size_t train_count = 0;
     size_t val_count = 0;
+    size_t total_sessions;
     size_t i;
 
-    if (!train_indices_out || !train_count_out || !val_indices_out || !val_count_out) {
+    if (!runtime || !train_indices_out || !train_count_out || !val_indices_out || !val_count_out) {
         return 0;
     }
+    total_sessions = runtime->count;
 
     train_indices = (size_t*)malloc((total_sessions > 0 ? total_sessions : 1) * sizeof(size_t));
     val_indices = (size_t*)malloc((total_sessions > 0 ? total_sessions : 1) * sizeof(size_t));
@@ -892,7 +889,7 @@ static int build_split_indices(
     }
 
     for (i = 0; i < total_sessions; ++i) {
-        if (is_validation_session(i, total_sessions)) {
+        if (validation_split_contains(runtime->sessions[i].battle_id, validation_seed)) {
             val_indices[val_count++] = i;
         } else {
             train_indices[train_count++] = i;
@@ -1938,6 +1935,7 @@ static int export_battle_snapshots(const char* replay_path, const char* battle_i
 static int evaluate_checkpoint_on_replay_file(
     const char* replay_path,
     const char* checkpoint_path,
+    unsigned int validation_seed,
     const RewardConfig* reward_config
 ) {
     char* resolved_checkpoint_path = NULL;
@@ -1986,7 +1984,8 @@ static int evaluate_checkpoint_on_replay_file(
         free(resolved_checkpoint_path);
         return 1;
     }
-    if (!build_split_indices(runtime.count, &train_indices, &train_sessions, &val_indices, &val_sessions)) {
+    if (!build_split_indices(
+            &runtime, validation_seed, &train_indices, &train_sessions, &val_indices, &val_sessions)) {
         fprintf(stderr, "Failed to build held-out split indices\n");
         env_runtime_free(&runtime);
         gru_model_destroy(model);
@@ -1994,8 +1993,8 @@ static int evaluate_checkpoint_on_replay_file(
         return 1;
     }
 
-    printf("[eval] checkpoint=%s train_sessions=%zu val_sessions=%zu\n",
-        resolved_checkpoint_path, train_sessions, val_sessions);
+    printf("[eval] checkpoint=%s train_sessions=%zu val_sessions=%zu validation_seed=%u\n",
+        resolved_checkpoint_path, train_sessions, val_sessions, validation_seed);
     printf("[eval] accepted_labels direct=%zu reconstructed=%zu failed=%zu\n",
         runtime.accepted_label_direct_count,
         runtime.accepted_label_reconstructed_count,
@@ -2032,12 +2031,16 @@ static int evaluate_checkpoint_on_replay_file(
             metrics.slot0_labels,
             metrics.slot1_labels,
             metrics.skipped_turns);
-        printf("[eval] validation metrics_version=%d action_nll=%.4f target_nll=%.4f full_turn_nll=%.4f full_turn_accuracy=%.4f joint_pair_accuracy=%.4f kind_accuracy=%.4f move_accuracy=%.4f switch_accuracy=%.4f tera_accuracy=%.4f target_accuracy=%.4f turns=%zu joint_pairs=%zu target_labels=%zu illegal_predictions=%zu nonfinite_values=%zu\n",
+        printf("[eval] validation metrics_version=%d action_nll=%.9g target_nll=%.9g full_turn_nll=%.9g value_loss=%.9g full_turn_accuracy=%.9g top3_accuracy=%.9g slot0_accuracy=%.9g slot1_accuracy=%.9g joint_pair_accuracy=%.9g kind_accuracy=%.9g move_accuracy=%.9g switch_accuracy=%.9g tera_accuracy=%.9g target_accuracy=%.9g turns=%zu action_labels=%zu slot0_labels=%zu slot1_labels=%zu joint_pairs=%zu kind_labels=%zu move_labels=%zu switch_labels=%zu tera_labels=%zu target_labels=%zu skipped_turns=%zu illegal_predictions=%zu nonfinite_values=%zu\n",
             POLICY_EVALUATION_METRICS_VERSION,
             policy_evaluation_action_nll(&metrics),
             policy_evaluation_target_nll(&metrics),
             policy_evaluation_full_turn_nll(&metrics),
+            policy_evaluation_value_loss(&metrics),
             policy_evaluation_full_turn_accuracy(&metrics),
+            policy_evaluation_top3_accuracy(&metrics),
+            policy_evaluation_slot0_accuracy(&metrics),
+            policy_evaluation_slot1_accuracy(&metrics),
             policy_evaluation_joint_pair_accuracy(&metrics),
             policy_evaluation_kind_accuracy(&metrics),
             policy_evaluation_move_accuracy(&metrics),
@@ -2045,8 +2048,16 @@ static int evaluate_checkpoint_on_replay_file(
             policy_evaluation_tera_accuracy(&metrics),
             policy_evaluation_target_accuracy(&metrics),
             metrics.decision_turns,
+            metrics.action_labels,
+            metrics.slot0_labels,
+            metrics.slot1_labels,
             metrics.joint_pair_labels,
+            metrics.kind_labels,
+            metrics.move_labels,
+            metrics.switch_labels,
+            metrics.tera_labels,
             metrics.target_labels,
+            metrics.skipped_turns,
             metrics.illegal_predictions,
             metrics.nonfinite_values);
         printf("[eval] elapsed=%.1fs sessions_per_sec=%.2f labels_per_sec=%.2f\n",
@@ -2230,6 +2241,8 @@ static int train_from_input_file(
     float adam_epsilon,
     int supervised_profile,
     GruSupervisedOptimizer supervised_optimizer,
+    unsigned int validation_seed,
+    int aux_checkpoints,
     const char* rl_reward_mode,
     const RewardConfig* reward_config,
     const char* expected_policy_tag,
@@ -2262,6 +2275,7 @@ static int train_from_input_file(
     const double train_eta_alpha = 0.2;
     const double train_eta_min_elapsed = 10.0;
     const size_t train_eta_min_episodes = 5;
+    size_t starting_step;
 
     if (!input_path || !checkpoint_path || epochs <= 0) {
         return 1;
@@ -2343,6 +2357,7 @@ static int train_from_input_file(
         checkpoint_state.gradient_clip,
         checkpoint_state.seed);
     trainer.step = checkpoint_state.step;
+    starting_step = trainer.step;
     if (rl_mode) {
         trainer.gamma = rl_gamma;
         trainer.entropy_coef = rl_entropy_coef;
@@ -2381,7 +2396,8 @@ static int train_from_input_file(
     }
     if (!(rl_mode
             ? build_all_train_indices(runtime.count, &train_indices, &train_sessions, &val_indices, &val_sessions)
-            : build_split_indices(runtime.count, &train_indices, &train_sessions, &val_indices, &val_sessions))) {
+            : build_split_indices(
+                &runtime, validation_seed, &train_indices, &train_sessions, &val_indices, &val_sessions))) {
         fprintf(stderr, "Failed to build train/validation split indices\n");
         env_runtime_free(&runtime);
         gru_model_destroy(model);
@@ -2416,7 +2432,8 @@ static int train_from_input_file(
             train_sessions,
             val_sessions);
     }
-    printf("[train] split train_sessions=%zu val_sessions=%zu epochs=%d\n", train_sessions, val_sessions, epochs);
+    printf("[train] split train_sessions=%zu val_sessions=%zu epochs=%d validation_seed=%u aux_checkpoints=%d\n",
+        train_sessions, val_sessions, epochs, validation_seed, aux_checkpoints);
     printf("[train] accepted_labels direct=%zu reconstructed=%zu failed=%zu\n",
         runtime.accepted_label_direct_count,
         runtime.accepted_label_reconstructed_count,
@@ -2597,7 +2614,8 @@ static int train_from_input_file(
                 }
                 fflush(stdout);
             }
-            if (!rl_mode && ((trained_in_epoch % 500u) == 0u || trained_in_epoch == train_sessions)) {
+            if (!rl_mode && aux_checkpoints &&
+                    ((trained_in_epoch % 500u) == 0u || trained_in_epoch == train_sessions)) {
                 TrainerCheckpointState periodic_state = gru_trainer_checkpoint_state(&trainer);
                 char* periodic_path = make_periodic_checkpoint_path(resolved_checkpoint_path, ((size_t)(epoch - 1) * train_sessions) + trained_in_epoch);
                 if (periodic_path) {
@@ -2659,13 +2677,17 @@ static int train_from_input_file(
                     val_metrics.slot0_labels,
                     val_metrics.slot1_labels,
                     val_metrics.skipped_turns);
-                printf("[train] epoch=%d validation metrics_version=%d action_nll=%.4f target_nll=%.4f full_turn_nll=%.4f full_turn_accuracy=%.4f joint_pair_accuracy=%.4f kind_accuracy=%.4f move_accuracy=%.4f switch_accuracy=%.4f tera_accuracy=%.4f target_accuracy=%.4f turns=%zu joint_pairs=%zu target_labels=%zu illegal_predictions=%zu nonfinite_values=%zu\n",
+                printf("[train] epoch=%d validation metrics_version=%d action_nll=%.9g target_nll=%.9g full_turn_nll=%.9g value_loss=%.9g full_turn_accuracy=%.9g top3_accuracy=%.9g slot0_accuracy=%.9g slot1_accuracy=%.9g joint_pair_accuracy=%.9g kind_accuracy=%.9g move_accuracy=%.9g switch_accuracy=%.9g tera_accuracy=%.9g target_accuracy=%.9g turns=%zu action_labels=%zu slot0_labels=%zu slot1_labels=%zu joint_pairs=%zu kind_labels=%zu move_labels=%zu switch_labels=%zu tera_labels=%zu target_labels=%zu skipped_turns=%zu illegal_predictions=%zu nonfinite_values=%zu\n",
                     epoch,
                     POLICY_EVALUATION_METRICS_VERSION,
                     policy_evaluation_action_nll(&val_metrics),
                     policy_evaluation_target_nll(&val_metrics),
                     policy_evaluation_full_turn_nll(&val_metrics),
+                    policy_evaluation_value_loss(&val_metrics),
                     policy_evaluation_full_turn_accuracy(&val_metrics),
+                    policy_evaluation_top3_accuracy(&val_metrics),
+                    policy_evaluation_slot0_accuracy(&val_metrics),
+                    policy_evaluation_slot1_accuracy(&val_metrics),
                     policy_evaluation_joint_pair_accuracy(&val_metrics),
                     policy_evaluation_kind_accuracy(&val_metrics),
                     policy_evaluation_move_accuracy(&val_metrics),
@@ -2673,8 +2695,16 @@ static int train_from_input_file(
                     policy_evaluation_tera_accuracy(&val_metrics),
                     policy_evaluation_target_accuracy(&val_metrics),
                     val_metrics.decision_turns,
+                    val_metrics.action_labels,
+                    val_metrics.slot0_labels,
+                    val_metrics.slot1_labels,
                     val_metrics.joint_pair_labels,
+                    val_metrics.kind_labels,
+                    val_metrics.move_labels,
+                    val_metrics.switch_labels,
+                    val_metrics.tera_labels,
                     val_metrics.target_labels,
+                    val_metrics.skipped_turns,
                     val_metrics.illegal_predictions,
                     val_metrics.nonfinite_values);
                 printf("[train] epoch=%d validation elapsed=%.1fs sessions_per_sec=%.2f labels_per_sec=%.2f\n",
@@ -2682,7 +2712,8 @@ static int train_from_input_file(
                     val_elapsed,
                     val_sessions_per_sec,
                     val_labels_per_sec);
-                if (!has_best_val || policy_evaluation_full_turn_nll(&val_metrics) < best_val_action_loss) {
+                if (aux_checkpoints &&
+                        (!has_best_val || policy_evaluation_full_turn_nll(&val_metrics) < best_val_action_loss)) {
                     has_best_val = 1;
                     best_val_action_loss = (float)policy_evaluation_full_turn_nll(&val_metrics);
                     best_state = gru_trainer_checkpoint_state(&trainer);
@@ -2702,7 +2733,7 @@ static int train_from_input_file(
             }
         }
 
-        if (!rl_mode) {
+        if (!rl_mode && aux_checkpoints) {
             TrainerCheckpointState epoch_state = gru_trainer_checkpoint_state(&trainer);
             char* epoch_path = make_epoch_checkpoint_path(resolved_checkpoint_path, (size_t)epoch);
             if (epoch_path) {
@@ -2761,11 +2792,12 @@ static int train_from_input_file(
             }
         }
     } else {
-        printf("trained mode=supervised step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f sessions=%zu\n",
+        printf("trained mode=supervised step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f labels=%zu sessions=%zu\n",
             trainer.step,
             trainer.last_action_loss,
             trainer.last_value_loss,
             trainer.last_accuracy,
+            trainer.step - starting_step,
             runtime.count);
     }
     printf("[train] saved checkpoint %s\n", resolved_checkpoint_path);
@@ -2978,6 +3010,8 @@ static int showdown_client_main(int argc, char** argv) {
     float adam_beta2;
     float adam_epsilon;
     int supervised_profile = parse_bool01_flag(argc, argv, "--supervised-profile", 1);
+    int validation_seed = parse_int_flag(argc, argv, "--validation-seed", 1337);
+    int aux_checkpoints = parse_bool01_flag(argc, argv, "--aux-checkpoints", 1);
     GruSupervisedOptimizer supervised_optimizer;
     const char* supervised_optimizer_name = parse_string_flag(
         argc, argv, "--supervised-optimizer", overfit_command ? "adam" : "sgd");
@@ -3023,6 +3057,10 @@ static int showdown_client_main(int argc, char** argv) {
     }
     if (overfit_command && (overfit_epochs <= 0 || overfit_seed < 0)) {
         fprintf(stderr, "--check-supervised-overfit requires --epochs > 0 and --seed >= 0\n");
+        return 1;
+    }
+    if (validation_seed < 0) {
+        fprintf(stderr, "--validation-seed must be >= 0\n");
         return 1;
     }
     {
@@ -3119,6 +3157,8 @@ static int showdown_client_main(int argc, char** argv) {
             adam_epsilon,
             supervised_profile,
             supervised_optimizer,
+            (unsigned int)validation_seed,
+            aux_checkpoints,
             rl_reward_mode,
             &reward_config,
             expected_policy_tag,
@@ -3155,6 +3195,8 @@ static int showdown_client_main(int argc, char** argv) {
             adam_epsilon,
             supervised_profile,
             supervised_optimizer,
+            (unsigned int)validation_seed,
+            aux_checkpoints,
             rl_reward_mode,
             &reward_config,
             expected_policy_tag,
@@ -3191,6 +3233,8 @@ static int showdown_client_main(int argc, char** argv) {
             adam_epsilon,
             supervised_profile,
             supervised_optimizer,
+            (unsigned int)validation_seed,
+            aux_checkpoints,
             rl_reward_mode,
             &reward_config,
             expected_policy_tag,
@@ -3227,6 +3271,8 @@ static int showdown_client_main(int argc, char** argv) {
             adam_epsilon,
             supervised_profile,
             supervised_optimizer,
+            (unsigned int)validation_seed,
+            aux_checkpoints,
             rl_reward_mode,
             &reward_config,
             expected_policy_tag,
@@ -3236,7 +3282,8 @@ static int showdown_client_main(int argc, char** argv) {
             anchor_kl_coef);
     }
     if (argc >= 4 && strcmp(argv[1], "--eval-supervised") == 0) {
-        return evaluate_checkpoint_on_replay_file(argv[2], argv[3], &reward_config);
+        return evaluate_checkpoint_on_replay_file(
+            argv[2], argv[3], (unsigned int)validation_seed, &reward_config);
     }
     if (argc >= 4 && strcmp(argv[1], "--clean-replay") == 0) {
         return clean_replay_file(argv[2], argv[3]);
@@ -3263,12 +3310,12 @@ static int showdown_client_main(int argc, char** argv) {
         fprintf(stderr,
         "Usage:\n"
         "  showdown_client --battle-agent [checkpoint]\n"
-        "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--supervised-profile 0|1]\n"
+        "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--ppo-minibatch-episodes N] [--target-kl F] [--shuffle-seed N] [--episode-limit N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
-        "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin>\n"
+        "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin> [--validation-seed N]\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
         "  showdown_client --export-battle <replay.jsonl> <battle_id> <output.json>\n"
         "  Set PORYGON_DEMO_GRU=1 for the demo mode.\n"

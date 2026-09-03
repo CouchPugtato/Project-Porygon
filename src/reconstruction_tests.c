@@ -5,6 +5,7 @@
 #include "gru_trainer.h"
 #include "learning_diagnostics.h"
 #include "policy_evaluation.h"
+#include "validation_split.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -4088,6 +4089,19 @@ cleanup:
     return ok;
 }
 
+static int test_validation_split_is_stable_and_seeded(void) {
+    uint64_t expected = UINT64_C(5406646322143240280);
+    if (!assert_true(validation_split_hash("battle-4", 1337u) == expected,
+            "validation split hash stays stable across builds")) return 0;
+    if (!assert_true(validation_split_contains("battle-4", 1337u),
+            "stable hash assigns matching battle to validation")) return 0;
+    if (!assert_true(!validation_split_contains("battle-alpha", 1337u),
+            "stable hash leaves nonmatching battle in training")) return 0;
+    return assert_true(
+        validation_split_hash("battle-alpha", 1337u) != validation_split_hash("battle-alpha", 1338u),
+        "validation seed changes the split hash");
+}
+
 int main(int argc, char** argv) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
@@ -4114,6 +4128,7 @@ int main(int argc, char** argv) {
     if (!test_policy_evaluation_matches_legal_runtime_policy()) return 1;
     if (!test_supervised_overfit_diagnostic_learns()) return 1;
     if (!test_ppo_update_moves_policy_and_value_in_expected_directions()) return 1;
+    if (!test_validation_split_is_stable_and_seeded()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;
     if (!test_observation_exports_active_slot_identity()) return 1;

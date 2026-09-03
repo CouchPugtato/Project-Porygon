@@ -13,6 +13,14 @@ DEFAULT_MAX_ACTIVE_MEMBERS = 5
 VALID_MEMBER_STATUSES = {"candidate", "active", "inactive", "rejected"}
 VALID_MEMBER_ROLES = {"main", "main_exploiter", "league_exploiter", "historical_snapshot", "champion"}
 PROMOTABLE_STATUSES = {"candidate", "active"}
+UNTRUSTED_LEGACY_CHECKPOINTS = {
+    "current_arch_full_ep10.chk",
+    "current_arch_full_ep20.chk",
+}
+
+
+def is_untrusted_legacy_checkpoint(path: str | Path) -> bool:
+    return Path(path).name.lower() in UNTRUSTED_LEGACY_CHECKPOINTS
 
 
 def parse_bool01(value: str) -> bool:
@@ -187,9 +195,10 @@ def opponent_stats_from_json(raw: object) -> dict[str, OpponentStats]:
 
 
 def league_member_from_json(raw: dict[str, object]) -> LeagueMember:
+    path = str(raw.get("path", "")).strip()
     return LeagueMember(
         id=str(raw.get("id", "")).strip(),
-        path=str(raw.get("path", "")).strip(),
+        path=path,
         generation=int(raw.get("generation", 0)),
         status=str(raw.get("status", "")).strip(),
         collection_weight=float(raw.get("collection_weight", 0.0)),
@@ -201,7 +210,7 @@ def league_member_from_json(raw: dict[str, object]) -> LeagueMember:
         source_run=str(raw.get("source_run", "")).strip(),
         experiment_id=str(raw.get("experiment_id", "")).strip(),
         training_config_id=str(raw.get("training_config_id", "")).strip(),
-        snapshot_eligible=bool(raw.get("snapshot_eligible", True)),
+        snapshot_eligible=bool(raw.get("snapshot_eligible", True)) and not is_untrusted_legacy_checkpoint(path),
         eval=league_eval_from_json(raw.get("eval")),
         opponent_stats=opponent_stats_from_json(raw.get("opponent_stats")),
         promoted_at=str(raw.get("promoted_at", "")),
@@ -342,10 +351,17 @@ def build_pool_payload(
     normalize_member_weights: bool,
     top_k: int,
 ) -> dict[str, object]:
+    automatic_selection = preset != "none"
     if preset != "none":
         champion = find_member(registry, registry.champion_id) if registry.champion_id else None
         if preset == "champion-plus-random":
-            selected = [champion] if champion is not None else []
+            selected = (
+                [champion]
+                if champion is not None
+                and champion.snapshot_eligible
+                and not is_untrusted_legacy_checkpoint(champion.path)
+                else []
+            )
             selected_member_ids = [member.id for member in selected]
             status_filter = "all"
             include_random = True
@@ -356,7 +372,13 @@ def build_pool_payload(
             if top_k <= 0:
                 raise SystemExit("--top-k must be > 0 when using --preset top-k")
             ranked = sorted(
-                [member for member in registry.members if member.status == "active"],
+                [
+                    member
+                    for member in registry.members
+                    if member.status == "active"
+                    and member.snapshot_eligible
+                    and not is_untrusted_legacy_checkpoint(member.path)
+                ],
                 key=lambda member: (member.generation, member.promoted_at or member.created_at, member.id),
                 reverse=True,
             )
@@ -372,6 +394,10 @@ def build_pool_payload(
         if status_filter != "all" and member.status != status_filter:
             continue
         if allowlist and member.id not in allowlist:
+            continue
+        if automatic_selection and (
+            not member.snapshot_eligible or is_untrusted_legacy_checkpoint(member.path)
+        ):
             continue
         selected.append(member)
     if allowlist:
@@ -461,7 +487,7 @@ def command_add_checkpoint(args: argparse.Namespace) -> None:
         source_run=args.source_run,
         experiment_id=args.experiment_id,
         training_config_id=args.training_config_id,
-        snapshot_eligible=args.snapshot_eligible,
+        snapshot_eligible=args.snapshot_eligible and not is_untrusted_legacy_checkpoint(args.path),
         created_at=utc_now_iso(),
     )
     registry.members.append(member)
@@ -519,6 +545,10 @@ def command_promote(args: argparse.Namespace) -> None:
     registry_path = Path(args.registry)
     registry = load_registry(registry_path)
     member = find_member(registry, args.id)
+    if is_untrusted_legacy_checkpoint(member.path):
+        raise SystemExit(
+            f"cannot promote untrusted legacy training milestone: {Path(member.path).name}"
+        )
     if args.generation is not None:
         member.generation = args.generation
     if member.status not in PROMOTABLE_STATUSES:

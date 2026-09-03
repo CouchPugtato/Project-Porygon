@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TextIO
 
 from artifact_io import write_json_atomically
+from league_manage import is_untrusted_legacy_checkpoint
 from rl_defaults import bool_default, float_default, int_default
 from eval_collapse_check import collapse_flags_for_group
 
@@ -218,6 +219,8 @@ def discover_confirmation_opponents(
                 if str(member.get("role", "")) == "historical_snapshot"
                 and str(member.get("status", "")) == "active"
                 and str(member.get("path", "")).strip()
+                and bool(member.get("snapshot_eligible", True))
+                and not is_untrusted_legacy_checkpoint(str(member.get("path", "")))
             ]
             champion_opponent_stats = (
                 champion.get("opponent_stats", {})

@@ -24,12 +24,15 @@ Files:
   - supports `--sample-files <N>` to train on a random subset of shards per epoch instead of the full run
   - supports `--reward-mode terminal|dense_additive` for RL reward shaping during replay reconstruction
   - supports `supervised_profile = true|false` to enable or fully disable per-episode supervised profiling work in `showdown_client`
+  - uses `validation_seed` to keep the battle-ID-based supervised holdout fixed across shards and epochs
+  - resumes the exact persisted epoch/shard plan when `resume = true`
   - supports a `Rich` live dashboard when `dashboard = true`
   - automatically falls back to plain-text output if `Rich` is unavailable or the terminal is not interactive
   - writes one raw trainer log per shard when `dashboard_write_raw_logs = true`
   - supports `env_<NAME> = <value>` entries to set subprocess environment variables for `showdown_client`
   - writes one batch-training stats JSON per shard under `models/runs/<run>/<checkpoint_stem>/<checkpoint_stem>_batch_training_stats/`
   - writes one training manifest JSON beside the checkpoint by default
+  - disables trainer-side auxiliary shard checkpoints and atomically publishes one checkpoint plus one weighted validation summary per complete dataset epoch
 - `live_rl_orchestrator.toml`
   - consumed by `py/tools/live_rl_orchestrator.py` before CLI args are applied
   - runs round-based live self-play RL using the current checkpoint on side `a`

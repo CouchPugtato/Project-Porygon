@@ -9,13 +9,23 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from balanced_checkpoint_eval import build_parser as build_balanced_eval_parser, prepare_shared_args
-from league_manage import LeagueEval, LeagueMember, LeagueRegistry, OpponentStats, build_pool_payload, league_member_from_json, member_to_json_dict
+from league_manage import (
+    LeagueEval,
+    LeagueMember,
+    LeagueRegistry,
+    OpponentStats,
+    build_pool_payload,
+    is_untrusted_legacy_checkpoint,
+    league_member_from_json,
+    member_to_json_dict,
+)
 from league_rl_orchestrator import (
     balanced_evaluation_artifacts_match,
     build_eval_command as build_league_eval_command,
     build_live_command as build_league_live_command,
     build_parser as build_league_parser,
     build_weighted_pool,
+    choose_parent_member,
     collect_recent_opponent_stats,
     league_promotion_assessment,
     matchup_difficulty_weight,
@@ -59,6 +69,55 @@ def member(
 
 
 class LeaguePoolTests(unittest.TestCase):
+    def test_legacy_epoch_artifacts_are_not_automatic_pool_candidates(self) -> None:
+        legacy = member("legacy")
+        legacy.path = "models/runs/run/current_arch_full_ep10.chk"
+        current = member("current")
+        registry = LeagueRegistry(1, current.id, 1, [legacy, current])
+
+        payload = build_pool_payload(
+            registry,
+            preset="active-mixed",
+            status_filter="active",
+            include_random=False,
+            random_weight=0.0,
+            selected_member_ids=[],
+            normalize_member_weights=False,
+            top_k=0,
+        )
+
+        self.assertTrue(is_untrusted_legacy_checkpoint(legacy.path))
+        self.assertFalse(is_untrusted_legacy_checkpoint(current.path))
+        checkpoint_names = [
+            item["name"] for item in payload["members"] if item["kind"] == "checkpoint"
+        ]
+        self.assertEqual(checkpoint_names, ["current"])
+
+    def test_legacy_champion_is_not_inferred_as_a_parent(self) -> None:
+        legacy = member("legacy", role="champion", generation=10)
+        legacy.path = "current_arch_full_ep10.chk"
+        current = member("current", role="main", generation=9)
+        registry = LeagueRegistry(10, legacy.id, 2, [legacy, current])
+
+        chosen = choose_parent_member(registry, "", "main")
+
+        self.assertEqual(chosen.id, "current")
+
+    def test_loading_legacy_epoch_artifact_disables_snapshot_eligibility(self) -> None:
+        restored = league_member_from_json(
+            {
+                "id": "legacy",
+                "path": "models/runs/run/current_arch_full_ep20.chk",
+                "generation": 1,
+                "status": "active",
+                "collection_weight": 1.0,
+                "role": "historical_snapshot",
+                "snapshot_eligible": True,
+            }
+        )
+
+        self.assertFalse(restored.snapshot_eligible)
+
     def test_champion_plus_random_preset_is_explicit(self) -> None:
         champion = member("champion")
         registry = LeagueRegistry(1, champion.id, 5, [champion, member("other")])

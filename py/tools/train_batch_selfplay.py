@@ -12,10 +12,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import TextIO
 
+from artifact_io import write_json_atomically
 from rl_defaults import float_default
 
 try:
@@ -142,6 +144,21 @@ def parse_key_values(line: str) -> dict[str, int | float | str]:
     return {match.group(1): coerce_value(match.group(2)) for match in KEY_VALUE_RE.finditer(line)}
 
 
+def validation_hash(battle_id: str, seed: int) -> int:
+    value = 14695981039346656037
+    for shift in range(0, 32, 8):
+        value ^= (seed >> shift) & 0xFF
+        value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    for byte in battle_id.encode("utf-8"):
+        value ^= byte
+        value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+
+def is_validation_battle(battle_id: str, seed: int) -> bool:
+    return validation_hash(battle_id, seed) % 10 == 0
+
+
 def batch_stats_dir(checkpoint_path: Path) -> Path:
     return checkpoint_path.parent / f"{checkpoint_path.stem}_batch_training_stats"
 
@@ -178,13 +195,13 @@ def collect_training_stats(lines: list[str]) -> dict[str, object]:
             profiles = stats.setdefault("supervised_profile", [])
             if isinstance(profiles, list):
                 profiles.append(parse_key_values(line))
-        elif line.startswith("[train] epoch=") and " validation action_loss=" in line:
+        elif (line.startswith("[train] epoch=") or line.startswith("[eval]")) and " validation action_loss=" in line:
             stats["validation_summary"] = parse_key_values(line)
-        elif line.startswith("[train] epoch=") and " validation top3_accuracy=" in line:
+        elif (line.startswith("[train] epoch=") or line.startswith("[eval]")) and " validation top3_accuracy=" in line:
             stats["validation_breakdown"] = parse_key_values(line)
-        elif line.startswith("[train] epoch=") and " validation metrics_version=" in line:
+        elif (line.startswith("[train] epoch=") or line.startswith("[eval]")) and " validation metrics_version=" in line:
             stats["validation_policy_metrics"] = parse_key_values(line)
-        elif line.startswith("[train] epoch=") and " validation elapsed=" in line:
+        elif (line.startswith("[train] epoch=") or line.startswith("[eval]")) and " validation elapsed=" in line:
             stats["validation_timing"] = parse_key_values(line)
         elif line.startswith("trained mode="):
             stats["final_train"] = parse_key_values(line)
@@ -205,6 +222,10 @@ def load_json_if_exists(path: Path) -> dict[str, object] | None:
 
 def replay_run_summary_path(run_name: str) -> Path:
     return DEFAULT_RUNS_ROOT / run_name / f"{run_name}_summary.json"
+
+
+def replay_run_manifest_path(run_name: str) -> Path:
+    return DEFAULT_RUNS_ROOT / run_name / f"{run_name}_manifest.json"
 
 
 def infer_collection_pool_source(run_name: str) -> dict[str, str]:
@@ -679,6 +700,44 @@ def run_trainer_and_capture(
     return return_code, captured_lines
 
 
+def evaluate_fixed_holdout(
+    args: argparse.Namespace,
+    replay_paths: list[Path],
+    checkpoint_path: Path,
+    repo_root: Path,
+    env: dict[str, str],
+    reporter: BaseReporter,
+    state: RunDisplayState,
+) -> dict[str, object]:
+    shard_stats: list[dict[str, object]] = []
+    state.current_shard_index = None
+    for index, replay_path in enumerate(replay_paths, start=1):
+        state.current_file = f"validation {index}/{len(replay_paths)}: {replay_path.name}"
+        state.last_notice = f"evaluating fixed holdout {index}/{len(replay_paths)}"
+        reporter.tick()
+        command = [
+            str(Path(args.trainer_exe)),
+            "--eval-supervised",
+            str(replay_path),
+            str(checkpoint_path),
+            "--validation-seed",
+            str(args.validation_seed),
+        ]
+        return_code, lines = run_trainer_and_capture(command, repo_root, env, reporter, None)
+        if return_code != 0:
+            raise RuntimeError(
+                f"fixed holdout evaluation failed shard={index}/{len(replay_paths)} "
+                f"path={replay_path} exit_code={return_code}"
+            )
+        shard_stats.append(collect_training_stats(lines))
+    state.current_file = None
+    return aggregate_validation_metrics(
+        shard_stats,
+        source_shard_count=len(replay_paths),
+        validation_seed=args.validation_seed,
+    )
+
+
 def write_batch_training_stats(
     path: Path,
     *,
@@ -718,9 +777,178 @@ def default_training_manifest_path(checkpoint_path: Path) -> Path:
     return checkpoint_path.parent / f"{checkpoint_path.stem}_training_manifest.json"
 
 
+def dataset_epoch_snapshot_path(checkpoint_path: Path, epoch: int) -> Path:
+    return checkpoint_path.with_name(
+        f"{checkpoint_path.stem}_dataset_epoch{epoch:03d}{checkpoint_path.suffix}"
+    )
+
+
+def dataset_epoch_validation_path(checkpoint_path: Path, epoch: int) -> Path:
+    return checkpoint_path.with_name(
+        f"{checkpoint_path.stem}_dataset_epoch{epoch:03d}_validation.json"
+    )
+
+
+def copy_file_atomically(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        shutil.copy2(source, temporary_path)
+        with temporary_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+VALIDATION_METRIC_DENOMINATORS = {
+    "action_nll": "turns",
+    "target_nll": "target_labels",
+    "full_turn_nll": "turns",
+    "value_loss": "turns",
+    "full_turn_accuracy": "turns",
+    "top3_accuracy": "turns",
+    "slot0_accuracy": "slot0_labels",
+    "slot1_accuracy": "slot1_labels",
+    "joint_pair_accuracy": "joint_pairs",
+    "kind_accuracy": "kind_labels",
+    "move_accuracy": "move_labels",
+    "switch_accuracy": "switch_labels",
+    "tera_accuracy": "tera_labels",
+    "target_accuracy": "target_labels",
+}
+
+VALIDATION_COUNT_KEYS = (
+    "turns",
+    "action_labels",
+    "slot0_labels",
+    "slot1_labels",
+    "joint_pairs",
+    "kind_labels",
+    "move_labels",
+    "switch_labels",
+    "tera_labels",
+    "target_labels",
+    "skipped_turns",
+    "illegal_predictions",
+    "nonfinite_values",
+)
+
+
+def aggregate_validation_metrics(
+    shard_stats: list[dict[str, object]],
+    *,
+    source_shard_count: int,
+    validation_seed: int,
+) -> dict[str, object]:
+    records = [
+        stats["validation_policy_metrics"]
+        for stats in shard_stats
+        if isinstance(stats.get("validation_policy_metrics"), dict)
+    ]
+    counts = {
+        key: sum(int(record.get(key, 0)) for record in records)
+        for key in VALIDATION_COUNT_KEYS
+    }
+    metrics: dict[str, float] = {}
+    for metric, denominator_key in VALIDATION_METRIC_DENOMINATORS.items():
+        denominator = counts[denominator_key]
+        weighted_sum = sum(
+            float(record.get(metric, 0.0)) * int(record.get(denominator_key, 0))
+            for record in records
+        )
+        metrics[metric] = weighted_sum / denominator if denominator > 0 else 0.0
+    return {
+        "metrics_version": 2,
+        "validation_seed": validation_seed,
+        "source_shard_count": source_shard_count,
+        "evaluated_shard_count": len(shard_stats),
+        "shards_with_holdout_labels": len(records),
+        "counts": counts,
+        "metrics": metrics,
+    }
+
+
+def validate_resume_manifest(
+    manifest: dict[str, object],
+    *,
+    run: str,
+    mode: str,
+    checkpoint: Path,
+    source_files: list[Path],
+    validation_seed: int,
+    epochs: int,
+    epochs_per_file: int,
+    sample_files: int,
+    shuffle: bool,
+) -> None:
+    expected_sources = [str(path.resolve()) for path in source_files]
+    checks = {
+        "run": run,
+        "mode": mode,
+        "output_checkpoint": str(checkpoint.resolve()),
+        "source_shards": expected_sources,
+        "validation_seed": validation_seed,
+        "epochs": epochs,
+        "epochs_per_file": epochs_per_file,
+        "sample_files": sample_files,
+        "shuffle": shuffle,
+    }
+    for key, expected in checks.items():
+        if manifest.get(key) != expected:
+            raise SystemExit(
+                f"cannot resume: manifest {key}={manifest.get(key)!r} does not match {expected!r}"
+            )
+    if not isinstance(manifest.get("epoch_plans"), dict) or not isinstance(
+        manifest.get("completed_shards"), list
+    ):
+        raise SystemExit("cannot resume: manifest predates resumable shard provenance")
+
+
+def completed_shard_map(manifest: dict[str, object]) -> dict[tuple[int, int, str], dict[str, object]]:
+    completed: dict[tuple[int, int, str], dict[str, object]] = {}
+    records = manifest.get("completed_shards", [])
+    if not isinstance(records, list):
+        return completed
+    for raw in records:
+        if not isinstance(raw, dict):
+            continue
+        key = (
+            int(raw.get("outer_epoch", 0)),
+            int(raw.get("shard_index", 0)),
+            str(raw.get("path", "")),
+        )
+        if key[0] > 0 and key[1] > 0 and key[2]:
+            completed[key] = raw
+    return completed
+
+
+def shard_identity(epoch: int, shard_index: int, replay_path: Path) -> tuple[int, int, str]:
+    return epoch, shard_index, str(replay_path.resolve())
+
+
+def completed_records_for_epoch(
+    completed: dict[tuple[int, int, str], dict[str, object]],
+    epoch: int,
+    replay_paths: list[Path],
+) -> dict[tuple[int, int, str], dict[str, object]]:
+    records: dict[tuple[int, int, str], dict[str, object]] = {}
+    for shard_index, replay_path in enumerate(replay_paths, start=1):
+        key = shard_identity(epoch, shard_index, replay_path)
+        if key in completed:
+            records[key] = completed[key]
+    return records
+
+
 def write_training_manifest(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_atomically(path, payload)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -737,6 +965,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shuffle", type=parse_bool01, default=True, help="Shuffle shard order each epoch")
     parser.add_argument("--supervised-profile", type=parse_bool01, default=True, help="Enable per-episode supervised profiling output")
     parser.add_argument("--supervised-optimizer", choices=["sgd", "adam"], default="sgd")
+    parser.add_argument("--validation-seed", type=int, default=1337)
+    parser.add_argument("--resume", type=parse_bool01, default=True)
     parser.add_argument("--dashboard", type=parse_bool01, default=True, help="Enable Rich dashboard output")
     parser.add_argument("--dashboard-visible-shards", type=positive_int, default=5, help="Number of shard rows to show in the dashboard")
     parser.add_argument("--dashboard-show-top-stats", type=parse_bool01, default=True, help="Show the dashboard top summary")
@@ -771,6 +1001,10 @@ def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> lis
                 "1" if args.supervised_profile else "0",
                 "--supervised-optimizer",
                 args.supervised_optimizer,
+                "--validation-seed",
+                str(args.validation_seed),
+                "--aux-checkpoints",
+                "0",
             ]
         )
         if args.learning_rate > 0.0:
@@ -820,6 +1054,8 @@ def main() -> None:
     argv = load_default_args(DEFAULT_ARGS_PATH) + sys.argv[1:]
     configured_env = load_default_env(DEFAULT_ARGS_PATH)
     args = parser.parse_args(argv)
+    if args.validation_seed < 0:
+        raise SystemExit("--validation-seed must be >= 0")
     repo_root = Path.cwd()
     run_dir = repo_root / DEFAULT_RUNS_ROOT / args.run
     trainer_exe = repo_root / Path(args.trainer_exe)
@@ -854,34 +1090,86 @@ def main() -> None:
 
     planned_total_shards = args.epochs * (min(len(all_files), args.sample_files) if args.sample_files > 0 else len(all_files))
     source_replay_summary = replay_run_summary_path(args.run).resolve()
+    source_replay_manifest = replay_run_manifest_path(args.run).resolve()
     collection_pool_source = infer_collection_pool_source(args.run)
-    training_manifest: dict[str, object] = {
-        "run": args.run,
-        "mode": args.mode,
-        "experiment_id": args.experiment_id,
-        "init_checkpoint": str(args.resolved_init_checkpoint) if args.resolved_init_checkpoint is not None else "",
-        "output_checkpoint": str(args.resolved_checkpoint.resolve()),
-        "checkpoint_initialized_from": initialized_checkpoint_path or "",
-        "checkpoint_preexisting": args.resolved_checkpoint.exists() and not initialized_from_init,
-        "source_replay_run": args.run,
-        "source_replay_summary_path": str(source_replay_summary) if source_replay_summary.exists() else "",
-        "collection_pool_source": collection_pool_source,
-        "pattern": args.pattern,
-        "reward_mode": args.reward_mode,
-        "gamma": args.gamma,
-        "learning_rate": args.learning_rate,
-        "entropy_coef": args.entropy_coef,
-        "advantage_norm": args.advantage_norm,
-        "sample_files": args.sample_files,
-        "epochs": args.epochs,
-        "epochs_per_file": args.epochs_per_file,
-        "shuffle": bool(args.shuffle),
-        "trainer_exe": str(trainer_exe.resolve()),
-        "configured_env": configured_env,
-        "status": "running",
-        "completed_files": 0,
-        "planned_total_shards": planned_total_shards,
-    }
+    existing_manifest = load_json_if_exists(args.resolved_manifest_path) if args.resume else None
+    if args.resume and args.resolved_manifest_path.exists() and existing_manifest is None:
+        raise SystemExit(f"cannot resume: manifest is not valid JSON: {args.resolved_manifest_path}")
+    if existing_manifest is not None:
+        validate_resume_manifest(
+            existing_manifest,
+            run=args.run,
+            mode=args.mode,
+            checkpoint=args.resolved_checkpoint,
+            source_files=all_files,
+            validation_seed=args.validation_seed,
+            epochs=args.epochs,
+            epochs_per_file=args.epochs_per_file,
+            sample_files=args.sample_files,
+            shuffle=bool(args.shuffle),
+        )
+        if existing_manifest.get("status") == "completed":
+            print(
+                f"[train_batch_selfplay] manifest already completed: {args.resolved_manifest_path}",
+                flush=True,
+            )
+            return
+        training_manifest = existing_manifest
+        training_manifest["status"] = "running"
+        training_manifest.pop("failure_reason", None)
+        raw_dataset_epochs = training_manifest.get("dataset_epochs", [])
+        dataset_epoch_records = (
+            [record for record in raw_dataset_epochs if isinstance(record, dict)]
+            if isinstance(raw_dataset_epochs, list)
+            else []
+        )
+        training_manifest["dataset_epochs"] = dataset_epoch_records
+        print(
+            f"[train_batch_selfplay] resuming from {args.resolved_manifest_path}",
+            flush=True,
+        )
+    else:
+        dataset_epoch_records: list[dict[str, object]] = []
+        training_manifest = {
+            "run": args.run,
+            "mode": args.mode,
+            "experiment_id": args.experiment_id,
+            "init_checkpoint": str(args.resolved_init_checkpoint) if args.resolved_init_checkpoint is not None else "",
+            "output_checkpoint": str(args.resolved_checkpoint.resolve()),
+            "checkpoint_initialized_from": initialized_checkpoint_path or "",
+            "checkpoint_preexisting": args.resolved_checkpoint.exists() and not initialized_from_init,
+            "source_replay_run": args.run,
+            "source_replay_summary_path": str(source_replay_summary) if source_replay_summary.exists() else "",
+            "source_replay_manifest_path": str(source_replay_manifest) if source_replay_manifest.exists() else "",
+            "collection_pool_source": collection_pool_source,
+            "pattern": args.pattern,
+            "reward_mode": args.reward_mode,
+            "supervised_optimizer": args.supervised_optimizer,
+            "validation_seed": args.validation_seed,
+            "aux_checkpoints": False,
+            "gamma": args.gamma,
+            "learning_rate": args.learning_rate,
+            "entropy_coef": args.entropy_coef,
+            "advantage_norm": args.advantage_norm,
+            "sample_files": args.sample_files,
+            "epochs": args.epochs,
+            "epochs_per_file": args.epochs_per_file,
+            "shuffle": bool(args.shuffle),
+            "trainer_exe": str(trainer_exe.resolve()),
+            "configured_env": configured_env,
+            "status": "running",
+            "completed_files": 0,
+            "planned_total_shards": planned_total_shards,
+            "source_shard_count": len(all_files),
+            "source_shards": [str(path.resolve()) for path in all_files],
+            "epoch_plans": {},
+            "completed_shards": [],
+            "dataset_epochs": dataset_epoch_records,
+        }
+
+    completed_shards = completed_shard_map(training_manifest)
+    completed_files = len(completed_shards)
+    training_manifest["completed_files"] = completed_files
     write_training_manifest(args.resolved_manifest_path, training_manifest)
     state = RunDisplayState(
         run=args.run,
@@ -889,13 +1177,13 @@ def main() -> None:
         checkpoint=str(args.resolved_checkpoint),
         epochs=args.epochs,
         planned_total_shards=planned_total_shards,
+        completed_files=completed_files,
         started_at=time.monotonic(),
         configured_env=configured_env,
     )
     reporter = select_reporter(args, state)
     reporter.run_started()
 
-    completed_files = 0
     shard_rate_ema = 0.0
     eta_alpha = 0.2
     eta_min_elapsed = 30.0
@@ -904,24 +1192,53 @@ def main() -> None:
 
     try:
         for epoch in range(1, args.epochs + 1):
-            epoch_files = list(all_files)
-            if args.shuffle:
-                random.shuffle(epoch_files)
-            if args.sample_files > 0 and len(epoch_files) > args.sample_files:
-                epoch_files = epoch_files[: args.sample_files]
+            epoch_plans = training_manifest["epoch_plans"]
+            assert isinstance(epoch_plans, dict)
+            plan_key = str(epoch)
+            stored_plan = epoch_plans.get(plan_key)
+            if isinstance(stored_plan, list):
+                epoch_files = [Path(str(path)) for path in stored_plan]
+                allowed_sources = {str(path.resolve()) for path in all_files}
+                unexpected = [path for path in epoch_files if str(path.resolve()) not in allowed_sources]
+                if unexpected:
+                    raise SystemExit(f"cannot resume: epoch {epoch} plan contains unknown shard {unexpected[0]}")
+            else:
+                epoch_files = list(all_files)
+                if args.shuffle:
+                    random.shuffle(epoch_files)
+                if args.sample_files > 0 and len(epoch_files) > args.sample_files:
+                    epoch_files = epoch_files[: args.sample_files]
+                epoch_plans[plan_key] = [str(path.resolve()) for path in epoch_files]
+                write_training_manifest(args.resolved_manifest_path, training_manifest)
+
+            epoch_completed = completed_records_for_epoch(completed_shards, epoch, epoch_files)
+            epoch_label_count = sum(int(record.get("label_count", 0)) for record in epoch_completed.values())
             epoch_started_at = time.monotonic()
             state.current_epoch = epoch
             state.current_epoch_shards = len(epoch_files)
-            state.current_epoch_completed = 0
+            state.current_epoch_completed = len(epoch_completed)
             state.current_shard_index = 1 if epoch_files else None
             state.epoch_shards = [
                 ShardDisplayState(epoch=epoch, shard_index=index, shard_count=len(epoch_files), filename=replay_path.name)
                 for index, replay_path in enumerate(epoch_files, start=1)
             ]
+            for index, replay_path in enumerate(epoch_files, start=1):
+                completed_key = shard_identity(epoch, index, replay_path)
+                completed_record = completed_shards.get(completed_key)
+                if completed_record is None:
+                    continue
+                shard_state = state.epoch_shards[index - 1]
+                shard_state.status = "done"
+                shard_state.stats_path = str(completed_record.get("stats_path", "")) or None
+                shard_state.progress_current = 1
+                shard_state.progress_total = 1
             state.last_notice = f"epoch {epoch}/{args.epochs} started"
             reporter.epoch_started()
 
             for shard_index, replay_path in enumerate(epoch_files, start=1):
+                completed_key = shard_identity(epoch, shard_index, replay_path)
+                if completed_key in completed_shards:
+                    continue
                 shard_started_at = time.monotonic()
                 command = trainer_command_for_file(args, replay_path)
                 raw_log = batch_log_path(args.resolved_checkpoint, epoch, shard_index, replay_path) if args.dashboard_write_raw_logs else None
@@ -977,6 +1294,24 @@ def main() -> None:
                         f"[train_batch_selfplay] shard failed epoch={epoch} shard={shard_index} "
                         f"path={replay_path} exit_code={return_code}"
                     )
+                final_train = parsed_stats.get("final_train")
+                if not isinstance(final_train, dict) or not isinstance(final_train.get("labels"), int):
+                    raise SystemExit(
+                        f"[train_batch_selfplay] trainer did not report an exact label count "
+                        f"epoch={epoch} shard={shard_index} path={replay_path}"
+                    )
+                epoch_label_count += int(final_train["labels"])
+                completed_record = {
+                    "outer_epoch": epoch,
+                    "shard_index": shard_index,
+                    "path": str(replay_path.resolve()),
+                    "label_count": int(final_train["labels"]),
+                    "stats_path": str(stats_path.resolve()),
+                }
+                raw_completed_shards = training_manifest["completed_shards"]
+                assert isinstance(raw_completed_shards, list)
+                raw_completed_shards.append(completed_record)
+                completed_shards[completed_key] = completed_record
 
                 if shard_state.progress_total <= 0:
                     shard_state.progress_total = 1
@@ -999,6 +1334,39 @@ def main() -> None:
                 training_manifest["completed_files"] = completed_files
                 training_manifest["current_epoch"] = epoch
                 training_manifest["last_completed_shard"] = shard_index
+                write_training_manifest(args.resolved_manifest_path, training_manifest)
+
+            epoch_already_published = any(
+                int(record.get("outer_epoch", 0)) == epoch for record in dataset_epoch_records
+            )
+            if args.mode == "supervised" and not epoch_already_published:
+                snapshot_path = dataset_epoch_snapshot_path(args.resolved_checkpoint, epoch)
+                validation_path = dataset_epoch_validation_path(args.resolved_checkpoint, epoch)
+                copy_file_atomically(args.resolved_checkpoint, snapshot_path)
+                validation_summary = evaluate_fixed_holdout(
+                    args,
+                    all_files,
+                    snapshot_path,
+                    repo_root,
+                    subprocess_env,
+                    reporter,
+                    state,
+                )
+                epoch_record = {
+                    "outer_epoch": epoch,
+                    "checkpoint": str(snapshot_path.resolve()),
+                    "training_shard_count": len(epoch_files),
+                    "source_shard_count": len(all_files),
+                    "label_count": epoch_label_count,
+                    "validation_seed": args.validation_seed,
+                    "source_manifest": str(source_replay_manifest) if source_replay_manifest.exists() else "",
+                    "training_shards": [str(path.resolve()) for path in epoch_files],
+                    "validation_summary": str(validation_path.resolve()),
+                }
+                validation_summary.update(epoch_record)
+                write_json_atomically(validation_path, validation_summary)
+                dataset_epoch_records.append(epoch_record)
+                training_manifest["dataset_epochs"] = dataset_epoch_records
                 write_training_manifest(args.resolved_manifest_path, training_manifest)
 
             epoch_elapsed = time.monotonic() - epoch_started_at

@@ -47,6 +47,7 @@ set(SHOWDOWN_CLIENT_SOURCES
 	src/gru_trainer.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c
+	src/validation_split.c
 )
 
 if(BUILD_LEGACY_NATIVE_SHOWDOWN)
@@ -73,6 +74,7 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/gru_trainer.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c
+	src/validation_split.c
 	src/id_tables.c
 	src/state_value.c
 	src/request_parser.c
