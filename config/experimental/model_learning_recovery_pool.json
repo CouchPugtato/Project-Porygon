@@ -1,0 +1,29 @@
+{
+  "coverage": {
+    "enabled": true,
+    "min_category_starts": 1,
+    "prefer_under_sampled_members": true
+  },
+  "members": [
+    {
+      "name": "random",
+      "kind": "random",
+      "weight": 0.4,
+      "category": "random"
+    },
+    {
+      "name": "current_arch_ep20_provisional",
+      "kind": "checkpoint",
+      "path": "models/runs/run_0093_current_arch_full/current_arch_full_ep20.chk",
+      "weight": 0.35,
+      "category": "parent"
+    },
+    {
+      "name": "run_0111_top_observed",
+      "kind": "checkpoint",
+      "path": "models/runs/run_0111_ppo_search_multi_batch_full_03_lr5em06_ent0p0003_anchor0p03_clip0p2_batch01_seed202_eps256/candidate.chk",
+      "weight": 0.25,
+      "category": "alternate"
+    }
+  ]
+}
