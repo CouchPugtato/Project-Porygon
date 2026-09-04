@@ -64,7 +64,9 @@ As of July 24, 2026, the intended long-term path is:
 3. capture provenance for collection, training, and eval runs
 4. reject obviously collapsed RL candidates before promotion discussion
 
-The current trusted baseline is `g4_teacher_sup_pool_wins_sup`.
+`g4_teacher_sup_pool_wins_sup` is the historical supervised baseline. The model
+learning audit did not verify it above random, so it is not a trusted strength
+baseline for promotion decisions.
 
 ## Warm-start training
 
@@ -97,10 +99,15 @@ regardless of shard ordering. After every complete outer dataset epoch, the wrap
 evaluates the resulting model over the holdout in every source shard and writes one
 label-count-weighted summary.
 
-Sharded supervised runs pass `--aux-checkpoints 0` to the C trainer so individual
-shards cannot overwrite `_epN`, `_epochN`, or `_best` files. The C trainer retains
-its compatible `--aux-checkpoints 1` default when invoked directly. The wrapper
-instead atomically publishes dataset-level artifacts:
+Sharded supervised runs write an ordered replay-path manifest and train every
+selected shard for an outer epoch inside one C process. Each replay runtime is
+freed before the next is loaded, while model weights and optimizer state stay
+alive. This prevents per-shard Adam resets without loading the whole dataset
+into memory. Adam moments are not stored in checkpoints, so they restart at an
+outer-epoch boundary. Use one outer epoch when diagnosing uninterrupted Adam
+training across a sampled shard set. The wrapper passes `--aux-checkpoints 0`;
+the C trainer retains its compatible `--aux-checkpoints 1` default for direct
+single-file use. The wrapper instead atomically publishes dataset-level artifacts:
 
 - `<checkpoint>_dataset_epochNNN.chk`
 - `<checkpoint>_dataset_epochNNN_validation.json`
@@ -131,6 +138,15 @@ The repository now has a first round-based actor -> learner path for live RL:
 This is intentionally round-based and restart-based. Actors are relaunched between rounds so each rollout batch is tied to one frozen policy version.
 
 League PPO is promotion-gated within the workflow. Each round runs as a one-update child capped by `--episode-limit` (default `256`), then receives a balanced screen (default 100 valid games per side). Safe candidates at or above `--round-expand-threshold` receive the full evaluation budget. Only a candidate that clears the full point, confidence, Tera, and collapse gates becomes the next round's parent. Rejected children remain recorded, the accepted parent is retained, the best observed child is preserved in the workflow manifest, and `--round-early-stop-patience` prevents a chain of degrading updates. Set `--round-gating false` only for deliberate legacy-style chained experiments.
+
+Controlled recovery runs can supply a fixed JSON pool with `--opponent-pool` and
+set `--round-eval-baseline random`. In that mode, a round advances only after a
+balanced random screen and full confirmation clear the configured confidence
+gate. `--eval-battle-seed-base` reuses one matched battle set across rounds so
+candidate comparisons have less matchup noise. Use `--registry-update false`
+while the starting checkpoint is provisional;
+the workflow retains all artifacts and its final assessment without changing the
+shared league registry.
 
 Artifacts:
 

@@ -352,6 +352,23 @@ def build_weighted_pool(
     }
 
 
+def load_fixed_opponent_pool(repo_root: Path, configured_path: str) -> tuple[Path, dict[str, object]]:
+    source_path = resolve_path(repo_root, configured_path)
+    if not source_path.exists():
+        raise SystemExit(f"opponent pool not found: {source_path}")
+    payload = load_json(source_path)
+    members = payload.get("members")
+    if not isinstance(members, list) or not members:
+        raise SystemExit(f"invalid opponent pool {source_path}: expected non-empty 'members'")
+    return source_path, payload
+
+
+def round_evaluation_baseline(selection: str, parent_checkpoint: Path) -> str | Path:
+    if selection == "random":
+        return "random"
+    return parent_checkpoint
+
+
 def load_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -1033,6 +1050,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dashboard", type=parse_bool, default=True)
     parser.add_argument("--dashboard-refresh-per-second", type=positive_float, default=8.0)
     parser.add_argument("--dashboard-write-raw-logs", type=parse_bool, default=True)
+    parser.add_argument("--opponent-pool", default="", help="Optional fixed pool JSON; disables registry-derived pool construction")
     parser.add_argument("--include-random-weight", type=float, default=0.0)
     parser.add_argument("--matchup-target-win-rate", type=target_win_rate_float, default=DEFAULT_MATCHUP_TARGET_WIN_RATE)
     parser.add_argument("--matchup-min-weight", type=positive_unit_float, default=DEFAULT_MATCHUP_MIN_WEIGHT)
@@ -1040,18 +1058,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-category-starts", type=nonnegative_int, default=DEFAULT_MIN_CATEGORY_STARTS)
     parser.add_argument("--eval-games", type=positive_int, default=500, help="Required valid evaluation games per candidate side")
     parser.add_argument("--round-gating", type=parse_bool, default=True, help="Evaluate each round before allowing its checkpoint to become the next parent")
+    parser.add_argument("--round-eval-baseline", choices=["parent", "random"], default="parent")
     parser.add_argument("--round-screen-games", type=positive_int, default=100, help="Valid screening games per side after each training round")
     parser.add_argument("--round-expand-threshold", type=float, default=0.50, help="Minimum screening score that advances to full evaluation")
     parser.add_argument("--round-early-stop-patience", type=positive_int, default=1, help="Stop after this many consecutive rejected rounds")
     parser.add_argument("--eval-concurrent-games", type=positive_int, default=40)
     parser.add_argument("--eval-worker-pairs", type=positive_int, default=120)
     parser.add_argument("--eval-max-replacement-attempts", type=positive_int, default=5)
+    parser.add_argument("--eval-battle-seed-base", type=int, default=None, help="Optional matched battle seed base for every balanced round evaluation")
     parser.add_argument("--startup-timeout-seconds", type=positive_int, default=120)
     parser.add_argument("--promote-threshold", type=float, default=float_default("promotion_earned_win_rate"))
     parser.add_argument("--promotion-confidence-threshold", type=float, default=DEFAULT_PROMOTION_CONFIDENCE_THRESHOLD)
     parser.add_argument("--min-promotion-tera-ratio", type=float, default=float_default("promotion_min_tera_baseline_ratio"))
     parser.add_argument("--snapshot-cadence", type=positive_int, default=5)
     parser.add_argument("--max-active-historical", type=positive_int, default=20)
+    parser.add_argument("--registry-update", type=parse_bool, default=True, help="Publish the final candidate and opponent statistics to the league registry")
     return parser
 
 
@@ -1091,16 +1112,20 @@ def main() -> None:
     pool_path = workflow_dir / f"{args.run_name}_opponent_pool.json"
     args.eval_run_name = f"{args.run_name}_vs_champion_balanced_{args.eval_games}_per_side"
 
-    pool_payload = build_weighted_pool(
-        registry,
-        args.learner_role,
-        parent_member.id,
-        args.include_random_weight,
-        target_win_rate=args.matchup_target_win_rate,
-        min_difficulty_weight=args.matchup_min_weight,
-        confidence_games=args.matchup_confidence_games,
-        min_category_starts=args.min_category_starts,
-    )
+    fixed_pool_source: Path | None = None
+    if args.opponent_pool:
+        fixed_pool_source, pool_payload = load_fixed_opponent_pool(repo_root, args.opponent_pool)
+    else:
+        pool_payload = build_weighted_pool(
+            registry,
+            args.learner_role,
+            parent_member.id,
+            args.include_random_weight,
+            target_win_rate=args.matchup_target_win_rate,
+            min_difficulty_weight=args.matchup_min_weight,
+            confidence_games=args.matchup_confidence_games,
+            min_category_starts=args.min_category_starts,
+        )
     write_json(pool_path, pool_payload)
 
     if args.resume and workflow_manifest_path.exists():
@@ -1111,6 +1136,7 @@ def main() -> None:
         workflow_manifest["parent_checkpoint"] = parent_member.path
         workflow_manifest["pool_path"] = str(pool_path)
         workflow_manifest["pool_payload"] = pool_payload
+        workflow_manifest["fixed_pool_source"] = str(fixed_pool_source) if fixed_pool_source else ""
         log(f"resuming league workflow from {workflow_manifest_path}")
     else:
         workflow_manifest = {
@@ -1123,20 +1149,24 @@ def main() -> None:
             "parent_checkpoint": parent_member.path,
             "pool_path": str(pool_path),
             "pool_payload": pool_payload,
+            "fixed_pool_source": str(fixed_pool_source) if fixed_pool_source else "",
         }
     workflow_manifest["evaluation_config"] = {
         "mode": "balanced_valid_games",
         "valid_games_per_side": args.eval_games,
         "max_replacement_attempts": args.eval_max_replacement_attempts,
+        "battle_seed_base": args.eval_battle_seed_base,
         "promotion_min_win_rate": args.promote_threshold,
         "promotion_confidence_threshold": args.promotion_confidence_threshold,
         "min_promotion_tera_ratio": args.min_promotion_tera_ratio,
         "champion_id": champion.id if champion is not None else "",
         "champion_checkpoint": str(champion_checkpoint) if champion_checkpoint is not None else "",
         "round_gating": args.round_gating,
+        "round_eval_baseline": args.round_eval_baseline,
         "round_screen_games_per_side": args.round_screen_games,
         "round_expand_threshold": args.round_expand_threshold,
         "round_early_stop_patience": args.round_early_stop_patience,
+        "registry_update": args.registry_update,
     }
     workflow_manifest["training_config"] = {
         "mode": args.training_mode,
@@ -1243,10 +1273,13 @@ def main() -> None:
         comparison_summary_path: Path | None = None
         comparison_collapse_flags = list(training_collapse_flags)
         gate_assessment: dict[str, object] | None = None
-        accepted = not args.round_gating or champion_checkpoint is None
+        accepted = not args.round_gating
         expanded = False
+        evaluation_baseline = round_evaluation_baseline(
+            args.round_eval_baseline, round_parent_checkpoint,
+        )
 
-        if args.round_gating and champion_checkpoint is not None:
+        if args.round_gating:
             screen_run_name = (
                 f"{args.run_name}_round{round_index:02d}_screen_balanced_"
                 f"{args.round_screen_games}_per_side"
@@ -1258,7 +1291,7 @@ def main() -> None:
                 screen_args,
                 repo_root,
                 round_candidate_checkpoint,
-                round_parent_checkpoint,
+                evaluation_baseline,
                 reporter,
                 logs_dir,
             )
@@ -1284,7 +1317,7 @@ def main() -> None:
                     confirmation_args,
                     repo_root,
                     round_candidate_checkpoint,
-                    round_parent_checkpoint,
+                    evaluation_baseline,
                     reporter,
                     logs_dir,
                 )
@@ -1319,6 +1352,7 @@ def main() -> None:
             "round": round_index,
             "run_name": round_run_name,
             "parent_checkpoint": str(round_parent_checkpoint),
+            "evaluation_baseline": model_spec_payload(evaluation_baseline),
             "candidate_checkpoint": str(round_candidate_checkpoint),
             "live_manifest_path": str(live_manifest_path),
             "training_collapse_flags": training_collapse_flags,
@@ -1344,6 +1378,7 @@ def main() -> None:
             "round": round_index,
             "candidate_checkpoint": round_candidate_checkpoint,
             "parent_checkpoint": round_parent_checkpoint,
+            "evaluation_baseline": evaluation_baseline,
             "summary": comparison_summary,
             "summary_path": comparison_summary_path,
             "collapse_flags": comparison_collapse_flags,
@@ -1395,16 +1430,21 @@ def main() -> None:
     eval_summary_path = best_round["summary_path"]
     promotion_assessment = None
 
-    # A later accepted parent was evaluated against its predecessor. Promotion
-    # still requires a direct, fully sized comparison with the registry champion.
-    best_baseline = Path(best_round["parent_checkpoint"]).resolve()
+    # Registry publication still requires a direct comparison with its champion,
+    # even when round acceptance used a different baseline.
+    best_baseline = best_round["evaluation_baseline"]
     best_has_full_eval = (
         eval_summary is not None
         and int(eval_summary.get("target_valid_games_per_side", 0) or 0) == args.eval_games
     )
-    if champion is not None and champion_checkpoint is not None:
+    best_baseline_is_champion = (
+        champion_checkpoint is not None
+        and isinstance(best_baseline, Path)
+        and best_baseline.resolve() == champion_checkpoint.resolve()
+    )
+    if args.registry_update and champion is not None and champion_checkpoint is not None:
         if not args.round_gating or (
-            best_baseline != champion_checkpoint.resolve() and best_has_full_eval
+            not best_baseline_is_champion and best_has_full_eval
         ):
             final_args = evaluation_args_for_round(
                 args,
@@ -1428,69 +1468,79 @@ def main() -> None:
         reporter.state.collapse_flags = list(collapse_flags)
         reporter.state.set_promotion(promotion_assessment)
         reporter.notice(f"promotion assessment: {promotion_assessment['status']}")
-    else:
+    elif args.registry_update:
         eval_summary = None
         eval_summary_path = None
+    elif eval_summary is not None:
+        promotion_assessment = league_promotion_assessment(args, eval_summary, collapse_flags)
+        reporter.state.collapse_flags = list(collapse_flags)
+        reporter.state.set_promotion(promotion_assessment)
+        reporter.notice(
+            f"controlled-run assessment: {promotion_assessment['status']} (registry unchanged)"
+        )
 
     recent_opponent_stats = collect_recent_opponent_stats(repo_root, round_manifests, args.run_name)
-    if recent_opponent_stats:
-        parent_member.opponent_stats = recent_opponent_stats
-
     candidate_id = args.member_id or args.run_name
-    if registry_has_member(registry, candidate_id):
-        candidate = find_member(registry, candidate_id)
-        candidate.path = str(candidate_checkpoint)
-        candidate.parent_id = parent_member.id
+    promoted = False
+    if args.registry_update:
         if recent_opponent_stats:
-            candidate.opponent_stats = recent_opponent_stats
-    else:
-        candidate = create_member_from_run(
-            args,
-            registry,
-            candidate_checkpoint,
-            parent_member,
-            eval_summary_path,
-            eval_summary,
-            collapse_flags,
-            recent_opponent_stats,
-        )
-        registry.members.append(candidate)
-        registry.current_generation = max(registry.current_generation, candidate.generation)
-    if eval_summary is not None:
-        candidate.eval.vs_champion_win_rate = float(eval_summary.get("valid_win_rate", 0.0) or 0.0)
-        candidate.eval.summary_path = str(eval_summary_path) if eval_summary_path else ""
-        candidate.eval.collapse_flags = list(collapse_flags)
+            parent_member.opponent_stats = recent_opponent_stats
+        if registry_has_member(registry, candidate_id):
+            candidate = find_member(registry, candidate_id)
+            candidate.path = str(candidate_checkpoint)
+            candidate.parent_id = parent_member.id
+            if recent_opponent_stats:
+                candidate.opponent_stats = recent_opponent_stats
+        else:
+            candidate = create_member_from_run(
+                args,
+                registry,
+                candidate_checkpoint,
+                parent_member,
+                eval_summary_path,
+                eval_summary,
+                collapse_flags,
+                recent_opponent_stats,
+            )
+            registry.members.append(candidate)
+            registry.current_generation = max(registry.current_generation, candidate.generation)
+        if eval_summary is not None:
+            candidate.eval.vs_champion_win_rate = float(eval_summary.get("valid_win_rate", 0.0) or 0.0)
+            candidate.eval.summary_path = str(eval_summary_path) if eval_summary_path else ""
+            candidate.eval.collapse_flags = list(collapse_flags)
 
-    if args.learner_role == "main" and len(round_records) >= args.snapshot_cadence:
-        snapshot_member = LeagueMember(
-            id=f"{candidate.id}_snapshot",
-            path=str(candidate_checkpoint),
-            generation=candidate.generation,
-            status="active",
-            collection_weight=1.0,
-            role="historical_snapshot",
-            parent_id=candidate.id,
-            regime="rl",
-            source_run=args.run_name,
-            experiment_id=args.experiment_id,
-            training_config_id=args.training_config_id,
-            snapshot_eligible=False,
-            opponent_stats=dict(recent_opponent_stats),
-        )
-        registry.members.append(snapshot_member)
+        if args.learner_role == "main" and len(round_records) >= args.snapshot_cadence:
+            registry.members.append(LeagueMember(
+                id=f"{candidate.id}_snapshot",
+                path=str(candidate_checkpoint),
+                generation=candidate.generation,
+                status="active",
+                collection_weight=1.0,
+                role="historical_snapshot",
+                parent_id=candidate.id,
+                regime="rl",
+                source_run=args.run_name,
+                experiment_id=args.experiment_id,
+                training_config_id=args.training_config_id,
+                snapshot_eligible=False,
+                opponent_stats=dict(recent_opponent_stats),
+            ))
 
-    if eval_summary is not None:
-        maybe_promote_candidate(args, registry, candidate, eval_summary, collapse_flags)
+        if eval_summary is not None:
+            maybe_promote_candidate(args, registry, candidate, eval_summary, collapse_flags)
 
-    historical_active = [member for member in registry.members if member.role == "historical_snapshot" and member.status == "active"]
-    for member in sort_recent(historical_active)[args.max_active_historical:]:
-        member.status = "inactive"
-
-    save_registry(registry_path, registry)
+        historical_active = [
+            member for member in registry.members
+            if member.role == "historical_snapshot" and member.status == "active"
+        ]
+        for member in sort_recent(historical_active)[args.max_active_historical:]:
+            member.status = "inactive"
+        save_registry(registry_path, registry)
+        promoted = registry.champion_id == candidate.id
 
     workflow_manifest["status"] = "completed"
     workflow_manifest["completed_at_unix"] = utc_now_unix()
-    workflow_manifest["candidate_id"] = candidate.id
+    workflow_manifest["candidate_id"] = candidate_id
     workflow_manifest["candidate_checkpoint"] = str(candidate_checkpoint)
     workflow_manifest["best_round"] = int(best_round["round"])
     workflow_manifest["rounds_completed"] = len(round_records)
@@ -1499,7 +1549,8 @@ def main() -> None:
     workflow_manifest["post_eval_collapse_flags"] = collapse_flags
     workflow_manifest["promotion_assessment"] = promotion_assessment
     workflow_manifest["recent_opponent_stats"] = opponent_stats_payload(recent_opponent_stats)
-    workflow_manifest["promoted"] = bool(registry.champion_id == candidate.id)
+    workflow_manifest["registry_updated"] = args.registry_update
+    workflow_manifest["promoted"] = promoted
     write_json(workflow_manifest_path, workflow_manifest)
     reporter.close()
 

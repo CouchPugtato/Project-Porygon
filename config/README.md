@@ -431,6 +431,13 @@ Registry additions:
 
 `league_rl_orchestrator.py` builds role-aware pools with separate champion, recent-main, historical, and exploiter budgets. Within each category it favors opponents whose recent learner win rate is closest to `league_matchup_target_win_rate` (default `0.50`). Low-sample results are shrunk toward the target using `league_matchup_confidence_games`, and `league_matchup_min_weight` keeps every eligible opponent in circulation. Generated pools require `league_min_category_starts` worker assignments per active category (default `1`); override it with `--min-category-starts`, or set it to `0` to disable quotas.
 
+Pass `--opponent-pool <path>` to use an exact static pool instead of deriving one
+from the registry. `experimental/model_learning_recovery_pool.json` mixes random,
+the provisional ep20 checkpoint, and the strongest run 0111 candidate. Pair it
+with `--round-eval-baseline random --registry-update false` so advancement means
+beating random with the configured confidence bound while the shared registry
+remains unchanged.
+
 League evaluation is balanced across both player sides. `--eval-games` specifies the valid-game target for each side, while disconnects and forfeits are replaced up to `--eval-max-replacement-attempts`. Promotion requires the point estimate in `promotion_earned_win_rate`, a lower 95% Wilson bound above `promotion_confidence_threshold`, no collapse flags, and sufficient Tera use relative to the champion. The combined summary and workflow manifest retain per-side runs, invalid counts, confidence bounds, promotion-gate results, and the complete PPO training configuration. League PPO defaults use `league_ppo_learning_rate = 0.00001` and `league_ppo_entropy_coef = 0.0001`, and the orchestrator forwards the shared anchor, clipping, KL-guard, minibatch, and Adam settings.
 
 Examples:

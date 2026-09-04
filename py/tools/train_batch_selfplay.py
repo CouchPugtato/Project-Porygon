@@ -39,6 +39,8 @@ DEFAULT_ARGS_PATH = Path("config/train_batch_selfplay.toml")
 KEY_VALUE_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 EPISODES_RE = re.compile(r"episodes=(\d+)/(\d+)")
 TRAIN_SPLIT_RE = re.compile(r"split train_sessions=(\d+)")
+BATCH_FILE_START_RE = re.compile(r"\[train-batch\] file_start index=(\d+)/(\d+).* path=(.+)$")
+BATCH_FILE_COMPLETE_RE = re.compile(r"\[train-batch\] file_complete index=(\d+)/(\d+)")
 
 
 def ema_update(previous: float, sample: float, alpha: float) -> float:
@@ -177,6 +179,44 @@ def batch_log_path(checkpoint_path: Path, epoch: int, shard_index: int, replay_p
     return batch_log_dir(checkpoint_path) / f"epoch{epoch:03d}_shard{shard_index:04d}_{safe_replay}.log"
 
 
+def replay_path_manifest_path(checkpoint_path: Path, epoch: int) -> Path:
+    return checkpoint_path.parent / f"{checkpoint_path.stem}_epoch{epoch:03d}_replays.txt"
+
+
+def epoch_batch_stats_path(checkpoint_path: Path, epoch: int) -> Path:
+    return batch_stats_dir(checkpoint_path) / f"epoch{epoch:03d}_batch_training_stats.json"
+
+
+def epoch_batch_log_path(checkpoint_path: Path, epoch: int) -> Path:
+    return batch_log_dir(checkpoint_path) / f"epoch{epoch:03d}_batch.log"
+
+
+def epoch_work_checkpoint_path(checkpoint_path: Path, epoch: int) -> Path:
+    return checkpoint_path.with_name(f".{checkpoint_path.stem}_epoch{epoch:03d}_work{checkpoint_path.suffix}")
+
+
+def write_replay_path_manifest(path: Path, replay_paths: list[Path]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            for replay_path in replay_paths:
+                handle.write(str(replay_path.resolve()))
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def collect_training_stats(lines: list[str]) -> dict[str, object]:
     stats: dict[str, object] = {}
     for raw_line in lines:
@@ -189,6 +229,17 @@ def collect_training_stats(lines: list[str]) -> dict[str, object]:
             accepted = stats.setdefault("accepted_labels", [])
             if isinstance(accepted, list):
                 accepted.append(parse_key_values(line))
+        elif line.startswith("[train-batch] file_complete "):
+            batch_files = stats.setdefault("batch_files", [])
+            if isinstance(batch_files, list):
+                result = parse_key_values(line)
+                index_value = result.get("index")
+                if isinstance(index_value, str) and "/" in index_value:
+                    index_text, count_text = index_value.split("/", 1)
+                    if index_text.isdigit() and count_text.isdigit():
+                        result["index"] = int(index_text)
+                        result["file_count"] = int(count_text)
+                batch_files.append(result)
         elif line.startswith("[train] split "):
             stats["split"] = parse_key_values(line)
         elif line.startswith("[train] epoch=") and "supervised_profile" in line:
@@ -428,6 +479,28 @@ class RichDashboardReporter(BaseReporter):
             self.live.stop()
 
     def trainer_line(self, line: str) -> None:
+        batch_start = BATCH_FILE_START_RE.search(line)
+        if batch_start and self.state.epoch_shards:
+            index = int(batch_start.group(1))
+            if 1 <= index <= len(self.state.epoch_shards):
+                self.state.current_shard_index = index
+                self.state.current_file = Path(batch_start.group(3)).name
+                shard = self.state.epoch_shards[index - 1]
+                shard.status = "running"
+                shard.started_at = time.monotonic()
+        batch_complete = BATCH_FILE_COMPLETE_RE.search(line)
+        if batch_complete and self.state.epoch_shards:
+            index = int(batch_complete.group(1))
+            if 1 <= index <= len(self.state.epoch_shards):
+                shard = self.state.epoch_shards[index - 1]
+                if shard.started_at is not None:
+                    shard.elapsed_seconds = time.monotonic() - shard.started_at
+                shard.started_at = None
+                shard.status = "done"
+                shard.progress_current = shard.progress_total or 1
+                shard.progress_total = shard.progress_total or 1
+                self.state.current_epoch_completed = index
+                self.state.completed_files += 1
         if self.state.current_shard_index is not None and self.state.epoch_shards:
             shard = self.state.epoch_shards[self.state.current_shard_index - 1]
             split_match = TRAIN_SPLIT_RE.search(line)
@@ -800,7 +873,9 @@ def copy_file_atomically(source: Path, destination: Path) -> None:
     temporary_path = Path(temporary_name)
     try:
         shutil.copy2(source, temporary_path)
-        with temporary_path.open("rb") as handle:
+        # Windows rejects fsync on a read-only descriptor. The temporary copy
+        # must be opened writable even though no further bytes are changed.
+        with temporary_path.open("rb+") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary_path, destination)
     except BaseException:
@@ -951,6 +1026,41 @@ def write_training_manifest(path: Path, payload: dict[str, object]) -> None:
     write_json_atomically(path, payload)
 
 
+def batch_label_counts(parsed_stats: dict[str, object], expected_files: int) -> dict[int, int]:
+    batch_files = parsed_stats.get("batch_files")
+    final_train = parsed_stats.get("final_train")
+    if not isinstance(batch_files, list) or len(batch_files) != expected_files:
+        reported_files = len(batch_files) if isinstance(batch_files, list) else 0
+        raise ValueError(
+            f"trainer reported {reported_files} completed files for a {expected_files}-file manifest"
+        )
+    if not isinstance(final_train, dict) or not isinstance(final_train.get("labels"), int):
+        raise ValueError("trainer did not report an exact batch label count")
+
+    labels_by_index: dict[int, int] = {}
+    for result in batch_files:
+        if not isinstance(result, dict):
+            continue
+        index_value = result.get("index")
+        if isinstance(index_value, str) and "/" in index_value:
+            index_value = index_value.split("/", 1)[0]
+        try:
+            index = int(index_value)
+            labels = int(result.get("labels", 0))
+        except (TypeError, ValueError):
+            continue
+        labels_by_index[index] = labels
+
+    if set(labels_by_index) != set(range(1, expected_files + 1)):
+        raise ValueError("trainer batch file indices do not match the replay manifest")
+    if sum(labels_by_index.values()) != int(final_train["labels"]):
+        raise ValueError(
+            f"trainer batch label total mismatch files={sum(labels_by_index.values())} "
+            f"final={final_train['labels']}"
+        )
+    return labels_by_index
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True, help="Run name under matches/runs/")
@@ -1027,6 +1137,28 @@ def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> lis
     return command
 
 
+def trainer_command_for_manifest(args: argparse.Namespace, manifest_path: Path, checkpoint_path: Path) -> list[str]:
+    command = [
+        str(Path(args.trainer_exe)),
+        "--train-supervised-manifest",
+        str(manifest_path),
+        str(checkpoint_path),
+        "--epochs",
+        str(args.epochs_per_file),
+        "--supervised-profile",
+        "1" if args.supervised_profile else "0",
+        "--supervised-optimizer",
+        args.supervised_optimizer,
+        "--validation-seed",
+        str(args.validation_seed),
+        "--aux-checkpoints",
+        "0",
+    ]
+    if args.learning_rate > 0.0:
+        command.extend(["--learning-rate", str(args.learning_rate)])
+    return command
+
+
 def ensure_initialized_checkpoint(args: argparse.Namespace) -> tuple[bool, str | None]:
     resolved_init = args.resolved_init_checkpoint
     if args.resolved_checkpoint.exists():
@@ -1047,6 +1179,106 @@ def ensure_initialized_checkpoint(args: argparse.Namespace) -> tuple[bool, str |
         flush=True,
     )
     return True, str(resolved_init)
+
+
+def train_supervised_epoch_batch(
+    args: argparse.Namespace,
+    epoch: int,
+    epoch_files: list[Path],
+    repo_root: Path,
+    subprocess_env: dict[str, str],
+    reporter: BaseReporter,
+    state: RunDisplayState,
+) -> tuple[Path, Path, dict[int, int], float]:
+    path_manifest = replay_path_manifest_path(args.resolved_checkpoint, epoch)
+    work_checkpoint = epoch_work_checkpoint_path(args.resolved_checkpoint, epoch)
+    stats_path = epoch_batch_stats_path(args.resolved_checkpoint, epoch)
+    raw_log = epoch_batch_log_path(args.resolved_checkpoint, epoch) if args.dashboard_write_raw_logs else None
+
+    expected_paths = [str(path.resolve()) for path in epoch_files]
+    existing_paths = []
+    if path_manifest.exists():
+        existing_paths = path_manifest.read_text(encoding="utf-8").splitlines()
+    existing_stats = load_json_if_exists(stats_path)
+    if (
+        work_checkpoint.exists()
+        and work_checkpoint.stat().st_size > 0
+        and existing_paths == expected_paths
+        and isinstance(existing_stats, dict)
+        and existing_stats.get("return_code") == 0
+        and isinstance(existing_stats.get("stats"), dict)
+    ):
+        try:
+            labels_by_index = batch_label_counts(existing_stats["stats"], len(epoch_files))
+        except ValueError:
+            pass
+        else:
+            snapshot_path = dataset_epoch_snapshot_path(args.resolved_checkpoint, epoch)
+            copy_file_atomically(work_checkpoint, snapshot_path)
+            elapsed = float(existing_stats.get("elapsed_seconds", 0.0))
+            print(
+                f"[train_batch_selfplay] recovered completed epoch {epoch} batch from {work_checkpoint}",
+                flush=True,
+            )
+            state.last_notice = f"recovered completed epoch {epoch} batch"
+            return stats_path, work_checkpoint, labels_by_index, elapsed
+
+    write_replay_path_manifest(path_manifest, epoch_files)
+    if args.resolved_checkpoint.exists():
+        copy_file_atomically(args.resolved_checkpoint, work_checkpoint)
+    else:
+        work_checkpoint.unlink(missing_ok=True)
+
+    command = trainer_command_for_manifest(args, path_manifest, work_checkpoint)
+    raw_log_fp: TextIO | None = None
+    state.current_shard_index = None
+    state.current_file = "starting supervised batch"
+    state.last_notice = f"training {len(epoch_files)} shards in one optimizer process"
+    reporter.shard_started()
+    if raw_log is not None:
+        raw_log.parent.mkdir(parents=True, exist_ok=True)
+        raw_log_fp = raw_log.open("w", encoding="utf-8")
+    started_at = time.monotonic()
+    try:
+        return_code, captured_lines = run_trainer_and_capture(
+            command, repo_root, subprocess_env, reporter, raw_log_fp
+        )
+    finally:
+        if raw_log_fp is not None:
+            raw_log_fp.close()
+    elapsed = time.monotonic() - started_at
+    parsed_stats = collect_training_stats(captured_lines)
+    write_json_atomically(
+        stats_path,
+        {
+            "run": args.run,
+            "mode": args.mode,
+            "epoch": epoch,
+            "epochs": args.epochs,
+            "replay_manifest": str(path_manifest.resolve()),
+            "checkpoint": str(args.resolved_checkpoint),
+            "work_checkpoint": str(work_checkpoint),
+            "command": command,
+            "elapsed_seconds": elapsed,
+            "return_code": return_code,
+            "dashboard_mode": state.dashboard_mode,
+            "raw_log_path": str(raw_log) if raw_log else None,
+            "stats": parsed_stats,
+        },
+    )
+    if return_code != 0:
+        state.last_notice = f"supervised batch failed with exit code {return_code}"
+        reporter.shard_failed()
+        raise SystemExit(state.last_notice)
+
+    try:
+        labels_by_index = batch_label_counts(parsed_stats, len(epoch_files))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+
+    snapshot_path = dataset_epoch_snapshot_path(args.resolved_checkpoint, epoch)
+    copy_file_atomically(work_checkpoint, snapshot_path)
+    return stats_path, work_checkpoint, labels_by_index, elapsed
 
 
 def main() -> None:
@@ -1145,6 +1377,8 @@ def main() -> None:
             "pattern": args.pattern,
             "reward_mode": args.reward_mode,
             "supervised_optimizer": args.supervised_optimizer,
+            "supervised_batch_mode": args.mode == "supervised",
+            "optimizer_process_scope": "outer_epoch" if args.mode == "supervised" else "per_shard",
             "validation_seed": args.validation_seed,
             "aux_checkpoints": False,
             "gamma": args.gamma,
@@ -1213,6 +1447,9 @@ def main() -> None:
 
             epoch_completed = completed_records_for_epoch(completed_shards, epoch, epoch_files)
             epoch_label_count = sum(int(record.get("label_count", 0)) for record in epoch_completed.values())
+            completed_snapshot = dataset_epoch_snapshot_path(args.resolved_checkpoint, epoch)
+            if args.mode == "supervised" and len(epoch_completed) == len(epoch_files) and completed_snapshot.exists():
+                copy_file_atomically(completed_snapshot, args.resolved_checkpoint)
             epoch_started_at = time.monotonic()
             state.current_epoch = epoch
             state.current_epoch_shards = len(epoch_files)
@@ -1235,7 +1472,58 @@ def main() -> None:
             state.last_notice = f"epoch {epoch}/{args.epochs} started"
             reporter.epoch_started()
 
-            for shard_index, replay_path in enumerate(epoch_files, start=1):
+            training_files = epoch_files
+            if args.mode == "supervised":
+                if epoch_completed and len(epoch_completed) != len(epoch_files):
+                    raise SystemExit(
+                        "cannot switch a partially completed legacy supervised epoch to batch mode; "
+                        "finish it with the previous executable or start a new output checkpoint"
+                    )
+                training_files = []
+                if not epoch_completed:
+                    stats_path, work_checkpoint, labels_by_index, batch_elapsed = train_supervised_epoch_batch(
+                        args,
+                        epoch,
+                        epoch_files,
+                        repo_root,
+                        subprocess_env,
+                        reporter,
+                        state,
+                    )
+                    raw_completed_shards = training_manifest["completed_shards"]
+                    assert isinstance(raw_completed_shards, list)
+                    for shard_index, replay_path in enumerate(epoch_files, start=1):
+                        completed_record = {
+                            "outer_epoch": epoch,
+                            "shard_index": shard_index,
+                            "path": str(replay_path.resolve()),
+                            "label_count": labels_by_index[shard_index],
+                            "stats_path": str(stats_path.resolve()),
+                            "optimizer_process": f"outer_epoch_{epoch}",
+                        }
+                        raw_completed_shards.append(completed_record)
+                        completed_shards[shard_identity(epoch, shard_index, replay_path)] = completed_record
+                        shard_state = state.epoch_shards[shard_index - 1]
+                        shard_state.status = "done"
+                        shard_state.stats_path = str(stats_path)
+                        shard_state.progress_current = shard_state.progress_total or 1
+                        shard_state.progress_total = shard_state.progress_total or 1
+                    epoch_label_count = sum(labels_by_index.values())
+                    completed_files = len(completed_shards)
+                    state.completed_files = completed_files
+                    state.current_epoch_completed = len(epoch_files)
+                    training_manifest["completed_files"] = completed_files
+                    training_manifest["current_epoch"] = epoch
+                    training_manifest["last_completed_shard"] = len(epoch_files)
+                    write_training_manifest(args.resolved_manifest_path, training_manifest)
+                    copy_file_atomically(work_checkpoint, args.resolved_checkpoint)
+                    work_checkpoint.unlink(missing_ok=True)
+                    state.last_notice = (
+                        f"epoch {epoch} batch trained labels={epoch_label_count} elapsed={batch_elapsed:.1f}s"
+                    )
+                    reporter.shard_finished()
+
+            for shard_index, replay_path in enumerate(training_files, start=1):
                 completed_key = shard_identity(epoch, shard_index, replay_path)
                 if completed_key in completed_shards:
                     continue
@@ -1342,7 +1630,8 @@ def main() -> None:
             if args.mode == "supervised" and not epoch_already_published:
                 snapshot_path = dataset_epoch_snapshot_path(args.resolved_checkpoint, epoch)
                 validation_path = dataset_epoch_validation_path(args.resolved_checkpoint, epoch)
-                copy_file_atomically(args.resolved_checkpoint, snapshot_path)
+                if not snapshot_path.exists():
+                    copy_file_atomically(args.resolved_checkpoint, snapshot_path)
                 validation_summary = evaluate_fixed_holdout(
                     args,
                     all_files,

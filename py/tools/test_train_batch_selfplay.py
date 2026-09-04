@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,15 +13,21 @@ if str(TOOLS_DIR) not in sys.path:
 
 from train_batch_selfplay import (
     aggregate_validation_metrics,
+    batch_label_counts,
     collect_training_stats,
     completed_records_for_epoch,
     completed_shard_map,
+    copy_file_atomically,
     dataset_epoch_snapshot_path,
     dataset_epoch_validation_path,
+    epoch_work_checkpoint_path,
     is_validation_battle,
+    replay_path_manifest_path,
     trainer_command_for_file,
+    trainer_command_for_manifest,
     validate_resume_manifest,
     validation_hash,
+    write_replay_path_manifest,
 )
 
 
@@ -73,8 +80,65 @@ class TrainingStatsTests(unittest.TestCase):
         self.assertEqual(stats["validation_policy_metrics"]["metrics_version"], 2)
         self.assertEqual(stats["validation_policy_metrics"]["turns"], 12)
 
+    def test_supervised_manifest_command_keeps_shards_in_one_process(self) -> None:
+        args = SimpleNamespace(
+            trainer_exe="build-fresh/showdown_client.exe",
+            epochs_per_file=1,
+            supervised_profile=False,
+            supervised_optimizer="adam",
+            validation_seed=20260903,
+            learning_rate=0.001,
+        )
+
+        command = trainer_command_for_manifest(
+            args, Path("models/replays.txt"), Path("models/work.chk")
+        )
+
+        self.assertEqual(command[1], "--train-supervised-manifest")
+        self.assertEqual(command[2:4], [str(Path("models/replays.txt")), str(Path("models/work.chk"))])
+        self.assertEqual(command[command.index("--supervised-optimizer") + 1], "adam")
+
+    def test_collects_per_file_batch_results(self) -> None:
+        stats = collect_training_stats(
+            [
+                "[train-batch] file_complete index=1/2 train_sessions=12 labels=99 elapsed=1.2s",
+                "[train-batch] file_complete index=2/2 train_sessions=8 labels=51 elapsed=0.8s",
+                "trained mode=supervised step=150 labels=150 sessions=20",
+            ]
+        )
+
+        self.assertEqual([entry["labels"] for entry in stats["batch_files"]], [99, 51])
+        self.assertEqual([entry["index"] for entry in stats["batch_files"]], [1, 2])
+        self.assertEqual([entry["file_count"] for entry in stats["batch_files"]], [2, 2])
+        self.assertEqual(stats["final_train"]["labels"], 150)
+
+    def test_recovers_label_counts_from_pre_fix_batch_stats(self) -> None:
+        parsed_stats = {
+            "batch_files": [
+                {"index": "1/2", "labels": 99},
+                {"index": "2/2", "labels": 51},
+            ],
+            "final_train": {"labels": 150},
+        }
+
+        self.assertEqual(batch_label_counts(parsed_stats, 2), {1: 99, 2: 51})
+
 
 class ValidationProvenanceTests(unittest.TestCase):
+    def test_atomic_checkpoint_copy_replaces_destination_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.chk"
+            destination = root / "snapshots" / "epoch.chk"
+            source.write_bytes(b"new checkpoint")
+            destination.parent.mkdir()
+            destination.write_bytes(b"old checkpoint")
+
+            copy_file_atomically(source, destination)
+
+            self.assertEqual(destination.read_bytes(), b"new checkpoint")
+            self.assertEqual(list(destination.parent.glob("*.tmp")), [])
+
     def test_validation_split_is_stable_and_seeded(self) -> None:
         self.assertEqual(validation_hash("battle-4", 1337), 5406646322143240280)
         self.assertTrue(is_validation_battle("battle-4", 1337))
@@ -123,6 +187,27 @@ class ValidationProvenanceTests(unittest.TestCase):
             dataset_epoch_validation_path(checkpoint, 3),
             Path("models/run/model_dataset_epoch003_validation.json"),
         )
+        self.assertEqual(
+            replay_path_manifest_path(checkpoint, 3),
+            Path("models/run/model_epoch003_replays.txt"),
+        )
+        self.assertEqual(
+            epoch_work_checkpoint_path(checkpoint, 3),
+            Path("models/run/.model_epoch003_work.chk"),
+        )
+
+    def test_replay_path_manifest_preserves_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / "worker 2.jsonl", root / "worker_1.jsonl"]
+            manifest = root / "batch" / "replays.txt"
+
+            write_replay_path_manifest(manifest, paths)
+
+            self.assertEqual(
+                manifest.read_text(encoding="utf-8").splitlines(),
+                [str(path.resolve()) for path in paths],
+            )
 
     def test_resume_uses_exact_completed_shard_identity(self) -> None:
         checkpoint = Path("models/run/model.chk")

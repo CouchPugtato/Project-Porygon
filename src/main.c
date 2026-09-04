@@ -98,6 +98,12 @@ typedef struct {
     size_t label_weight_sum;
 } RlTrainingSummary;
 
+typedef enum {
+    TRAIN_INPUT_REPLAY = 0,
+    TRAIN_INPUT_EPISODE_BATCH = 1,
+    TRAIN_INPUT_REPLAY_MANIFEST = 2
+} TrainInputKind;
+
 static GruModel* create_default_model(void) {
     return gru_model_create(observation_flat_size(), 128, OBS_NUM_ACTIONS);
 }
@@ -2215,10 +2221,167 @@ static int run_runtime_mode(const char* checkpoint_path) {
     return 0;
 }
 
+static char* trim_manifest_line(char* line) {
+    char* start = line;
+    char* end;
+    while (*start && isspace((unsigned char)*start)) {
+        ++start;
+    }
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) {
+        --end;
+    }
+    *end = '\0';
+    return start;
+}
+
+static size_t replay_manifest_file_count(FILE* manifest) {
+    char line[4096];
+    size_t count = 0;
+    if (!manifest) {
+        return 0;
+    }
+    rewind(manifest);
+    while (fgets(line, sizeof(line), manifest)) {
+        char* path = trim_manifest_line(line);
+        if (*path && *path != '#') {
+            ++count;
+        }
+    }
+    rewind(manifest);
+    return count;
+}
+
+static int train_supervised_replay_manifest(
+    const char* manifest_path,
+    GruModel* model,
+    GruTrainer* trainer,
+    int epochs_per_file,
+    unsigned int validation_seed,
+    EnvRewardMode reward_mode,
+    const EnvDenseRewardConfig* dense_reward_config,
+    size_t* labels_out,
+    size_t* sessions_out
+) {
+    FILE* manifest;
+    char line[4096];
+    size_t file_count;
+    size_t file_index = 0;
+    size_t total_labels = 0;
+    size_t total_sessions = 0;
+
+    if (!manifest_path || !model || !trainer || epochs_per_file <= 0) {
+        return 0;
+    }
+    manifest = fopen(manifest_path, "r");
+    if (!manifest) {
+        fprintf(stderr, "Failed to open replay manifest '%s': %s\n", manifest_path, strerror(errno));
+        return 0;
+    }
+    file_count = replay_manifest_file_count(manifest);
+    if (file_count == 0) {
+        fprintf(stderr, "Replay manifest contains no paths: %s\n", manifest_path);
+        fclose(manifest);
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), manifest)) {
+        char* replay_path = trim_manifest_line(line);
+        EnvRuntime runtime;
+        size_t* train_indices = NULL;
+        size_t* val_indices = NULL;
+        size_t train_sessions = 0;
+        size_t val_sessions = 0;
+        size_t file_start_step;
+        clock_t file_start_clock;
+        int repeat;
+
+        if (!*replay_path || *replay_path == '#') {
+            continue;
+        }
+        ++file_index;
+        file_start_clock = clock();
+        if (!load_runtime_from_replay_file(
+                replay_path, model, &runtime, reward_mode, dense_reward_config)) {
+            fclose(manifest);
+            return 0;
+        }
+        if (!build_split_indices(
+                &runtime, validation_seed, &train_indices, &train_sessions, &val_indices, &val_sessions)) {
+            fprintf(stderr, "Failed to build split for replay manifest file '%s'\n", replay_path);
+            env_runtime_free(&runtime);
+            fclose(manifest);
+            return 0;
+        }
+        printf("[train-batch] file_start index=%zu/%zu train_sessions=%zu val_sessions=%zu path=%s\n",
+            file_index, file_count, train_sessions, val_sessions, replay_path);
+        fflush(stdout);
+        file_start_step = trainer->step;
+
+        for (repeat = 1; repeat <= epochs_per_file; ++repeat) {
+            size_t order_i;
+            shuffle_indices(train_indices, train_sessions);
+            for (order_i = 0; order_i < train_sessions; ++order_i) {
+                size_t session_index = train_indices[order_i];
+                if (!gru_trainer_supervised_episode(
+                        trainer, model, &runtime.sessions[session_index].episode)) {
+                    fprintf(stderr, "Failed supervised training episode in '%s'\n", replay_path);
+                    free(train_indices);
+                    free(val_indices);
+                    env_runtime_free(&runtime);
+                    fclose(manifest);
+                    return 0;
+                }
+                printf("[train-batch] file_progress index=%zu/%zu repeat=%d/%d episodes=%zu/%zu step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f\n",
+                    file_index,
+                    file_count,
+                    repeat,
+                    epochs_per_file,
+                    order_i + 1,
+                    train_sessions,
+                    trainer->step,
+                    trainer->last_action_loss,
+                    trainer->last_value_loss,
+                    trainer->last_accuracy);
+                fflush(stdout);
+            }
+        }
+
+        {
+            size_t file_labels = trainer->step - file_start_step;
+            double elapsed = elapsed_seconds_since(file_start_clock);
+            total_labels += file_labels;
+            total_sessions += train_sessions * (size_t)epochs_per_file;
+            printf("[train-batch] file_complete index=%zu/%zu train_sessions=%zu labels=%zu direct=%zu reconstructed=%zu failed=%zu elapsed=%.1fs\n",
+                file_index,
+                file_count,
+                train_sessions,
+                file_labels,
+                runtime.accepted_label_direct_count,
+                runtime.accepted_label_reconstructed_count,
+                runtime.accepted_label_failed_count,
+                elapsed);
+            fflush(stdout);
+        }
+        free(train_indices);
+        free(val_indices);
+        env_runtime_free(&runtime);
+    }
+
+    fclose(manifest);
+    if (labels_out) {
+        *labels_out = total_labels;
+    }
+    if (sessions_out) {
+        *sessions_out = total_sessions;
+    }
+    return 1;
+}
+
 static int train_from_input_file(
     const char* input_path,
     const char* checkpoint_path,
-    int input_is_episode_batch,
+    TrainInputKind input_kind,
     int rl_mode,
     int ppo_mode,
     int epochs,
@@ -2292,7 +2455,7 @@ static int train_from_input_file(
                 rl_reward_mode ? rl_reward_mode : "");
             return 1;
         }
-        if (!input_is_episode_batch && strstr(input_path, "legacy") != NULL) {
+        if (input_kind == TRAIN_INPUT_REPLAY && strstr(input_path, "legacy") != NULL) {
             printf("[train-rl] warning: replay path contains 'legacy'; RL is intended for fresh post-fix runs only\n");
         }
     } else {
@@ -2375,9 +2538,55 @@ static int train_from_input_file(
     } else {
         trainer.supervised_profile_enabled = supervised_profile;
         trainer.supervised_optimizer = supervised_optimizer;
+        trainer.adam_beta1 = adam_beta1;
+        trainer.adam_beta2 = adam_beta2;
+        trainer.adam_epsilon = adam_epsilon;
     }
 
-    if (!(input_is_episode_batch
+    if (input_kind == TRAIN_INPUT_REPLAY_MANIFEST) {
+        size_t trained_labels = 0;
+        size_t trained_sessions = 0;
+        if (rl_mode || !train_supervised_replay_manifest(
+                input_path,
+                model,
+                &trainer,
+                epochs,
+                validation_seed,
+                reward_mode,
+                reward_config ? &reward_config->dense_additive : NULL,
+                &trained_labels,
+                &trained_sessions)) {
+            gru_model_destroy(anchor_model);
+            gru_model_destroy(model);
+            free(resolved_anchor_checkpoint_path);
+            free(resolved_checkpoint_path);
+            return 1;
+        }
+        checkpoint_state = gru_trainer_checkpoint_state(&trainer);
+        if (!checkpoint_save(resolved_checkpoint_path, model, &checkpoint_state)) {
+            fprintf(stderr, "Failed to save checkpoint '%s'\n", resolved_checkpoint_path);
+            gru_model_destroy(anchor_model);
+            gru_model_destroy(model);
+            free(resolved_anchor_checkpoint_path);
+            free(resolved_checkpoint_path);
+            return 1;
+        }
+        printf("trained mode=supervised step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f labels=%zu sessions=%zu\n",
+            trainer.step,
+            trainer.last_action_loss,
+            trainer.last_value_loss,
+            trainer.last_accuracy,
+            trained_labels,
+            trained_sessions);
+        printf("[train] saved checkpoint %s\n", resolved_checkpoint_path);
+        gru_model_destroy(anchor_model);
+        gru_model_destroy(model);
+        free(resolved_anchor_checkpoint_path);
+        free(resolved_checkpoint_path);
+        return 0;
+    }
+
+    if (!(input_kind == TRAIN_INPUT_EPISODE_BATCH
             ? load_runtime_from_episode_batch_file(
                 input_path,
                 model,
@@ -3089,6 +3298,7 @@ static int showdown_client_main(int argc, char** argv) {
     if (argc >= 2 &&
             (strcmp(argv[1], "--train-supervised") == 0 ||
              strcmp(argv[1], "--train-rl") == 0 ||
+             strcmp(argv[1], "--train-supervised-manifest") == 0 ||
             strcmp(argv[1], "--train-live-rl") == 0 ||
             strcmp(argv[1], "--train-live-ppo") == 0 ||
             strcmp(argv[1], "--check-supervised-overfit") == 0 ||
@@ -3134,7 +3344,45 @@ static int showdown_client_main(int argc, char** argv) {
         return train_from_input_file(
             argv[2],
             argv[3],
+            TRAIN_INPUT_REPLAY,
             0,
+            0,
+            epochs,
+            learning_rate_override,
+            rl_gamma,
+            rl_entropy_coef,
+            rl_advantage_norm,
+            gae_lambda,
+            ppo_clip_epsilon,
+            ppo_value_clip_epsilon,
+            ppo_target_kl,
+            ppo_target_kl_min_episodes,
+            ppo_target_kl_min_labels,
+            ppo_target_kl_hard_multiplier,
+            ppo_target_kl_hard_consecutive_updates,
+            ppo_shuffle_seed,
+            ppo_episode_limit,
+            ppo_minibatch_episodes,
+            adam_beta1,
+            adam_beta2,
+            adam_epsilon,
+            supervised_profile,
+            supervised_optimizer,
+            (unsigned int)validation_seed,
+            aux_checkpoints,
+            rl_reward_mode,
+            &reward_config,
+            expected_policy_tag,
+            training_summary_path,
+            parent_checkpoint_metadata,
+            anchor_checkpoint_path,
+            anchor_kl_coef);
+    }
+    if (argc >= 4 && strcmp(argv[1], "--train-supervised-manifest") == 0) {
+        return train_from_input_file(
+            argv[2],
+            argv[3],
+            TRAIN_INPUT_REPLAY_MANIFEST,
             0,
             0,
             epochs,
@@ -3172,7 +3420,7 @@ static int showdown_client_main(int argc, char** argv) {
         return train_from_input_file(
             argv[2],
             argv[3],
-            0,
+            TRAIN_INPUT_REPLAY,
             1,
             0,
             epochs,
@@ -3210,7 +3458,7 @@ static int showdown_client_main(int argc, char** argv) {
         return train_from_input_file(
             argv[2],
             argv[3],
-            1,
+            TRAIN_INPUT_EPISODE_BATCH,
             1,
             0,
             epochs,
@@ -3248,7 +3496,7 @@ static int showdown_client_main(int argc, char** argv) {
         return train_from_input_file(
             argv[2],
             argv[3],
-            1,
+            TRAIN_INPUT_EPISODE_BATCH,
             1,
             1,
             epochs,
@@ -3312,6 +3560,7 @@ static int showdown_client_main(int argc, char** argv) {
         "Usage:\n"
         "  showdown_client --battle-agent [checkpoint]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
+        "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"

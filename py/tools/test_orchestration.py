@@ -29,9 +29,11 @@ from league_rl_orchestrator import (
     choose_parent_member,
     collect_recent_opponent_stats,
     league_promotion_assessment,
+    load_fixed_opponent_pool,
     matchup_difficulty_weight,
     maybe_promote_candidate,
     round_candidate_rank,
+    round_evaluation_baseline,
     round_screen_should_expand,
     RoundMappedWorkflowReporter,
 )
@@ -70,6 +72,24 @@ def member(
 
 
 class LeaguePoolTests(unittest.TestCase):
+    def test_fixed_pool_preserves_configured_members_and_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pool_path = root / "pool.json"
+            configured = {
+                "members": [
+                    {"name": "random", "kind": "random", "weight": 0.4},
+                    {"name": "parent", "kind": "random", "weight": 0.35},
+                    {"name": "alternate", "kind": "random", "weight": 0.25},
+                ]
+            }
+            pool_path.write_text(json.dumps(configured), encoding="utf-8")
+
+            resolved, loaded = load_fixed_opponent_pool(root, "pool.json")
+
+            self.assertEqual(resolved, pool_path.resolve())
+            self.assertEqual(loaded, configured)
+
     def test_legacy_epoch_artifacts_are_not_automatic_pool_candidates(self) -> None:
         legacy = member("legacy")
         legacy.path = "models/runs/run/current_arch_full_ep10.chk"
@@ -532,6 +552,8 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(args.episode_limit, 256)
         self.assertTrue(args.round_gating)
         self.assertEqual(args.round_screen_games, 100)
+        self.assertEqual(args.round_eval_baseline, "parent")
+        self.assertTrue(args.registry_update)
         live_command = build_league_live_command(
             args, Path("repo"), Path("pool.json"), Path("parent.chk"),
         )
@@ -542,6 +564,19 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(live_command[live_command.index("--format") + 1], args.format)
         self.assertEqual(live_command[live_command.index("--episode-limit") + 1], "256")
         self.assertEqual(eval_command[eval_command.index("--format") + 1], args.format)
+
+    def test_controlled_round_can_gate_against_random_without_registry_updates(self) -> None:
+        args = build_league_parser().parse_args([
+            "--run-name", "controlled", "--games", "10", "--concurrent-games", "2",
+            "--round-eval-baseline", "random", "--registry-update", "false",
+            "--opponent-pool", "config/pool.json", "--eval-battle-seed-base", "1180000",
+        ])
+        parent = Path("parent.chk")
+
+        self.assertEqual(round_evaluation_baseline(args.round_eval_baseline, parent), "random")
+        self.assertFalse(args.registry_update)
+        self.assertEqual(args.opponent_pool, "config/pool.json")
+        self.assertEqual(args.eval_battle_seed_base, 1180000)
 
 
 class WorkflowDashboardTests(unittest.TestCase):
