@@ -287,19 +287,6 @@ python py/tools/replay_diagnose.py --glob "matches/runs/run_0050_g1_best_loss_re
 python py/tools/replay_diagnose.py --run run_0050_g1_best_loss_review --side a --include-outcomes loss --sample-losses 15
 ```
 
-`py/tools/replay_switch_diagnose.py` focuses specifically on switch-slot behavior and splits it by:
-
-- outcome (`win`, `loss`, `draw`)
-- `forced_switch`
-- `reduced_active`
-- `voluntary_switch`
-
-Example:
-
-```powershell
-python py/tools/replay_switch_diagnose.py --run run_0060_g8_teacher_sup_pool_collect_200shards_postfaint_wins --side a
-```
-
 `py/tools/eval_collapse_check.py` reads a selfplay summary and emits a compact collapse report for RL guardrails.
 
 Current default checks:
@@ -352,35 +339,6 @@ python py/tools/live_rl_orchestrator.py --run-name run_live_rl_g4_test --init-ch
 ```
 
 Pools emitted by `league_rl_orchestrator.py` use the adaptive strategy automatically. Category totals stay fixed while members inside each category are reweighted toward the configured 50% learner win-rate target after every round. Static pool JSON files continue unchanged, though the exact pool used is still snapshotted for reproducibility.
-
-For reduced-board / post-faint curriculum extraction:
-
-- `py/tools/replay_extract_postfaint.py` copies full battles into a new run folder when the selected side encounters:
-  - a `forceSwitch` request, or
-  - a request with fewer than two active mons
-- it keeps the whole battle so the existing trainer can still reconstruct state from the start of the replay
-- `--wins-only` further restricts the extracted set to earned wins for the selected side
-
-Examples:
-
-```powershell
-python py/tools/replay_extract_postfaint.py --run run_0050_g1_best_loss_review --output-run run_0050_g1_best_postfaint --side a
-python py/tools/replay_extract_postfaint.py --run run_0050_g1_best_loss_review --output-run run_0050_g1_best_postfaint_wins --side a --wins-only
-python py/tools/train_batch_selfplay.py --run run_0050_g1_best_postfaint --mode supervised --pattern "worker_*_a_raw.jsonl" --checkpoint g1_best_postfaint_sup.chk --epochs 1
-```
-
-For wins-only full-battle extraction:
-
-- `py/tools/replay_extract_wins.py` copies only full battles that ended in an earned `win` for the selected side
-- it excludes disconnect/forfeit wins by requiring terminal `reward > 0.0`
-- use this when you want a cleaner teacher-only supervised dataset without truncating battle context
-
-Example:
-
-```powershell
-python py/tools/replay_extract_wins.py --run run_0044_teacher_sup_pool_collect --output-run run_0044_teacher_sup_pool_collect_wins --side a
-python py/tools/train_batch_selfplay.py --run run_0044_teacher_sup_pool_collect_wins --mode supervised --pattern "worker_*_a_raw.jsonl" --checkpoint g1_teacher_sup_pool_wins_sup.chk --epochs 1
-```
 
 ### League registry workflow
 

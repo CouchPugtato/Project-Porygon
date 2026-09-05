@@ -3,6 +3,7 @@ build/
 matches/
 models/
 external/
+scratch/
 
 CMakeFiles/
 CMakeCache.txt
