@@ -20,10 +20,11 @@ from live_rl_orchestrator import (
     WorkflowDashboardState,
     select_workflow_reporter,
 )
-from rl_defaults import float_default
+from rl_defaults import float_default, load_cli_defaults
 
 
 DEFAULT_MATCH_RUNS_ROOT = Path("matches") / "runs"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "balanced_checkpoint_eval.toml"
 
 
 def positive_int(value: str) -> int:
@@ -68,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate an existing candidate checkpoint against a baseline on both player sides.",
     )
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--candidate-checkpoint", required=True)
     parser.add_argument(
@@ -108,6 +110,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    configured, _ = config_parser.parse_known_args(argv)
+    config_path = resolve_path(resolve_repo_root(), configured.config)
+    parser = build_parser()
+    try:
+        defaults = load_cli_defaults(config_path)
+    except (OSError, RuntimeError) as exc:
+        parser.error(str(exc))
+    args = parser.parse_args(defaults + argv)
+    args.config = str(config_path)
+    return args
+
+
 def prepare_shared_args(args: argparse.Namespace) -> argparse.Namespace:
     """Expose the names consumed by the shared league evaluation implementation."""
     args.eval_run_name = args.run_name
@@ -127,7 +144,7 @@ def validate_unit_interval(parser: argparse.ArgumentParser, label: str, value: f
 
 def main() -> None:
     parser = build_parser()
-    args = prepare_shared_args(parser.parse_args(sys.argv[1:]))
+    args = prepare_shared_args(parse_args(sys.argv[1:]))
     validate_unit_interval(parser, "promotion-min-win-rate", args.promotion_min_win_rate)
     validate_unit_interval(parser, "promotion-confidence-threshold", args.promotion_confidence_threshold)
     validate_unit_interval(parser, "min-promotion-tera-ratio", args.min_promotion_tera_ratio)
@@ -151,6 +168,7 @@ def main() -> None:
     logs_dir = run_dir / "logs"
     manifest: dict[str, object] = {
         "run_name": args.run_name,
+        "config": args.config,
         "status": "running",
         "started_at_unix": time.time(),
         "evaluation_mode": "balanced_valid_games",

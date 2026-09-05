@@ -8,7 +8,11 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from balanced_checkpoint_eval import build_parser as build_balanced_eval_parser, prepare_shared_args
+from balanced_checkpoint_eval import (
+    build_parser as build_balanced_eval_parser,
+    parse_args as parse_balanced_eval_args,
+    prepare_shared_args,
+)
 from league_manage import (
     LeagueEval,
     LeagueMember,
@@ -32,6 +36,7 @@ from league_rl_orchestrator import (
     load_fixed_opponent_pool,
     matchup_difficulty_weight,
     maybe_promote_candidate,
+    parse_args as parse_league_args,
     round_candidate_rank,
     round_evaluation_baseline,
     round_screen_should_expand,
@@ -72,6 +77,28 @@ def member(
 
 
 class LeaguePoolTests(unittest.TestCase):
+    def test_league_config_defaults_allow_cli_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "league.toml"
+            config_path.write_text(
+                "games = 100\n"
+                "concurrent_games = 4\n"
+                "worker_pairs = 6\n"
+                "registry_update = false\n",
+                encoding="utf-8",
+            )
+
+            args = parse_league_args([
+                "--config", str(config_path), "--run-name", "configured",
+                "--games", "200",
+            ])
+
+            self.assertEqual(args.games, 200)
+            self.assertEqual(args.concurrent_games, 4)
+            self.assertEqual(args.worker_pairs, 6)
+            self.assertFalse(args.registry_update)
+            self.assertEqual(args.config, str(config_path.resolve()))
+
     def test_fixed_pool_preserves_configured_members_and_weights(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -701,6 +728,31 @@ class WorkflowDashboardTests(unittest.TestCase):
 
 
 class BalancedCheckpointEvalTests(unittest.TestCase):
+    def test_balanced_eval_config_defaults_allow_cli_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "balanced.toml"
+            config_path.write_text(
+                "games_per_side = 100\n"
+                "concurrent_games = 4\n"
+                "worker_pairs = 6\n"
+                "dashboard = false\n",
+                encoding="utf-8",
+            )
+
+            args = parse_balanced_eval_args([
+                "--config", str(config_path),
+                "--run-name", "configured-eval",
+                "--candidate-checkpoint", "candidate.chk",
+                "--baseline", "random",
+                "--games-per-side", "200",
+            ])
+
+            self.assertEqual(args.games_per_side, 200)
+            self.assertEqual(args.concurrent_games, 4)
+            self.assertEqual(args.worker_pairs, 6)
+            self.assertFalse(args.dashboard)
+            self.assertEqual(args.config, str(config_path.resolve()))
+
     def test_balanced_eval_detects_a_nonacting_candidate_runtime(self) -> None:
         self.assertTrue(
             candidate_runtime_appears_broken(

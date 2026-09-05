@@ -41,6 +41,14 @@ Files:
   - writes one workflow manifest under `models/runs/<run_name>/` plus one per-round manifest
   - renders collection, PPO training, round, KL/safety, and ETA progress when `dashboard = true`
   - writes live state to the workflow manifest and raw per-round subprocess logs under `models/runs/<run_name>/logs/`
+- `league_rl_orchestrator.toml`
+  - consumed by `py/tools/league_rl_orchestrator.py` before CLI arguments are applied
+  - carries the current recovery pool, PPO safety settings, worker limits, parent gate, and read-only registry policy
+  - leaves run names and battle/pool seeds on the command line so separate experiments cannot silently reuse them
+- `balanced_checkpoint_eval.toml`
+  - consumed by `py/tools/balanced_checkpoint_eval.py` before CLI arguments are applied
+  - carries the balanced-game target, worker limits, resource guards, promotion thresholds, and dashboard settings
+  - leaves the run name, candidate, baseline, and deterministic seeds on the command line
 - `ppo_search.toml`
   - consumed by `py/tools/ppo_search.py` before CLI arguments are applied
   - controls the candidate grid, staged evaluation sizes, worker limits, and search dashboard
@@ -125,9 +133,12 @@ python -m py.communicator.main
 python py/tools/selfplay_server.py
 python py/tools/train_batch_selfplay.py
 python py/tools/live_rl_orchestrator.py
+python py/tools/league_rl_orchestrator.py --run-name <run> --pool-seed <seed> --eval-battle-seed-base <seed>
+python py/tools/balanced_checkpoint_eval.py --run-name <run> --candidate-checkpoint <checkpoint> --baseline <checkpoint-or-random> --pool-seed <seed> --battle-seed-base <seed>
 ```
 
 Those commands will use the tokens from these files automatically.
+Pass `--config <path>` to either new entrypoint to use a different flat TOML file; later CLI arguments still win.
 
 For the communicator, `--replay-save <run_name>` resolves to:
 

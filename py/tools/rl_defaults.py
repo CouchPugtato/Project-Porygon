@@ -35,6 +35,18 @@ def load_rl_defaults(path: Path = DEFAULTS_PATH) -> dict[str, object]:
     return payload
 
 
+def load_cli_defaults(path: Path) -> list[str]:
+    """Translate a flat config file into arguments that explicit CLI flags can override."""
+    args: list[str] = []
+    for key, value in load_rl_defaults(path).items():
+        if isinstance(value, bool):
+            value_text = "true" if value else "false"
+        else:
+            value_text = str(value)
+        args.extend(["--" + key.replace("_", "-"), value_text])
+    return args
+
+
 RL_DEFAULTS = load_rl_defaults()
 REWARD_DEFAULTS = load_rl_defaults(REWARD_DEFAULTS_PATH)
 

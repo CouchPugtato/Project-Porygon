@@ -38,11 +38,12 @@ from ppo_search import (
     valid_outcome_counts,
     wilson_interval,
 )
-from rl_defaults import bool_default, float_default, int_default
+from rl_defaults import bool_default, float_default, int_default, load_cli_defaults
 
 
 DEFAULT_RUNS_ROOT = Path("models") / "runs"
 DEFAULT_LEAGUE_ROOT = Path("models") / "league"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "league_rl_orchestrator.toml"
 DEFAULT_MATCHUP_TARGET_WIN_RATE = float_default("league_matchup_target_win_rate")
 DEFAULT_MATCHUP_MIN_WEIGHT = float_default("league_matchup_min_weight")
 DEFAULT_MATCHUP_CONFIDENCE_GAMES = int_default("league_matchup_confidence_games")
@@ -1002,6 +1003,7 @@ class RoundMappedWorkflowReporter:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--registry", default=str(DEFAULT_REGISTRY_PATH))
     parser.add_argument("--parent-id", default="")
@@ -1076,9 +1078,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    configured, _ = config_parser.parse_known_args(argv)
+    config_path = resolve_path(resolve_repo_root(), configured.config)
+    parser = build_parser()
+    try:
+        defaults = load_cli_defaults(config_path)
+    except (OSError, RuntimeError) as exc:
+        parser.error(str(exc))
+    args = parser.parse_args(defaults + argv)
+    args.config = str(config_path)
+    return args
+
+
 def main() -> None:
     parser = build_parser()
-    args = parser.parse_args(sys.argv[1:])
+    args = parse_args(sys.argv[1:])
     for label, value in (
         ("promote-threshold", args.promote_threshold),
         ("promotion-confidence-threshold", args.promotion_confidence_threshold),
@@ -1151,6 +1168,7 @@ def main() -> None:
             "pool_payload": pool_payload,
             "fixed_pool_source": str(fixed_pool_source) if fixed_pool_source else "",
         }
+    workflow_manifest["config"] = args.config
     workflow_manifest["evaluation_config"] = {
         "mode": "balanced_valid_games",
         "valid_games_per_side": args.eval_games,

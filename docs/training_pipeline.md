@@ -202,6 +202,7 @@ PPO safety behavior:
 - the training summary records the input parent, output checkpoint, anchor, shuffle seed, minibatch size, available/processed episode counts, and whether the ordinary or emergency KL stop fired
 
 Stable algorithm and guardrail defaults are centralized in `config/rl_defaults.toml`. Reward weights remain in `config/reward_weights.toml` because both the C runtime and Python communicator consume them.
+The current controlled league profile is in `config/league_rl_orchestrator.toml`; run-specific names and seeds remain explicit CLI arguments.
 
 Use `py/tools/eval_collapse_check.py` to re-run those checks from an existing summary JSON.
 
@@ -215,13 +216,15 @@ baseline. It reuses the league evaluator's side balancing, valid-outcome rules,
 replacement blocks, Wilson interval, collapse checks, resume provenance,
 dashboard, and promotion assessment. Pass `--battle-seed-base` to reuse the same
 random teams when the candidate changes sides.
+Operational defaults are loaded from `config/balanced_checkpoint_eval.toml`.
+Pass `--config <path>` to select another profile; explicit CLI flags override it.
 
 The combined summary and manifest are written under `matches/runs/<run-name>/`. Raw self-play logs are retained in that run's `logs/` directory by default. `--games-per-side` is a valid-game target: disconnect and forfeit outcomes remain visible as invalid but do not satisfy it.
 
 Example:
 
 ```powershell
-python .\py\tools\balanced_checkpoint_eval.py --run-name eval_round03_vs_champion --candidate-checkpoint .\models\runs\candidate\round03.chk --baseline-checkpoint .\models\runs\champion\champion.chk --games-per-side 250 --concurrent-games 70 --worker-pairs 125 --pool-seed 10301 --format gen9randomdoublesbattle --resume true
+python .\py\tools\balanced_checkpoint_eval.py --run-name eval_round03_vs_champion --candidate-checkpoint .\models\runs\candidate\round03.chk --baseline-checkpoint .\models\runs\champion\champion.chk --pool-seed 10301 --battle-seed-base 1030100
 ```
 
 Use this path to screen intermediate checkpoints or perform an independent comparison. Automatic league promotion remains the responsibility of `league_rl_orchestrator.py`; the standalone evaluator reports what the configured gates would decide but does not mutate registry state.
@@ -361,7 +364,7 @@ Promotion now requires all of the following:
 - no policy-collapse guard fires
 - candidate Tera use meets the configured champion-relative minimum
 
-A candidate that clears the point estimate but not the confidence bound is retained as a tentative winner rather than promoted. League PPO training also forwards the shared anchor, clipping, KL-guard, minibatch, and Adam settings to the trainer; the league-specific learning-rate and entropy defaults are the stable anchored values in `config/rl_defaults.toml`.
+A candidate that clears the point estimate but not the confidence bound is retained as a tentative winner rather than promoted. League PPO training also forwards the shared anchor, clipping, KL-guard, minibatch, and Adam settings to the trainer. `config/league_rl_orchestrator.toml` holds the current full workflow profile, while reusable algorithm defaults remain in `config/rl_defaults.toml`. Explicit CLI flags override either entrypoint config.
 
 ## Recommended first RL ladder
 

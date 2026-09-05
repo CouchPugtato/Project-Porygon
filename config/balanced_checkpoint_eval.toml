@@ -1,0 +1,17 @@
+games_per_side = 250
+concurrent_games = 80
+worker_pairs = 140
+max_replacement_attempts = 5
+format = "gen9randomdoublesbattle"
+launch_stagger_seconds = 0.20
+resource_check_seconds = 2.0
+min_available_memory_gb = 2.0
+min_available_pagefile_gb = 4.0
+startup_timeout_seconds = 120
+promotion_min_win_rate = 0.50
+promotion_confidence_threshold = 0.50
+min_promotion_tera_ratio = 0.60
+resume = true
+dashboard = true
+dashboard_refresh_per_second = 8.0
+dashboard_write_raw_logs = true
