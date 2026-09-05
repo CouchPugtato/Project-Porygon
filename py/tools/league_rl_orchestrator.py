@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -22,6 +23,7 @@ from league_manage import (
     member_to_json_dict,
     save_registry,
 )
+from artifact_io import write_json_atomically
 from opponent_sampling import ADAPTIVE_STRATEGY, matchup_difficulty_weight as calculate_matchup_difficulty_weight
 from model_spec import model_spec_payload, recorded_model_spec_matches
 from live_rl_orchestrator import (
@@ -133,8 +135,7 @@ def resolve_path(repo_root: Path, value: str | Path) -> Path:
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    write_json_atomically(path, payload)
 
 
 def log(message: str) -> None:
@@ -658,6 +659,40 @@ def candidate_runtime_appears_broken(
     )
 
 
+def evaluation_block_limit(valid_games: int, block_games: int, replacement_blocks: int) -> int:
+    return math.ceil(valid_games / block_games) + replacement_blocks
+
+
+def select_evaluation_block_run(
+    args: argparse.Namespace,
+    repo_root: Path,
+    candidate_checkpoint: Path,
+    champion_checkpoint: str | Path,
+    candidate_side: str,
+    block_index: int,
+    requested_games: int,
+    battle_seed_base: int | None,
+) -> tuple[str, Path, bool]:
+    model_a = candidate_checkpoint if candidate_side == "a" else champion_checkpoint
+    model_b = champion_checkpoint if candidate_side == "a" else candidate_checkpoint
+    base_name = f"{args.eval_run_name}_side_{candidate_side}_block_{block_index:02d}"
+    retry = 1
+    while True:
+        run_name = base_name if retry == 1 else f"{base_name}_retry_{retry:02d}"
+        summary_path = evaluation_summary_path(repo_root, run_name)
+        if not summary_path.parent.exists():
+            return run_name, summary_path, False
+        if summary_path.exists() and args.resume and evaluation_artifacts_match(
+            summary_path,
+            model_a,
+            model_b,
+            requested_games,
+            battle_seed_base,
+        ):
+            return run_name, summary_path, True
+        retry += 1
+
+
 def run_balanced_valid_evaluation(
     args: argparse.Namespace,
     repo_root: Path,
@@ -696,35 +731,47 @@ def run_balanced_valid_evaluation(
         side_candidate_stats: dict[str, object] = {}
         side_champion_stats: dict[str, object] = {}
         side_runs: list[str] = []
-        for attempt in range(1, args.eval_max_replacement_attempts + 1):
+        block_capacity = evaluation_block_limit(
+            args.eval_games,
+            args.eval_block_games,
+            args.eval_max_replacement_attempts,
+        )
+        for block_index in range(1, block_capacity + 1):
             before = valid_outcome_counts(side_candidate_stats, side_champion_stats)
             shortfall = args.eval_games - int(before["valid_games"])
             if shortfall <= 0:
                 break
-            run_name = f"{args.eval_run_name}_side_{candidate_side}_attempt_{attempt:02d}"
-            summary_path = evaluation_summary_path(repo_root, run_name)
-            model_a = candidate_checkpoint if candidate_side == "a" else champion_checkpoint
-            model_b = champion_checkpoint if candidate_side == "a" else candidate_checkpoint
-            can_resume = (
-                args.resume
-                and summary_path.exists()
-                and evaluation_artifacts_match(
-                    summary_path,
-                    model_a,
-                    model_b,
-                    shortfall,
-                    None if paired_seed_base is None else paired_seed_base + (attempt - 1) * 1000000,
-                )
+            requested_games = min(shortfall, args.eval_block_games)
+            planned_blocks = min(
+                block_capacity,
+                block_index - 1 + math.ceil(shortfall / args.eval_block_games),
+            )
+            block_seed = (
+                None
+                if paired_seed_base is None
+                else paired_seed_base + (block_index - 1) * 1000000
+            )
+            run_name, summary_path, can_resume = select_evaluation_block_run(
+                args,
+                repo_root,
+                candidate_checkpoint,
+                champion_checkpoint,
+                candidate_side,
+                block_index,
+                requested_games,
+                block_seed,
             )
             reporter.state.begin_evaluation(
                 candidate_side,
                 int(before["valid_games"]),
                 int(before["invalid_games"]),
-                shortfall,
+                requested_games,
+                block_index,
+                planned_blocks,
             )
             reporter.notice(
-                f"evaluation side {candidate_side.upper()} attempt {attempt}: "
-                f"need {shortfall} valid games"
+                f"evaluation side {candidate_side.upper()} block {block_index}/{planned_blocks}: "
+                f"requesting {requested_games}, need {shortfall} valid games"
             )
             if can_resume:
                 reporter.notice(f"reusing evaluation block: {run_name}")
@@ -737,13 +784,16 @@ def run_balanced_valid_evaluation(
                         candidate_checkpoint,
                         champion_checkpoint,
                         candidate_side,
-                        shortfall,
-                        args.pool_seed + 100000 + side_index * 1000 + attempt,
-                        None if paired_seed_base is None else paired_seed_base + (attempt - 1) * 1000000,
+                        requested_games,
+                        args.pool_seed + 100000 + side_index * 10000 + block_index,
+                        block_seed,
                     ),
                     repo_root,
                     reporter,
                     logs_dir / f"{run_name}.log" if args.dashboard_write_raw_logs else None,
+                    child_process_manifest_path=(
+                        repo_root / "matches" / "runs" / run_name / f"{run_name}_processes.json"
+                    ).resolve(),
                 )
             block = load_json(summary_path)
             if block.get("status") != "completed":
@@ -760,6 +810,9 @@ def run_balanced_valid_evaluation(
             reporter.state.update_evaluation(
                 candidate_side, int(after["valid_games"]), int(after["invalid_games"]),
             )
+            reporter.state.complete_evaluation_block()
+            if int(after["valid_games"]) >= args.eval_games:
+                reporter.state.evaluation_blocks_total = block_index
             reporter.notice(
                 f"evaluation side={candidate_side} valid={int(after['valid_games'])}/{args.eval_games} "
                 f"invalid={int(after['invalid_games'])} raw={int(after['raw_games'])}"
@@ -779,7 +832,7 @@ def run_balanced_valid_evaluation(
                 f"could not collect {args.eval_games} valid games with candidate on side {candidate_side}; "
                 f"collected {int(side_outcomes['valid_games'])} valid and "
                 f"{int(side_outcomes['invalid_games'])} invalid after "
-                f"{args.eval_max_replacement_attempts} attempts"
+                f"{block_capacity} completed blocks"
             )
         side_results[candidate_side] = {**side_outcomes, "run_names": side_runs}
         candidate_stats = aggregate_group_stats(candidate_stats, side_candidate_stats)
@@ -796,6 +849,7 @@ def run_balanced_valid_evaluation(
         "evaluation_mode": "balanced_valid_games",
         "target_valid_games_per_side": args.eval_games,
         "target_valid_games": 2 * args.eval_games,
+        "evaluation_block_games": args.eval_block_games,
         "raw_games": int(valid["raw_games"]),
         "valid_games": int(valid["valid_games"]),
         "invalid_games": int(valid["invalid_games"]),
@@ -1059,6 +1113,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--matchup-confidence-games", type=positive_int, default=DEFAULT_MATCHUP_CONFIDENCE_GAMES)
     parser.add_argument("--min-category-starts", type=nonnegative_int, default=DEFAULT_MIN_CATEGORY_STARTS)
     parser.add_argument("--eval-games", type=positive_int, default=500, help="Required valid evaluation games per candidate side")
+    parser.add_argument("--eval-block-games", type=positive_int, default=250, help="Maximum valid-game request per resumable evaluation block")
     parser.add_argument("--round-gating", type=parse_bool, default=True, help="Evaluate each round before allowing its checkpoint to become the next parent")
     parser.add_argument("--round-eval-baseline", choices=["parent", "random"], default="parent")
     parser.add_argument("--round-screen-games", type=positive_int, default=100, help="Valid screening games per side after each training round")
@@ -1172,6 +1227,7 @@ def main() -> None:
     workflow_manifest["evaluation_config"] = {
         "mode": "balanced_valid_games",
         "valid_games_per_side": args.eval_games,
+        "block_games": args.eval_block_games,
         "max_replacement_attempts": args.eval_max_replacement_attempts,
         "battle_seed_base": args.eval_battle_seed_base,
         "promotion_min_win_rate": args.promote_threshold,

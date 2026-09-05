@@ -906,6 +906,7 @@ class PoolOrchestrator:
         self.run_dir = run_dir_for_name(args.run_name)
         self.summary_path = self.run_dir / f"{args.run_name}_summary.json"
         self.manifest_path = self.run_dir / f"{args.run_name}_manifest.json"
+        self.process_manifest_path = self.run_dir / f"{args.run_name}_processes.json"
         self.log_path = self.run_dir / "orchestrator.log"
         self.server_log_path = self.run_dir / "showdown_server.log"
         self.client_log_path = self.run_dir / "showdown_client_static.log"
@@ -963,6 +964,23 @@ class PoolOrchestrator:
         self._failed = False
         self._failure_reason = ""
         self._group_member_stats: dict[str, dict[str, dict[str, int]]] = {"a": {}, "b": {}}
+
+    def _write_process_manifest(self, status: str = "running") -> None:
+        children: list[dict[str, object]] = []
+        if self.server is not None and self.server.process is not None:
+            children.append({"role": "showdown_server", "pid": self.server.process.pid})
+        if self.client is not None and self.client.process is not None:
+            children.append({"role": "watch_client", "pid": self.client.process.pid})
+        for worker_token, worker in self.worker_processes.items():
+            if worker.process is not None:
+                children.append({"role": worker_token, "pid": worker.process.pid})
+        write_json_atomically(self.process_manifest_path, {
+            "run_name": self.args.run_name,
+            "owner_pid": os.getpid(),
+            "status": status,
+            "children": children,
+            "updated_at_unix": time.time(),
+        })
 
     @property
     def target_games_label(self) -> str:
@@ -1340,6 +1358,7 @@ class PoolOrchestrator:
         )
         self.log(f"starting local showdown server in {showdown_dir}")
         await self.server.start()
+        self._write_process_manifest()
         await self.server.wait_until_ready(self.args.startup_timeout_seconds)
         self.log(f"showdown server ready at {self.server_uri}")
         self.log(f"watch client URL: {self.watch_url}")
@@ -1357,6 +1376,7 @@ class PoolOrchestrator:
             return
         self.client = ClientProcess(client_dir, self.args.client_host, self.args.client_port, self.client_log_path)
         await self.client.start()
+        self._write_process_manifest()
         await self.client.wait_until_ready(self.client_entrypoint, self.args.startup_timeout_seconds)
 
     async def _start_worker(self, spec: WorkerSpec) -> None:
@@ -1377,9 +1397,10 @@ class PoolOrchestrator:
         )
         self.replay_monitor.register_worker(spec.worker_token, spec.replay_path)
         await worker.start()
+        self.worker_processes[spec.worker_token] = worker
+        self._write_process_manifest()
         if self.args.launch_stagger_seconds > 0.0:
             await asyncio.sleep(self.args.launch_stagger_seconds)
-        self.worker_processes[spec.worker_token] = worker
         self.group_modes_seen[spec.model_group].add(launch_identity.mode)
         if launch_identity.sampled_from_pool and launch_identity.sampled_member_name:
             member_stats = self._touch_member_stats(spec.model_group, launch_identity.sampled_member_name)
@@ -1809,6 +1830,7 @@ class PoolOrchestrator:
                 self._log_handle.close()
             if self.client is not None:
                 await self.client.terminate()
+            self._write_process_manifest("stopped")
             signal.signal(signal.SIGINT, previous_sigint_handler)
 
 

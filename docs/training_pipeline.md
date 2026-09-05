@@ -219,7 +219,7 @@ random teams when the candidate changes sides.
 Operational defaults are loaded from `config/balanced_checkpoint_eval.toml`.
 Pass `--config <path>` to select another profile; explicit CLI flags override it.
 
-The combined summary and manifest are written under `matches/runs/<run-name>/`. Raw self-play logs are retained in that run's `logs/` directory by default. `--games-per-side` is a valid-game target: disconnect and forfeit outcomes remain visible as invalid but do not satisfy it.
+The combined summary and manifest are written under `matches/runs/<run-name>/`. Raw self-play logs are retained in that run's `logs/` directory by default. `--games-per-side` is a valid-game target: disconnect and forfeit outcomes remain visible as invalid but do not satisfy it. `--block-games` defaults to 250. Completed blocks survive a later subprocess crash and are reused by `--resume true`; incomplete blocks restart under a clean retry run name.
 
 Example:
 
@@ -355,7 +355,7 @@ During a multi-round live run, `live_rl_orchestrator.py` also closes the loop im
 
 Interactive live and league runs share a single terminal dashboard. It tracks round completion, current collection games, PPO episodes and optimization metrics, active ETA, and collapse warnings. During a league run the same display continues through valid-game evaluation on both sides, then reports the Wilson interval and promotion-gate result. Non-interactive terminals fall back to plain text; progress remains available in the workflow manifest and raw child output is retained in the workflow's `logs/` directory by default.
 
-League candidates are evaluated against the current champion on both player sides. `--eval-games` is the required number of valid games per side; disconnects and forfeits do not count, and the orchestrator launches replacement blocks up to `--eval-max-replacement-attempts`. The combined evaluation summary records raw, valid, and invalid totals, per-side results, collapse metrics, and a 95% Wilson interval for the candidate's valid-game score.
+League candidates are evaluated against the current champion on both player sides. `--eval-games` is the required number of valid games per side. Each self-play subprocess is capped by `--eval-block-games`; disconnects and forfeits do not count, so the evaluator may add up to `--eval-max-replacement-attempts` blocks. Each block writes its own atomic summary. Resume aggregates matching completed blocks and skips failed partial directories. The process manifest for the active block also gives the parent evaluator a bounded list of child PIDs to clean up after a native subprocess failure. The combined evaluation summary records raw, valid, and invalid totals, per-side results, collapse metrics, and a 95% Wilson interval for the candidate's valid-game score.
 
 Promotion now requires all of the following:
 

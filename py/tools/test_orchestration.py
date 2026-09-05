@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from balanced_checkpoint_eval import (
     build_parser as build_balanced_eval_parser,
@@ -32,6 +33,7 @@ from league_rl_orchestrator import (
     candidate_runtime_appears_broken,
     choose_parent_member,
     collect_recent_opponent_stats,
+    evaluation_block_limit,
     league_promotion_assessment,
     load_fixed_opponent_pool,
     matchup_difficulty_weight,
@@ -40,6 +42,8 @@ from league_rl_orchestrator import (
     round_candidate_rank,
     round_evaluation_baseline,
     round_screen_should_expand,
+    run_balanced_valid_evaluation,
+    select_evaluation_block_run,
     RoundMappedWorkflowReporter,
 )
 from live_rl_orchestrator import (
@@ -52,7 +56,9 @@ from live_rl_orchestrator import (
     extract_episode_batch,
     round_manifest_completed,
     run_reported_command,
+    terminate_recorded_child_processes,
 )
+from model_spec import model_spec_payload
 from opponent_sampling import refresh_adaptive_pool
 from rl_defaults import float_default
 from selfplay_server import load_model_pool, pool_coverage_summary, sample_pool_member, validate_pool_member
@@ -680,6 +686,16 @@ class WorkflowDashboardTests(unittest.TestCase):
         self.assertEqual(payload["evaluation"]["workers_started"], 92)
         self.assertEqual(payload["evaluation"]["workers_total"], 140)
 
+    def test_reporter_tracks_resumable_evaluation_blocks(self) -> None:
+        state = WorkflowDashboardState("eval-run", 0, 0, 1000, "Balanced evaluation")
+        state.begin_evaluation("a", valid=250, invalid=10, attempt_total=250, block_current=2, blocks_total=9)
+        state.complete_evaluation_block()
+
+        evaluation = state.progress_payload()["evaluation"]
+        self.assertEqual(evaluation["block_current"], 2)
+        self.assertEqual(evaluation["blocks_completed"], 2)
+        self.assertEqual(evaluation["blocks_total"], 9)
+
     def test_reported_command_captures_logs_and_persists_manifest_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -700,6 +716,23 @@ class WorkflowDashboardTests(unittest.TestCase):
             saved = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["progress"]["collection"], {"current": 10, "total": 10})
             self.assertIn("completed_games=10/10", raw_log_path.read_text(encoding="utf-8"))
+
+    def test_failed_child_cleanup_uses_only_matching_process_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "processes.json"
+            manifest_path.write_text(json.dumps({
+                "owner_pid": 1234,
+                "status": "running",
+                "children": [{"role": "worker_001_a", "pid": 5678}],
+            }), encoding="utf-8")
+            completed = SimpleNamespace(returncode=0)
+            with patch("live_rl_orchestrator.subprocess.run", return_value=completed) as run:
+                stopped = terminate_recorded_child_processes(manifest_path, 1234)
+                ignored = terminate_recorded_child_processes(manifest_path, 9999)
+
+            self.assertEqual(stopped, [5678])
+            self.assertEqual(ignored, [])
+            run.assert_called_once()
 
     def test_episode_batch_extraction_copies_episode_records_verbatim(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -728,6 +761,10 @@ class WorkflowDashboardTests(unittest.TestCase):
 
 
 class BalancedCheckpointEvalTests(unittest.TestCase):
+    def test_balanced_eval_splits_targets_into_base_and_replacement_blocks(self) -> None:
+        self.assertEqual(evaluation_block_limit(1000, 250, 5), 9)
+        self.assertEqual(evaluation_block_limit(501, 250, 2), 5)
+
     def test_balanced_eval_config_defaults_allow_cli_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "balanced.toml"
@@ -750,6 +787,7 @@ class BalancedCheckpointEvalTests(unittest.TestCase):
             self.assertEqual(args.games_per_side, 200)
             self.assertEqual(args.concurrent_games, 4)
             self.assertEqual(args.worker_pairs, 6)
+            self.assertEqual(args.block_games, 250)
             self.assertFalse(args.dashboard)
             self.assertEqual(args.config, str(config_path.resolve()))
 
@@ -782,6 +820,7 @@ class BalancedCheckpointEvalTests(unittest.TestCase):
         ]))
         self.assertEqual(args.eval_run_name, "round03-eval")
         self.assertEqual(args.eval_games, 300)
+        self.assertEqual(args.eval_block_games, 250)
         self.assertEqual(args.eval_concurrent_games, 12)
         self.assertEqual(args.eval_worker_pairs, 20)
         self.assertEqual(args.eval_max_replacement_attempts, 7)
@@ -792,6 +831,109 @@ class BalancedCheckpointEvalTests(unittest.TestCase):
         )
         self.assertEqual(command[command.index("--games") + 1], "300")
         self.assertEqual(command[command.index("--format") + 1], "gen9randomdoublesbattle")
+
+    def test_failed_evaluation_block_gets_a_clean_retry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            candidate = root / "candidate.chk"
+            candidate.write_bytes(b"candidate")
+            args = SimpleNamespace(eval_run_name="resume-eval", resume=True)
+
+            run_name, summary_path, reusable = select_evaluation_block_run(
+                args, root, candidate, "random", "a", 1, 250, 7000,
+            )
+            self.assertEqual(run_name, "resume-eval_side_a_block_01")
+            self.assertFalse(reusable)
+
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            retry_name, retry_path, reusable = select_evaluation_block_run(
+                args, root, candidate, "random", "a", 1, 250, 7000,
+            )
+            self.assertEqual(retry_name, "resume-eval_side_a_block_01_retry_02")
+            self.assertFalse(reusable)
+
+            retry_path.parent.mkdir(parents=True, exist_ok=True)
+            retry_path.write_text(json.dumps({
+                "status": "completed",
+                "target_games": 250,
+                "battle_seed_base": 7000,
+                "model_specs": {
+                    "a": model_spec_payload(candidate),
+                    "b": model_spec_payload("random"),
+                },
+            }), encoding="utf-8")
+            selected_name, _, reusable = select_evaluation_block_run(
+                args, root, candidate, "random", "a", 1, 250, 7000,
+            )
+            self.assertEqual(selected_name, retry_name)
+            self.assertTrue(reusable)
+
+    def test_balanced_eval_resumes_completed_blocks_after_a_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            candidate = root / "candidate.chk"
+            candidate.write_bytes(b"candidate")
+            args = SimpleNamespace(
+                eval_run_name="crash-resume",
+                eval_games=500,
+                eval_block_games=250,
+                eval_max_replacement_attempts=2,
+                eval_battle_seed_base=9000,
+                eval_worker_pairs=4,
+                eval_concurrent_games=4,
+                pool_seed=12,
+                format="gen9randomdoublesbattle",
+                launch_stagger_seconds=0.0,
+                resource_check_seconds=1.0,
+                min_available_memory_gb=1.0,
+                min_available_pagefile_gb=1.0,
+                startup_timeout_seconds=30,
+                dashboard_write_raw_logs=False,
+                resume=True,
+            )
+            reporter = BaseWorkflowReporter(
+                WorkflowDashboardState("crash-resume", 0, 0, 500, "Balanced evaluation")
+            )
+            calls: list[str] = []
+
+            def finish_block(command: list[str], *_args: object, **_kwargs: object) -> None:
+                run_name = command[command.index("--run-name") + 1]
+                calls.append(run_name)
+                run_dir = root / "matches" / "runs" / run_name
+                run_dir.mkdir(parents=True, exist_ok=True)
+                if len(calls) == 2:
+                    raise RuntimeError("simulated native crash")
+                games = int(command[command.index("--games") + 1])
+                model_a = command[command.index("--model-a") + 1]
+                model_b = command[command.index("--model-b") + 1]
+                seed = int(command[command.index("--battle-seed-base") + 1])
+                half = games // 2
+                group_a = {"matches_played": games, "earned_wins": half, "total_moves": games}
+                group_b = {"matches_played": games, "earned_wins": games - half, "total_moves": games}
+                (run_dir / f"{run_name}_summary.json").write_text(json.dumps({
+                    "status": "completed",
+                    "target_games": games,
+                    "battle_seed_base": seed,
+                    "model_specs": {
+                        "a": model_spec_payload(model_a),
+                        "b": model_spec_payload(model_b),
+                    },
+                    "group_stats": {"a": group_a, "b": group_b},
+                }), encoding="utf-8")
+
+            with patch("league_rl_orchestrator.run_reported_command", side_effect=finish_block):
+                with self.assertRaisesRegex(RuntimeError, "simulated native crash"):
+                    run_balanced_valid_evaluation(
+                        args, root, candidate, "random", reporter, root / "logs",
+                    )
+                _, summary = run_balanced_valid_evaluation(
+                    args, root, candidate, "random", reporter, root / "logs",
+                )
+
+            self.assertEqual(calls.count("crash-resume_side_a_block_01"), 1)
+            self.assertIn("crash-resume_side_a_block_02_retry_02", calls)
+            self.assertEqual(summary["valid_games"], 1000)
+            self.assertEqual(len(summary["run_names"]), 4)
 
 
 class ResumeAndCollapseTests(unittest.TestCase):

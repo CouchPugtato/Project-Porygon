@@ -81,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Checkpoint path or 'random'",
     )
     parser.add_argument("--games-per-side", type=positive_int, default=250)
+    parser.add_argument("--block-games", type=positive_int, default=250)
     parser.add_argument("--concurrent-games", type=positive_int, default=70)
     parser.add_argument("--worker-pairs", type=positive_int, default=125)
     parser.add_argument("--max-replacement-attempts", type=positive_int, default=5)
@@ -129,6 +130,7 @@ def prepare_shared_args(args: argparse.Namespace) -> argparse.Namespace:
     """Expose the names consumed by the shared league evaluation implementation."""
     args.eval_run_name = args.run_name
     args.eval_games = args.games_per_side
+    args.eval_block_games = args.block_games
     args.eval_concurrent_games = args.concurrent_games
     args.eval_worker_pairs = args.worker_pairs
     args.eval_max_replacement_attempts = args.max_replacement_attempts
@@ -176,6 +178,7 @@ def main() -> None:
         "baseline_checkpoint": str(baseline_checkpoint),
         "summary_path": str(summary_path),
         "valid_games_per_side": args.games_per_side,
+        "block_games": args.block_games,
         "max_replacement_attempts": args.max_replacement_attempts,
         "pool_seed": args.pool_seed,
         "battle_seed_base": args.battle_seed_base,

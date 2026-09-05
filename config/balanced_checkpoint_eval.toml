@@ -1,6 +1,7 @@
 games_per_side = 250
-concurrent_games = 80
-worker_pairs = 140
+block_games = 250
+concurrent_games = 60
+worker_pairs = 90
 max_replacement_attempts = 5
 format = "gen9randomdoublesbattle"
 launch_stagger_seconds = 0.20

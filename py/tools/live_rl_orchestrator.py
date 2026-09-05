@@ -91,6 +91,9 @@ class WorkflowDashboardState:
     evaluation_invalid: dict[str, int] = field(default_factory=lambda: {"a": 0, "b": 0})
     evaluation_attempt_current: int = 0
     evaluation_attempt_total: int = 0
+    evaluation_block_current: int = 0
+    evaluation_blocks_completed: int = 0
+    evaluation_blocks_total: int = 0
     evaluation_workers_started: int = 0
     evaluation_workers_total: int = 0
     active_started_at: float | None = None
@@ -137,13 +140,24 @@ class WorkflowDashboardState:
         if collapse_flags is not None:
             self.collapse_flags = list(collapse_flags)
 
-    def begin_evaluation(self, side: str, valid: int, invalid: int, attempt_total: int) -> None:
+    def begin_evaluation(
+        self,
+        side: str,
+        valid: int,
+        invalid: int,
+        attempt_total: int,
+        block_current: int = 1,
+        blocks_total: int = 1,
+    ) -> None:
         self.phase = "evaluation"
         self.evaluation_side = side
         self.evaluation_valid[side] = valid
         self.evaluation_invalid[side] = invalid
         self.evaluation_attempt_current = 0
         self.evaluation_attempt_total = attempt_total
+        self.evaluation_block_current = block_current
+        self.evaluation_blocks_completed = max(0, block_current - 1)
+        self.evaluation_blocks_total = blocks_total
         self.evaluation_workers_started = 0
         self.evaluation_workers_total = 0
         self.active_started_at = time.monotonic()
@@ -152,6 +166,12 @@ class WorkflowDashboardState:
     def update_evaluation(self, side: str, valid: int, invalid: int) -> None:
         self.evaluation_valid[side] = valid
         self.evaluation_invalid[side] = invalid
+
+    def complete_evaluation_block(self) -> None:
+        self.evaluation_blocks_completed = max(
+            self.evaluation_blocks_completed,
+            self.evaluation_block_current,
+        )
 
     def finish_evaluation(self, summary: dict[str, object]) -> None:
         self.phase = "promotion decision"
@@ -200,6 +220,9 @@ class WorkflowDashboardState:
                 "valid_target_per_side": self.evaluation_games_per_side,
                 "attempt_current": self.evaluation_attempt_current,
                 "attempt_total": self.evaluation_attempt_total,
+                "block_current": self.evaluation_block_current,
+                "blocks_completed": self.evaluation_blocks_completed,
+                "blocks_total": self.evaluation_blocks_total,
                 "workers_started": self.evaluation_workers_started,
                 "workers_total": self.evaluation_workers_total,
             },
@@ -426,6 +449,14 @@ class RichWorkflowReporter(BaseWorkflowReporter):
                 ("PPO training", state.training_current, state.training_total, f"{state.training_current}/{state.training_total} episodes"),
             ))
         if state.evaluation_games_per_side:
+            if state.phase == "evaluation" and state.evaluation_blocks_total:
+                rows.append((
+                    f"{state.evaluation_side.upper()} blocks",
+                    state.evaluation_blocks_completed,
+                    state.evaluation_blocks_total,
+                    f"{state.evaluation_blocks_completed}/{state.evaluation_blocks_total} complete; "
+                    f"running {state.evaluation_block_current}/{state.evaluation_blocks_total}",
+                ))
             if (
                 state.phase == "evaluation"
                 and state.evaluation_workers_total
@@ -539,6 +570,7 @@ def run_reported_command(
     reporter: BaseWorkflowReporter,
     raw_log_path: Path | None = None,
     extra_env: dict[str, str] | None = None,
+    child_process_manifest_path: Path | None = None,
 ) -> None:
     reporter.command_started(command)
     env = os.environ.copy()
@@ -550,6 +582,7 @@ def run_reported_command(
     if raw_log_path:
         raw_log_path.parent.mkdir(parents=True, exist_ok=True)
     raw_log: TextIO | None = raw_log_path.open("w", encoding="utf-8") if raw_log_path else None
+    process: subprocess.Popen[str] | None = None
     try:
         process = subprocess.Popen(
             command,
@@ -570,11 +603,56 @@ def run_reported_command(
                     raw_log.flush()
                 reporter.child_line(line)
         return_code = process.wait()
+    except BaseException:
+        if process is not None and child_process_manifest_path is not None:
+            terminate_recorded_child_processes(child_process_manifest_path, process.pid)
+        raise
     finally:
         if raw_log:
             raw_log.close()
     if return_code != 0:
+        if child_process_manifest_path is not None:
+            terminate_recorded_child_processes(child_process_manifest_path, process.pid)
         raise RuntimeError(f"command failed with exit code {return_code}")
+
+
+def terminate_recorded_child_processes(path: Path, owner_pid: int) -> list[int]:
+    """Stop child PIDs recorded by a failed self-play orchestrator."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            int(payload.get("owner_pid", 0) or 0) != owner_pid
+            or payload.get("status") != "running"
+        ):
+            return []
+        records = payload.get("children", []) or []
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+    stopped: list[int] = []
+    for record in records:
+        try:
+            pid = int(record.get("pid", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if pid <= 0 or pid == os.getpid():
+            continue
+        if os.name == "nt":
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode == 0:
+                stopped.append(pid)
+        else:
+            try:
+                os.kill(pid, 15)
+                stopped.append(pid)
+            except (OSError, ProcessLookupError):
+                pass
+    return stopped
 
 
 def positive_int(value: str) -> int:
