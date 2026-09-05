@@ -199,7 +199,11 @@ PPO safety behavior:
 - `--shuffle-seed` makes the episode order reproducible across candidates trained from the same batch
 - `--target-kl` uses the label-weighted running mean and does not stop until both `--target-kl-min-episodes` and `--target-kl-min-labels` have been processed
 - `--target-kl-hard-multiplier` defines an extreme-minibatch threshold, and `--target-kl-hard-consecutive-updates` requires repeated breaches (default `2`) before the emergency stop fires; isolated outliers remain visible in the summary without discarding the candidate
-- the training summary records the input parent, output checkpoint, anchor, shuffle seed, minibatch size, available/processed episode counts, and whether the ordinary or emergency KL stop fired
+- an emergency KL stop writes a rejected summary, returns a nonzero exit code, and does not overwrite or create the output checkpoint
+- a missing live-PPO output is initialized from `--parent-checkpoint`; an existing output must be byte-identical to that parent before an update begins
+- the training summary records the input parent, output checkpoint, anchor, shuffle seed, minibatch size, available/processed episode counts, whether the checkpoint was published, and whether the ordinary or emergency KL stop fired
+
+Live episode records carry their reward mode and dense-weight values. The self-play server forwards these settings to every model-backed battle agent, and the trainer rejects batches whose recorded rewards do not match the requested mode or weights. Older episode batches have no reward metadata and are treated as terminal-reward data. Dense rewards therefore require a newly collected `dense_additive` batch; changing only the training flag cannot relabel an existing terminal batch.
 
 Stable algorithm and guardrail defaults are centralized in `config/rl_defaults.toml`. Reward weights remain in `config/reward_weights.toml` because both the C runtime and Python communicator consume them.
 The current controlled league profile is in `config/league_rl_orchestrator.toml`; run-specific names and seeds remain explicit CLI arguments.

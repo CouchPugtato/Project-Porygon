@@ -511,6 +511,21 @@ class PpoSearchTests(unittest.TestCase):
             self.assertAlmostEqual(float(state.active_metrics["approx_kl"]), 0.01)
             self.assertIn("episodes=8/16", raw_log.read_text(encoding="utf-8"))
 
+    def test_streamed_command_can_accept_a_rejected_training_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state = SearchDisplayState("search", 1, 1, 1, 10, 10)
+            writer = ManifestProgressWriter(root / "manifest.json", {}, state)
+            reporter = BaseSearchReporter(SimpleNamespace(), state, writer)
+            return_code = run_command(
+                [sys.executable, "-c", "raise SystemExit(2)"],
+                root,
+                reporter,
+                None,
+                accepted_return_codes=(0, 2),
+            )
+            self.assertEqual(return_code, 2)
+
     def test_train_command_uses_fixed_batch_anchor_and_reproducible_guards(self) -> None:
         params = Hyperparameters(2.5e-5, 3e-4, 0.01, 0.2, 101)
         command = build_train_command(
@@ -561,6 +576,7 @@ class PpoSearchTests(unittest.TestCase):
 
     def test_safety_flags_reject_hard_stop_and_inactive_anchor(self) -> None:
         flags = training_safety_flags({
+            "checkpoint_published": False,
             "episode_count": 4,
             "labels": 82,
             "approx_kl": 0.005,
@@ -572,6 +588,7 @@ class PpoSearchTests(unittest.TestCase):
             "tera_action_rate": 0.03,
             "move_slot_rates": {},
         }, safety_args(), 0.01)
+        self.assertIn("checkpoint_not_published", flags)
         self.assertIn("target_kl_hard_stop", flags)
         self.assertIn("anchor_inactive", flags)
         self.assertTrue(any(flag.startswith("target_kl_before_min_episodes") for flag in flags))
@@ -614,6 +631,13 @@ class PpoSearchTests(unittest.TestCase):
             mismatched = Hyperparameters(5e-5, 3e-4, 0.01, 0.2, 101)
             self.assertFalse(training_artifacts_match(
                 summary, batch, parent, anchor, candidate, mismatched, args,
+            ))
+            payload = json.loads(summary.read_text(encoding="utf-8"))
+            payload["checkpoint_published"] = False
+            payload["status"] = "rejected"
+            summary.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertFalse(training_artifacts_match(
+                summary, batch, parent, anchor, candidate, params, args,
             ))
 
     def test_resume_requires_matching_evaluation_models(self) -> None:

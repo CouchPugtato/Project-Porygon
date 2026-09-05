@@ -7,6 +7,8 @@
 
 #include "action_mapper.h"
 
+#define EPISODE_REWARD_MODE_LEN 32
+
 typedef struct {
     float* observations;
     uint8_t* legal_masks;
@@ -20,6 +22,11 @@ typedef struct {
     size_t count;
     size_t capacity;
     size_t obs_dim;
+    char reward_mode[EPISODE_REWARD_MODE_LEN];
+    float dense_hp_swing_weight;
+    float dense_faint_swing_weight;
+    float dense_reward_clip;
+    int reward_config_present;
 } Episode;
 
 int episode_init(Episode* episode, size_t capacity, size_t obs_dim);

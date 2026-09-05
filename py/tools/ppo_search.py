@@ -1213,7 +1213,8 @@ def run_command(
     reporter: BaseSearchReporter,
     raw_log_path: Path | None,
     env_updates: dict[str, str] | None = None,
-) -> None:
+    accepted_return_codes: tuple[int, ...] = (0,),
+) -> int:
     reporter.command_started(command)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -1245,8 +1246,9 @@ def run_command(
     finally:
         if raw_log:
             raw_log.close()
-    if return_code != 0:
+    if return_code not in accepted_return_codes:
         raise RuntimeError(f"command failed with exit code {return_code}")
+    return return_code
 
 
 def safe_float_token(value: float) -> str:
@@ -1355,6 +1357,8 @@ def build_eval_command(
 
 def training_safety_flags(summary: dict[str, object], args: argparse.Namespace, anchor_coef: float) -> list[str]:
     flags: list[str] = []
+    if summary.get("checkpoint_published", True) is False:
+        flags.append("checkpoint_not_published")
     episodes = int(summary.get("episode_count", 0) or 0)
     labels = int(summary.get("labels", 0) or 0)
     approx_kl = float(summary.get("approx_kl", 0.0) or 0.0)
@@ -1449,7 +1453,9 @@ def training_artifacts_match(
             if not math.isclose(float(summary.get(key, math.nan)), expected, rel_tol=1e-6, abs_tol=1e-12):
                 return False
         return (
-            int(summary.get("shuffle_seed", -1)) == params.shuffle_seed
+            summary.get("checkpoint_published", True) is not False
+            and summary.get("status", "completed") != "rejected"
+            and int(summary.get("shuffle_seed", -1)) == params.shuffle_seed
             and int(summary.get("episode_limit", 0) or 0) == params.episode_limit
             and int(summary.get("minibatch_episodes", -1)) == args.ppo_minibatch_episodes
             and int(summary.get("target_kl_hard_consecutive_updates", -1))
@@ -3234,7 +3240,7 @@ def main() -> None:
             )
             if not can_resume:
                 shutil.copy2(init_checkpoint, checkpoint_path)
-                run_command(
+                training_return_code = run_command(
                     build_train_command(
                         phase_args, trainer_exe, training_batch, init_checkpoint, anchor_checkpoint,
                         checkpoint_path, summary_path, params,
@@ -3243,7 +3249,10 @@ def main() -> None:
                     reporter,
                     logs_dir / f"{run_name}_training.log" if args.dashboard_write_raw_logs else None,
                     trainer_env,
+                    accepted_return_codes=(0, 2),
                 )
+                if training_return_code == 2 and not summary_path.exists():
+                    raise RuntimeError("trainer rejected the PPO update without writing a training summary")
             trial = collect_training_result(
                 run_name, params, checkpoint_path, summary_path, phase_args,
                 training_reused=can_resume,

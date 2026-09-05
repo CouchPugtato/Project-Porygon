@@ -76,6 +76,26 @@ static int extract_json_size_t_value(const char* json, const char* key, size_t* 
     return 1;
 }
 
+static int extract_json_float_value(const char* json, const char* key, float* out) {
+    const char* p = find_after_key(json, key);
+    char* endptr = NULL;
+    float value;
+    if (!p || !out) {
+        return 0;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return 0;
+    }
+    p = skip_ws(p + 1);
+    value = strtof(p, &endptr);
+    if (endptr == p) {
+        return 0;
+    }
+    *out = value;
+    return 1;
+}
+
 static int extract_json_array_bounds(const char* json, const char* key, const char** start_out, const char** end_out) {
     const char* p = find_after_key(json, key);
     const char* start;
@@ -313,6 +333,7 @@ int episode_init(Episode* episode, size_t capacity, size_t obs_dim) {
     }
     memset(episode, 0, sizeof(*episode));
     episode->obs_dim = obs_dim;
+    strcpy(episode->reward_mode, "terminal");
     return episode_grow(episode, capacity ? capacity : 4);
 }
 
@@ -389,7 +410,16 @@ int episode_write_json_record(FILE* out, const Episode* episode, const char* bat
     write_json_escaped(out, battle_id ? battle_id : "");
     fputs("\",\"policy_tag\":\"", out);
     write_json_escaped(out, policy_tag ? policy_tag : "");
-    fprintf(out, "\",\"obs_dim\":%zu,\"count\":%zu,\"observations\":[", episode->obs_dim, episode->count);
+    fputs("\",\"reward_mode\":\"", out);
+    write_json_escaped(out, episode->reward_mode);
+    fprintf(out,
+        "\",\"dense_hp_swing_weight\":%.9g,\"dense_faint_swing_weight\":%.9g,"
+        "\"dense_reward_clip\":%.9g,\"obs_dim\":%zu,\"count\":%zu,\"observations\":[",
+        episode->dense_hp_swing_weight,
+        episode->dense_faint_swing_weight,
+        episode->dense_reward_clip,
+        episode->obs_dim,
+        episode->count);
     for (i = 0; i < obs_count; ++i) {
         if (i > 0) fputc(',', out);
         fprintf(out, "%.9g", episode->observations[i]);
@@ -534,6 +564,11 @@ int episode_parse_json_record(
     if (!episode_init(episode, count, obs_dim)) {
         return 0;
     }
+    extract_json_string_value(json, "reward_mode", episode->reward_mode, sizeof(episode->reward_mode));
+    episode->reward_config_present =
+        extract_json_float_value(json, "dense_hp_swing_weight", &episode->dense_hp_swing_weight) &&
+        extract_json_float_value(json, "dense_faint_swing_weight", &episode->dense_faint_swing_weight) &&
+        extract_json_float_value(json, "dense_reward_clip", &episode->dense_reward_clip);
     episode->count = count;
     if (!extract_json_array_bounds(json, "observations", &start, &end) ||
             !parse_float_array(start, end, episode->observations, count * obs_dim) ||

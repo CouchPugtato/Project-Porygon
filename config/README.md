@@ -17,6 +17,7 @@ Files:
   - consumed by `py/communicator/main.py` when launched with no CLI args
 - `selfplay_server.toml`
   - consumed by `py/tools/selfplay_server.py` when launched with no CLI args
+  - forwards `reward_mode` and dense reward weights to every live battle agent and records them in run artifacts
 - `train_batch_selfplay.toml`
   - consumed by `py/tools/train_batch_selfplay.py` before CLI args are applied
   - supports `--init-checkpoint <path>` for warm-start RL/supervised runs without manual checkpoint copying
@@ -36,6 +37,7 @@ Files:
 - `live_rl_orchestrator.toml`
   - consumed by `py/tools/live_rl_orchestrator.py` before CLI args are applied
   - runs round-based live self-play RL using the current checkpoint on side `a`
+  - collects episode rewards using the configured mode; episode-batch training rejects a different mode or dense-weight set
   - collects `episode_complete` records directly from worker JSONLs and trains with `showdown_client --train-live-rl`
   - copies the parent checkpoint into each round output path before the RL update so actor rollouts stay versioned by round
   - writes one workflow manifest under `models/runs/<run_name>/` plus one per-round manifest

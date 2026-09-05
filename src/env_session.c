@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+const char* env_reward_mode_name(EnvRewardMode reward_mode) {
+    return reward_mode == ENV_REWARD_DENSE_ADDITIVE ? "dense_additive" : "terminal";
+}
+
 #define ENV_DENSE_HP_SWING_WEIGHT_DEFAULT 0.10f
 #define ENV_DENSE_FAINT_SWING_WEIGHT_DEFAULT 0.25f
 #define ENV_DENSE_REWARD_CLIP_DEFAULT 0.40f
@@ -146,6 +150,12 @@ static EnvSession* ensure_session(EnvRuntime* runtime, const char* battle_id, in
     if (!episode_init(&session->episode, 32, runtime->obs_dim)) {
         return NULL;
     }
+    snprintf(session->episode.reward_mode, sizeof(session->episode.reward_mode), "%s",
+        env_reward_mode_name(runtime->reward_mode));
+    session->episode.dense_hp_swing_weight = runtime->dense_reward_config.hp_swing_weight;
+    session->episode.dense_faint_swing_weight = runtime->dense_reward_config.faint_swing_weight;
+    session->episode.dense_reward_clip = runtime->dense_reward_config.reward_clip;
+    session->episode.reward_config_present = 1;
     session->hidden_state = (float*)calloc(gru_model_hidden_dim(runtime->model), sizeof(float));
     session->flat_observation = (float*)calloc(runtime->obs_dim, sizeof(float));
     if (!session->hidden_state || !session->flat_observation) {

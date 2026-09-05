@@ -22,7 +22,7 @@ from typing import Literal, TextIO
 import websockets
 
 from artifact_io import write_json_atomically
-from rl_defaults import float_default, int_default
+from rl_defaults import float_default, int_default, reward_float_default
 from showdown_determinism import apply_deterministic_battle_seed_patch
 
 
@@ -706,6 +706,10 @@ class WorkerProcess:
         server_uri: str,
         battle_format: str,
         reconnect_seconds: float,
+        reward_mode: str,
+        dense_hp_swing_weight: float,
+        dense_faint_swing_weight: float,
+        dense_reward_clip: float,
         on_log_line,
         worker_log_stdout: bool,
     ) -> None:
@@ -716,6 +720,10 @@ class WorkerProcess:
         self.server_uri = server_uri
         self.battle_format = battle_format
         self.reconnect_seconds = reconnect_seconds
+        self.reward_mode = reward_mode
+        self.dense_hp_swing_weight = dense_hp_swing_weight
+        self.dense_faint_swing_weight = dense_faint_swing_weight
+        self.dense_reward_clip = dense_reward_clip
         self.on_log_line = on_log_line
         self.worker_log_stdout = worker_log_stdout
         self.process: asyncio.subprocess.Process | None = None
@@ -760,6 +768,12 @@ class WorkerProcess:
             command.append("--battle-agent")
             if self.launch_identity.checkpoint_path:
                 command.append(self.launch_identity.checkpoint_path)
+            command.extend([
+                "--reward-mode", self.reward_mode,
+                "--dense-additive-hp-swing-weight", str(self.dense_hp_swing_weight),
+                "--dense-additive-faint-swing-weight", str(self.dense_faint_swing_weight),
+                "--dense-additive-reward-clip", str(self.dense_reward_clip),
+            ])
         return command
 
     async def start(self) -> None:
@@ -1300,6 +1314,12 @@ class PoolOrchestrator:
             "worker_games": self.worker_games,
             "ensure_shard_count": bool(self.args.ensure_shard_count),
             "format": self.args.format,
+            "reward_mode": self.args.reward_mode,
+            "dense_reward_config": {
+                "hp_swing_weight": self.args.dense_additive_hp_swing_weight,
+                "faint_swing_weight": self.args.dense_additive_faint_swing_weight,
+                "reward_clip": self.args.dense_additive_reward_clip,
+            },
             "pool_seed": self.args.pool_seed,
             "battle_seed_base": self.args.battle_seed_base,
             "deterministic_battle_pairing": self.args.battle_seed_base is not None,
@@ -1392,6 +1412,10 @@ class PoolOrchestrator:
             server_uri=self.server_uri,
             battle_format=self.args.format,
             reconnect_seconds=self.args.reconnect_seconds,
+            reward_mode=self.args.reward_mode,
+            dense_hp_swing_weight=self.args.dense_additive_hp_swing_weight,
+            dense_faint_swing_weight=self.args.dense_additive_faint_swing_weight,
+            dense_reward_clip=self.args.dense_additive_reward_clip,
             on_log_line=self._on_worker_log_line,
             worker_log_stdout=self.args.worker_log_stdout,
         )
@@ -1710,6 +1734,12 @@ class PoolOrchestrator:
             "model_b_workers": self.model_b_workers,
             "server_uri": self.server_uri,
             "format": self.args.format,
+            "reward_mode": self.args.reward_mode,
+            "dense_reward_config": {
+                "hp_swing_weight": self.args.dense_additive_hp_swing_weight,
+                "faint_swing_weight": self.args.dense_additive_faint_swing_weight,
+                "reward_clip": self.args.dense_additive_reward_clip,
+            },
             "pool_seed": self.args.pool_seed,
             "battle_seed_base": self.args.battle_seed_base,
             "deterministic_battle_pairing": self.args.battle_seed_base is not None,
@@ -1860,6 +1890,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server-start-command", default="")
     parser.add_argument("--format", default=DEFAULT_FORMAT)
     parser.add_argument("--worker-think-mode", choices=["live", "random"], default="live")
+    parser.add_argument("--reward-mode", choices=["terminal", "dense_additive"], default="terminal")
+    parser.add_argument("--dense-additive-hp-swing-weight", type=float, default=reward_float_default("dense_additive_hp_swing_weight"))
+    parser.add_argument("--dense-additive-faint-swing-weight", type=float, default=reward_float_default("dense_additive_faint_swing_weight"))
+    parser.add_argument("--dense-additive-reward-clip", type=float, default=reward_float_default("dense_additive_reward_clip"))
     parser.add_argument("--model-a-weight", type=positive_int, default=1)
     parser.add_argument("--model-b-weight", type=positive_int, default=1)
     parser.add_argument("--reconnect-seconds", type=nonnegative_float, default=DEFAULT_RECONNECT_SECONDS)

@@ -767,6 +767,13 @@ static int test_runtime_dense_additive_rewards(void) {
         return 0;
     }
     session = &runtime.sessions[0];
+    if (!assert_true(strcmp(session->episode.reward_mode, "dense_additive") == 0 &&
+            session->episode.reward_config_present,
+            "dense runtime records reward provenance")) {
+        env_runtime_free(&runtime);
+        gru_model_destroy(model);
+        return 0;
+    }
     if (!assert_true(session->episode.count == 1, "first dense request appends one step")) {
         env_runtime_free(&runtime);
         gru_model_destroy(model);
@@ -3033,6 +3040,16 @@ static int test_episode_target_roundtrip(void) {
     episode.factorized_actions[0].slot0_target_mask =
         FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
         FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+    strncpy(episode.reward_mode, "dense_additive", sizeof(episode.reward_mode) - 1);
+    episode.dense_hp_swing_weight = 0.10f;
+    episode.dense_faint_swing_weight = 0.25f;
+    episode.dense_reward_clip = 0.40f;
+    episode.reward_config_present = 1;
+    strncpy(episode.reward_mode, "dense_additive", sizeof(episode.reward_mode) - 1);
+    episode.dense_hp_swing_weight = 0.10f;
+    episode.dense_faint_swing_weight = 0.25f;
+    episode.dense_reward_clip = 0.40f;
+    episode.reward_config_present = 1;
     remove(replay_path);
     file = fopen(replay_path, "w+b");
     ok &= assert_true(file != NULL, "open target replay temporary file");
@@ -3049,6 +3066,20 @@ static int test_episode_target_roundtrip(void) {
             "target replay preserves selected target");
         ok &= assert_true(parsed.factorized_actions[0].slot0_target_mask == episode.factorized_actions[0].slot0_target_mask,
             "target replay preserves legal target mask");
+        ok &= assert_true(strcmp(parsed.reward_mode, "dense_additive") == 0,
+            "episode replay preserves reward mode");
+        ok &= assert_true(parsed.reward_config_present &&
+                fabs((double)(parsed.dense_hp_swing_weight - 0.10f)) < 0.0001 &&
+                fabs((double)(parsed.dense_faint_swing_weight - 0.25f)) < 0.0001 &&
+                fabs((double)(parsed.dense_reward_clip - 0.40f)) < 0.0001,
+            "episode replay preserves dense reward configuration");
+        ok &= assert_true(strcmp(parsed.reward_mode, "dense_additive") == 0,
+            "episode replay preserves reward mode");
+        ok &= assert_true(parsed.reward_config_present &&
+                fabs((double)(parsed.dense_hp_swing_weight - 0.10f)) < 0.0001 &&
+                fabs((double)(parsed.dense_faint_swing_weight - 0.25f)) < 0.0001 &&
+                fabs((double)(parsed.dense_reward_clip - 0.40f)) < 0.0001,
+            "episode replay preserves dense reward configuration");
     }
     if (file) fclose(file);
     remove(replay_path);

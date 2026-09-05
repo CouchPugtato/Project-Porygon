@@ -19,6 +19,8 @@ typedef enum {
     ENV_REWARD_DENSE_ADDITIVE = 1
 } EnvRewardMode;
 
+const char* env_reward_mode_name(EnvRewardMode reward_mode);
+
 typedef struct {
     float hp_swing_weight;
     float faint_swing_weight;

@@ -61,7 +61,15 @@ from live_rl_orchestrator import (
 from model_spec import model_spec_payload
 from opponent_sampling import refresh_adaptive_pool
 from rl_defaults import float_default
-from selfplay_server import load_model_pool, pool_coverage_summary, sample_pool_member, validate_pool_member
+from selfplay_server import (
+    WorkerLaunchIdentity,
+    WorkerProcess,
+    WorkerSpec,
+    load_model_pool,
+    pool_coverage_summary,
+    sample_pool_member,
+    validate_pool_member,
+)
 
 
 def member(
@@ -937,6 +945,40 @@ class BalancedCheckpointEvalTests(unittest.TestCase):
 
 
 class ResumeAndCollapseTests(unittest.TestCase):
+    def test_selfplay_worker_forwards_dense_rewards_to_battle_agent(self) -> None:
+        spec = WorkerSpec(
+            worker_id=1,
+            pair_index=0,
+            model_group="a",
+            checkpoint_path="parent.chk",
+            mode="live",
+            username="PoryA",
+            replay_save_token="dense-worker",
+            replay_path=Path("dense-worker.jsonl"),
+            stdout_log_path=Path("dense-worker.log"),
+            shutdown_path=Path("dense-worker.stop"),
+        )
+        worker = WorkerProcess(
+            spec,
+            WorkerLaunchIdentity("live", "parent.chk", "parent.chk"),
+            Path.cwd(),
+            sys.executable,
+            "ws://127.0.0.1:8000/showdown/websocket",
+            "gen9randomdoublesbattle",
+            5.0,
+            "dense_additive",
+            0.1,
+            0.25,
+            0.4,
+            lambda *_args: None,
+            False,
+        )
+
+        command = worker.command()
+
+        self.assertEqual(command[command.index("--reward-mode") + 1], "dense_additive")
+        self.assertEqual(command[command.index("--dense-additive-faint-swing-weight") + 1], "0.25")
+
     def test_selfplay_command_uses_round_pool_snapshot(self) -> None:
         args = SimpleNamespace(
             games=100,
@@ -955,11 +997,17 @@ class ResumeAndCollapseTests(unittest.TestCase):
             min_available_pagefile_gb=1.0,
             model_b_pool="initial_pool.json",
             model_b="",
+            reward_mode="dense_additive",
+            dense_additive_hp_swing_weight=0.1,
+            dense_additive_faint_swing_weight=0.25,
+            dense_additive_reward_clip=0.4,
         )
         snapshot = Path("round_pool.json")
         command = build_selfplay_command(args, Path.cwd(), "collect", Path("actor.chk"), snapshot)
         pool_index = command.index("--model-b-pool")
         self.assertEqual(command[pool_index + 1], str(snapshot))
+        self.assertEqual(command[command.index("--reward-mode") + 1], "dense_additive")
+        self.assertEqual(command[command.index("--dense-additive-hp-swing-weight") + 1], "0.1")
 
     def test_completed_round_requires_manifest_checkpoint_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -975,6 +1023,9 @@ class ResumeAndCollapseTests(unittest.TestCase):
                 "training_round_stats_path": str(summary),
             }), encoding="utf-8")
             self.assertTrue(round_manifest_completed(manifest))
+            summary.write_text('{"checkpoint_published": false}\n', encoding="utf-8")
+            self.assertFalse(round_manifest_completed(manifest))
+            summary.write_text("{}\n", encoding="utf-8")
             summary.unlink()
             self.assertFalse(round_manifest_completed(manifest))
 
@@ -986,8 +1037,9 @@ class ResumeAndCollapseTests(unittest.TestCase):
             used_pool = root / "used_pool.json"
             next_pool = root / "next_pool.json"
             manifest = root / "round.json"
-            for path in (checkpoint, summary, used_pool, next_pool):
+            for path in (checkpoint, used_pool, next_pool):
                 path.write_bytes(b"artifact")
+            summary.write_text("{}\n", encoding="utf-8")
             manifest.write_text(json.dumps({
                 "status": "completed",
                 "output_checkpoint": str(checkpoint),

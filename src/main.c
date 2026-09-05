@@ -296,6 +296,44 @@ static char* resolve_checkpoint_path(const char* checkpoint_arg) {
     return resolved;
 }
 
+static int files_have_same_bytes(const char* left_path, const char* right_path) {
+    unsigned char left_buffer[65536];
+    unsigned char right_buffer[65536];
+    FILE* left;
+    FILE* right;
+    int equal = 1;
+    if (!left_path || !right_path) {
+        return 0;
+    }
+    if (strcmp(left_path, right_path) == 0) {
+        return 1;
+    }
+    left = fopen(left_path, "rb");
+    right = fopen(right_path, "rb");
+    if (!left || !right) {
+        if (left) fclose(left);
+        if (right) fclose(right);
+        return 0;
+    }
+    while (1) {
+        size_t left_count = fread(left_buffer, 1, sizeof(left_buffer), left);
+        size_t right_count = fread(right_buffer, 1, sizeof(right_buffer), right);
+        if (left_count != right_count || memcmp(left_buffer, right_buffer, left_count) != 0) {
+            equal = 0;
+            break;
+        }
+        if (left_count < sizeof(left_buffer)) {
+            if (ferror(left) || ferror(right)) {
+                equal = 0;
+            }
+            break;
+        }
+    }
+    fclose(left);
+    fclose(right);
+    return equal;
+}
+
 static char* make_periodic_checkpoint_path(const char* base_path, size_t episodes_done) {
     const char* dot;
     size_t stem_len;
@@ -1152,6 +1190,32 @@ static int load_runtime_from_episode_batch_file(
             ++invalid_lines;
             continue;
         }
+        if (strcmp(episode.reward_mode, env_reward_mode_name(reward_mode)) != 0) {
+            fprintf(stderr,
+                "[train-live-rl] reward_mode mismatch battle=%s expected=%s actual=%s\n",
+                battle_id,
+                env_reward_mode_name(reward_mode),
+                episode.reward_mode);
+            episode_free(&episode);
+            free(line);
+            fclose(f);
+            env_runtime_free(runtime);
+            return 0;
+        }
+        if (reward_mode == ENV_REWARD_DENSE_ADDITIVE &&
+                (!dense_reward_config || !episode.reward_config_present ||
+                 fabsf(episode.dense_hp_swing_weight - dense_reward_config->hp_swing_weight) > 1.0e-6f ||
+                 fabsf(episode.dense_faint_swing_weight - dense_reward_config->faint_swing_weight) > 1.0e-6f ||
+                 fabsf(episode.dense_reward_clip - dense_reward_config->reward_clip) > 1.0e-6f)) {
+            fprintf(stderr,
+                "[train-live-rl] dense reward config mismatch battle=%s; collect a batch with the requested reward weights\n",
+                battle_id);
+            episode_free(&episode);
+            free(line);
+            fclose(f);
+            env_runtime_free(runtime);
+            return 0;
+        }
         if (expected_policy_tag && *expected_policy_tag) {
             if (strcmp(policy_tag, expected_policy_tag) != 0) {
                 fprintf(stderr,
@@ -1315,7 +1379,8 @@ static int write_rl_training_summary_json(
     const char* anchor_checkpoint,
     float anchor_kl_coef,
     const char* reward_mode,
-    const RewardConfig* reward_config
+    const RewardConfig* reward_config,
+    int checkpoint_published
 ) {
     FILE* out;
     size_t i;
@@ -1327,6 +1392,8 @@ static int write_rl_training_summary_json(
         return 0;
     }
     fputs("{\n", out);
+    fprintf(out, "  \"status\": \"%s\",\n", checkpoint_published ? "completed" : "rejected");
+    fprintf(out, "  \"checkpoint_published\": %s,\n", checkpoint_published ? "true" : "false");
     fputs("  \"input_episode_batch\": ", out); json_write_escaped(out, input_path ? input_path : ""); fputs(",\n", out);
     fputs("  \"parent_checkpoint\": ", out); json_write_escaped(out, parent_checkpoint ? parent_checkpoint : ""); fputs(",\n", out);
     fputs("  \"output_checkpoint\": ", out); json_write_escaped(out, output_checkpoint ? output_checkpoint : ""); fputs(",\n", out);
@@ -2144,7 +2211,11 @@ static int run_demo_gru(void) {
         return 0;
 }
 
-static int run_runtime_mode(const char* checkpoint_path) {
+static int run_runtime_mode(
+    const char* checkpoint_path,
+    const char* reward_mode_name,
+    const EnvDenseRewardConfig* dense_reward_config
+) {
     GruModel* model = NULL;
     TrainerCheckpointState state;
     CheckpointLoadResult checkpoint_result;
@@ -2154,6 +2225,12 @@ static int run_runtime_mode(const char* checkpoint_path) {
     char* resolved_checkpoint_path = NULL;
     FILE* replay_file = NULL;
     const char* replay_path = getenv("PORYGON_REPLAY_PATH");
+    EnvRewardMode reward_mode;
+
+    if (!parse_reward_mode(reward_mode_name, &reward_mode)) {
+        fprintf(stderr, "[runtime] unsupported reward mode '%s'\n", reward_mode_name ? reward_mode_name : "");
+        return 1;
+    }
 
     memset(&state, 0, sizeof(state));
     memset(&checkpoint_result, 0, sizeof(checkpoint_result));
@@ -2182,7 +2259,7 @@ static int run_runtime_mode(const char* checkpoint_path) {
     if (replay_path && *replay_path) {
         replay_file = fopen(replay_path, "a");
     }
-    if (!env_runtime_init(&runtime, model, replay_file, 0, ENV_REWARD_TERMINAL, NULL,
+    if (!env_runtime_init(&runtime, model, replay_file, 0, reward_mode, dense_reward_config,
             resolved_checkpoint_path ? resolved_checkpoint_path : checkpoint_path)) {
         fprintf(stderr, "Failed to initialize runtime\n");
         fclose(replay_file);
@@ -2440,6 +2517,7 @@ static int train_from_input_file(
     const double train_eta_min_elapsed = 10.0;
     const size_t train_eta_min_episodes = 5;
     size_t starting_step;
+    int output_checkpoint_loaded;
 
     if (!input_path || !checkpoint_path || epochs <= 0) {
         return 1;
@@ -2469,10 +2547,41 @@ static int train_from_input_file(
     memset(&checkpoint_state, 0, sizeof(checkpoint_state));
     memset(&anchor_checkpoint_state, 0, sizeof(anchor_checkpoint_state));
     model = load_current_checkpoint(resolved_checkpoint_path, &checkpoint_state, &checkpoint_result);
+    output_checkpoint_loaded = model != NULL;
     if (!model) {
         if (checkpoint_result.status == CHECKPOINT_LOAD_NOT_FOUND) {
-            model = create_default_model();
-            printf("[train] checkpoint not found; starting fresh model -> %s\n", resolved_checkpoint_path);
+            if (rl_mode && input_kind == TRAIN_INPUT_EPISODE_BATCH) {
+                char* resolved_parent_path;
+                if (!parent_checkpoint_metadata || !*parent_checkpoint_metadata) {
+                    fprintf(stderr,
+                        "[train-live-rl] output checkpoint is missing; --parent-checkpoint must identify the behavior checkpoint\n");
+                    free(resolved_checkpoint_path);
+                    return 1;
+                }
+                resolved_parent_path = resolve_checkpoint_path(parent_checkpoint_metadata);
+                if (!resolved_parent_path) {
+                    fprintf(stderr, "[train-live-rl] failed to resolve parent checkpoint\n");
+                    free(resolved_checkpoint_path);
+                    return 1;
+                }
+                model = load_current_checkpoint(resolved_parent_path, &checkpoint_state, &checkpoint_result);
+                if (!model) {
+                    report_checkpoint_load_failure(
+                        "[train-live-rl] failed to initialize from parent",
+                        resolved_parent_path,
+                        &checkpoint_result);
+                    free(resolved_parent_path);
+                    free(resolved_checkpoint_path);
+                    return 1;
+                }
+                printf("[train-live-rl] initialized output from parent %s -> %s\n",
+                    resolved_parent_path,
+                    resolved_checkpoint_path);
+                free(resolved_parent_path);
+            } else {
+                model = create_default_model();
+                printf("[train] checkpoint not found; starting fresh model -> %s\n", resolved_checkpoint_path);
+            }
         } else {
             report_checkpoint_load_failure("[train] refusing incompatible", resolved_checkpoint_path, &checkpoint_result);
             free(resolved_checkpoint_path);
@@ -2484,6 +2593,27 @@ static int train_from_input_file(
     if (!model) {
         free(resolved_checkpoint_path);
         return 1;
+    }
+    if (output_checkpoint_loaded && ppo_mode && input_kind == TRAIN_INPUT_EPISODE_BATCH) {
+        char* resolved_parent_path;
+        if (!parent_checkpoint_metadata || !*parent_checkpoint_metadata) {
+            fprintf(stderr,
+                "[train-live-ppo] --parent-checkpoint is required to verify behavior-policy initialization\n");
+            gru_model_destroy(model);
+            free(resolved_checkpoint_path);
+            return 1;
+        }
+        resolved_parent_path = resolve_checkpoint_path(parent_checkpoint_metadata);
+        if (!resolved_parent_path ||
+                !files_have_same_bytes(resolved_checkpoint_path, resolved_parent_path)) {
+            fprintf(stderr,
+                "[train-live-ppo] output checkpoint does not match --parent-checkpoint; refusing off-policy initialization\n");
+            free(resolved_parent_path);
+            gru_model_destroy(model);
+            free(resolved_checkpoint_path);
+            return 1;
+        }
+        free(resolved_parent_path);
     }
     if (rl_mode && anchor_checkpoint_path && *anchor_checkpoint_path && anchor_kl_coef > 0.0f) {
         resolved_anchor_checkpoint_path = resolve_checkpoint_path(anchor_checkpoint_path);
@@ -2961,6 +3091,36 @@ static int train_from_input_file(
         }
     }
 
+    if (rl_mode && rl_summary.target_kl_hard_stop) {
+        if (training_summary_path && *training_summary_path &&
+                !write_rl_training_summary_json(
+                    training_summary_path,
+                    &rl_summary,
+                    &trainer,
+                    input_path,
+                    parent_checkpoint_metadata && *parent_checkpoint_metadata
+                        ? parent_checkpoint_metadata
+                        : resolved_checkpoint_path,
+                    resolved_checkpoint_path,
+                    resolved_anchor_checkpoint_path ? resolved_anchor_checkpoint_path : "",
+                    anchor_kl_coef,
+                    rl_reward_mode,
+                    reward_config,
+                    0)) {
+            fprintf(stderr, "Failed to write rejected RL training summary '%s'\n", training_summary_path);
+        }
+        fprintf(stderr,
+            "[train-ppo] rejected update; checkpoint was not published after hard KL stop\n");
+        free(train_indices);
+        free(val_indices);
+        env_runtime_free(&runtime);
+        gru_model_destroy(anchor_model);
+        gru_model_destroy(model);
+        free(resolved_anchor_checkpoint_path);
+        free(resolved_checkpoint_path);
+        return 2;
+    }
+
     checkpoint_state = gru_trainer_checkpoint_state(&trainer);
     if (!checkpoint_save(resolved_checkpoint_path, model, &checkpoint_state)) {
         fprintf(stderr, "Failed to save checkpoint '%s'\n", resolved_checkpoint_path);
@@ -2997,7 +3157,8 @@ static int train_from_input_file(
                     resolved_anchor_checkpoint_path ? resolved_anchor_checkpoint_path : "",
                     anchor_kl_coef,
                     rl_reward_mode,
-                    reward_config)) {
+                    reward_config,
+                    1)) {
                 fprintf(stderr, "Failed to write RL training summary '%s'\n", training_summary_path);
             }
         }
@@ -3325,7 +3486,10 @@ static int showdown_client_main(int argc, char** argv) {
     }
 #endif
     if (argc >= 2 && (strcmp(argv[1], "--battle-agent") == 0 || strcmp(argv[1], "--runtime") == 0)) {
-        return run_runtime_mode(argc >= 3 ? argv[2] : NULL);
+        return run_runtime_mode(
+            argc >= 3 ? argv[2] : NULL,
+            rl_reward_mode,
+            &reward_config.dense_additive);
     }
     if (argc >= 4 && overfit_command) {
         return run_supervised_overfit_check(
@@ -3558,7 +3722,7 @@ static int showdown_client_main(int argc, char** argv) {
 #else
         fprintf(stderr,
         "Usage:\n"
-        "  showdown_client --battle-agent [checkpoint]\n"
+        "  showdown_client --battle-agent [checkpoint] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"

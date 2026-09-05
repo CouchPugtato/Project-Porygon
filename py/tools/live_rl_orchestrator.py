@@ -774,6 +774,16 @@ def build_selfplay_command(
     checkpoint_path: Path,
     model_b_pool_path: Path | None = None,
 ) -> list[str]:
+    reward_mode = getattr(args, "reward_mode", "terminal")
+    dense_hp_weight = getattr(
+        args, "dense_additive_hp_swing_weight", reward_float_default("dense_additive_hp_swing_weight"),
+    )
+    dense_faint_weight = getattr(
+        args, "dense_additive_faint_swing_weight", reward_float_default("dense_additive_faint_swing_weight"),
+    )
+    dense_reward_clip = getattr(
+        args, "dense_additive_reward_clip", reward_float_default("dense_additive_reward_clip"),
+    )
     command = [
         sys.executable,
         str((repo_root / "py" / "tools" / "selfplay_server.py").resolve()),
@@ -799,6 +809,14 @@ def build_selfplay_command(
         args.format,
         "--worker-think-mode",
         args.worker_think_mode,
+        "--reward-mode",
+        reward_mode,
+        "--dense-additive-hp-swing-weight",
+        str(dense_hp_weight),
+        "--dense-additive-faint-swing-weight",
+        str(dense_faint_weight),
+        "--dense-additive-reward-clip",
+        str(dense_reward_clip),
         "--serve-client",
         "1" if args.serve_client else "0",
         "--worker-log-stdout",
@@ -901,6 +919,12 @@ def round_manifest_completed(round_manifest_path: Path) -> bool:
     output_checkpoint = Path(str(payload.get("output_checkpoint", "")))
     training_summary = Path(str(payload.get("training_round_stats_path", "")))
     if not output_checkpoint.exists() or not training_summary.exists():
+        return False
+    try:
+        training_payload = load_json(training_summary)
+    except Exception:
+        return False
+    if training_payload.get("checkpoint_published", True) is False:
         return False
     for key in ("opponent_pool_path", "next_opponent_pool_path"):
         artifact = str(payload.get(key, "")).strip()
