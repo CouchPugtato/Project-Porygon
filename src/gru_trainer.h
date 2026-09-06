@@ -65,6 +65,12 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
 TrainerCheckpointState gru_trainer_checkpoint_state(const GruTrainer* trainer);
 int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const Episode* episode);
 int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, const Episode* episode);
+int gru_trainer_critic_minibatch(
+    GruTrainer* trainer,
+    GruModel* model,
+    const Episode* const* episodes,
+    size_t episode_count,
+    int update_recurrent);
 int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode* episode);
 int gru_trainer_ppo_minibatch(
     GruTrainer* trainer,

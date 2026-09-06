@@ -344,6 +344,20 @@ int gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
     const FactorizedPolicySnapshot* anchor_policy,
     float anchor_kl_coef
 );
+int gru_model_critic_head_accumulate_hidden(
+    GruModel* model,
+    const float* hidden_state,
+    float target_value,
+    float* value_out
+);
+int gru_model_critic_recurrent_accumulate_sequence_window(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    float target_value,
+    float* value_loss_out
+);
 int gru_model_policy_gradient_update_sequence_window_dual_anchored(
     GruModel* model,
     const float* sequence,

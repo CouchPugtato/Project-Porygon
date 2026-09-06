@@ -3354,6 +3354,138 @@ static int run_supervised_overfit_check(
     return rc;
 }
 
+static int run_critic_fit_check(
+    const char* episode_batch_path,
+    const char* checkpoint_path,
+    const char* report_path,
+    size_t epochs,
+    size_t minibatch_episodes,
+    float learning_rate,
+    float gamma,
+    unsigned int validation_seed,
+    unsigned int shuffle_seed,
+    float adam_beta1,
+    float adam_beta2,
+    float adam_epsilon,
+    const char* reward_mode_name,
+    const RewardConfig* reward_config
+) {
+    GruModel* head_model = NULL;
+    GruModel* recurrent_model = NULL;
+    TrainerCheckpointState checkpoint_state;
+    CheckpointLoadResult checkpoint_result;
+    EnvRewardMode reward_mode;
+    EnvRuntime runtime;
+    const Episode** train_episodes = NULL;
+    const Episode** holdout_episodes = NULL;
+    size_t train_count = 0;
+    size_t holdout_count = 0;
+    GruTrainer head_trainer;
+    GruTrainer recurrent_trainer;
+    CriticFitResult result;
+    size_t i;
+    int rc = 1;
+
+    memset(&runtime, 0, sizeof(runtime));
+    if (!episode_batch_path || !checkpoint_path || !report_path ||
+            epochs == 0 || minibatch_episodes == 0 || !reward_config ||
+            !parse_reward_mode(reward_mode_name, &reward_mode)) {
+        fprintf(stderr, "[critic-fit] invalid diagnostic configuration\n");
+        return 1;
+    }
+    head_model = load_current_checkpoint(checkpoint_path, &checkpoint_state, &checkpoint_result);
+    if (!head_model) {
+        report_checkpoint_load_failure("[critic-fit] failed to load", checkpoint_path, &checkpoint_result);
+        goto cleanup;
+    }
+    recurrent_model = load_current_checkpoint(checkpoint_path, &checkpoint_state, &checkpoint_result);
+    if (!recurrent_model) {
+        report_checkpoint_load_failure("[critic-fit] failed to load", checkpoint_path, &checkpoint_result);
+        goto cleanup;
+    }
+    if (!load_runtime_from_episode_batch_file(
+            episode_batch_path,
+            head_model,
+            &runtime,
+            reward_mode,
+            &reward_config->dense_additive,
+            "")) {
+        goto cleanup;
+    }
+    train_episodes = (const Episode**)malloc(runtime.count * sizeof(*train_episodes));
+    holdout_episodes = (const Episode**)malloc(runtime.count * sizeof(*holdout_episodes));
+    if (!train_episodes || !holdout_episodes) goto cleanup;
+    for (i = 0; i < runtime.count; ++i) {
+        const EnvSession* session = &runtime.sessions[i];
+        if (!episode_has_labels(&session->episode)) continue;
+        if (validation_split_contains(session->battle_id, validation_seed)) {
+            holdout_episodes[holdout_count++] = &session->episode;
+        } else {
+            train_episodes[train_count++] = &session->episode;
+        }
+    }
+    if (train_count == 0 || holdout_count == 0) {
+        fprintf(stderr,
+            "[critic-fit] stable split produced train=%zu holdout=%zu; use a larger batch or another validation seed\n",
+            train_count,
+            holdout_count);
+        goto cleanup;
+    }
+
+    gru_trainer_init(&head_trainer, learning_rate, 16u, 1.0f, shuffle_seed);
+    gru_trainer_init(&recurrent_trainer, learning_rate, 16u, 1.0f, shuffle_seed);
+    head_trainer.gamma = gamma;
+    recurrent_trainer.gamma = gamma;
+    head_trainer.adam_beta1 = recurrent_trainer.adam_beta1 = adam_beta1;
+    head_trainer.adam_beta2 = recurrent_trainer.adam_beta2 = adam_beta2;
+    head_trainer.adam_epsilon = recurrent_trainer.adam_epsilon = adam_epsilon;
+    printf("[critic-fit] train=%zu holdout=%zu epochs=%zu minibatch_episodes=%zu learning_rate=%.9g gamma=%.6g\n",
+        train_count, holdout_count, epochs, minibatch_episodes, learning_rate, gamma);
+    if (!learning_diagnostic_run_critic_fit(
+            &head_trainer,
+            head_model,
+            &recurrent_trainer,
+            recurrent_model,
+            train_episodes,
+            train_count,
+            holdout_episodes,
+            holdout_count,
+            epochs,
+            minibatch_episodes,
+            shuffle_seed,
+            &result)) {
+        fprintf(stderr, "[critic-fit] diagnostic execution failed\n");
+        goto cleanup;
+    }
+    if (!learning_diagnostic_write_critic_report(
+            report_path,
+            episode_batch_path,
+            checkpoint_path,
+            validation_seed,
+            shuffle_seed,
+            epochs,
+            minibatch_episodes,
+            &head_trainer,
+            &result)) {
+        fprintf(stderr, "[critic-fit] failed to write report '%s': %s\n", report_path, strerror(errno));
+        goto cleanup;
+    }
+    printf("[critic-fit] learnable=%d head_holdout_ev=%.4f recurrent_holdout_ev=%.4f report=%s\n",
+        result.critic_learnable,
+        result.head_after_holdout.overall.explained_variance,
+        result.recurrent_after_holdout.overall.explained_variance,
+        report_path);
+    rc = 0;
+
+cleanup:
+    free(holdout_episodes);
+    free(train_episodes);
+    env_runtime_free(&runtime);
+    gru_model_destroy(recurrent_model);
+    gru_model_destroy(head_model);
+    return rc;
+}
+
 static int clean_replay_file(const char* input_path, const char* output_path) {
     FILE* in;
     FILE* out;
@@ -3404,8 +3536,12 @@ static int clean_replay_file(const char* input_path, const char* output_path) {
 static int showdown_client_main(int argc, char** argv) {
     int epochs = parse_epochs_arg(argc, argv, 1);
     int overfit_command = argc >= 2 && strcmp(argv[1], "--check-supervised-overfit") == 0;
+    int critic_fit_command = argc >= 2 && strcmp(argv[1], "--check-critic-fit") == 0;
     int overfit_epochs = parse_int_flag(argc, argv, "--epochs", 200);
     int overfit_seed = parse_int_flag(argc, argv, "--seed", 20260902);
+    int critic_fit_epochs = parse_int_flag(argc, argv, "--epochs", 10);
+    int critic_fit_seed = parse_int_flag(argc, argv, "--seed", 20260906);
+    int critic_fit_minibatch_episodes = parse_int_flag(argc, argv, "--critic-minibatch-episodes", 8);
     float learning_rate_override;
     const char* expected_policy_tag = parse_string_flag(argc, argv, "--policy-tag-expected", "");
     const char* training_summary_path = parse_string_flag(argc, argv, "--training-summary-path", "");
@@ -3450,7 +3586,7 @@ static int showdown_client_main(int argc, char** argv) {
     learning_rate_override = parse_float_flag(argc, argv, "--learning-rate", -1.0f);
     anchor_kl_coef = parse_float_flag(argc, argv, "--anchor-kl-coef", 0.0f);
     rl_gamma = parse_float_flag(argc, argv, "--gamma",
-        ppo_command ? rl_defaults.ppo_gamma : rl_defaults.policy_gradient_gamma);
+        (ppo_command || critic_fit_command) ? rl_defaults.ppo_gamma : rl_defaults.policy_gradient_gamma);
     rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef",
         ppo_command ? rl_defaults.ppo_entropy_coef : rl_defaults.policy_gradient_entropy_coef);
     rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", rl_defaults.advantage_norm);
@@ -3477,6 +3613,12 @@ static int showdown_client_main(int argc, char** argv) {
     }
     if (overfit_command && (overfit_epochs <= 0 || overfit_seed < 0)) {
         fprintf(stderr, "--check-supervised-overfit requires --epochs > 0 and --seed >= 0\n");
+        return 1;
+    }
+    if (critic_fit_command &&
+            (critic_fit_epochs <= 0 || critic_fit_seed < 0 || critic_fit_minibatch_episodes <= 0)) {
+        fprintf(stderr,
+            "--check-critic-fit requires --epochs > 0, --seed >= 0, and --critic-minibatch-episodes > 0\n");
         return 1;
     }
     if (validation_seed < 0) {
@@ -3512,6 +3654,7 @@ static int showdown_client_main(int argc, char** argv) {
             strcmp(argv[1], "--train-live-rl") == 0 ||
             strcmp(argv[1], "--train-live-ppo") == 0 ||
             strcmp(argv[1], "--check-supervised-overfit") == 0 ||
+            strcmp(argv[1], "--check-critic-fit") == 0 ||
             strcmp(argv[1], "--eval-supervised") == 0)) {
         training_or_eval_mode = 1;
     }
@@ -3551,6 +3694,23 @@ static int showdown_client_main(int argc, char** argv) {
             adam_beta1,
             adam_beta2,
             adam_epsilon,
+            &reward_config);
+    }
+    if (argc >= 5 && critic_fit_command) {
+        return run_critic_fit_check(
+            argv[2],
+            argv[3],
+            argv[4],
+            (size_t)critic_fit_epochs,
+            (size_t)critic_fit_minibatch_episodes,
+            learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
+            rl_gamma,
+            (unsigned int)validation_seed,
+            (unsigned int)critic_fit_seed,
+            adam_beta1,
+            adam_beta2,
+            adam_epsilon,
+            rl_reward_mode,
             &reward_config);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-supervised") == 0) {
@@ -3775,6 +3935,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
+        "  showdown_client --check-critic-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--ppo-minibatch-episodes N] [--target-kl F] [--shuffle-seed N] [--episode-limit N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"

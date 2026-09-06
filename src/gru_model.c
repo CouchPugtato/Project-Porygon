@@ -3495,6 +3495,47 @@ int gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
         NULL, NULL, NULL, choice, anchor_policy, anchor_kl_coef);
 }
 
+int gru_model_critic_head_accumulate_hidden(
+    GruModel* model,
+    const float* hidden_state,
+    float target_value,
+    float* value_out
+) {
+    GruGradientAccum* accum;
+    float value;
+    float error;
+    size_t h;
+    if (!model || !hidden_state || !gru_gradient_accum_ensure(model)) return 0;
+    accum = &model->grad_accum;
+    value = model->value_bias;
+    for (h = 0; h < model->hidden_dim; ++h) value += model->value_head[h] * hidden_state[h];
+    error = value - target_value;
+    for (h = 0; h < model->hidden_dim; ++h) {
+        accum->value_head[h] += error * hidden_state[h];
+    }
+    accum->value_bias += error;
+    accum->count += 1u;
+    if (value_out) *value_out = value;
+    return 1;
+}
+
+int gru_model_critic_recurrent_accumulate_sequence_window(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    float target_value,
+    float* value_loss_out
+) {
+    unsigned char legal_mask[OBS_NUM_ACTIONS] = {0};
+    legal_mask[0] = 1;
+    return recurrent_update_sequence(
+        model, sequence, steps, initial_hidden_state,
+        NULL, -1, legal_mask, 0,
+        0.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1,
+        NULL, value_loss_out, NULL, NULL, NULL, 0.0f);
+}
+
 int gru_model_policy_gradient_update_sequence_window_dual_anchored(
     GruModel* model,
     const float* sequence,

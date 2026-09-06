@@ -560,6 +560,117 @@ int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const E
     return 1;
 }
 
+static int critic_episode_accumulate(
+    GruTrainer* trainer,
+    GruModel* model,
+    const Episode* episode,
+    int update_recurrent,
+    size_t* labels_out
+) {
+    size_t hidden_dim;
+    float* returns = NULL;
+    float* hidden = NULL;
+    float* next_hidden = NULL;
+    float* hidden_after = NULL;
+    float running_return = 0.0f;
+    size_t labels = 0;
+    size_t t;
+    int ok = 0;
+
+    if (!trainer || !model || !episode || !labels_out) return 0;
+    hidden_dim = gru_model_hidden_dim(model);
+    returns = (float*)calloc(episode->count, sizeof(float));
+    hidden = (float*)calloc(hidden_dim, sizeof(float));
+    next_hidden = (float*)malloc(hidden_dim * sizeof(float));
+    hidden_after = (float*)calloc(episode->count * hidden_dim, sizeof(float));
+    if (!returns || !hidden || !next_hidden || !hidden_after) goto cleanup;
+
+    for (t = episode->count; t > 0; --t) {
+        size_t index = t - 1u;
+        if (episode->dones[index]) running_return = 0.0f;
+        running_return = episode->rewards[index] + trainer->gamma * running_return;
+        returns[index] = running_return;
+    }
+    gru_model_zero_state(model, hidden);
+    for (t = 0; t < episode->count; ++t) {
+        gru_model_forward_step(
+            model,
+            episode->observations + t * episode->obs_dim,
+            hidden,
+            next_hidden,
+            NULL,
+            NULL);
+        memcpy(hidden_after + t * hidden_dim, next_hidden, hidden_dim * sizeof(float));
+        memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
+    }
+    for (t = 0; t < episode->count; ++t) {
+        size_t start;
+        size_t steps;
+        const float* initial_hidden;
+        if (episode->actions[t] < 0 && episode->actions2[t] < 0) continue;
+        start = t + 1u > trainer->bptt_window ? t + 1u - trainer->bptt_window : 0u;
+        steps = t - start + 1u;
+        initial_hidden = start > 0 ? hidden_after + (start - 1u) * hidden_dim : NULL;
+        if (update_recurrent) {
+            if (!gru_model_critic_recurrent_accumulate_sequence_window(
+                    model,
+                    episode->observations + start * episode->obs_dim,
+                    steps,
+                    initial_hidden,
+                    returns[t],
+                    NULL)) {
+                goto cleanup;
+            }
+        } else if (!gru_model_critic_head_accumulate_hidden(
+                model, hidden_after + t * hidden_dim, returns[t], NULL)) {
+            goto cleanup;
+        }
+        ++labels;
+    }
+    *labels_out += labels;
+    ok = 1;
+
+cleanup:
+    free(returns);
+    free(hidden);
+    free(next_hidden);
+    free(hidden_after);
+    return ok;
+}
+
+int gru_trainer_critic_minibatch(
+    GruTrainer* trainer,
+    GruModel* model,
+    const Episode* const* episodes,
+    size_t episode_count,
+    int update_recurrent
+) {
+    size_t labels = 0;
+    size_t i;
+    if (!trainer || !model || !episodes || episode_count == 0) return 0;
+    gru_model_clear_accumulated_supervised_updates(model);
+    for (i = 0; i < episode_count; ++i) {
+        if (!critic_episode_accumulate(
+                trainer, model, episodes[i], update_recurrent, &labels)) {
+            gru_model_clear_accumulated_supervised_updates(model);
+            return 0;
+        }
+    }
+    if (!gru_model_apply_accumulated_adam_updates(
+            model,
+            trainer->learning_rate,
+            trainer->adam_beta1,
+            trainer->adam_beta2,
+            trainer->adam_epsilon,
+            trainer->gradient_clip)) {
+        gru_model_clear_accumulated_supervised_updates(model);
+        return 0;
+    }
+    trainer->step += labels;
+    trainer->last_rl_labels = labels;
+    return labels > 0;
+}
+
 int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, const Episode* episode) {
     size_t t;
     size_t labeled_steps = 0;

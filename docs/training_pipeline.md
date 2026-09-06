@@ -48,6 +48,26 @@ checks. They cover direct positive and negative advantages, mixed winning and
 losing episodes under production advantage normalization, and value learning
 when the policy term is clipped.
 
+`--check-critic-fit` tests whether recorded returns are learnable before more
+PPO is attempted. It creates two temporary in-memory copies of an existing
+checkpoint and never publishes either one. The first copy trains only the value
+head, leaving policy outputs unchanged. The second also trains the shared GRU
+and entity representation using only value loss; policy-head parameters remain
+frozen, while the report measures any policy-probability drift caused by the
+shared representation changing.
+
+Battle IDs are assigned to a fixed 90/10 train/holdout split using
+`--validation-seed`. Both branches receive the same deterministic training
+order and discounted Monte Carlo return targets. The JSON report compares
+train and holdout value loss, explained variance, correlation, and bias overall
+and for wins and losses. The aggregate check requires holdout explained
+variance of at least `0.05`, an improvement of at least `0.02`, and
+return/value correlation of at least `0.20`. A recurrent fit also fails when
+its absolute policy-probability drift exceeds `0.01`, its train-to-holdout
+explained-variance gap exceeds `0.25`, or a sufficiently large win/loss
+subgroup has negative return/value correlation. These are diagnostic
+thresholds, not strength or promotion results.
+
 Current implementation notes:
 
 - The repository now includes the protocol/session/raw-state/trainer/checkpoint path.

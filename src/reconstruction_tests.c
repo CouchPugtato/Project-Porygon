@@ -4363,6 +4363,107 @@ static int test_ppo_critic_diagnostics(void) {
         "critic diagnostic reports return/value correlation");
 }
 
+static int test_critic_head_fit_preserves_policy(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode episode;
+    const Episode* minibatch[1];
+    GruTrainer trainer;
+    float probability_before;
+    float probability_after;
+    float value_before;
+    float value_after;
+    int ok = 1;
+
+    memset(&episode, 0, sizeof(episode));
+    if (!assert_true(model && initialize_learning_episode(&episode, 1.0f, 1.0f, 0) &&
+            selected_joint_probability_and_value(
+                model, &episode, &probability_before, &value_before),
+            "initialize critic-head fitting fixture")) {
+        ok = 0;
+        goto cleanup;
+    }
+    gru_trainer_init(&trainer, 0.01f, 16u, 1.0f, 41u);
+    trainer.gamma = 1.0f;
+    minibatch[0] = &episode;
+    ok &= assert_true(gru_trainer_critic_minibatch(&trainer, model, minibatch, 1u, 0),
+        "fit value head without recurrent updates");
+    ok &= assert_true(selected_joint_probability_and_value(
+        model, &episode, &probability_after, &value_after),
+        "evaluate critic-head fitting result");
+    ok &= assert_true(probability_after == probability_before,
+        "value-head-only fitting leaves policy probabilities unchanged");
+    ok &= assert_true(fabsf(1.0f - value_after) < fabsf(1.0f - value_before),
+        "value-head-only fitting moves the prediction toward its return");
+
+cleanup:
+    episode_free(&episode);
+    gru_model_destroy(model);
+    return ok;
+}
+
+static int test_recurrent_critic_fit_updates_value(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode episode;
+    const Episode* minibatch[1];
+    GruTrainer trainer;
+    float probability;
+    float value_before;
+    float value_after;
+    int ok = 1;
+
+    memset(&episode, 0, sizeof(episode));
+    if (!assert_true(model && initialize_learning_episode(&episode, 1.0f, -1.0f, 0) &&
+            selected_joint_probability_and_value(model, &episode, &probability, &value_before),
+            "initialize recurrent critic fitting fixture")) {
+        ok = 0;
+        goto cleanup;
+    }
+    gru_trainer_init(&trainer, 0.01f, 16u, 1.0f, 43u);
+    trainer.gamma = 1.0f;
+    minibatch[0] = &episode;
+    ok &= assert_true(gru_trainer_critic_minibatch(&trainer, model, minibatch, 1u, 1),
+        "fit critic through the recurrent representation");
+    ok &= assert_true(selected_joint_probability_and_value(
+        model, &episode, &probability, &value_after),
+        "evaluate recurrent critic fitting result");
+    ok &= assert_true(fabsf(-1.0f - value_after) < fabsf(-1.0f - value_before),
+        "recurrent critic fitting moves the prediction toward its return");
+
+cleanup:
+    episode_free(&episode);
+    gru_model_destroy(model);
+    return ok;
+}
+
+static int test_critic_fit_assessment_rejects_overfit_and_policy_drift(void) {
+    CriticFitResult result;
+    memset(&result, 0, sizeof(result));
+    result.recurrent_training_completed = 1;
+    result.before_holdout.overall.sample_count = 1000u;
+    result.before_holdout.overall.explained_variance = 0.03;
+    result.recurrent_after_holdout.overall.sample_count = 1000u;
+    result.recurrent_after_holdout.overall.explained_variance = 0.06;
+    result.recurrent_after_holdout.overall.return_value_correlation = 0.27;
+    result.recurrent_after_holdout.wins.sample_count = 400u;
+    result.recurrent_after_holdout.wins.return_value_correlation = -0.10;
+    result.recurrent_after_holdout.losses.sample_count = 600u;
+    result.recurrent_after_holdout.losses.return_value_correlation = -0.02;
+    result.recurrent_after_train.overall.explained_variance = 0.86;
+    result.recurrent_policy_probability_delta = -0.055;
+
+    learning_diagnostic_assess_critic_fit(&result);
+    if (!assert_true(result.recurrent_aggregate_generalizes,
+            "critic aggregate threshold can pass before safety checks")) return 0;
+    if (!assert_true(result.recurrent_overfit,
+            "critic assessment detects a large train-holdout gap")) return 0;
+    if (!assert_true(!result.recurrent_policy_drift_acceptable,
+            "critic assessment rejects material policy drift")) return 0;
+    if (!assert_true(!result.recurrent_outcome_consistent,
+            "critic assessment rejects negative holdout subgroup correlations")) return 0;
+    return assert_true(!result.recurrent_generalizes && !result.critic_learnable,
+        "aggregate-only critic improvement is not marked learnable");
+}
+
 static int test_ppo_update_moves_policy_and_value_in_expected_directions(void) {
     GruModel* positive_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     GruModel* negative_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
@@ -4476,6 +4577,9 @@ int main(int argc, char** argv) {
     if (!test_ppo_clipped_policy_still_updates_value()) return 1;
     if (!test_dual_action_turn_has_one_value_target()) return 1;
     if (!test_ppo_critic_diagnostics()) return 1;
+    if (!test_critic_head_fit_preserves_policy()) return 1;
+    if (!test_recurrent_critic_fit_updates_value()) return 1;
+    if (!test_critic_fit_assessment_rejects_overfit_and_policy_drift()) return 1;
     if (!test_validation_split_is_stable_and_seeded()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;
