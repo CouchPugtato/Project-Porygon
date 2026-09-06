@@ -43,16 +43,25 @@ typedef struct {
 
 typedef struct {
     CriticFitEvaluation before_train;
+    CriticFitEvaluation before_selection;
     CriticFitEvaluation before_holdout;
     CriticFitEvaluation head_after_train;
+    CriticFitEvaluation head_after_selection;
     CriticFitEvaluation head_after_holdout;
     CriticFitEvaluation recurrent_after_train;
+    CriticFitEvaluation recurrent_after_selection;
     CriticFitEvaluation recurrent_after_holdout;
     double head_policy_probability_delta;
     double recurrent_policy_probability_delta;
     int head_policy_unchanged;
     int head_training_completed;
     int recurrent_training_completed;
+    size_t head_epochs_completed;
+    size_t head_best_epoch;
+    size_t recurrent_epochs_completed;
+    size_t recurrent_best_epoch;
+    int head_stopped_early;
+    int recurrent_stopped_early;
     int head_generalizes;
     int recurrent_aggregate_generalizes;
     int recurrent_policy_drift_acceptable;
@@ -92,10 +101,13 @@ int learning_diagnostic_run_critic_fit(
     GruModel* recurrent_model,
     const Episode* const* train_episodes,
     size_t train_count,
+    const Episode* const* selection_episodes,
+    size_t selection_count,
     const Episode* const* holdout_episodes,
     size_t holdout_count,
     size_t epochs,
     size_t minibatch_episodes,
+    size_t early_stop_patience,
     unsigned int shuffle_seed,
     CriticFitResult* result
 );
@@ -108,7 +120,9 @@ int learning_diagnostic_write_critic_report(
     unsigned int shuffle_seed,
     size_t epochs,
     size_t minibatch_episodes,
-    const GruTrainer* trainer,
+    size_t early_stop_patience,
+    const GruTrainer* head_trainer,
+    const GruTrainer* recurrent_trainer,
     const CriticFitResult* result
 );
 

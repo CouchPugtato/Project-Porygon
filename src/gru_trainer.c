@@ -565,25 +565,44 @@ static int critic_episode_accumulate(
     GruModel* model,
     const Episode* episode,
     int update_recurrent,
-    size_t* labels_out
+    size_t* labels_out,
+    float* anchor_kl_sum,
+    float* anchor_kl_max
 ) {
     size_t hidden_dim;
     float* returns = NULL;
     float* hidden = NULL;
     float* next_hidden = NULL;
     float* hidden_after = NULL;
+    float* anchor_hidden = NULL;
+    float* anchor_next_hidden = NULL;
+    float* anchor_hidden_after = NULL;
     float running_return = 0.0f;
     size_t labels = 0;
     size_t t;
+    int anchor_enabled;
     int ok = 0;
 
-    if (!trainer || !model || !episode || !labels_out) return 0;
+    if (!trainer || !model || !episode || !labels_out || !anchor_kl_sum || !anchor_kl_max) return 0;
+    anchor_enabled = update_recurrent && trainer->anchor_model && trainer->anchor_kl_coef > 0.0f;
+    if (anchor_enabled &&
+            (gru_model_input_dim(trainer->anchor_model) != gru_model_input_dim(model) ||
+             gru_model_hidden_dim(trainer->anchor_model) != gru_model_hidden_dim(model) ||
+             gru_model_num_actions(trainer->anchor_model) != gru_model_num_actions(model))) {
+        return 0;
+    }
     hidden_dim = gru_model_hidden_dim(model);
     returns = (float*)calloc(episode->count, sizeof(float));
     hidden = (float*)calloc(hidden_dim, sizeof(float));
     next_hidden = (float*)malloc(hidden_dim * sizeof(float));
     hidden_after = (float*)calloc(episode->count * hidden_dim, sizeof(float));
+    if (anchor_enabled) {
+        anchor_hidden = (float*)calloc(hidden_dim, sizeof(float));
+        anchor_next_hidden = (float*)malloc(hidden_dim * sizeof(float));
+        anchor_hidden_after = (float*)calloc(episode->count * hidden_dim, sizeof(float));
+    }
     if (!returns || !hidden || !next_hidden || !hidden_after) goto cleanup;
+    if (anchor_enabled && (!anchor_hidden || !anchor_next_hidden || !anchor_hidden_after)) goto cleanup;
 
     for (t = episode->count; t > 0; --t) {
         size_t index = t - 1u;
@@ -592,6 +611,7 @@ static int critic_episode_accumulate(
         returns[index] = running_return;
     }
     gru_model_zero_state(model, hidden);
+    if (anchor_enabled) gru_model_zero_state(trainer->anchor_model, anchor_hidden);
     for (t = 0; t < episode->count; ++t) {
         gru_model_forward_step(
             model,
@@ -602,6 +622,17 @@ static int critic_episode_accumulate(
             NULL);
         memcpy(hidden_after + t * hidden_dim, next_hidden, hidden_dim * sizeof(float));
         memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
+        if (anchor_enabled) {
+            gru_model_forward_step(
+                trainer->anchor_model,
+                episode->observations + t * episode->obs_dim,
+                anchor_hidden,
+                anchor_next_hidden,
+                NULL,
+                NULL);
+            memcpy(anchor_hidden_after + t * hidden_dim, anchor_next_hidden, hidden_dim * sizeof(float));
+            memcpy(anchor_hidden, anchor_next_hidden, hidden_dim * sizeof(float));
+        }
     }
     for (t = 0; t < episode->count; ++t) {
         size_t start;
@@ -612,14 +643,62 @@ static int critic_episode_accumulate(
         steps = t - start + 1u;
         initial_hidden = start > 0 ? hidden_after + (start - 1u) * hidden_dim : NULL;
         if (update_recurrent) {
-            if (!gru_model_critic_recurrent_accumulate_sequence_window(
-                    model,
-                    episode->observations + start * episode->obs_dim,
-                    steps,
-                    initial_hidden,
-                    returns[t],
-                    NULL)) {
-                goto cleanup;
+            if (anchor_enabled) {
+                FactorizedPolicySnapshot current_snapshot;
+                FactorizedPolicySnapshot anchor_snapshot;
+                unsigned char slot_mask_a[OBS_NUM_ACTIONS] = {0};
+                unsigned char slot_mask_b[OBS_NUM_ACTIONS] = {0};
+                float ignored_log_prob;
+                float ignored_value;
+                float ignored_entropy;
+                float step_kl;
+                if (!evaluate_joint_step(
+                        model, hidden_after + t * hidden_dim, episode, t,
+                        &ignored_log_prob, &ignored_value, &ignored_entropy, &current_snapshot) ||
+                        !evaluate_joint_step(
+                            trainer->anchor_model,
+                            anchor_hidden_after + t * hidden_dim,
+                            episode,
+                            t,
+                            &ignored_log_prob,
+                            &ignored_value,
+                            &ignored_entropy,
+                            &anchor_snapshot)) {
+                    goto cleanup;
+                }
+                step_kl = factorized_step_anchor_kl(
+                    &current_snapshot, &anchor_snapshot, episode, t);
+                *anchor_kl_sum += step_kl;
+                if (step_kl > *anchor_kl_max) *anchor_kl_max = step_kl;
+                if (episode->actions[t] >= 0) {
+                    build_step_slot_legal_mask(episode, t, 0, slot_mask_a);
+                }
+                if (episode->actions2[t] >= 0) {
+                    build_step_slot_legal_mask(episode, t, 1, slot_mask_b);
+                }
+                if (!gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
+                        model,
+                        episode->observations + start * episode->obs_dim,
+                        steps,
+                        initial_hidden,
+                        slot_mask_a,
+                        slot_mask_b,
+                        &episode->factorized_actions[t],
+                        0.0f,
+                        returns[t],
+                        0.0f,
+                        &anchor_snapshot,
+                        trainer->anchor_kl_coef)) {
+                    goto cleanup;
+                }
+            } else if (!gru_model_critic_recurrent_accumulate_sequence_window(
+                model,
+                episode->observations + start * episode->obs_dim,
+                steps,
+                initial_hidden,
+                returns[t],
+                NULL)) {
+                    goto cleanup;
             }
         } else if (!gru_model_critic_head_accumulate_hidden(
                 model, hidden_after + t * hidden_dim, returns[t], NULL)) {
@@ -635,6 +714,9 @@ cleanup:
     free(hidden);
     free(next_hidden);
     free(hidden_after);
+    free(anchor_hidden);
+    free(anchor_next_hidden);
+    free(anchor_hidden_after);
     return ok;
 }
 
@@ -647,11 +729,14 @@ int gru_trainer_critic_minibatch(
 ) {
     size_t labels = 0;
     size_t i;
+    float anchor_kl_sum = 0.0f;
+    float anchor_kl_max = 0.0f;
     if (!trainer || !model || !episodes || episode_count == 0) return 0;
     gru_model_clear_accumulated_supervised_updates(model);
     for (i = 0; i < episode_count; ++i) {
         if (!critic_episode_accumulate(
-                trainer, model, episodes[i], update_recurrent, &labels)) {
+                trainer, model, episodes[i], update_recurrent, &labels,
+                &anchor_kl_sum, &anchor_kl_max)) {
             gru_model_clear_accumulated_supervised_updates(model);
             return 0;
         }
@@ -668,6 +753,9 @@ int gru_trainer_critic_minibatch(
     }
     trainer->step += labels;
     trainer->last_rl_labels = labels;
+    trainer->last_anchor_kl_mean = labels > 0 ? anchor_kl_sum / (float)labels : 0.0f;
+    trainer->last_anchor_kl_max = anchor_kl_max;
+    trainer->last_anchor_loss = trainer->anchor_kl_coef * trainer->last_anchor_kl_mean;
     return labels > 0;
 }
 

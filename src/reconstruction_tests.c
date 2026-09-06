@@ -4464,6 +4464,130 @@ static int test_critic_fit_assessment_rejects_overfit_and_policy_drift(void) {
         "aggregate-only critic improvement is not marked learnable");
 }
 
+static int test_critic_policy_anchor_reduces_drift(void) {
+    GruModel* anchor = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* unconstrained = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* constrained = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode episode;
+    const Episode* minibatch[1];
+    GruTrainer unconstrained_trainer;
+    GruTrainer constrained_trainer;
+    float* parameters = NULL;
+    size_t parameter_count;
+    float probability_before = 0.0f;
+    float unconstrained_probability = 0.0f;
+    float constrained_probability = 0.0f;
+    float ignored_value;
+    int update;
+    int ok = 1;
+
+    memset(&episode, 0, sizeof(episode));
+    if (!anchor || !unconstrained || !constrained) {
+        ok = 0;
+        goto cleanup;
+    }
+    parameter_count = gru_model_parameter_count(anchor);
+    parameters = (float*)malloc(parameter_count * sizeof(float));
+    if (!assert_true(parameters &&
+            gru_model_export_parameters(anchor, parameters, parameter_count) &&
+            gru_model_import_parameters(unconstrained, parameters, parameter_count) &&
+            gru_model_import_parameters(constrained, parameters, parameter_count) &&
+            initialize_learning_episode(&episode, 1.0f, -1.0f, 0) &&
+            selected_joint_probability_and_value(
+                anchor, &episode, &probability_before, &ignored_value),
+            "initialize policy-anchored critic fixture")) {
+        ok = 0;
+        goto cleanup;
+    }
+    gru_trainer_init(&unconstrained_trainer, 0.01f, 16u, 1.0f, 47u);
+    gru_trainer_init(&constrained_trainer, 0.01f, 16u, 1.0f, 47u);
+    unconstrained_trainer.gamma = constrained_trainer.gamma = 1.0f;
+    constrained_trainer.anchor_model = anchor;
+    constrained_trainer.anchor_kl_coef = 10.0f;
+    minibatch[0] = &episode;
+    for (update = 0; update < 6; ++update) {
+        ok &= assert_true(gru_trainer_critic_minibatch(
+            &unconstrained_trainer, unconstrained, minibatch, 1u, 1),
+            "run unconstrained recurrent critic update");
+        ok &= assert_true(gru_trainer_critic_minibatch(
+            &constrained_trainer, constrained, minibatch, 1u, 1),
+            "run policy-anchored recurrent critic update");
+    }
+    ok &= assert_true(selected_joint_probability_and_value(
+        unconstrained, &episode, &unconstrained_probability, &ignored_value),
+        "evaluate unconstrained critic policy drift");
+    ok &= assert_true(selected_joint_probability_and_value(
+        constrained, &episode, &constrained_probability, &ignored_value),
+        "evaluate constrained critic policy drift");
+    ok &= assert_true(constrained_trainer.last_anchor_kl_mean > 0.0f,
+        "policy-anchored critic reports anchor divergence");
+    ok &= assert_true(
+        fabsf(constrained_probability - probability_before) <
+            fabsf(unconstrained_probability - probability_before),
+        "policy anchor reduces critic-induced policy drift");
+
+cleanup:
+    free(parameters);
+    episode_free(&episode);
+    gru_model_destroy(constrained);
+    gru_model_destroy(unconstrained);
+    gru_model_destroy(anchor);
+    return ok;
+}
+
+static int test_critic_fit_early_stopping_restores_best_epoch(void) {
+    GruModel* head_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* recurrent_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode episode;
+    const Episode* episodes[1];
+    GruTrainer head_trainer;
+    GruTrainer recurrent_trainer;
+    CriticFitResult result;
+    int ok = 1;
+
+    memset(&episode, 0, sizeof(episode));
+    if (!assert_true(head_model && recurrent_model &&
+            initialize_learning_episode(&episode, 1.0f, 1.0f, 0),
+            "initialize critic early-stopping fixture")) {
+        ok = 0;
+        goto cleanup;
+    }
+    gru_trainer_init(&head_trainer, 0.0f, 16u, 1.0f, 53u);
+    gru_trainer_init(&recurrent_trainer, 0.0f, 16u, 1.0f, 53u);
+    head_trainer.gamma = recurrent_trainer.gamma = 1.0f;
+    episodes[0] = &episode;
+    ok &= assert_true(learning_diagnostic_run_critic_fit(
+        &head_trainer,
+        head_model,
+        &recurrent_trainer,
+        recurrent_model,
+        episodes,
+        1u,
+        episodes,
+        1u,
+        episodes,
+        1u,
+        3u,
+        1u,
+        1u,
+        53u,
+        &result),
+        "run critic fit with early stopping");
+    ok &= assert_true(result.head_epochs_completed == 1u &&
+            result.recurrent_epochs_completed == 1u,
+        "critic branches stop after one stale selection epoch");
+    ok &= assert_true(result.head_best_epoch == 0u && result.recurrent_best_epoch == 0u,
+        "critic branches retain the untrained selection optimum");
+    ok &= assert_true(result.head_stopped_early && result.recurrent_stopped_early,
+        "critic fit reports early stopping");
+
+cleanup:
+    episode_free(&episode);
+    gru_model_destroy(recurrent_model);
+    gru_model_destroy(head_model);
+    return ok;
+}
+
 static int test_ppo_update_moves_policy_and_value_in_expected_directions(void) {
     GruModel* positive_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     GruModel* negative_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
@@ -4580,6 +4704,8 @@ int main(int argc, char** argv) {
     if (!test_critic_head_fit_preserves_policy()) return 1;
     if (!test_recurrent_critic_fit_updates_value()) return 1;
     if (!test_critic_fit_assessment_rejects_overfit_and_policy_drift()) return 1;
+    if (!test_critic_policy_anchor_reduces_drift()) return 1;
+    if (!test_critic_fit_early_stopping_restores_best_epoch()) return 1;
     if (!test_validation_split_is_stable_and_seeded()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;

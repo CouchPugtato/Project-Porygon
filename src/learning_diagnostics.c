@@ -269,19 +269,51 @@ static int train_critic_branch(
     size_t episode_count,
     size_t epochs,
     size_t minibatch_episodes,
+    const Episode* const* selection_episodes,
+    size_t selection_count,
+    size_t early_stop_patience,
     unsigned int shuffle_seed,
-    int update_recurrent
+    int update_recurrent,
+    size_t* epochs_completed_out,
+    size_t* best_epoch_out,
+    int* stopped_early_out
 ) {
     const Episode** minibatch;
     size_t* order;
+    float* best_parameters = NULL;
+    size_t parameter_count = 0;
     unsigned int shuffle_state = shuffle_seed;
     double started_at = critic_wall_seconds();
+    double best_selection_loss = 0.0;
+    size_t stale_epochs = 0;
     size_t epoch;
     size_t i;
+    int use_early_stopping = early_stop_patience > 0 && selection_count > 0;
+
+    if (!epochs_completed_out || !best_epoch_out || !stopped_early_out) return 0;
+    *epochs_completed_out = 0;
+    *best_epoch_out = 0;
+    *stopped_early_out = 0;
 
     order = (size_t*)malloc(episode_count * sizeof(size_t));
     minibatch = (const Episode**)malloc(minibatch_episodes * sizeof(*minibatch));
+    if (use_early_stopping) {
+        CriticFitEvaluation initial_selection;
+        parameter_count = gru_model_parameter_count(model);
+        best_parameters = (float*)malloc(parameter_count * sizeof(float));
+        if (!best_parameters ||
+                !gru_model_export_parameters(model, best_parameters, parameter_count) ||
+                !evaluate_critic(
+                    trainer, model, selection_episodes, selection_count, &initial_selection)) {
+            free(best_parameters);
+            free(order);
+            free(minibatch);
+            return 0;
+        }
+        best_selection_loss = initial_selection.overall.value_loss;
+    }
     if (!order || !minibatch) {
+        free(best_parameters);
         free(order);
         free(minibatch);
         return 0;
@@ -296,18 +328,60 @@ static int train_critic_branch(
             for (j = 0; j < batch_count; ++j) minibatch[j] = episodes[order[i + j]];
             if (!gru_trainer_critic_minibatch(
                     trainer, model, minibatch, batch_count, update_recurrent)) {
+                free(best_parameters);
                 free(order);
                 free(minibatch);
                 return 0;
             }
         }
+        *epochs_completed_out = epoch + 1u;
         {
             double elapsed = critic_wall_seconds() - started_at;
             double eta = elapsed / (double)(epoch + 1u) * (double)(epochs - epoch - 1u);
-            printf("[critic-fit] mode=%s epoch=%zu/%zu elapsed=%.1fs eta=%.1fs\n",
-                name, epoch + 1u, epochs, elapsed, eta);
+            if (use_early_stopping) {
+                CriticFitEvaluation selection;
+                if (!evaluate_critic(
+                        trainer, model, selection_episodes, selection_count, &selection)) {
+                    free(best_parameters);
+                    free(order);
+                    free(minibatch);
+                    return 0;
+                }
+                if (selection.overall.value_loss < best_selection_loss - 1.0e-5) {
+                    best_selection_loss = selection.overall.value_loss;
+                    *best_epoch_out = epoch + 1u;
+                    stale_epochs = 0;
+                    if (!gru_model_export_parameters(model, best_parameters, parameter_count)) {
+                        free(best_parameters);
+                        free(order);
+                        free(minibatch);
+                        return 0;
+                    }
+                } else {
+                    ++stale_epochs;
+                }
+                printf("[critic-fit] mode=%s epoch=%zu/%zu selection_value_loss=%.6f best_epoch=%zu elapsed=%.1fs eta=%.1fs\n",
+                    name, epoch + 1u, epochs, selection.overall.value_loss,
+                    *best_epoch_out, elapsed, eta);
+                if (stale_epochs >= early_stop_patience) {
+                    *stopped_early_out = epoch + 1u < epochs;
+                    break;
+                }
+            } else {
+                *best_epoch_out = epoch + 1u;
+                printf("[critic-fit] mode=%s epoch=%zu/%zu elapsed=%.1fs eta=%.1fs\n",
+                    name, epoch + 1u, epochs, elapsed, eta);
+            }
         }
     }
+    if (use_early_stopping &&
+            !gru_model_import_parameters(model, best_parameters, parameter_count)) {
+        free(best_parameters);
+        free(order);
+        free(minibatch);
+        return 0;
+    }
+    free(best_parameters);
     free(order);
     free(minibatch);
     return 1;
@@ -363,10 +437,13 @@ int learning_diagnostic_run_critic_fit(
     GruModel* recurrent_model,
     const Episode* const* train_episodes,
     size_t train_count,
+    const Episode* const* selection_episodes,
+    size_t selection_count,
     const Episode* const* holdout_episodes,
     size_t holdout_count,
     size_t epochs,
     size_t minibatch_episodes,
+    size_t early_stop_patience,
     unsigned int shuffle_seed,
     CriticFitResult* result
 ) {
@@ -377,11 +454,14 @@ int learning_diagnostic_run_critic_fit(
 
     if (!head_trainer || !head_model || !recurrent_trainer || !recurrent_model ||
             !train_episodes || train_count == 0 || !holdout_episodes || holdout_count == 0 ||
+            (early_stop_patience > 0 && (!selection_episodes || selection_count == 0)) ||
             epochs == 0 || minibatch_episodes == 0 || !result) {
         return 0;
     }
     memset(result, 0, sizeof(*result));
     if (!evaluate_critic(head_trainer, head_model, train_episodes, train_count, &result->before_train) ||
+            (selection_count > 0 && !evaluate_critic(
+                head_trainer, head_model, selection_episodes, selection_count, &result->before_selection)) ||
             !evaluate_critic(head_trainer, head_model, holdout_episodes, holdout_count, &result->before_holdout) ||
             !evaluate_episodes(head_trainer, head_model, holdout_episodes, holdout_count, &policy_before)) {
         return 0;
@@ -390,9 +470,15 @@ int learning_diagnostic_run_critic_fit(
 
     result->head_training_completed = train_critic_branch(
         "head", head_trainer, head_model, train_episodes, train_count,
-        epochs, minibatch_episodes, shuffle_seed, 0);
+        epochs, minibatch_episodes, selection_episodes, selection_count,
+        early_stop_patience, shuffle_seed, 0,
+        &result->head_epochs_completed, &result->head_best_epoch,
+        &result->head_stopped_early);
     if (result->head_training_completed &&
             (!evaluate_critic(head_trainer, head_model, train_episodes, train_count, &result->head_after_train) ||
+             (selection_count > 0 && !evaluate_critic(
+                head_trainer, head_model, selection_episodes, selection_count,
+                &result->head_after_selection)) ||
              !evaluate_critic(head_trainer, head_model, holdout_episodes, holdout_count, &result->head_after_holdout) ||
              !evaluate_episodes(head_trainer, head_model, holdout_episodes, holdout_count, &head_policy_after))) {
         return 0;
@@ -407,9 +493,15 @@ int learning_diagnostic_run_critic_fit(
 
     result->recurrent_training_completed = train_critic_branch(
         "recurrent", recurrent_trainer, recurrent_model, train_episodes, train_count,
-        epochs, minibatch_episodes, shuffle_seed, 1);
+        epochs, minibatch_episodes, selection_episodes, selection_count,
+        early_stop_patience, shuffle_seed, 1,
+        &result->recurrent_epochs_completed, &result->recurrent_best_epoch,
+        &result->recurrent_stopped_early);
     if (result->recurrent_training_completed &&
             (!evaluate_critic(recurrent_trainer, recurrent_model, train_episodes, train_count, &result->recurrent_after_train) ||
+             (selection_count > 0 && !evaluate_critic(
+                recurrent_trainer, recurrent_model, selection_episodes, selection_count,
+                &result->recurrent_after_selection)) ||
              !evaluate_critic(recurrent_trainer, recurrent_model, holdout_episodes, holdout_count, &result->recurrent_after_holdout) ||
              !evaluate_episodes(recurrent_trainer, recurrent_model, holdout_episodes, holdout_count, &recurrent_policy_after))) {
         return 0;
@@ -587,12 +679,14 @@ int learning_diagnostic_write_critic_report(
     unsigned int shuffle_seed,
     size_t epochs,
     size_t minibatch_episodes,
-    const GruTrainer* trainer,
+    size_t early_stop_patience,
+    const GruTrainer* head_trainer,
+    const GruTrainer* recurrent_trainer,
     const CriticFitResult* result
 ) {
     const char* recommendation;
     FILE* out;
-    if (!report_path || !*report_path || !trainer || !result) return 0;
+    if (!report_path || !*report_path || !head_trainer || !recurrent_trainer || !result) return 0;
     if (result->head_generalizes) recommendation = "value_head_warmup";
     else if (result->recurrent_generalizes) recommendation = "recurrent_critic_fit";
     else if (result->recurrent_aggregate_generalizes) recommendation =
@@ -601,7 +695,7 @@ int learning_diagnostic_write_critic_report(
     out = fopen(report_path, "w");
     if (!out) return 0;
 
-    fputs("{\n  \"diagnostic\": \"critic_fit\",\n  \"metrics_version\": 2,\n", out);
+    fputs("{\n  \"diagnostic\": \"critic_fit\",\n  \"metrics_version\": 3,\n", out);
     fputs("  \"source_episode_batch\": ", out);
     write_json_string(out, source_path);
     fputs(",\n  \"checkpoint\": ", out);
@@ -611,6 +705,8 @@ int learning_diagnostic_write_critic_report(
         "  \"shuffle_seed\": %u,\n"
         "  \"epochs\": %zu,\n"
         "  \"minibatch_episodes\": %zu,\n"
+        "  \"early_stop_patience\": %zu,\n"
+        "  \"selection_split_enabled\": %s,\n"
         "  \"learning_rate\": %.9g,\n"
         "  \"gamma\": %.9g,\n"
         "  \"bptt_window\": %zu,\n"
@@ -621,28 +717,63 @@ int learning_diagnostic_write_critic_report(
         shuffle_seed,
         epochs,
         minibatch_episodes,
-        trainer->learning_rate,
-        trainer->gamma,
-        trainer->bptt_window);
+        early_stop_patience,
+        early_stop_patience > 0 ? "true" : "false",
+        head_trainer->learning_rate,
+        head_trainer->gamma,
+        head_trainer->bptt_window);
     fputs("  \"before\": {\n    \"train\": ", out);
     write_critic_evaluation(out, &result->before_train, "    ");
+    if (early_stop_patience > 0) {
+        fputs(",\n    \"selection\": ", out);
+        write_critic_evaluation(out, &result->before_selection, "    ");
+    }
     fputs(",\n    \"holdout\": ", out);
     write_critic_evaluation(out, &result->before_holdout, "    ");
     fputs("\n  },\n  \"value_head_only\": {\n    \"training_completed\": ", out);
     fputs(result->head_training_completed ? "true" : "false", out);
+    fprintf(out,
+        ",\n    \"epochs_completed\": %zu,\n"
+        "    \"best_epoch\": %zu,\n"
+        "    \"stopped_early\": %s",
+        result->head_epochs_completed,
+        result->head_best_epoch,
+        result->head_stopped_early ? "true" : "false");
     fputs(",\n    \"policy_outputs_unchanged\": ", out);
     fputs(result->head_policy_unchanged ? "true" : "false", out);
     fprintf(out, ",\n    \"policy_action_probability_delta\": %.9g,\n    \"train\": ",
         result->head_policy_probability_delta);
     write_critic_evaluation(out, &result->head_after_train, "    ");
+    if (early_stop_patience > 0) {
+        fputs(",\n    \"selection\": ", out);
+        write_critic_evaluation(out, &result->head_after_selection, "    ");
+    }
     fputs(",\n    \"holdout\": ", out);
     write_critic_evaluation(out, &result->head_after_holdout, "    ");
     fputs("\n  },\n  \"recurrent_critic\": {\n    \"training_completed\": ", out);
     fputs(result->recurrent_training_completed ? "true" : "false", out);
-    fputs(",\n    \"policy_head_parameters_frozen\": true,\n", out);
+    fprintf(out,
+        ",\n    \"epochs_completed\": %zu,\n"
+        "    \"best_epoch\": %zu,\n"
+        "    \"stopped_early\": %s,\n"
+        "    \"policy_anchor_kl_coef\": %.9g,\n"
+        "    \"last_anchor_kl_mean\": %.9g,\n"
+        "    \"last_anchor_kl_max\": %.9g,\n"
+        "    \"policy_head_parameters_frozen\": %s,\n",
+        result->recurrent_epochs_completed,
+        result->recurrent_best_epoch,
+        result->recurrent_stopped_early ? "true" : "false",
+        recurrent_trainer->anchor_kl_coef,
+        recurrent_trainer->last_anchor_kl_mean,
+        recurrent_trainer->last_anchor_kl_max,
+        recurrent_trainer->anchor_kl_coef > 0.0f ? "false" : "true");
     fprintf(out, "    \"policy_action_probability_delta\": %.9g,\n    \"train\": ",
         result->recurrent_policy_probability_delta);
     write_critic_evaluation(out, &result->recurrent_after_train, "    ");
+    if (early_stop_patience > 0) {
+        fputs(",\n    \"selection\": ", out);
+        write_critic_evaluation(out, &result->recurrent_after_selection, "    ");
+    }
     fputs(",\n    \"holdout\": ", out);
     write_critic_evaluation(out, &result->recurrent_after_holdout, "    ");
     fputs("\n  },\n  \"assessment\": {\n", out);
