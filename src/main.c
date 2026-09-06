@@ -93,6 +93,14 @@ typedef struct {
     int target_kl_hard_consecutive_updates;
     int target_kl_hard_breach_count;
     double value_mean_sum;
+    double critic_return_sum;
+    double critic_return_square_sum;
+    double critic_value_sum;
+    double critic_value_square_sum;
+    double critic_value_error_sum;
+    double critic_value_error_square_sum;
+    double critic_return_value_product_sum;
+    size_t critic_sample_count;
     double advantage_mean_sum;
     double abs_advantage_mean_sum;
     size_t label_weight_sum;
@@ -257,6 +265,14 @@ static void rl_training_summary_record_trainer(RlTrainingSummary* summary, const
     summary->approx_kl_sum += (double)trainer->last_approx_kl * (double)trainer->last_rl_labels;
     summary->clip_fraction_sum += (double)trainer->last_clip_fraction * (double)trainer->last_rl_labels;
     summary->value_mean_sum += (double)trainer->last_mean_value * (double)trainer->last_rl_labels;
+    summary->critic_return_sum += trainer->last_return_sum;
+    summary->critic_return_square_sum += trainer->last_return_square_sum;
+    summary->critic_value_sum += trainer->last_value_sum;
+    summary->critic_value_square_sum += trainer->last_value_square_sum;
+    summary->critic_value_error_sum += trainer->last_value_error_sum;
+    summary->critic_value_error_square_sum += trainer->last_value_error_square_sum;
+    summary->critic_return_value_product_sum += trainer->last_return_value_product_sum;
+    summary->critic_sample_count += trainer->last_critic_samples;
     summary->advantage_mean_sum += (double)trainer->last_mean_advantage * (double)trainer->last_rl_labels;
     summary->abs_advantage_mean_sum += (double)trainer->last_mean_abs_advantage * (double)trainer->last_rl_labels;
     summary->label_weight_sum += trainer->last_rl_labels;
@@ -1384,8 +1400,35 @@ static int write_rl_training_summary_json(
 ) {
     FILE* out;
     size_t i;
+    double return_mean = 0.0;
+    double value_mean = 0.0;
+    double return_variance = 0.0;
+    double value_variance = 0.0;
+    double error_variance = 0.0;
+    double covariance = 0.0;
+    double explained_variance = 0.0;
+    double return_value_correlation = 0.0;
     if (!path || !*path || !summary || !trainer || !reward_mode || !reward_config) {
         return 0;
+    }
+    if (summary->critic_sample_count > 0) {
+        double count = (double)summary->critic_sample_count;
+        return_mean = summary->critic_return_sum / count;
+        value_mean = summary->critic_value_sum / count;
+        return_variance = summary->critic_return_square_sum / count - return_mean * return_mean;
+        value_variance = summary->critic_value_square_sum / count - value_mean * value_mean;
+        error_variance = summary->critic_value_error_square_sum / count -
+            (summary->critic_value_error_sum / count) * (summary->critic_value_error_sum / count);
+        covariance = summary->critic_return_value_product_sum / count - return_mean * value_mean;
+        if (return_variance < 0.0) return_variance = 0.0;
+        if (value_variance < 0.0) value_variance = 0.0;
+        if (error_variance < 0.0) error_variance = 0.0;
+        if (return_variance > 1.0e-12) {
+            explained_variance = 1.0 - error_variance / return_variance;
+        }
+        if (return_variance > 1.0e-12 && value_variance > 1.0e-12) {
+            return_value_correlation = covariance / sqrt(return_variance * value_variance);
+        }
     }
     out = fopen(path, "w");
     if (!out) {
@@ -1441,6 +1484,10 @@ static int write_rl_training_summary_json(
     }
     fputs("},\n", out);
     fprintf(out, "  \"mean_value_prediction\": %.6f,\n", summary->label_weight_sum > 0 ? summary->value_mean_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"critic_explained_variance\": %.6f,\n", explained_variance);
+    fprintf(out, "  \"return_value_correlation\": %.6f,\n", return_value_correlation);
+    fprintf(out, "  \"value_bias\": %.6f,\n", value_mean - return_mean);
+    fprintf(out, "  \"critic_samples\": %zu,\n", summary->critic_sample_count);
     fprintf(out, "  \"mean_advantage\": %.6f,\n", summary->label_weight_sum > 0 ? summary->advantage_mean_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"mean_absolute_advantage\": %.6f,\n", summary->label_weight_sum > 0 ? summary->abs_advantage_mean_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"policy_loss\": %.6f,\n", summary->label_weight_sum > 0 ? summary->policy_loss_sum / (double)summary->label_weight_sum : 0.0);
@@ -2903,7 +2950,7 @@ static int train_from_input_file(
                     eta = (double)(train_sessions - trained_in_epoch) / train_eta_rate_ema;
                 }
                 if (rl_mode) {
-                    printf("[train-%s] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f anchor_kl_mean=%.4f anchor_kl_max=%.4f clip_fraction=%.4f hard_kl_breaches=%d/%d labels=%zu\n",
+                    printf("[train-%s] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f explained_variance=%.4f return_value_correlation=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f anchor_kl_mean=%.4f anchor_kl_max=%.4f clip_fraction=%.4f hard_kl_breaches=%d/%d labels=%zu\n",
                         ppo_mode ? "ppo" : "rl",
                         epoch,
                         trained_in_epoch,
@@ -2912,6 +2959,8 @@ static int train_from_input_file(
                         trainer.last_mean_return,
                         trainer.last_policy_loss,
                         trainer.last_value_loss,
+                        gru_trainer_critic_explained_variance(&trainer),
+                        gru_trainer_return_value_correlation(&trainer),
                         trainer.last_mean_advantage,
                         trainer.last_entropy,
                         trainer.last_approx_kl,

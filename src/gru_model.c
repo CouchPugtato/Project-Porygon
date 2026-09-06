@@ -2687,10 +2687,12 @@ static int recurrent_update_sequence(
     }
 
     dv = value - target_value;
-    grad_value_bias += dv * (float)target_count;
+    /* The critic predicts one value for the turn, even when doubles requires
+       two actions. Policy targets are per slot; the value target is not. */
+    grad_value_bias += dv;
     for (h = 0; h < hdim; ++h) {
-        grad_value_head[h] += dv * (float)target_count * h_states[(steps - 1) * hdim + h];
-        grad_h[h] += model->value_head[h] * dv * (float)target_count;
+        grad_value_head[h] += dv * h_states[(steps - 1) * hdim + h];
+        grad_h[h] += model->value_head[h] * dv;
     }
     if (action_loss_out) {
         *action_loss_out = action_loss_sum / (float)target_count;

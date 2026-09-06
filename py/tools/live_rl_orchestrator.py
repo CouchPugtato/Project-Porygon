@@ -125,7 +125,8 @@ class WorkflowDashboardState:
         self.active_started_at = time.monotonic()
         self.active_eta_seconds = None
         for key in (
-            "policy_loss", "value_loss", "entropy", "approx_kl", "anchor_kl_mean",
+            "policy_loss", "value_loss", "explained_variance", "return_value_correlation",
+            "entropy", "approx_kl", "anchor_kl_mean",
             "anchor_kl_max", "clip_fraction", "hard_kl_breaches", "labels",
         ):
             self.metrics.pop(key, None)
@@ -329,7 +330,8 @@ class BaseWorkflowReporter:
             self.state.training_total = int(train_match.group(2))
             values = parse_key_values(line)
             for key in (
-                "policy_loss", "value_loss", "entropy", "approx_kl", "anchor_kl_mean",
+                "policy_loss", "value_loss", "explained_variance", "return_value_correlation",
+                "entropy", "approx_kl", "anchor_kl_mean",
                 "anchor_kl_max", "clip_fraction", "hard_kl_breaches", "labels",
             ):
                 if key in values:
@@ -524,6 +526,10 @@ class RichWorkflowReporter(BaseWorkflowReporter):
             table.add_row(
                 f"[bold]Approx KL[/]: {metric('approx_kl')}", f"[bold]Anchor KL[/]: {metric('anchor_kl_mean')}",
                 f"[bold]Clip frac[/]: {metric('clip_fraction', 3)}", f"[bold]KL guard[/]: {metric('hard_kl_breaches', 0)}",
+            )
+            table.add_row(
+                f"[bold]Critic EV[/]: {metric('explained_variance')}",
+                f"[bold]Return/value corr[/]: {metric('return_value_correlation')}", "", "",
             )
             has_rows = True
         if state.valid_win_rate is not None:

@@ -43,10 +43,10 @@ target probabilities, optimizer settings, and explicit failure reasons. A
 failed criterion produces a nonzero exit code and blocks the remaining recovery
 benchmark work.
 
-The reconstruction test executable also contains a deterministic PPO direction
-check. It verifies that one update raises a positive-advantage joint-action
-probability, lowers a negative-advantage probability, and moves both value
-predictions toward their returns.
+The reconstruction test executable also contains deterministic PPO direction
+checks. They cover direct positive and negative advantages, mixed winning and
+losing episodes under production advantage normalization, and value learning
+when the policy term is clipped.
 
 Current implementation notes:
 
@@ -159,7 +159,7 @@ Artifacts:
 
 This path is the preferred long-term direction over replay RL because it removes the off-policy mismatch from training on older logged actions.
 
-The preferred live optimizer is now PPO (`--train-live-ppo`). Live episode records include rollout-time log probabilities, values, factorized actions, explicit move-target choices and masks, and a frozen actor `policy_tag`. PPO uses GAE, policy clipping, value clipping, target-KL stopping, and accumulated Adam updates. Targetable moves learn among self, ally, left-foe, and right-foe choices; moves without a selectable target do not contribute target-head loss.
+The preferred live optimizer is now PPO (`--train-live-ppo`). Live episode records include rollout-time log probabilities, values, factorized actions, explicit move-target choices and masks, and a frozen actor `policy_tag`. PPO uses GAE, policy clipping, value clipping, target-KL stopping, and accumulated Adam updates. Advantages are normalized once across all labelled turns in an optimizer minibatch, preserving the outcome difference between battles. Targetable moves learn among self, ally, left-foe, and right-foe choices; moves without a selectable target do not contribute target-head loss.
 
 When both active slots act, the policy normalizes over legal action pairs instead of sampling the slots independently. Each slot retains its own move/switch/Tera score, while an unordered pair head adds a symmetric compatibility score. The interaction therefore values combinations without imposing an arbitrary slot-0-then-slot-1 direction. Double Tera and duplicate switch destinations are masked before sampling. Singles and turns where only one slot chooses continue to use the per-slot factorized heads directly.
 
@@ -196,12 +196,14 @@ PPO safety behavior:
 
 - `--anchor-checkpoint` and `--anchor-kl-coef` apply to PPO as well as ordinary policy-gradient training
 - PPO accumulates a configurable number of episodes before each Adam update (`--ppo-minibatch-episodes`, default `8`), reducing sensitivity to one unusually short or unusual battle
+- the critic contributes once per decision turn, including dual-action turns, and continues learning when PPO clips only the policy objective
 - `--shuffle-seed` makes the episode order reproducible across candidates trained from the same batch
 - `--target-kl` uses the label-weighted running mean and does not stop until both `--target-kl-min-episodes` and `--target-kl-min-labels` have been processed
 - `--target-kl-hard-multiplier` defines an extreme-minibatch threshold, and `--target-kl-hard-consecutive-updates` requires repeated breaches (default `2`) before the emergency stop fires; isolated outliers remain visible in the summary without discarding the candidate
 - an emergency KL stop writes a rejected summary, returns a nonzero exit code, and does not overwrite or create the output checkpoint
 - a missing live-PPO output is initialized from `--parent-checkpoint`; an existing output must be byte-identical to that parent before an update begins
 - the training summary records the input parent, output checkpoint, anchor, shuffle seed, minibatch size, available/processed episode counts, whether the checkpoint was published, and whether the ordinary or emergency KL stop fired
+- `critic_explained_variance`, `return_value_correlation`, and `value_bias` indicate whether the critic is ranking returns usefully; value loss alone cannot distinguish a useful critic from a nearly constant prediction
 
 Live episode records carry their reward mode and dense-weight values. The self-play server forwards these settings to every model-backed battle agent, and the trainer rejects batches whose recorded rewards do not match the requested mode or weights. Older episode batches have no reward metadata and are treated as terminal-reward data. Dense rewards therefore require a newly collected `dense_additive` batch; changing only the training flag cannot relabel an existing terminal batch.
 

@@ -643,6 +643,7 @@ class WorkflowDashboardTests(unittest.TestCase):
         reporter.child_line("[live-rl] dashboard phase=training round=2/4 total=480\n")
         reporter.child_line(
             "[train-ppo] epoch=1 episodes=16/480 policy_loss=0.0123 value_loss=0.1010 "
+            "explained_variance=0.2400 return_value_correlation=0.5100 "
             "entropy=2.2000 approx_kl=0.0040 anchor_kl_mean=0.0010 "
             "clip_fraction=0.020 hard_kl_breaches=0/2 labels=320\n"
         )
@@ -650,6 +651,8 @@ class WorkflowDashboardTests(unittest.TestCase):
         self.assertEqual((state.training_current, state.training_total), (16, 480))
         self.assertEqual(state.metrics["hard_kl_breaches"], "0/2")
         self.assertAlmostEqual(float(state.metrics["approx_kl"]), 0.004)
+        self.assertAlmostEqual(float(state.metrics["explained_variance"]), 0.24)
+        self.assertAlmostEqual(float(state.metrics["return_value_correlation"]), 0.51)
         self.assertEqual(state.active_eta_seconds, 58.0)
 
         reporter.child_line('[live-rl] dashboard collapse_flags=["warn_anchor_kl_high:0.120"]\n')

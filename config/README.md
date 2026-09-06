@@ -122,7 +122,8 @@ PPO-search dashboard notes:
 
 Live/league dashboard notes:
 
-- standalone live RL shows round, collection, PPO-training, KL, anchor, clipping, and safety state
+- standalone live RL shows round, collection, PPO-training, critic explained variance,
+  return/value correlation, KL, anchor, clipping, and safety state
 - league RL uses the same display across nested live training, balanced side-A/side-B evaluation, confidence intervals, and the final promotion gate
 - the nested live process runs in plain-output mode during a league workflow so only one terminal dashboard owns the screen
 - non-interactive runs retain plain-text output and still write the manifest `progress` object

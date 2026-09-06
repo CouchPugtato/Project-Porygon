@@ -27,6 +27,14 @@ typedef struct {
     float last_mean_advantage;
     float last_mean_abs_advantage;
     float last_mean_value;
+    double last_return_sum;
+    double last_return_square_sum;
+    double last_value_sum;
+    double last_value_square_sum;
+    double last_value_error_sum;
+    double last_value_error_square_sum;
+    double last_return_value_product_sum;
+    size_t last_critic_samples;
     float last_entropy;
     float last_anchor_kl_mean;
     float last_anchor_kl_max;
@@ -69,6 +77,8 @@ int gru_trainer_ppo_hard_kl_stop_update(
     float hard_multiplier,
     int required_consecutive_updates,
     int* consecutive_breaches);
+double gru_trainer_critic_explained_variance(const GruTrainer* trainer);
+double gru_trainer_return_value_correlation(const GruTrainer* trainer);
 const char* gru_supervised_optimizer_name(GruSupervisedOptimizer optimizer);
 
 #endif

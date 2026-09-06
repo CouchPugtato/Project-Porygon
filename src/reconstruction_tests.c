@@ -4140,6 +4140,229 @@ static int selected_joint_probability_and_value(
     return 1;
 }
 
+static int initialize_two_step_ppo_episode(Episode* episode, int move_slot, float terminal_reward) {
+    float first_observation[4] = {0.25f, -0.5f, 0.75f, 0.1f};
+    float second_observation[4] = {0.3f, -0.4f, 0.7f, 0.2f};
+    uint8_t legal[OBS_NUM_ACTIONS] = {0};
+    int action0 = move_slot == 1 ? OBS_A1_MOVE1 : OBS_A1_MOVE2;
+    int action1 = move_slot == 1 ? OBS_A2_MOVE1 : OBS_A2_MOVE2;
+    size_t t;
+
+    legal[OBS_A1_MOVE1] = 1;
+    legal[OBS_A1_MOVE2] = 1;
+    legal[OBS_A2_MOVE1] = 1;
+    legal[OBS_A2_MOVE2] = 1;
+    if (!episode_init(episode, 2u, 4u) ||
+            !episode_append(episode, first_observation, legal, action0, 0.0f, 0) ||
+            !episode_append(episode, second_observation, legal, action0, terminal_reward, 1)) {
+        return 0;
+    }
+    for (t = 0; t < episode->count; ++t) {
+        episode->actions2[t] = action1;
+        factorized_action_choice_from_flat_actions(&episode->factorized_actions[t], action0, action1);
+    }
+    return 1;
+}
+
+static int selected_joint_probability_and_value_at(
+    const GruModel* model,
+    const Episode* episode,
+    size_t step,
+    float* probability_out,
+    float* value_out
+) {
+    float hidden[8] = {0};
+    float flat_policy[OBS_NUM_ACTIONS];
+    FactorizedPolicySnapshot snapshot;
+    int action0;
+    int action1;
+    size_t pair_index;
+    if (!model || !episode || step >= episode->count || !probability_out || !value_out) return 0;
+    gru_model_forward_sequence(model, episode->observations, step + 1u, hidden, flat_policy, value_out);
+    if (!gru_model_evaluate_policy_snapshot(
+            model, hidden, episode->legal_masks + step * OBS_NUM_ACTIONS, 1, &snapshot, value_out) ||
+            !factorized_action_choice_to_flat_actions(
+                &episode->factorized_actions[step], &action0, &action1)) {
+        return 0;
+    }
+    pair_index = (size_t)action0 * FACTORIZED_LOCAL_ACTION_DIM +
+        (size_t)(action1 - FACTORIZED_LOCAL_ACTION_DIM);
+    *probability_out = snapshot.joint_policy[pair_index];
+    return 1;
+}
+
+static int populate_ppo_behavior_predictions(GruModel* model, Episode* episode) {
+    size_t t;
+    for (t = 0; t < episode->count; ++t) {
+        float probability;
+        float value;
+        if (!selected_joint_probability_and_value_at(model, episode, t, &probability, &value) ||
+                probability <= 0.0f) {
+            return 0;
+        }
+        episode->old_log_probs[t] = logf(probability);
+        episode->old_values[t] = value;
+    }
+    return 1;
+}
+
+static int test_ppo_normalizes_advantages_across_minibatch(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode winning_episode;
+    Episode losing_episode;
+    const Episode* minibatch[2];
+    GruTrainer trainer;
+    float winning_probability_before;
+    float winning_probability_after;
+    float losing_probability_before;
+    float losing_probability_after;
+    float ignored_value;
+    int ok = 1;
+
+    memset(&winning_episode, 0, sizeof(winning_episode));
+    memset(&losing_episode, 0, sizeof(losing_episode));
+    if (!assert_true(model && zero_model_parameters(model) &&
+            initialize_two_step_ppo_episode(&winning_episode, 2, 1.0f) &&
+            initialize_two_step_ppo_episode(&losing_episode, 1, -1.0f) &&
+            populate_ppo_behavior_predictions(model, &winning_episode) &&
+            populate_ppo_behavior_predictions(model, &losing_episode),
+            "initialize mixed-outcome PPO minibatch fixture")) {
+        ok = 0;
+        goto cleanup;
+    }
+    ok &= assert_true(selected_joint_probability_and_value_at(
+        model, &winning_episode, 0u, &winning_probability_before, &ignored_value),
+        "evaluate winning episode before normalized PPO minibatch");
+    ok &= assert_true(selected_joint_probability_and_value_at(
+        model, &losing_episode, 0u, &losing_probability_before, &ignored_value),
+        "evaluate losing episode before normalized PPO minibatch");
+
+    gru_trainer_init(&trainer, 0.01f, 16u, 1.0f, 29u);
+    trainer.advantage_norm = 1;
+    trainer.entropy_coef = 0.0f;
+    minibatch[0] = &winning_episode;
+    minibatch[1] = &losing_episode;
+    ok &= assert_true(gru_trainer_ppo_minibatch(&trainer, model, minibatch, 2u),
+        "apply production normalized PPO minibatch");
+    ok &= assert_true(fabsf(trainer.last_mean_advantage) < 1.0e-5f,
+        "minibatch-normalized advantages have a shared zero mean");
+    ok &= assert_true(selected_joint_probability_and_value_at(
+        model, &winning_episode, 0u, &winning_probability_after, &ignored_value),
+        "evaluate winning episode after normalized PPO minibatch");
+    ok &= assert_true(selected_joint_probability_and_value_at(
+        model, &losing_episode, 0u, &losing_probability_after, &ignored_value),
+        "evaluate losing episode after normalized PPO minibatch");
+    ok &= assert_true(winning_probability_after > winning_probability_before,
+        "shared normalization reinforces actions from the winning episode");
+    ok &= assert_true(losing_probability_after < losing_probability_before,
+        "shared normalization suppresses actions from the losing episode");
+
+cleanup:
+    episode_free(&losing_episode);
+    episode_free(&winning_episode);
+    gru_model_destroy(model);
+    return ok;
+}
+
+static int test_ppo_clipped_policy_still_updates_value(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode episode;
+    GruTrainer trainer;
+    float probability;
+    float value_before;
+    float value_after;
+    int ok = 1;
+
+    memset(&episode, 0, sizeof(episode));
+    if (!assert_true(model && zero_model_parameters(model) &&
+            initialize_learning_episode(&episode, 1.0f, 1.0f, 0) &&
+            selected_joint_probability_and_value(model, &episode, &probability, &value_before),
+            "initialize clipped-policy value fixture")) {
+        ok = 0;
+        goto cleanup;
+    }
+    episode.old_values[0] = value_before;
+    episode.old_log_probs[0] = logf(probability) - logf(2.0f);
+    gru_trainer_init(&trainer, 0.01f, 16u, 1.0f, 31u);
+    trainer.advantage_norm = 0;
+    trainer.entropy_coef = 0.0f;
+    ok &= assert_true(gru_trainer_ppo_episode(&trainer, model, &episode),
+        "apply PPO update with clipped positive policy advantage");
+    ok &= assert_true(selected_joint_probability_and_value(
+        model, &episode, &probability, &value_after),
+        "evaluate critic after clipped policy update");
+    ok &= assert_true(value_after > value_before,
+        "critic still learns when PPO clips the policy term");
+
+cleanup:
+    episode_free(&episode);
+    gru_model_destroy(model);
+    return ok;
+}
+
+static int test_dual_action_turn_has_one_value_target(void) {
+    GruModel* single_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* dual_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode single_episode;
+    Episode dual_episode;
+    GruTrainer single_trainer;
+    GruTrainer dual_trainer;
+    float hidden[8] = {0};
+    float policy[OBS_NUM_ACTIONS];
+    float single_value;
+    float dual_value;
+    int ok = 1;
+
+    memset(&single_episode, 0, sizeof(single_episode));
+    memset(&dual_episode, 0, sizeof(dual_episode));
+    if (!assert_true(single_model && dual_model &&
+            zero_model_parameters(single_model) && zero_model_parameters(dual_model) &&
+            initialize_learning_episode(&single_episode, 1.0f, 1.0f, 0) &&
+            initialize_learning_episode(&dual_episode, 1.0f, 1.0f, 0),
+            "initialize single- and dual-action value fixtures")) {
+        ok = 0;
+        goto cleanup;
+    }
+    single_episode.actions2[0] = -1;
+    factorized_action_choice_from_flat_actions(
+        &single_episode.factorized_actions[0], single_episode.actions[0], -1);
+    gru_trainer_init(&single_trainer, 0.01f, 16u, 100.0f, 37u);
+    gru_trainer_init(&dual_trainer, 0.01f, 16u, 100.0f, 37u);
+    ok &= assert_true(gru_trainer_supervised_episode(
+        &single_trainer, single_model, &single_episode), "train single-action value fixture");
+    ok &= assert_true(gru_trainer_supervised_episode(
+        &dual_trainer, dual_model, &dual_episode), "train dual-action value fixture");
+    gru_model_forward_sequence(single_model, single_episode.observations, 1u, hidden, policy, &single_value);
+    memset(hidden, 0, sizeof(hidden));
+    gru_model_forward_sequence(dual_model, dual_episode.observations, 1u, hidden, policy, &dual_value);
+    ok &= assert_true(fabsf(single_value - dual_value) < 1.0e-6f,
+        "dual-action turn applies the turn-level value target once");
+
+cleanup:
+    episode_free(&dual_episode);
+    episode_free(&single_episode);
+    gru_model_destroy(dual_model);
+    gru_model_destroy(single_model);
+    return ok;
+}
+
+static int test_ppo_critic_diagnostics(void) {
+    GruTrainer trainer;
+    memset(&trainer, 0, sizeof(trainer));
+    trainer.last_critic_samples = 2u;
+    trainer.last_return_sum = 0.0;
+    trainer.last_return_square_sum = 2.0;
+    trainer.last_value_sum = 0.0;
+    trainer.last_value_square_sum = 0.5;
+    trainer.last_value_error_sum = 0.0;
+    trainer.last_value_error_square_sum = 0.5;
+    trainer.last_return_value_product_sum = 1.0;
+    if (!assert_true(fabs(gru_trainer_critic_explained_variance(&trainer) - 0.75) < 1.0e-9,
+            "critic explained variance uses return and residual variance")) return 0;
+    return assert_true(fabs(gru_trainer_return_value_correlation(&trainer) - 1.0) < 1.0e-9,
+        "critic diagnostic reports return/value correlation");
+}
+
 static int test_ppo_update_moves_policy_and_value_in_expected_directions(void) {
     GruModel* positive_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     GruModel* negative_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
@@ -4249,6 +4472,10 @@ int main(int argc, char** argv) {
     if (!test_policy_evaluation_matches_legal_runtime_policy()) return 1;
     if (!test_supervised_overfit_diagnostic_learns()) return 1;
     if (!test_ppo_update_moves_policy_and_value_in_expected_directions()) return 1;
+    if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
+    if (!test_ppo_clipped_policy_still_updates_value()) return 1;
+    if (!test_dual_action_turn_has_one_value_target()) return 1;
+    if (!test_ppo_critic_diagnostics()) return 1;
     if (!test_validation_split_is_stable_and_seeded()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;

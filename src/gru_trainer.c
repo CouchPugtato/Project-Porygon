@@ -1077,10 +1077,84 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
     return 1;
 }
 
+typedef struct {
+    int enabled;
+    float mean;
+    float standard_deviation;
+} PpoAdvantageNormalization;
+
+static void compute_ppo_returns_and_advantages(
+    const GruTrainer* trainer,
+    const Episode* episode,
+    float* returns,
+    float* advantages
+) {
+    size_t t;
+    float gae = 0.0f;
+
+    for (t = episode->count; t > 0; --t) {
+        size_t idx = t - 1;
+        float nonterminal = episode->dones[idx] ? 0.0f : 1.0f;
+        float next_value = idx + 1 < episode->count ? episode->old_values[idx + 1] : 0.0f;
+        float delta = episode->rewards[idx] + trainer->gamma * next_value * nonterminal -
+            episode->old_values[idx];
+        gae = delta + trainer->gamma * trainer->gae_lambda * nonterminal * gae;
+        advantages[idx] = gae;
+        if (returns) returns[idx] = gae + episode->old_values[idx];
+    }
+}
+
+static int ppo_minibatch_advantage_normalization(
+    const GruTrainer* trainer,
+    const Episode* const* episodes,
+    size_t episode_count,
+    PpoAdvantageNormalization* normalization
+) {
+    double sum = 0.0;
+    double square_sum = 0.0;
+    size_t count = 0;
+    size_t i;
+
+    if (!trainer || !episodes || !normalization) return 0;
+    memset(normalization, 0, sizeof(*normalization));
+    if (!trainer->advantage_norm) return 1;
+
+    for (i = 0; i < episode_count; ++i) {
+        const Episode* episode = episodes[i];
+        float* advantages;
+        size_t t;
+        if (!episode) return 0;
+        advantages = (float*)malloc(episode->count * sizeof(float));
+        if ((episode->count > 0) && !advantages) {
+            free(advantages);
+            return 0;
+        }
+        compute_ppo_returns_and_advantages(trainer, episode, NULL, advantages);
+        for (t = 0; t < episode->count; ++t) {
+            if (episode->actions[t] < 0 && episode->actions2[t] < 0) continue;
+            sum += advantages[t];
+            square_sum += (double)advantages[t] * advantages[t];
+            ++count;
+        }
+        free(advantages);
+    }
+
+    if (count > 1) {
+        double mean = sum / (double)count;
+        double variance = square_sum / (double)count - mean * mean;
+        if (variance < 0.0) variance = 0.0;
+        normalization->mean = (float)mean;
+        normalization->standard_deviation = (float)sqrt(variance);
+        normalization->enabled = normalization->standard_deviation > 1.0e-6f;
+    }
+    return 1;
+}
+
 static int gru_trainer_ppo_episode_accumulate(
     GruTrainer* trainer,
     GruModel* model,
     const Episode* episode,
+    const PpoAdvantageNormalization* normalization,
     int clear_before,
     int apply_after
 ) {
@@ -1097,10 +1171,14 @@ static int gru_trainer_ppo_episode_accumulate(
     float* anchor_hidden = NULL;
     float* anchor_next_hidden = NULL;
     float* anchor_hidden_after = NULL;
-    float gae = 0.0f;
     float advantage_sum = 0.0f;
     float return_sum = 0.0f;
+    double return_square_sum = 0.0;
     float mean_value_sum = 0.0f;
+    double value_square_sum = 0.0;
+    double value_error_sum = 0.0;
+    double value_error_square_sum = 0.0;
+    double return_value_product_sum = 0.0;
     float abs_advantage_sum = 0.0f;
     float policy_loss_sum = 0.0f;
     float value_loss_sum = 0.0f;
@@ -1130,6 +1208,14 @@ static int gru_trainer_ppo_episode_accumulate(
         trainer->last_mean_advantage = 0.0f;
         trainer->last_mean_abs_advantage = 0.0f;
         trainer->last_mean_value = 0.0f;
+        trainer->last_return_sum = 0.0;
+        trainer->last_return_square_sum = 0.0;
+        trainer->last_value_sum = 0.0;
+        trainer->last_value_square_sum = 0.0;
+        trainer->last_value_error_sum = 0.0;
+        trainer->last_value_error_square_sum = 0.0;
+        trainer->last_return_value_product_sum = 0.0;
+        trainer->last_critic_samples = 0;
         trainer->last_entropy = 0.0f;
         trainer->last_approx_kl = 0.0f;
         trainer->last_clip_fraction = 0.0f;
@@ -1202,37 +1288,12 @@ static int gru_trainer_ppo_episode_accumulate(
         }
     }
 
-    for (t = episode->count; t > 0; --t) {
-        size_t idx = t - 1;
-        float next_value = 0.0f;
-        float nonterminal = episode->dones[idx] ? 0.0f : 1.0f;
-        float delta;
-        if (idx + 1 < episode->count) {
-            next_value = episode->old_values[idx + 1];
-        }
-        delta = episode->rewards[idx] + trainer->gamma * next_value * nonterminal - episode->old_values[idx];
-        gae = delta + trainer->gamma * trainer->gae_lambda * nonterminal * gae;
-        advantages[idx] = gae;
-        returns[idx] = advantages[idx] + episode->old_values[idx];
-    }
-
-    if (trainer->advantage_norm && episode->count > 1) {
-        float mean = 0.0f;
-        float variance = 0.0f;
+    compute_ppo_returns_and_advantages(trainer, episode, returns, advantages);
+    if (normalization && normalization->enabled) {
         for (t = 0; t < episode->count; ++t) {
-            mean += advantages[t];
-        }
-        mean /= (float)episode->count;
-        for (t = 0; t < episode->count; ++t) {
-            float centered = advantages[t] - mean;
-            variance += centered * centered;
-        }
-        variance /= (float)episode->count;
-        variance = sqrtf(variance);
-        if (variance > 1.0e-6f) {
-            for (t = 0; t < episode->count; ++t) {
-                advantages[t] = (advantages[t] - mean) / variance;
-            }
+            if (episode->actions[t] < 0 && episode->actions2[t] < 0) continue;
+            advantages[t] = (advantages[t] - normalization->mean) /
+                normalization->standard_deviation;
         }
     }
 
@@ -1330,7 +1391,13 @@ static int gru_trainer_ppo_episode_accumulate(
         advantage_sum += advantages[t];
         abs_advantage_sum += fabsf(advantages[t]);
         return_sum += returns[t];
+        return_square_sum += (double)returns[t] * returns[t];
         mean_value_sum += current_value;
+        value_square_sum += (double)current_value * current_value;
+        value_error_sum += (double)returns[t] - current_value;
+        value_error_square_sum += ((double)returns[t] - current_value) *
+            ((double)returns[t] - current_value);
+        return_value_product_sum += (double)returns[t] * current_value;
 
         start = (t + 1 > trainer->bptt_window) ? (t + 1 - trainer->bptt_window) : 0;
         steps = (t - start) + 1;
@@ -1341,8 +1408,7 @@ static int gru_trainer_ppo_episode_accumulate(
         if (episode->actions2[t] >= 0) {
             build_step_slot_legal_mask(episode, t, 1, slot_mask_b);
         }
-        if ((fabsf(effective_advantage) > 0.0f || anchor_enabled) &&
-                !(anchor_enabled ?
+        if (!(anchor_enabled ?
                 gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
                     model,
                     episode->observations + (start * episode->obs_dim),
@@ -1401,6 +1467,14 @@ static int gru_trainer_ppo_episode_accumulate(
     trainer->last_mean_advantage = labeled_steps > 0 ? advantage_sum / (float)labeled_steps : 0.0f;
     trainer->last_mean_abs_advantage = labeled_steps > 0 ? abs_advantage_sum / (float)labeled_steps : 0.0f;
     trainer->last_mean_value = labeled_steps > 0 ? mean_value_sum / (float)labeled_steps : 0.0f;
+    trainer->last_return_sum = return_sum;
+    trainer->last_return_square_sum = return_square_sum;
+    trainer->last_value_sum = mean_value_sum;
+    trainer->last_value_square_sum = value_square_sum;
+    trainer->last_value_error_sum = value_error_sum;
+    trainer->last_value_error_square_sum = value_error_square_sum;
+    trainer->last_return_value_product_sum = return_value_product_sum;
+    trainer->last_critic_samples = labeled_steps;
     trainer->last_entropy = labeled_steps > 0 ? entropy_sum / (float)labeled_steps : 0.0f;
     trainer->last_approx_kl = labeled_steps > 0 ? approx_kl_sum / (float)labeled_steps : 0.0f;
     trainer->last_clip_fraction = labeled_steps > 0 ? clip_fraction_sum / (float)labeled_steps : 0.0f;
@@ -1422,7 +1496,10 @@ static int gru_trainer_ppo_episode_accumulate(
 }
 
 int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode* episode) {
-    return gru_trainer_ppo_episode_accumulate(trainer, model, episode, 1, 1);
+    const Episode* episodes[1] = {episode};
+    PpoAdvantageNormalization normalization;
+    if (!ppo_minibatch_advantage_normalization(trainer, episodes, 1u, &normalization)) return 0;
+    return gru_trainer_ppo_episode_accumulate(trainer, model, episode, &normalization, 1, 1);
 }
 
 int gru_trainer_ppo_hard_kl_stop_update(
@@ -1445,6 +1522,41 @@ int gru_trainer_ppo_hard_kl_stop_update(
     return *consecutive_breaches >= required;
 }
 
+double gru_trainer_critic_explained_variance(const GruTrainer* trainer) {
+    double count;
+    double return_mean;
+    double error_mean;
+    double return_variance;
+    double error_variance;
+    if (!trainer || trainer->last_critic_samples == 0) return 0.0;
+    count = (double)trainer->last_critic_samples;
+    return_mean = trainer->last_return_sum / count;
+    error_mean = trainer->last_value_error_sum / count;
+    return_variance = trainer->last_return_square_sum / count - return_mean * return_mean;
+    error_variance = trainer->last_value_error_square_sum / count - error_mean * error_mean;
+    if (return_variance <= 1.0e-12) return 0.0;
+    if (error_variance < 0.0) error_variance = 0.0;
+    return 1.0 - error_variance / return_variance;
+}
+
+double gru_trainer_return_value_correlation(const GruTrainer* trainer) {
+    double count;
+    double return_mean;
+    double value_mean;
+    double return_variance;
+    double value_variance;
+    double covariance;
+    if (!trainer || trainer->last_critic_samples == 0) return 0.0;
+    count = (double)trainer->last_critic_samples;
+    return_mean = trainer->last_return_sum / count;
+    value_mean = trainer->last_value_sum / count;
+    return_variance = trainer->last_return_square_sum / count - return_mean * return_mean;
+    value_variance = trainer->last_value_square_sum / count - value_mean * value_mean;
+    covariance = trainer->last_return_value_product_sum / count - return_mean * value_mean;
+    if (return_variance <= 1.0e-12 || value_variance <= 1.0e-12) return 0.0;
+    return covariance / sqrt(return_variance * value_variance);
+}
+
 int gru_trainer_ppo_minibatch(
     GruTrainer* trainer,
     GruModel* model,
@@ -1459,20 +1571,33 @@ int gru_trainer_ppo_minibatch(
     double mean_advantage_sum = 0.0;
     double mean_abs_advantage_sum = 0.0;
     double mean_value_sum = 0.0;
+    double return_sum = 0.0;
+    double return_square_sum = 0.0;
+    double value_square_sum = 0.0;
+    double value_error_sum = 0.0;
+    double value_error_square_sum = 0.0;
+    double return_value_product_sum = 0.0;
+    size_t critic_samples = 0;
     double entropy_sum = 0.0;
     double approx_kl_sum = 0.0;
     double clip_fraction_sum = 0.0;
     double anchor_kl_sum = 0.0;
     double anchor_loss_sum = 0.0;
     float anchor_kl_max = 0.0f;
+    PpoAdvantageNormalization normalization;
 
     if (!trainer || !model || !episodes || episode_count == 0) {
+        return 0;
+    }
+    if (!ppo_minibatch_advantage_normalization(
+            trainer, episodes, episode_count, &normalization)) {
         return 0;
     }
     gru_model_clear_accumulated_supervised_updates(model);
     for (i = 0; i < episode_count; ++i) {
         size_t episode_labels;
-        if (!episodes[i] || !gru_trainer_ppo_episode_accumulate(trainer, model, episodes[i], 0, 0)) {
+        if (!episodes[i] || !gru_trainer_ppo_episode_accumulate(
+                trainer, model, episodes[i], &normalization, 0, 0)) {
             gru_model_clear_accumulated_supervised_updates(model);
             return 0;
         }
@@ -1484,6 +1609,13 @@ int gru_trainer_ppo_minibatch(
         mean_advantage_sum += (double)trainer->last_mean_advantage * episode_labels;
         mean_abs_advantage_sum += (double)trainer->last_mean_abs_advantage * episode_labels;
         mean_value_sum += (double)trainer->last_mean_value * episode_labels;
+        return_sum += trainer->last_return_sum;
+        return_square_sum += trainer->last_return_square_sum;
+        value_square_sum += trainer->last_value_square_sum;
+        value_error_sum += trainer->last_value_error_sum;
+        value_error_square_sum += trainer->last_value_error_square_sum;
+        return_value_product_sum += trainer->last_return_value_product_sum;
+        critic_samples += trainer->last_critic_samples;
         entropy_sum += (double)trainer->last_entropy * episode_labels;
         approx_kl_sum += (double)trainer->last_approx_kl * episode_labels;
         clip_fraction_sum += (double)trainer->last_clip_fraction * episode_labels;
@@ -1509,6 +1641,14 @@ int gru_trainer_ppo_minibatch(
     trainer->last_mean_advantage = labels > 0 ? (float)(mean_advantage_sum / labels) : 0.0f;
     trainer->last_mean_abs_advantage = labels > 0 ? (float)(mean_abs_advantage_sum / labels) : 0.0f;
     trainer->last_mean_value = labels > 0 ? (float)(mean_value_sum / labels) : 0.0f;
+    trainer->last_return_sum = return_sum;
+    trainer->last_return_square_sum = return_square_sum;
+    trainer->last_value_sum = mean_value_sum;
+    trainer->last_value_square_sum = value_square_sum;
+    trainer->last_value_error_sum = value_error_sum;
+    trainer->last_value_error_square_sum = value_error_square_sum;
+    trainer->last_return_value_product_sum = return_value_product_sum;
+    trainer->last_critic_samples = critic_samples;
     trainer->last_entropy = labels > 0 ? (float)(entropy_sum / labels) : 0.0f;
     trainer->last_approx_kl = labels > 0 ? (float)(approx_kl_sum / labels) : 0.0f;
     trainer->last_clip_fraction = labels > 0 ? (float)(clip_fraction_sum / labels) : 0.0f;
