@@ -674,6 +674,8 @@ int learning_diagnostic_write_supervised_report(
 int learning_diagnostic_write_critic_report(
     const char* report_path,
     const char* source_path,
+    const char* selection_source_path,
+    const char* holdout_source_path,
     const char* checkpoint_path,
     unsigned int validation_seed,
     unsigned int shuffle_seed,
@@ -695,9 +697,15 @@ int learning_diagnostic_write_critic_report(
     out = fopen(report_path, "w");
     if (!out) return 0;
 
-    fputs("{\n  \"diagnostic\": \"critic_fit\",\n  \"metrics_version\": 3,\n", out);
+    fputs("{\n  \"diagnostic\": \"critic_fit\",\n  \"metrics_version\": 4,\n", out);
     fputs("  \"source_episode_batch\": ", out);
     write_json_string(out, source_path);
+    fputs(",\n  \"training_source\": ", out);
+    write_json_string(out, source_path);
+    fputs(",\n  \"selection_source\": ", out);
+    write_json_string(out, selection_source_path);
+    fputs(",\n  \"holdout_source\": ", out);
+    write_json_string(out, holdout_source_path);
     fputs(",\n  \"checkpoint\": ", out);
     write_json_string(out, checkpoint_path);
     fprintf(out,

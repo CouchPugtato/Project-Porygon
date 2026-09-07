@@ -75,6 +75,13 @@ explained-variance gap exceeds `0.25`, or a sufficiently large win/loss
 subgroup has negative return/value correlation. These are diagnostic
 thresholds, not strength or promotion results.
 
+`--check-critic-fit-manifest` is the stronger form of the diagnostic. Its
+newline-delimited manifest supplies multiple training batches. A stable 90/10
+split of those battles provides training and early-stopping selection data,
+while the separately named episode batch is used only for the final holdout
+evaluation. Blank manifest lines and lines beginning with `#` are ignored.
+The report records all three sources explicitly.
+
 Current implementation notes:
 
 - The repository now includes the protocol/session/raw-state/trainer/checkpoint path.

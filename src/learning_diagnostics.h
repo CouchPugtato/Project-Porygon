@@ -115,6 +115,8 @@ int learning_diagnostic_run_critic_fit(
 int learning_diagnostic_write_critic_report(
     const char* report_path,
     const char* source_path,
+    const char* selection_source_path,
+    const char* holdout_source_path,
     const char* checkpoint_path,
     unsigned int validation_seed,
     unsigned int shuffle_seed,

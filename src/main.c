@@ -3354,8 +3354,109 @@ static int run_supervised_overfit_check(
     return rc;
 }
 
+typedef struct {
+    EnvRuntime* runtimes;
+    size_t runtime_count;
+    const Episode** episodes;
+    size_t episode_count;
+} CriticEpisodeSet;
+
+static void critic_episode_set_free(CriticEpisodeSet* set) {
+    size_t i;
+    if (!set) return;
+    for (i = 0; i < set->runtime_count; ++i) {
+        env_runtime_free(&set->runtimes[i]);
+    }
+    free(set->episodes);
+    free(set->runtimes);
+    memset(set, 0, sizeof(*set));
+}
+
+static int critic_episode_set_add_batch(
+    CriticEpisodeSet* set,
+    const char* path,
+    GruModel* model,
+    EnvRewardMode reward_mode,
+    const EnvDenseRewardConfig* dense_reward_config
+) {
+    EnvRuntime* runtimes;
+    const Episode** episodes;
+    EnvRuntime* runtime;
+    size_t labeled_count = 0;
+    size_t i;
+
+    if (!set || !path || !*path || !model || !dense_reward_config) return 0;
+    runtimes = (EnvRuntime*)realloc(
+        set->runtimes, (set->runtime_count + 1u) * sizeof(*runtimes));
+    if (!runtimes) return 0;
+    set->runtimes = runtimes;
+    runtime = &set->runtimes[set->runtime_count];
+    memset(runtime, 0, sizeof(*runtime));
+    if (!load_runtime_from_episode_batch_file(
+            path, model, runtime, reward_mode, dense_reward_config, "")) {
+        return 0;
+    }
+    for (i = 0; i < runtime->count; ++i) {
+        if (episode_has_labels(&runtime->sessions[i].episode)) ++labeled_count;
+    }
+    episodes = (const Episode**)realloc(
+        set->episodes, (set->episode_count + labeled_count) * sizeof(*episodes));
+    if (!episodes && labeled_count > 0) {
+        env_runtime_free(runtime);
+        return 0;
+    }
+    set->episodes = episodes;
+    for (i = 0; i < runtime->count; ++i) {
+        if (episode_has_labels(&runtime->sessions[i].episode)) {
+            set->episodes[set->episode_count++] = &runtime->sessions[i].episode;
+        }
+    }
+    ++set->runtime_count;
+    printf("[critic-fit] loaded source=%s labeled_episodes=%zu total_episodes=%zu\n",
+        path, labeled_count, set->episode_count);
+    return 1;
+}
+
+static int critic_episode_set_load_manifest(
+    CriticEpisodeSet* set,
+    const char* manifest_path,
+    GruModel* model,
+    EnvRewardMode reward_mode,
+    const EnvDenseRewardConfig* dense_reward_config
+) {
+    FILE* manifest;
+    char line[4096];
+    size_t paths_loaded = 0;
+
+    if (!set || !manifest_path || !*manifest_path) return 0;
+    manifest = fopen(manifest_path, "r");
+    if (!manifest) {
+        fprintf(stderr, "Failed to open critic batch manifest '%s': %s\n",
+            manifest_path, strerror(errno));
+        return 0;
+    }
+    while (fgets(line, sizeof(line), manifest)) {
+        char* path = trim_manifest_line(line);
+        if (!*path || *path == '#') continue;
+        if (!critic_episode_set_add_batch(
+                set, path, model, reward_mode, dense_reward_config)) {
+            fclose(manifest);
+            return 0;
+        }
+        ++paths_loaded;
+    }
+    fclose(manifest);
+    if (paths_loaded == 0) {
+        fprintf(stderr, "Critic batch manifest contains no paths: %s\n", manifest_path);
+        return 0;
+    }
+    return 1;
+}
+
 static int run_critic_fit_check(
     const char* episode_batch_path,
+    const char* holdout_batch_path,
+    int training_source_is_manifest,
     const char* checkpoint_path,
     const char* report_path,
     size_t epochs,
@@ -3378,6 +3479,8 @@ static int run_critic_fit_check(
     CheckpointLoadResult checkpoint_result;
     EnvRewardMode reward_mode;
     EnvRuntime runtime;
+    CriticEpisodeSet training_set;
+    CriticEpisodeSet holdout_set;
     const Episode** train_episodes = NULL;
     const Episode** selection_episodes = NULL;
     const Episode** holdout_episodes = NULL;
@@ -3391,8 +3494,12 @@ static int run_critic_fit_check(
     int rc = 1;
 
     memset(&runtime, 0, sizeof(runtime));
+    memset(&training_set, 0, sizeof(training_set));
+    memset(&holdout_set, 0, sizeof(holdout_set));
     if (!episode_batch_path || !checkpoint_path || !report_path ||
             epochs == 0 || minibatch_episodes == 0 || !reward_config ||
+            (training_source_is_manifest &&
+                (!holdout_batch_path || !*holdout_batch_path || early_stop_patience == 0)) ||
             !parse_reward_mode(reward_mode_name, &reward_mode)) {
         fprintf(stderr, "[critic-fit] invalid diagnostic configuration\n");
         return 1;
@@ -3407,30 +3514,67 @@ static int run_critic_fit_check(
         report_checkpoint_load_failure("[critic-fit] failed to load", checkpoint_path, &checkpoint_result);
         goto cleanup;
     }
-    if (!load_runtime_from_episode_batch_file(
-            episode_batch_path,
-            head_model,
-            &runtime,
-            reward_mode,
-            &reward_config->dense_additive,
-            "")) {
-        goto cleanup;
-    }
-    train_episodes = (const Episode**)malloc(runtime.count * sizeof(*train_episodes));
-    selection_episodes = (const Episode**)malloc(runtime.count * sizeof(*selection_episodes));
-    holdout_episodes = (const Episode**)malloc(runtime.count * sizeof(*holdout_episodes));
-    if (!train_episodes || !selection_episodes || !holdout_episodes) goto cleanup;
-    for (i = 0; i < runtime.count; ++i) {
-        const EnvSession* session = &runtime.sessions[i];
-        uint64_t split_bucket;
-        if (!episode_has_labels(&session->episode)) continue;
-        split_bucket = validation_split_hash(session->battle_id, validation_seed) % UINT64_C(10);
-        if (split_bucket == UINT64_C(0)) {
-            holdout_episodes[holdout_count++] = &session->episode;
-        } else if (early_stop_patience > 0 && split_bucket == UINT64_C(1)) {
-            selection_episodes[selection_count++] = &session->episode;
-        } else {
-            train_episodes[train_count++] = &session->episode;
+    if (training_source_is_manifest) {
+        if (!critic_episode_set_load_manifest(
+                &training_set,
+                episode_batch_path,
+                head_model,
+                reward_mode,
+                &reward_config->dense_additive) ||
+                !critic_episode_set_add_batch(
+                    &holdout_set,
+                    holdout_batch_path,
+                    head_model,
+                    reward_mode,
+                    &reward_config->dense_additive)) {
+            goto cleanup;
+        }
+        train_episodes = (const Episode**)malloc(
+            training_set.episode_count * sizeof(*train_episodes));
+        selection_episodes = (const Episode**)malloc(
+            training_set.episode_count * sizeof(*selection_episodes));
+        if (!train_episodes || !selection_episodes) goto cleanup;
+        for (i = 0; i < training_set.runtime_count; ++i) {
+            const EnvRuntime* source_runtime = &training_set.runtimes[i];
+            size_t session_index;
+            for (session_index = 0; session_index < source_runtime->count; ++session_index) {
+                const EnvSession* session = &source_runtime->sessions[session_index];
+                if (!episode_has_labels(&session->episode)) continue;
+                if (validation_split_contains(session->battle_id, validation_seed)) {
+                    selection_episodes[selection_count++] = &session->episode;
+                } else {
+                    train_episodes[train_count++] = &session->episode;
+                }
+            }
+        }
+        holdout_episodes = holdout_set.episodes;
+        holdout_count = holdout_set.episode_count;
+    } else {
+        if (!load_runtime_from_episode_batch_file(
+                episode_batch_path,
+                head_model,
+                &runtime,
+                reward_mode,
+                &reward_config->dense_additive,
+                "")) {
+            goto cleanup;
+        }
+        train_episodes = (const Episode**)malloc(runtime.count * sizeof(*train_episodes));
+        selection_episodes = (const Episode**)malloc(runtime.count * sizeof(*selection_episodes));
+        holdout_episodes = (const Episode**)malloc(runtime.count * sizeof(*holdout_episodes));
+        if (!train_episodes || !selection_episodes || !holdout_episodes) goto cleanup;
+        for (i = 0; i < runtime.count; ++i) {
+            const EnvSession* session = &runtime.sessions[i];
+            uint64_t split_bucket;
+            if (!episode_has_labels(&session->episode)) continue;
+            split_bucket = validation_split_hash(session->battle_id, validation_seed) % UINT64_C(10);
+            if (split_bucket == UINT64_C(0)) {
+                holdout_episodes[holdout_count++] = &session->episode;
+            } else if (early_stop_patience > 0 && split_bucket == UINT64_C(1)) {
+                selection_episodes[selection_count++] = &session->episode;
+            } else {
+                train_episodes[train_count++] = &session->episode;
+            }
         }
     }
     if (train_count == 0 || holdout_count == 0 ||
@@ -3475,6 +3619,9 @@ static int run_critic_fit_check(
     if (!learning_diagnostic_write_critic_report(
             report_path,
             episode_batch_path,
+            training_source_is_manifest ? episode_batch_path :
+                (early_stop_patience > 0 ? episode_batch_path : ""),
+            training_source_is_manifest ? holdout_batch_path : episode_batch_path,
             checkpoint_path,
             validation_seed,
             shuffle_seed,
@@ -3495,9 +3642,11 @@ static int run_critic_fit_check(
     rc = 0;
 
 cleanup:
-    free(holdout_episodes);
+    if (!training_source_is_manifest) free(holdout_episodes);
     free(selection_episodes);
     free(train_episodes);
+    critic_episode_set_free(&holdout_set);
+    critic_episode_set_free(&training_set);
     env_runtime_free(&runtime);
     gru_model_destroy(recurrent_model);
     gru_model_destroy(head_model);
@@ -3554,7 +3703,10 @@ static int clean_replay_file(const char* input_path, const char* output_path) {
 static int showdown_client_main(int argc, char** argv) {
     int epochs = parse_epochs_arg(argc, argv, 1);
     int overfit_command = argc >= 2 && strcmp(argv[1], "--check-supervised-overfit") == 0;
-    int critic_fit_command = argc >= 2 && strcmp(argv[1], "--check-critic-fit") == 0;
+    int critic_fit_manifest_command = argc >= 2 &&
+        strcmp(argv[1], "--check-critic-fit-manifest") == 0;
+    int critic_fit_command = argc >= 2 &&
+        (strcmp(argv[1], "--check-critic-fit") == 0 || critic_fit_manifest_command);
     int overfit_epochs = parse_int_flag(argc, argv, "--epochs", 200);
     int overfit_seed = parse_int_flag(argc, argv, "--seed", 20260902);
     int critic_fit_epochs = parse_int_flag(argc, argv, "--epochs", 10);
@@ -3676,6 +3828,7 @@ static int showdown_client_main(int argc, char** argv) {
             strcmp(argv[1], "--train-live-ppo") == 0 ||
             strcmp(argv[1], "--check-supervised-overfit") == 0 ||
             strcmp(argv[1], "--check-critic-fit") == 0 ||
+            strcmp(argv[1], "--check-critic-fit-manifest") == 0 ||
             strcmp(argv[1], "--eval-supervised") == 0)) {
         training_or_eval_mode = 1;
     }
@@ -3717,9 +3870,32 @@ static int showdown_client_main(int argc, char** argv) {
             adam_epsilon,
             &reward_config);
     }
+    if (argc >= 6 && critic_fit_manifest_command) {
+        return run_critic_fit_check(
+            argv[2],
+            argv[3],
+            1,
+            argv[4],
+            argv[5],
+            (size_t)critic_fit_epochs,
+            (size_t)critic_fit_minibatch_episodes,
+            learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
+            rl_gamma,
+            (unsigned int)validation_seed,
+            (unsigned int)critic_fit_seed,
+            adam_beta1,
+            adam_beta2,
+            adam_epsilon,
+            (size_t)critic_early_stop_patience,
+            critic_policy_kl_coef,
+            rl_reward_mode,
+            &reward_config);
+    }
     if (argc >= 5 && critic_fit_command) {
         return run_critic_fit_check(
             argv[2],
+            NULL,
+            0,
             argv[3],
             argv[4],
             (size_t)critic_fit_epochs,
@@ -3959,6 +4135,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
         "  showdown_client --check-critic-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --check-critic-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--ppo-minibatch-episodes N] [--target-kl F] [--shuffle-seed N] [--episode-limit N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
