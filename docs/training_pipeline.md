@@ -50,7 +50,8 @@ when the policy term is clipped.
 
 `--check-critic-fit` tests whether recorded returns are learnable before more
 PPO is attempted. It creates two temporary in-memory copies of an existing
-checkpoint and never publishes either one. The first copy trains only the value
+checkpoint and does not publish either one by default. The first copy trains
+only the value
 head, leaving policy outputs unchanged. The second also trains the shared GRU
 and entity representation using value loss. By default its policy-head
 parameters remain frozen, while the report measures any policy-probability
@@ -81,6 +82,14 @@ split of those battles provides training and early-stopping selection data,
 while the separately named episode batch is used only for the final holdout
 evaluation. Blank manifest lines and lines beginning with `#` are ignored.
 The report records all three sources explicitly.
+
+Passing `--critic-output-checkpoint PATH` opts into publishing the selected
+recurrent critic. Publication occurs only after every learnability and safety
+gate passes, and uses the same atomic checkpoint replacement as normal
+training. The report records whether publication was requested, rejected,
+completed, or failed, along with the selected trainer step. A rejected or
+failed publication returns a nonzero exit code without replacing the requested
+checkpoint.
 
 Current implementation notes:
 

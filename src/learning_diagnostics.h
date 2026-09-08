@@ -74,6 +74,13 @@ typedef struct {
 
 void learning_diagnostic_assess_critic_fit(CriticFitResult* result);
 
+int learning_diagnostic_publish_critic_checkpoint(
+    const char* output_path,
+    const GruModel* model,
+    const GruTrainer* trainer,
+    const CriticFitResult* result
+);
+
 int learning_diagnostic_run_supervised_overfit(
     GruTrainer* trainer,
     GruModel* model,
@@ -118,6 +125,9 @@ int learning_diagnostic_write_critic_report(
     const char* selection_source_path,
     const char* holdout_source_path,
     const char* checkpoint_path,
+    const char* output_checkpoint_path,
+    int publication_requested,
+    int checkpoint_published,
     unsigned int validation_seed,
     unsigned int shuffle_seed,
     size_t epochs,

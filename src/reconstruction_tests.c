@@ -4554,6 +4554,8 @@ static int test_critic_fit_early_stopping_restores_best_epoch(void) {
     }
     gru_trainer_init(&head_trainer, 0.0f, 16u, 1.0f, 53u);
     gru_trainer_init(&recurrent_trainer, 0.0f, 16u, 1.0f, 53u);
+    head_trainer.step = 101u;
+    recurrent_trainer.step = 101u;
     head_trainer.gamma = recurrent_trainer.gamma = 1.0f;
     episodes[0] = &episode;
     ok &= assert_true(learning_diagnostic_run_critic_fit(
@@ -4580,11 +4582,59 @@ static int test_critic_fit_early_stopping_restores_best_epoch(void) {
         "critic branches retain the untrained selection optimum");
     ok &= assert_true(result.head_stopped_early && result.recurrent_stopped_early,
         "critic fit reports early stopping");
+    ok &= assert_true(head_trainer.step == 101u && recurrent_trainer.step == 101u,
+        "critic early stopping restores the selected epoch trainer step");
 
 cleanup:
     episode_free(&episode);
     gru_model_destroy(recurrent_model);
     gru_model_destroy(head_model);
+    return ok;
+}
+
+static int test_critic_checkpoint_publication_is_pass_gated(void) {
+    const char* checkpoint_path = "critic_fit_published_test.bin";
+    const char* temporary_path = "critic_fit_published_test.bin.tmp";
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* loaded = NULL;
+    GruTrainer trainer;
+    TrainerCheckpointState loaded_state;
+    CriticFitResult result;
+    FILE* file;
+    int ok = 1;
+
+    remove(checkpoint_path);
+    remove(temporary_path);
+    memset(&result, 0, sizeof(result));
+    if (!assert_true(model != NULL, "initialize critic publication fixture")) return 0;
+    gru_trainer_init(&trainer, 0.0001f, 16u, 1.0f, 59u);
+    trainer.step = 321u;
+
+    result.critic_learnable = 1;
+    ok &= assert_true(!learning_diagnostic_publish_critic_checkpoint(
+            checkpoint_path, model, &trainer, &result),
+        "critic publication rejects a recurrent candidate that failed its gates");
+    file = fopen(checkpoint_path, "rb");
+    ok &= assert_true(file == NULL,
+        "rejected critic publication does not create a checkpoint");
+    if (file) fclose(file);
+
+    result.recurrent_generalizes = 1;
+    ok &= assert_true(learning_diagnostic_publish_critic_checkpoint(
+            checkpoint_path, model, &trainer, &result),
+        "critic publication writes an eligible recurrent checkpoint");
+    loaded = checkpoint_load(checkpoint_path, &loaded_state);
+    ok &= assert_true(loaded != NULL && loaded_state.step == trainer.step,
+        "published critic checkpoint preserves the selected trainer step");
+    file = fopen(temporary_path, "rb");
+    ok &= assert_true(file == NULL,
+        "atomic critic publication leaves no temporary checkpoint");
+    if (file) fclose(file);
+
+    remove(checkpoint_path);
+    remove(temporary_path);
+    gru_model_destroy(loaded);
+    gru_model_destroy(model);
     return ok;
 }
 
@@ -4706,6 +4756,7 @@ int main(int argc, char** argv) {
     if (!test_critic_fit_assessment_rejects_overfit_and_policy_drift()) return 1;
     if (!test_critic_policy_anchor_reduces_drift()) return 1;
     if (!test_critic_fit_early_stopping_restores_best_epoch()) return 1;
+    if (!test_critic_checkpoint_publication_is_pass_gated()) return 1;
     if (!test_validation_split_is_stable_and_seeded()) return 1;
     if (!test_request_reconciliation_preserves_identity()) return 1;
     if (!test_observation_request_flags_and_side_features()) return 1;

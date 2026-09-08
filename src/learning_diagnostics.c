@@ -1,5 +1,7 @@
 #include "learning_diagnostics.h"
 
+#include "checkpoint.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -285,6 +287,7 @@ static int train_critic_branch(
     unsigned int shuffle_state = shuffle_seed;
     double started_at = critic_wall_seconds();
     double best_selection_loss = 0.0;
+    size_t best_step = trainer->step;
     size_t stale_epochs = 0;
     size_t epoch;
     size_t i;
@@ -350,6 +353,7 @@ static int train_critic_branch(
                 if (selection.overall.value_loss < best_selection_loss - 1.0e-5) {
                     best_selection_loss = selection.overall.value_loss;
                     *best_epoch_out = epoch + 1u;
+                    best_step = trainer->step;
                     stale_epochs = 0;
                     if (!gru_model_export_parameters(model, best_parameters, parameter_count)) {
                         free(best_parameters);
@@ -381,6 +385,7 @@ static int train_critic_branch(
         free(minibatch);
         return 0;
     }
+    if (use_early_stopping) trainer->step = best_step;
     free(best_parameters);
     free(order);
     free(minibatch);
@@ -428,6 +433,21 @@ void learning_diagnostic_assess_critic_fit(CriticFitResult* result) {
         result->recurrent_outcome_consistent &&
         !result->recurrent_overfit;
     result->critic_learnable = result->head_generalizes || result->recurrent_generalizes;
+}
+
+int learning_diagnostic_publish_critic_checkpoint(
+    const char* output_path,
+    const GruModel* model,
+    const GruTrainer* trainer,
+    const CriticFitResult* result
+) {
+    TrainerCheckpointState state;
+    if (!output_path || !*output_path || !model || !trainer || !result ||
+            !result->recurrent_generalizes) {
+        return 0;
+    }
+    state = gru_trainer_checkpoint_state(trainer);
+    return checkpoint_save(output_path, model, &state);
 }
 
 int learning_diagnostic_run_critic_fit(
@@ -677,6 +697,9 @@ int learning_diagnostic_write_critic_report(
     const char* selection_source_path,
     const char* holdout_source_path,
     const char* checkpoint_path,
+    const char* output_checkpoint_path,
+    int publication_requested,
+    int checkpoint_published,
     unsigned int validation_seed,
     unsigned int shuffle_seed,
     size_t epochs,
@@ -687,6 +710,7 @@ int learning_diagnostic_write_critic_report(
     const CriticFitResult* result
 ) {
     const char* recommendation;
+    const char* publication_status;
     FILE* out;
     if (!report_path || !*report_path || !head_trainer || !recurrent_trainer || !result) return 0;
     if (result->head_generalizes) recommendation = "value_head_warmup";
@@ -694,10 +718,14 @@ int learning_diagnostic_write_critic_report(
     else if (result->recurrent_aggregate_generalizes) recommendation =
         "recurrent_critic_overfits_or_changes_policy";
     else recommendation = "critic_signal_not_generalizing";
+    if (!publication_requested) publication_status = "not_requested";
+    else if (checkpoint_published) publication_status = "published";
+    else if (!result->recurrent_generalizes) publication_status = "rejected_by_gates";
+    else publication_status = "save_failed";
     out = fopen(report_path, "w");
     if (!out) return 0;
 
-    fputs("{\n  \"diagnostic\": \"critic_fit\",\n  \"metrics_version\": 4,\n", out);
+    fputs("{\n  \"diagnostic\": \"critic_fit\",\n  \"metrics_version\": 5,\n", out);
     fputs("  \"source_episode_batch\": ", out);
     write_json_string(out, source_path);
     fputs(",\n  \"training_source\": ", out);
@@ -708,8 +736,15 @@ int learning_diagnostic_write_critic_report(
     write_json_string(out, holdout_source_path);
     fputs(",\n  \"checkpoint\": ", out);
     write_json_string(out, checkpoint_path);
+    fputs(",\n  \"output_checkpoint\": ", out);
+    write_json_string(out, output_checkpoint_path);
+    fputs(",\n  \"publication_status\": ", out);
+    write_json_string(out, publication_status);
     fprintf(out,
-        ",\n  \"validation_seed\": %u,\n"
+        ",\n  \"publication_requested\": %s,\n"
+        "  \"published_checkpoint\": %s,\n"
+        "  \"published_checkpoint_step\": %zu,\n"
+        "  \"validation_seed\": %u,\n"
         "  \"shuffle_seed\": %u,\n"
         "  \"epochs\": %zu,\n"
         "  \"minibatch_episodes\": %zu,\n"
@@ -719,8 +754,10 @@ int learning_diagnostic_write_critic_report(
         "  \"gamma\": %.9g,\n"
         "  \"bptt_window\": %zu,\n"
         "  \"optimizer\": \"adam\",\n"
-        "  \"return_target\": \"discounted_monte_carlo\",\n"
-        "  \"published_checkpoint\": false,\n",
+        "  \"return_target\": \"discounted_monte_carlo\",\n",
+        publication_requested ? "true" : "false",
+        checkpoint_published ? "true" : "false",
+        checkpoint_published ? recurrent_trainer->step : 0u,
         validation_seed,
         shuffle_seed,
         epochs,

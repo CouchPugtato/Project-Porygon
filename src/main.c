@@ -3459,6 +3459,7 @@ static int run_critic_fit_check(
     int training_source_is_manifest,
     const char* checkpoint_path,
     const char* report_path,
+    const char* output_checkpoint_path,
     size_t epochs,
     size_t minibatch_episodes,
     float learning_rate,
@@ -3492,6 +3493,8 @@ static int run_critic_fit_check(
     CriticFitResult result;
     size_t i;
     int rc = 1;
+    int publication_requested;
+    int checkpoint_published = 0;
 
     memset(&runtime, 0, sizeof(runtime));
     memset(&training_set, 0, sizeof(training_set));
@@ -3587,6 +3590,8 @@ static int run_critic_fit_check(
 
     gru_trainer_init(&head_trainer, learning_rate, 16u, 1.0f, shuffle_seed);
     gru_trainer_init(&recurrent_trainer, learning_rate, 16u, 1.0f, shuffle_seed);
+    head_trainer.step = checkpoint_state.step;
+    recurrent_trainer.step = checkpoint_state.step;
     head_trainer.gamma = gamma;
     recurrent_trainer.gamma = gamma;
     head_trainer.adam_beta1 = recurrent_trainer.adam_beta1 = adam_beta1;
@@ -3616,6 +3621,11 @@ static int run_critic_fit_check(
         fprintf(stderr, "[critic-fit] diagnostic execution failed\n");
         goto cleanup;
     }
+    publication_requested = output_checkpoint_path && *output_checkpoint_path;
+    if (publication_requested && result.recurrent_generalizes) {
+        checkpoint_published = learning_diagnostic_publish_critic_checkpoint(
+            output_checkpoint_path, recurrent_model, &recurrent_trainer, &result);
+    }
     if (!learning_diagnostic_write_critic_report(
             report_path,
             episode_batch_path,
@@ -3623,6 +3633,9 @@ static int run_critic_fit_check(
                 (early_stop_patience > 0 ? episode_batch_path : ""),
             training_source_is_manifest ? holdout_batch_path : episode_batch_path,
             checkpoint_path,
+            output_checkpoint_path,
+            publication_requested,
+            checkpoint_published,
             validation_seed,
             shuffle_seed,
             epochs,
@@ -3634,11 +3647,18 @@ static int run_critic_fit_check(
         fprintf(stderr, "[critic-fit] failed to write report '%s': %s\n", report_path, strerror(errno));
         goto cleanup;
     }
-    printf("[critic-fit] learnable=%d head_holdout_ev=%.4f recurrent_holdout_ev=%.4f report=%s\n",
+    printf("[critic-fit] learnable=%d head_holdout_ev=%.4f recurrent_holdout_ev=%.4f checkpoint_published=%d report=%s\n",
         result.critic_learnable,
         result.head_after_holdout.overall.explained_variance,
         result.recurrent_after_holdout.overall.explained_variance,
+        checkpoint_published,
         report_path);
+    if (publication_requested && !checkpoint_published) {
+        fprintf(stderr, "[critic-fit] checkpoint publication %s\n",
+            result.recurrent_generalizes ? "failed" :
+                "rejected because the recurrent learnability and safety gates did not pass");
+        goto cleanup;
+    }
     rc = 0;
 
 cleanup:
@@ -3714,6 +3734,8 @@ static int showdown_client_main(int argc, char** argv) {
     int critic_fit_minibatch_episodes = parse_int_flag(argc, argv, "--critic-minibatch-episodes", 8);
     int critic_early_stop_patience = parse_int_flag(argc, argv, "--critic-early-stop-patience", 0);
     float critic_policy_kl_coef = parse_float_flag(argc, argv, "--critic-policy-kl-coef", 0.0f);
+    const char* critic_output_checkpoint_path = parse_string_flag(
+        argc, argv, "--critic-output-checkpoint", "");
     float learning_rate_override;
     const char* expected_policy_tag = parse_string_flag(argc, argv, "--policy-tag-expected", "");
     const char* training_summary_path = parse_string_flag(argc, argv, "--training-summary-path", "");
@@ -3877,6 +3899,7 @@ static int showdown_client_main(int argc, char** argv) {
             1,
             argv[4],
             argv[5],
+            critic_output_checkpoint_path,
             (size_t)critic_fit_epochs,
             (size_t)critic_fit_minibatch_episodes,
             learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
@@ -3898,6 +3921,7 @@ static int showdown_client_main(int argc, char** argv) {
             0,
             argv[3],
             argv[4],
+            critic_output_checkpoint_path,
             (size_t)critic_fit_epochs,
             (size_t)critic_fit_minibatch_episodes,
             learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
@@ -4134,8 +4158,8 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
-        "  showdown_client --check-critic-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
-        "  showdown_client --check-critic-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --check-critic-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --check-critic-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--ppo-minibatch-episodes N] [--target-kl F] [--shuffle-seed N] [--episode-limit N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
