@@ -3673,6 +3673,149 @@ cleanup:
     return rc;
 }
 
+static int run_ppo_update_audit(
+    const char* episode_batch_path,
+    const char* before_checkpoint_path,
+    const char* after_checkpoint_path,
+    const char* report_path,
+    int episode_limit,
+    unsigned int selection_seed,
+    float gamma,
+    float gae_lambda,
+    const char* reward_mode_name,
+    const RewardConfig* reward_config
+) {
+    GruModel* before_model = NULL;
+    GruModel* after_model = NULL;
+    TrainerCheckpointState before_state;
+    TrainerCheckpointState after_state;
+    CheckpointLoadResult load_result;
+    EnvRewardMode reward_mode;
+    EnvRuntime runtime;
+    size_t* indices = NULL;
+    size_t episode_count = 0;
+    size_t* unused_validation_indices = NULL;
+    size_t unused_validation_count = 0;
+    const Episode** episodes = NULL;
+    GruTrainer trainer;
+    PpoUpdateAuditResult result;
+    size_t i;
+    int rc = 1;
+
+    memset(&runtime, 0, sizeof(runtime));
+    memset(&before_state, 0, sizeof(before_state));
+    memset(&after_state, 0, sizeof(after_state));
+    if (!episode_batch_path || !before_checkpoint_path || !after_checkpoint_path ||
+            !report_path || episode_limit < 0 || !reward_config ||
+            !parse_reward_mode(reward_mode_name, &reward_mode)) {
+        fprintf(stderr, "[ppo-audit] invalid diagnostic configuration\n");
+        return 1;
+    }
+    before_model = load_current_checkpoint(
+        before_checkpoint_path, &before_state, &load_result);
+    if (!before_model) {
+        report_checkpoint_load_failure(
+            "[ppo-audit] failed to load before checkpoint",
+            before_checkpoint_path,
+            &load_result);
+        goto cleanup;
+    }
+    after_model = load_current_checkpoint(
+        after_checkpoint_path, &after_state, &load_result);
+    if (!after_model) {
+        report_checkpoint_load_failure(
+            "[ppo-audit] failed to load after checkpoint",
+            after_checkpoint_path,
+            &load_result);
+        goto cleanup;
+    }
+    if (gru_model_input_dim(before_model) != gru_model_input_dim(after_model) ||
+            gru_model_hidden_dim(before_model) != gru_model_hidden_dim(after_model) ||
+            gru_model_num_actions(before_model) != gru_model_num_actions(after_model)) {
+        fprintf(stderr, "[ppo-audit] before and after checkpoints are incompatible\n");
+        goto cleanup;
+    }
+    if (!load_runtime_from_episode_batch_file(
+            episode_batch_path,
+            before_model,
+            &runtime,
+            reward_mode,
+            &reward_config->dense_additive,
+            "") ||
+            !build_all_train_indices(
+                runtime.count,
+                &indices,
+                &episode_count,
+                &unused_validation_indices,
+                &unused_validation_count)) {
+        goto cleanup;
+    }
+    filter_labeled_train_indices(&runtime, indices, &episode_count);
+    if (episode_count == 0) {
+        fprintf(stderr, "[ppo-audit] episode batch contains no labeled episodes\n");
+        goto cleanup;
+    }
+    if (episode_limit > 0 && episode_count > (size_t)episode_limit) {
+        srand(selection_seed);
+        shuffle_indices(indices, episode_count);
+        episode_count = (size_t)episode_limit;
+    }
+    episodes = (const Episode**)malloc(episode_count * sizeof(*episodes));
+    if (!episodes) goto cleanup;
+    for (i = 0; i < episode_count; ++i) {
+        episodes[i] = &runtime.sessions[indices[i]].episode;
+    }
+
+    gru_trainer_init(
+        &trainer,
+        before_state.learning_rate,
+        before_state.bptt_window ? before_state.bptt_window : 16u,
+        before_state.gradient_clip,
+        before_state.seed);
+    trainer.gamma = gamma;
+    trainer.gae_lambda = gae_lambda;
+    printf("[ppo-audit] episodes=%zu gamma=%.6g gae_lambda=%.6g selection_seed=%u\n",
+        episode_count, gamma, gae_lambda, selection_seed);
+    if (!learning_diagnostic_run_ppo_update_audit(
+            &trainer,
+            before_model,
+            after_model,
+            episodes,
+            episode_count,
+            &result) ||
+            !learning_diagnostic_write_ppo_update_report(
+                report_path,
+                episode_batch_path,
+                before_checkpoint_path,
+                after_checkpoint_path,
+                gamma,
+                gae_lambda,
+                (size_t)(episode_limit > 0 ? episode_limit : 0),
+                selection_seed,
+                &result)) {
+        fprintf(stderr, "[ppo-audit] diagnostic or report generation failed\n");
+        goto cleanup;
+    }
+    printf("[ppo-audit] samples=%zu advantage_log_prob_correlation=%.4f value_loss=%.4f->%.4f legal_kl=%.6f behavior_match=%d report=%s\n",
+        result.sample_count,
+        result.advantage_log_probability_delta_correlation,
+        result.before_value.value_loss,
+        result.after_value.value_loss,
+        result.mean_legal_policy_kl,
+        result.behavior_policy_matches,
+        report_path);
+    rc = result.nonfinite_count == 0 && result.behavior_policy_matches ? 0 : 1;
+
+cleanup:
+    free(episodes);
+    free(unused_validation_indices);
+    free(indices);
+    env_runtime_free(&runtime);
+    gru_model_destroy(after_model);
+    gru_model_destroy(before_model);
+    return rc;
+}
+
 static int clean_replay_file(const char* input_path, const char* output_path) {
     FILE* in;
     FILE* out;
@@ -3727,6 +3870,7 @@ static int showdown_client_main(int argc, char** argv) {
         strcmp(argv[1], "--check-critic-fit-manifest") == 0;
     int critic_fit_command = argc >= 2 &&
         (strcmp(argv[1], "--check-critic-fit") == 0 || critic_fit_manifest_command);
+    int ppo_audit_command = argc >= 2 && strcmp(argv[1], "--audit-ppo-update") == 0;
     int overfit_epochs = parse_int_flag(argc, argv, "--epochs", 200);
     int overfit_seed = parse_int_flag(argc, argv, "--seed", 20260902);
     int critic_fit_epochs = parse_int_flag(argc, argv, "--epochs", 10);
@@ -3780,7 +3924,9 @@ static int showdown_client_main(int argc, char** argv) {
     learning_rate_override = parse_float_flag(argc, argv, "--learning-rate", -1.0f);
     anchor_kl_coef = parse_float_flag(argc, argv, "--anchor-kl-coef", 0.0f);
     rl_gamma = parse_float_flag(argc, argv, "--gamma",
-        (ppo_command || critic_fit_command) ? rl_defaults.ppo_gamma : rl_defaults.policy_gradient_gamma);
+        (ppo_command || critic_fit_command || ppo_audit_command)
+            ? rl_defaults.ppo_gamma
+            : rl_defaults.policy_gradient_gamma);
     rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef",
         ppo_command ? rl_defaults.ppo_entropy_coef : rl_defaults.policy_gradient_entropy_coef);
     rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", rl_defaults.advantage_norm);
@@ -3814,6 +3960,10 @@ static int showdown_client_main(int argc, char** argv) {
              critic_early_stop_patience < 0 || critic_policy_kl_coef < 0.0f)) {
         fprintf(stderr,
             "--check-critic-fit requires positive epochs/minibatch size and non-negative seed, patience, and policy KL coefficient\n");
+        return 1;
+    }
+    if (ppo_audit_command && (ppo_episode_limit < 0 || ppo_shuffle_seed < 0)) {
+        fprintf(stderr, "--audit-ppo-update requires non-negative episode limit and seed\n");
         return 1;
     }
     if (validation_seed < 0) {
@@ -3851,6 +4001,7 @@ static int showdown_client_main(int argc, char** argv) {
             strcmp(argv[1], "--check-supervised-overfit") == 0 ||
             strcmp(argv[1], "--check-critic-fit") == 0 ||
             strcmp(argv[1], "--check-critic-fit-manifest") == 0 ||
+            strcmp(argv[1], "--audit-ppo-update") == 0 ||
             strcmp(argv[1], "--eval-supervised") == 0)) {
         training_or_eval_mode = 1;
     }
@@ -3911,6 +4062,19 @@ static int showdown_client_main(int argc, char** argv) {
             adam_epsilon,
             (size_t)critic_early_stop_patience,
             critic_policy_kl_coef,
+            rl_reward_mode,
+            &reward_config);
+    }
+    if (argc >= 6 && ppo_audit_command) {
+        return run_ppo_update_audit(
+            argv[2],
+            argv[3],
+            argv[4],
+            argv[5],
+            ppo_episode_limit,
+            (unsigned int)ppo_shuffle_seed,
+            rl_gamma,
+            gae_lambda,
             rl_reward_mode,
             &reward_config);
     }
@@ -4160,6 +4324,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
         "  showdown_client --check-critic-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --check-critic-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --audit-ppo-update <episode_batch.jsonl> <before.bin> <after.bin> <report.json> [--episode-limit N] [--shuffle-seed N] [--gamma F] [--gae-lambda F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--ppo-minibatch-episodes N] [--target-kl F] [--shuffle-seed N] [--episode-limit N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"

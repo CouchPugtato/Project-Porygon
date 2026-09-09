@@ -4206,6 +4206,74 @@ static int populate_ppo_behavior_predictions(GruModel* model, Episode* episode) 
     return 1;
 }
 
+static int test_real_batch_ppo_update_audit_tracks_actor_direction(void) {
+    GruModel* before_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* after_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode positive_episode;
+    Episode negative_episode;
+    const Episode* episodes[2];
+    GruTrainer trainer;
+    PpoUpdateAuditResult result;
+    int ok = 1;
+
+    memset(&positive_episode, 0, sizeof(positive_episode));
+    memset(&negative_episode, 0, sizeof(negative_episode));
+    if (!assert_true(before_model && after_model &&
+            zero_model_parameters(before_model) && zero_model_parameters(after_model) &&
+            initialize_learning_episode(&positive_episode, 1.0f, 1.0f, 0) &&
+            initialize_learning_episode(&negative_episode, -1.0f, -1.0f, 0),
+            "initialize real-batch PPO audit fixture")) {
+        ok = 0;
+        goto cleanup;
+    }
+    negative_episode.actions[0] = OBS_A1_MOVE1;
+    negative_episode.actions2[0] = OBS_A2_MOVE1;
+    factorized_action_choice_from_flat_actions(
+        &negative_episode.factorized_actions[0], OBS_A1_MOVE1, OBS_A2_MOVE1);
+    ok &= assert_true(
+        populate_ppo_behavior_predictions(before_model, &positive_episode) &&
+        populate_ppo_behavior_predictions(before_model, &negative_episode),
+        "record behavior predictions for PPO audit fixture");
+
+    gru_trainer_init(&trainer, 0.01f, 16u, 1.0f, 61u);
+    trainer.gamma = 1.0f;
+    trainer.gae_lambda = 1.0f;
+    trainer.advantage_norm = 1;
+    trainer.entropy_coef = 0.0f;
+    episodes[0] = &positive_episode;
+    episodes[1] = &negative_episode;
+    ok &= assert_true(gru_trainer_ppo_minibatch(
+            &trainer, after_model, episodes, 2u),
+        "apply PPO update for real-batch audit fixture");
+    ok &= assert_true(learning_diagnostic_run_ppo_update_audit(
+            &trainer,
+            before_model,
+            after_model,
+            episodes,
+            2u,
+            &result),
+        "run real-batch PPO update audit");
+    ok &= assert_true(result.sample_count == 2u && result.nonfinite_count == 0u,
+        "PPO audit accounts for each labeled step");
+    ok &= assert_true(result.behavior_policy_matches,
+        "PPO audit verifies the behavior checkpoint provenance");
+    ok &= assert_true(result.actor_direction_consistent &&
+            result.advantage_log_probability_delta_correlation > 0.0,
+        "PPO audit detects probability movement aligned with advantage");
+    ok &= assert_true(result.mean_legal_policy_kl > 0.0,
+        "PPO audit measures legal-policy movement");
+    ok &= assert_true(result.bins[0].sample_count == 1u &&
+            result.bins[4].sample_count == 1u,
+        "PPO audit separates strong negative and positive advantages");
+
+cleanup:
+    episode_free(&negative_episode);
+    episode_free(&positive_episode);
+    gru_model_destroy(after_model);
+    gru_model_destroy(before_model);
+    return ok;
+}
+
 static int test_ppo_normalizes_advantages_across_minibatch(void) {
     GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     Episode winning_episode;
@@ -4746,6 +4814,7 @@ int main(int argc, char** argv) {
     if (!test_checkpoint_compatibility_validation()) return 1;
     if (!test_policy_evaluation_matches_legal_runtime_policy()) return 1;
     if (!test_supervised_overfit_diagnostic_learns()) return 1;
+    if (!test_real_batch_ppo_update_audit_tracks_actor_direction()) return 1;
     if (!test_ppo_update_moves_policy_and_value_in_expected_directions()) return 1;
     if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
     if (!test_ppo_clipped_policy_still_updates_value()) return 1;

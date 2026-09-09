@@ -61,6 +61,19 @@ typedef struct {
     float adam_epsilon;
 } GruTrainer;
 
+typedef struct {
+    int has_action;
+    float return_target;
+    float raw_advantage;
+    float behavior_log_probability;
+    float before_log_probability;
+    float after_log_probability;
+    float behavior_value;
+    float before_value;
+    float after_value;
+    float legal_policy_kl;
+} GruPpoStepComparison;
+
 void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_window, float gradient_clip, unsigned int seed);
 TrainerCheckpointState gru_trainer_checkpoint_state(const GruTrainer* trainer);
 int gru_trainer_supervised_episode(GruTrainer* trainer, GruModel* model, const Episode* episode);
@@ -77,6 +90,14 @@ int gru_trainer_ppo_minibatch(
     GruModel* model,
     const Episode* const* episodes,
     size_t episode_count);
+int gru_trainer_compare_ppo_episode(
+    const GruTrainer* trainer,
+    const GruModel* before_model,
+    const GruModel* after_model,
+    const Episode* episode,
+    GruPpoStepComparison* comparisons,
+    size_t comparison_count
+);
 int gru_trainer_ppo_hard_kl_stop_update(
     float approx_kl,
     float target_kl,

@@ -846,3 +846,371 @@ int learning_diagnostic_write_critic_report(
     fputs("\n  }\n}\n", out);
     return fclose(out) == 0;
 }
+
+typedef struct {
+    double raw_advantage;
+    double return_target;
+    double before_log_probability;
+    double after_log_probability;
+    double behavior_log_probability;
+    double before_value;
+    double after_value;
+    double behavior_value;
+    double legal_policy_kl;
+} PpoAuditSample;
+
+typedef struct {
+    double raw_advantage_sum;
+    double standardized_advantage_sum;
+    double before_probability_sum;
+    double after_probability_sum;
+    double probability_delta_sum;
+    double log_probability_delta_sum;
+    double legal_policy_kl_sum;
+    size_t increased_count;
+    size_t count;
+} PpoAuditBinAccumulator;
+
+static int ppo_audit_bin_index(double standardized_advantage) {
+    if (standardized_advantage <= -1.0) return 0;
+    if (standardized_advantage < -0.1) return 1;
+    if (standardized_advantage <= 0.1) return 2;
+    if (standardized_advantage < 1.0) return 3;
+    return 4;
+}
+
+static double ppo_audit_correlation(
+    double x_sum,
+    double y_sum,
+    double x_square_sum,
+    double y_square_sum,
+    double product_sum,
+    size_t count
+) {
+    double sample_count;
+    double x_variance;
+    double y_variance;
+    double covariance;
+    if (count < 2u) return 0.0;
+    sample_count = (double)count;
+    x_variance = x_square_sum / sample_count -
+        (x_sum / sample_count) * (x_sum / sample_count);
+    y_variance = y_square_sum / sample_count -
+        (y_sum / sample_count) * (y_sum / sample_count);
+    covariance = product_sum / sample_count -
+        (x_sum / sample_count) * (y_sum / sample_count);
+    if (x_variance <= 1.0e-12 || y_variance <= 1.0e-12) return 0.0;
+    return covariance / sqrt(x_variance * y_variance);
+}
+
+static void ppo_audit_finish_bin(
+    const PpoAuditBinAccumulator* accumulator,
+    PpoUpdateAuditBin* bin
+) {
+    double count;
+    memset(bin, 0, sizeof(*bin));
+    bin->sample_count = accumulator->count;
+    if (accumulator->count == 0) return;
+    count = (double)accumulator->count;
+    bin->mean_raw_advantage = accumulator->raw_advantage_sum / count;
+    bin->mean_standardized_advantage = accumulator->standardized_advantage_sum / count;
+    bin->mean_before_probability = accumulator->before_probability_sum / count;
+    bin->mean_after_probability = accumulator->after_probability_sum / count;
+    bin->mean_probability_delta = accumulator->probability_delta_sum / count;
+    bin->mean_log_probability_delta = accumulator->log_probability_delta_sum / count;
+    bin->probability_increased_fraction = (double)accumulator->increased_count / count;
+    bin->mean_legal_policy_kl = accumulator->legal_policy_kl_sum / count;
+}
+
+int learning_diagnostic_run_ppo_update_audit(
+    const GruTrainer* trainer,
+    const GruModel* before_model,
+    const GruModel* after_model,
+    const Episode* const* episodes,
+    size_t episode_count,
+    PpoUpdateAuditResult* result
+) {
+    PpoAuditSample* samples = NULL;
+    size_t sample_count = 0;
+    size_t sample_capacity = 0;
+    size_t i;
+    double advantage_sum = 0.0;
+    double advantage_square_sum = 0.0;
+    double log_delta_sum = 0.0;
+    double log_delta_square_sum = 0.0;
+    double advantage_log_delta_sum = 0.0;
+    double behavior_log_error_sum = 0.0;
+    double behavior_value_error_sum = 0.0;
+    double legal_kl_sum = 0.0;
+    double positive_log_delta_sum = 0.0;
+    double negative_log_delta_sum = 0.0;
+    size_t positive_count = 0;
+    size_t negative_count = 0;
+    CriticMetricAccumulator before_value = {0};
+    CriticMetricAccumulator after_value = {0};
+    PpoAuditBinAccumulator bins[PPO_UPDATE_AUDIT_BIN_COUNT] = {{0}};
+
+    if (!trainer || !before_model || !after_model || !episodes || !result) return 0;
+    memset(result, 0, sizeof(*result));
+    result->episode_count = episode_count;
+    before_value.episode_count = episode_count;
+    after_value.episode_count = episode_count;
+
+    for (i = 0; i < episode_count; ++i) {
+        const Episode* episode = episodes[i];
+        GruPpoStepComparison* comparisons;
+        size_t t;
+        if (!episode) goto failure;
+        comparisons = (GruPpoStepComparison*)calloc(
+            episode->count, sizeof(*comparisons));
+        if (episode->count > 0 && !comparisons) goto failure;
+        if (!gru_trainer_compare_ppo_episode(
+                trainer,
+                before_model,
+                after_model,
+                episode,
+                comparisons,
+                episode->count)) {
+            free(comparisons);
+            goto failure;
+        }
+        for (t = 0; t < episode->count; ++t) {
+            const GruPpoStepComparison* comparison = &comparisons[t];
+            PpoAuditSample* sample;
+            if (!comparison->has_action) continue;
+            if (!isfinite(comparison->return_target) ||
+                    !isfinite(comparison->raw_advantage) ||
+                    !isfinite(comparison->before_log_probability) ||
+                    !isfinite(comparison->after_log_probability) ||
+                    !isfinite(comparison->before_value) ||
+                    !isfinite(comparison->after_value) ||
+                    !isfinite(comparison->legal_policy_kl)) {
+                ++result->nonfinite_count;
+                continue;
+            }
+            if (sample_count == sample_capacity) {
+                size_t new_capacity = sample_capacity ? sample_capacity * 2u : 1024u;
+                PpoAuditSample* resized = (PpoAuditSample*)realloc(
+                    samples, new_capacity * sizeof(*samples));
+                if (!resized) {
+                    free(comparisons);
+                    goto failure;
+                }
+                samples = resized;
+                sample_capacity = new_capacity;
+            }
+            sample = &samples[sample_count++];
+            sample->raw_advantage = comparison->raw_advantage;
+            sample->return_target = comparison->return_target;
+            sample->before_log_probability = comparison->before_log_probability;
+            sample->after_log_probability = comparison->after_log_probability;
+            sample->behavior_log_probability = comparison->behavior_log_probability;
+            sample->before_value = comparison->before_value;
+            sample->after_value = comparison->after_value;
+            sample->behavior_value = comparison->behavior_value;
+            sample->legal_policy_kl = comparison->legal_policy_kl;
+        }
+        free(comparisons);
+    }
+    if (sample_count == 0) goto failure;
+
+    for (i = 0; i < sample_count; ++i) {
+        advantage_sum += samples[i].raw_advantage;
+        advantage_square_sum += samples[i].raw_advantage * samples[i].raw_advantage;
+    }
+    result->sample_count = sample_count;
+    result->raw_advantage_mean = advantage_sum / (double)sample_count;
+    {
+        double variance = advantage_square_sum / (double)sample_count -
+            result->raw_advantage_mean * result->raw_advantage_mean;
+        if (variance < 0.0) variance = 0.0;
+        result->raw_advantage_standard_deviation = sqrt(variance);
+    }
+
+    for (i = 0; i < sample_count; ++i) {
+        const PpoAuditSample* sample = &samples[i];
+        double standardized_advantage = result->raw_advantage_standard_deviation > 1.0e-12
+            ? (sample->raw_advantage - result->raw_advantage_mean) /
+                result->raw_advantage_standard_deviation
+            : 0.0;
+        double before_probability = exp(sample->before_log_probability);
+        double after_probability = exp(sample->after_log_probability);
+        double probability_delta = after_probability - before_probability;
+        double log_probability_delta = sample->after_log_probability -
+            sample->before_log_probability;
+        int bin_index = ppo_audit_bin_index(standardized_advantage);
+        PpoAuditBinAccumulator* bin = &bins[bin_index];
+
+        behavior_log_error_sum += fabs(
+            sample->before_log_probability - sample->behavior_log_probability);
+        behavior_value_error_sum += fabs(sample->before_value - sample->behavior_value);
+        legal_kl_sum += sample->legal_policy_kl;
+        if (sample->legal_policy_kl > result->max_legal_policy_kl) {
+            result->max_legal_policy_kl = sample->legal_policy_kl;
+        }
+        log_delta_sum += log_probability_delta;
+        log_delta_square_sum += log_probability_delta * log_probability_delta;
+        advantage_log_delta_sum += sample->raw_advantage * log_probability_delta;
+        if (standardized_advantage > 0.1) {
+            positive_log_delta_sum += log_probability_delta;
+            ++positive_count;
+        } else if (standardized_advantage < -0.1) {
+            negative_log_delta_sum += log_probability_delta;
+            ++negative_count;
+        }
+        critic_metric_add(&before_value, sample->return_target, sample->before_value);
+        critic_metric_add(&after_value, sample->return_target, sample->after_value);
+
+        bin->raw_advantage_sum += sample->raw_advantage;
+        bin->standardized_advantage_sum += standardized_advantage;
+        bin->before_probability_sum += before_probability;
+        bin->after_probability_sum += after_probability;
+        bin->probability_delta_sum += probability_delta;
+        bin->log_probability_delta_sum += log_probability_delta;
+        bin->legal_policy_kl_sum += sample->legal_policy_kl;
+        if (probability_delta > 0.0) ++bin->increased_count;
+        ++bin->count;
+    }
+
+    result->behavior_log_probability_mean_absolute_error =
+        behavior_log_error_sum / (double)sample_count;
+    result->behavior_value_mean_absolute_error =
+        behavior_value_error_sum / (double)sample_count;
+    result->mean_legal_policy_kl = legal_kl_sum / (double)sample_count;
+    result->advantage_log_probability_delta_correlation = ppo_audit_correlation(
+        advantage_sum,
+        log_delta_sum,
+        advantage_square_sum,
+        log_delta_square_sum,
+        advantage_log_delta_sum,
+        sample_count);
+    critic_metric_finish(&before_value, &result->before_value);
+    critic_metric_finish(&after_value, &result->after_value);
+    for (i = 0; i < PPO_UPDATE_AUDIT_BIN_COUNT; ++i) {
+        ppo_audit_finish_bin(&bins[i], &result->bins[i]);
+    }
+    result->behavior_policy_matches =
+        result->behavior_log_probability_mean_absolute_error <= 1.0e-4 &&
+        result->behavior_value_mean_absolute_error <= 1.0e-4;
+    result->value_loss_decreased =
+        result->after_value.value_loss < result->before_value.value_loss;
+    result->actor_direction_consistent =
+        result->advantage_log_probability_delta_correlation > 0.0 &&
+        positive_count > 0u && negative_count > 0u &&
+        positive_log_delta_sum / (double)positive_count >
+            negative_log_delta_sum / (double)negative_count;
+    free(samples);
+    return 1;
+
+failure:
+    free(samples);
+    return 0;
+}
+
+static void write_ppo_audit_value_metrics(FILE* out, const CriticFitMetrics* metrics) {
+    fprintf(out,
+        "{\"samples\": %zu, \"nonfinite_values\": %zu, "
+        "\"value_loss\": %.9g, \"explained_variance\": %.9g, "
+        "\"return_value_correlation\": %.9g, \"value_bias\": %.9g}",
+        metrics->sample_count,
+        metrics->nonfinite_count,
+        metrics->value_loss,
+        metrics->explained_variance,
+        metrics->return_value_correlation,
+        metrics->value_bias);
+}
+
+int learning_diagnostic_write_ppo_update_report(
+    const char* report_path,
+    const char* episode_batch_path,
+    const char* before_checkpoint_path,
+    const char* after_checkpoint_path,
+    float gamma,
+    float gae_lambda,
+    size_t episode_limit,
+    unsigned int selection_seed,
+    const PpoUpdateAuditResult* result
+) {
+    static const char* bin_names[PPO_UPDATE_AUDIT_BIN_COUNT] = {
+        "strong_negative", "negative", "near_zero", "positive", "strong_positive"
+    };
+    FILE* out;
+    size_t i;
+    if (!report_path || !*report_path || !result) return 0;
+    out = fopen(report_path, "w");
+    if (!out) return 0;
+
+    fputs("{\n  \"diagnostic\": \"ppo_update_audit\",\n  \"metrics_version\": 1,\n", out);
+    fputs("  \"episode_batch\": ", out);
+    write_json_string(out, episode_batch_path);
+    fputs(",\n  \"before_checkpoint\": ", out);
+    write_json_string(out, before_checkpoint_path);
+    fputs(",\n  \"after_checkpoint\": ", out);
+    write_json_string(out, after_checkpoint_path);
+    fprintf(out,
+        ",\n  \"gamma\": %.9g,\n"
+        "  \"gae_lambda\": %.9g,\n"
+        "  \"episode_limit\": %zu,\n"
+        "  \"selection_seed\": %u,\n"
+        "  \"episode_count\": %zu,\n"
+        "  \"sample_count\": %zu,\n"
+        "  \"nonfinite_count\": %zu,\n"
+        "  \"advantage_basis\": \"raw GAE from recorded behavior values before minibatch normalization\",\n"
+        "  \"standardized_advantage_bin_edges\": [-1.0, -0.1, 0.1, 1.0],\n"
+        "  \"raw_advantage_mean\": %.9g,\n"
+        "  \"raw_advantage_standard_deviation\": %.9g,\n"
+        "  \"advantage_log_probability_delta_correlation\": %.9g,\n"
+        "  \"behavior_log_probability_mean_absolute_error\": %.9g,\n"
+        "  \"behavior_value_mean_absolute_error\": %.9g,\n"
+        "  \"mean_legal_policy_kl\": %.9g,\n"
+        "  \"max_legal_policy_kl\": %.9g,\n",
+        gamma,
+        gae_lambda,
+        episode_limit,
+        selection_seed,
+        result->episode_count,
+        result->sample_count,
+        result->nonfinite_count,
+        result->raw_advantage_mean,
+        result->raw_advantage_standard_deviation,
+        result->advantage_log_probability_delta_correlation,
+        result->behavior_log_probability_mean_absolute_error,
+        result->behavior_value_mean_absolute_error,
+        result->mean_legal_policy_kl,
+        result->max_legal_policy_kl);
+    fputs("  \"value_before\": ", out);
+    write_ppo_audit_value_metrics(out, &result->before_value);
+    fputs(",\n  \"value_after\": ", out);
+    write_ppo_audit_value_metrics(out, &result->after_value);
+    fputs(",\n  \"advantage_bins\": {\n", out);
+    for (i = 0; i < PPO_UPDATE_AUDIT_BIN_COUNT; ++i) {
+        const PpoUpdateAuditBin* bin = &result->bins[i];
+        fprintf(out,
+            "    \"%s\": {\"samples\": %zu, \"mean_raw_advantage\": %.9g, "
+            "\"mean_standardized_advantage\": %.9g, "
+            "\"mean_before_probability\": %.9g, \"mean_after_probability\": %.9g, "
+            "\"mean_probability_delta\": %.9g, \"mean_log_probability_delta\": %.9g, "
+            "\"probability_increased_fraction\": %.9g, \"mean_legal_policy_kl\": %.9g}%s\n",
+            bin_names[i],
+            bin->sample_count,
+            bin->mean_raw_advantage,
+            bin->mean_standardized_advantage,
+            bin->mean_before_probability,
+            bin->mean_after_probability,
+            bin->mean_probability_delta,
+            bin->mean_log_probability_delta,
+            bin->probability_increased_fraction,
+            bin->mean_legal_policy_kl,
+            i + 1u < PPO_UPDATE_AUDIT_BIN_COUNT ? "," : "");
+    }
+    fprintf(out,
+        "  },\n  \"checks\": {\n"
+        "    \"behavior_policy_matches\": %s,\n"
+        "    \"value_loss_decreased\": %s,\n"
+        "    \"actor_direction_consistent\": %s\n"
+        "  }\n}\n",
+        result->behavior_policy_matches ? "true" : "false",
+        result->value_loss_decreased ? "true" : "false",
+        result->actor_direction_consistent ? "true" : "false");
+    return fclose(out) == 0;
+}

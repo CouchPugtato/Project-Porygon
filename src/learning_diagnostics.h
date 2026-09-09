@@ -72,6 +72,39 @@ typedef struct {
     int critic_learnable;
 } CriticFitResult;
 
+#define PPO_UPDATE_AUDIT_BIN_COUNT 5
+
+typedef struct {
+    size_t sample_count;
+    double mean_raw_advantage;
+    double mean_standardized_advantage;
+    double mean_before_probability;
+    double mean_after_probability;
+    double mean_probability_delta;
+    double mean_log_probability_delta;
+    double probability_increased_fraction;
+    double mean_legal_policy_kl;
+} PpoUpdateAuditBin;
+
+typedef struct {
+    size_t episode_count;
+    size_t sample_count;
+    size_t nonfinite_count;
+    double raw_advantage_mean;
+    double raw_advantage_standard_deviation;
+    double advantage_log_probability_delta_correlation;
+    double behavior_log_probability_mean_absolute_error;
+    double behavior_value_mean_absolute_error;
+    double mean_legal_policy_kl;
+    double max_legal_policy_kl;
+    CriticFitMetrics before_value;
+    CriticFitMetrics after_value;
+    PpoUpdateAuditBin bins[PPO_UPDATE_AUDIT_BIN_COUNT];
+    int behavior_policy_matches;
+    int value_loss_decreased;
+    int actor_direction_consistent;
+} PpoUpdateAuditResult;
+
 void learning_diagnostic_assess_critic_fit(CriticFitResult* result);
 
 int learning_diagnostic_publish_critic_checkpoint(
@@ -136,6 +169,27 @@ int learning_diagnostic_write_critic_report(
     const GruTrainer* head_trainer,
     const GruTrainer* recurrent_trainer,
     const CriticFitResult* result
+);
+
+int learning_diagnostic_run_ppo_update_audit(
+    const GruTrainer* trainer,
+    const GruModel* before_model,
+    const GruModel* after_model,
+    const Episode* const* episodes,
+    size_t episode_count,
+    PpoUpdateAuditResult* result
+);
+
+int learning_diagnostic_write_ppo_update_report(
+    const char* report_path,
+    const char* episode_batch_path,
+    const char* before_checkpoint_path,
+    const char* after_checkpoint_path,
+    float gamma,
+    float gae_lambda,
+    size_t episode_limit,
+    unsigned int selection_seed,
+    const PpoUpdateAuditResult* result
 );
 
 #endif

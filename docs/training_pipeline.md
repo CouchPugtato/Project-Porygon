@@ -91,6 +91,21 @@ completed, or failed, along with the selected trainer step. A rejected or
 failed publication returns a nonzero exit code without replacing the requested
 checkpoint.
 
+`--audit-ppo-update` compares the behavior checkpoint with an already-trained
+PPO checkpoint on the episode batch that produced the update. It does not train
+or publish a model. The audit reports value loss, explained variance, legal
+policy KL, and demonstrated-action probability movement across five advantage
+bands. It also checks the recorded behavior log probabilities and values
+against the supplied before checkpoint, catching the wrong-parent comparison.
+
+The advantage bands use raw GAE calculated from recorded behavior values before
+per-minibatch normalization. This keeps the report reproducible without
+claiming that a globally standardized band is the exact advantage seen in each
+shuffled minibatch. Use the same `--episode-limit`, `--shuffle-seed`, `--gamma`,
+and `--gae-lambda` as the training run to reproduce its selected episode set
+and return calculation. The JSON records the standardized-advantage bin edges
+used for the five bands.
+
 Current implementation notes:
 
 - The repository now includes the protocol/session/raw-state/trainer/checkpoint path.

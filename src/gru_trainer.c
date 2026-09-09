@@ -1303,6 +1303,111 @@ static void compute_ppo_returns_and_advantages(
     }
 }
 
+int gru_trainer_compare_ppo_episode(
+    const GruTrainer* trainer,
+    const GruModel* before_model,
+    const GruModel* after_model,
+    const Episode* episode,
+    GruPpoStepComparison* comparisons,
+    size_t comparison_count
+) {
+    size_t hidden_dim;
+    float* returns = NULL;
+    float* advantages = NULL;
+    float* before_hidden = NULL;
+    float* after_hidden = NULL;
+    float* before_next = NULL;
+    float* after_next = NULL;
+    size_t t;
+    int ok = 0;
+
+    if (!trainer || !before_model || !after_model || !episode || !comparisons ||
+            comparison_count < episode->count ||
+            gru_model_input_dim(before_model) != gru_model_input_dim(after_model) ||
+            gru_model_hidden_dim(before_model) != gru_model_hidden_dim(after_model) ||
+            gru_model_num_actions(before_model) != gru_model_num_actions(after_model)) {
+        return 0;
+    }
+    memset(comparisons, 0, comparison_count * sizeof(*comparisons));
+    if (episode->count == 0) return 1;
+
+    hidden_dim = gru_model_hidden_dim(before_model);
+    returns = (float*)malloc(episode->count * sizeof(*returns));
+    advantages = (float*)malloc(episode->count * sizeof(*advantages));
+    before_hidden = (float*)calloc(hidden_dim, sizeof(*before_hidden));
+    after_hidden = (float*)calloc(hidden_dim, sizeof(*after_hidden));
+    before_next = (float*)malloc(hidden_dim * sizeof(*before_next));
+    after_next = (float*)malloc(hidden_dim * sizeof(*after_next));
+    if (!returns || !advantages || !before_hidden || !after_hidden ||
+            !before_next || !after_next) {
+        goto cleanup;
+    }
+    compute_ppo_returns_and_advantages(trainer, episode, returns, advantages);
+
+    for (t = 0; t < episode->count; ++t) {
+        GruPpoStepComparison* comparison = &comparisons[t];
+        FactorizedPolicySnapshot before_snapshot;
+        FactorizedPolicySnapshot after_snapshot;
+        float ignored_entropy;
+
+        gru_model_forward_step(
+            before_model,
+            episode->observations + t * episode->obs_dim,
+            before_hidden,
+            before_next,
+            NULL,
+            NULL);
+        gru_model_forward_step(
+            after_model,
+            episode->observations + t * episode->obs_dim,
+            after_hidden,
+            after_next,
+            NULL,
+            NULL);
+        memcpy(before_hidden, before_next, hidden_dim * sizeof(*before_hidden));
+        memcpy(after_hidden, after_next, hidden_dim * sizeof(*after_hidden));
+        if (episode->actions[t] < 0 && episode->actions2[t] < 0) continue;
+
+        if (!evaluate_joint_step(
+                before_model,
+                before_hidden,
+                episode,
+                t,
+                &comparison->before_log_probability,
+                &comparison->before_value,
+                &ignored_entropy,
+                &before_snapshot) ||
+                !evaluate_joint_step(
+                    after_model,
+                    after_hidden,
+                    episode,
+                    t,
+                    &comparison->after_log_probability,
+                    &comparison->after_value,
+                    &ignored_entropy,
+                    &after_snapshot)) {
+            goto cleanup;
+        }
+        comparison->has_action = 1;
+        comparison->return_target = returns[t];
+        comparison->raw_advantage = advantages[t];
+        comparison->behavior_log_probability = episode->old_log_probs[t];
+        comparison->behavior_value = episode->old_values[t];
+        comparison->legal_policy_kl = factorized_step_anchor_kl(
+            &after_snapshot, &before_snapshot, episode, t);
+    }
+    ok = 1;
+
+cleanup:
+    free(returns);
+    free(advantages);
+    free(before_hidden);
+    free(after_hidden);
+    free(before_next);
+    free(after_next);
+    return ok;
+}
+
 static int ppo_minibatch_advantage_normalization(
     const GruTrainer* trainer,
     const Episode* const* episodes,
