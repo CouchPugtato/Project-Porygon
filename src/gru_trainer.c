@@ -29,6 +29,7 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
     trainer->ppo_clip_epsilon = 0.2f;
     trainer->ppo_value_clip_epsilon = 0.2f;
     trainer->target_kl = 0.02f;
+    trainer->target_kl_source = GRU_PPO_TARGET_KL_SAMPLED_ACTION;
     trainer->gae_lambda = 0.95f;
     trainer->adam_beta1 = 0.9f;
     trainer->adam_beta2 = 0.999f;
@@ -1807,7 +1808,7 @@ int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode*
 }
 
 int gru_trainer_ppo_hard_kl_stop_update(
-    float approx_kl,
+    float observed_kl,
     float target_kl,
     float hard_multiplier,
     int required_consecutive_updates,
@@ -1818,12 +1819,26 @@ int gru_trainer_ppo_hard_kl_stop_update(
         return 0;
     }
     if (target_kl <= 0.0f || hard_multiplier <= 0.0f ||
-            approx_kl <= target_kl * hard_multiplier) {
+            observed_kl <= target_kl * hard_multiplier) {
         *consecutive_breaches = 0;
         return 0;
     }
     ++(*consecutive_breaches);
     return *consecutive_breaches >= required;
+}
+
+float gru_trainer_ppo_target_kl_observation(const GruTrainer* trainer) {
+    if (!trainer) return 0.0f;
+    if (trainer->target_kl_source == GRU_PPO_TARGET_KL_EXACT_LEGAL_POLICY) {
+        return trainer->last_anchor_kl_mean;
+    }
+    return trainer->last_approx_kl;
+}
+
+const char* gru_ppo_target_kl_source_name(GruPpoTargetKlSource source) {
+    return source == GRU_PPO_TARGET_KL_EXACT_LEGAL_POLICY
+        ? "exact_legal_policy_kl"
+        : "sampled_action_log_ratio";
 }
 
 double gru_trainer_critic_explained_variance(const GruTrainer* trainer) {

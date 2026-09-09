@@ -1499,6 +1499,9 @@ static int write_rl_training_summary_json(
     fprintf(out, "  \"clip_fraction\": %.6f,\n", summary->label_weight_sum > 0 ? summary->clip_fraction_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"anchor_kl_max\": %.6f,\n", summary->anchor_kl_max);
     fprintf(out, "  \"target_kl\": %.6f,\n", trainer->target_kl);
+    fputs("  \"target_kl_source\": ", out);
+    json_write_escaped(out, gru_ppo_target_kl_source_name(trainer->target_kl_source));
+    fputs(",\n", out);
     fprintf(out, "  \"target_kl_min_episodes\": %d,\n", summary->target_kl_min_episodes);
     fprintf(out, "  \"target_kl_min_labels\": %d,\n", summary->target_kl_min_labels);
     fprintf(out, "  \"target_kl_hard_multiplier\": %.6f,\n", summary->target_kl_hard_multiplier);
@@ -2565,6 +2568,7 @@ static int train_from_input_file(
     const size_t train_eta_min_episodes = 5;
     size_t starting_step;
     int output_checkpoint_loaded;
+    int anchor_is_behavior_parent = 0;
 
     if (!input_path || !checkpoint_path || epochs <= 0) {
         return 1;
@@ -2689,6 +2693,15 @@ static int train_from_input_file(
             free(resolved_checkpoint_path);
             return 1;
         }
+        if (ppo_mode && input_kind == TRAIN_INPUT_EPISODE_BATCH &&
+                parent_checkpoint_metadata && *parent_checkpoint_metadata) {
+            char* resolved_parent_path = resolve_checkpoint_path(parent_checkpoint_metadata);
+            if (resolved_parent_path) {
+                anchor_is_behavior_parent = files_have_same_bytes(
+                    resolved_anchor_checkpoint_path, resolved_parent_path);
+            }
+            free(resolved_parent_path);
+        }
     }
     gru_trainer_init(&trainer,
         learning_rate_override > 0.0f
@@ -2707,11 +2720,18 @@ static int train_from_input_file(
         trainer.ppo_clip_epsilon = ppo_clip_epsilon;
         trainer.ppo_value_clip_epsilon = ppo_value_clip_epsilon;
         trainer.target_kl = ppo_target_kl;
+        trainer.target_kl_source = anchor_is_behavior_parent
+            ? GRU_PPO_TARGET_KL_EXACT_LEGAL_POLICY
+            : GRU_PPO_TARGET_KL_SAMPLED_ACTION;
         trainer.adam_beta1 = adam_beta1;
         trainer.adam_beta2 = adam_beta2;
         trainer.adam_epsilon = adam_epsilon;
         trainer.anchor_model = anchor_model;
         trainer.anchor_kl_coef = anchor_kl_coef;
+        if (ppo_mode) {
+            printf("[train-ppo] target_kl_source=%s\n",
+                gru_ppo_target_kl_source_name(trainer.target_kl_source));
+        }
     } else {
         trainer.supervised_profile_enabled = supervised_profile;
         trainer.supervised_optimizer = supervised_optimizer;
@@ -2900,8 +2920,11 @@ static int train_from_input_file(
                 }
                 rl_training_summary_record_trainer(&rl_summary, &trainer);
                 if (ppo_mode && trainer.target_kl > 0.0f) {
-                    float running_approx_kl = rl_summary.label_weight_sum > 0
-                        ? (float)(rl_summary.approx_kl_sum / (double)rl_summary.label_weight_sum)
+                    float observed_kl = gru_trainer_ppo_target_kl_observation(&trainer);
+                    float running_target_kl = rl_summary.label_weight_sum > 0
+                        ? (float)((trainer.target_kl_source == GRU_PPO_TARGET_KL_EXACT_LEGAL_POLICY
+                            ? rl_summary.anchor_kl_mean_sum
+                            : rl_summary.approx_kl_sum) / (double)rl_summary.label_weight_sum)
                         : 0.0f;
                     int minimum_reached =
                         rl_summary.episode_count >= (size_t)(ppo_target_kl_min_episodes > 0 ? ppo_target_kl_min_episodes : 0) &&
@@ -2910,7 +2933,7 @@ static int train_from_input_file(
                         ? ppo_target_kl_hard_consecutive_updates
                         : 1;
                     int hard_stop = gru_trainer_ppo_hard_kl_stop_update(
-                        trainer.last_approx_kl,
+                        observed_kl,
                         trainer.target_kl,
                         ppo_target_kl_hard_multiplier,
                         required_hard_breaches,
@@ -2918,11 +2941,11 @@ static int train_from_input_file(
                     if (consecutive_hard_kl_updates > rl_summary.target_kl_hard_breach_count) {
                         rl_summary.target_kl_hard_breach_count = consecutive_hard_kl_updates;
                     }
-                    if ((minimum_reached && running_approx_kl > trainer.target_kl) || hard_stop) {
+                    if ((minimum_reached && running_target_kl > trainer.target_kl) || hard_stop) {
                         ppo_early_stop = 1;
                         rl_summary.target_kl_exceeded = 1;
                         rl_summary.target_kl_hard_stop = hard_stop ? 1 : 0;
-                        rl_summary.target_kl_trigger = hard_stop ? trainer.last_approx_kl : running_approx_kl;
+                        rl_summary.target_kl_trigger = hard_stop ? observed_kl : running_target_kl;
                     }
                 }
             } else {
@@ -2950,7 +2973,7 @@ static int train_from_input_file(
                     eta = (double)(train_sessions - trained_in_epoch) / train_eta_rate_ema;
                 }
                 if (rl_mode) {
-                    printf("[train-%s] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f explained_variance=%.4f return_value_correlation=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f anchor_kl_mean=%.4f anchor_kl_max=%.4f clip_fraction=%.4f hard_kl_breaches=%d/%d labels=%zu\n",
+                    printf("[train-%s] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f explained_variance=%.4f return_value_correlation=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f anchor_kl_mean=%.4f anchor_kl_max=%.4f kl_guard=%.4f kl_source=%s clip_fraction=%.4f hard_kl_breaches=%d/%d labels=%zu\n",
                         ppo_mode ? "ppo" : "rl",
                         epoch,
                         trained_in_epoch,
@@ -2966,6 +2989,8 @@ static int train_from_input_file(
                         trainer.last_approx_kl,
                         trainer.last_anchor_kl_mean,
                         trainer.last_anchor_kl_max,
+                        gru_trainer_ppo_target_kl_observation(&trainer),
+                        gru_ppo_target_kl_source_name(trainer.target_kl_source),
                         trainer.last_clip_fraction,
                         consecutive_hard_kl_updates,
                         ppo_target_kl_hard_consecutive_updates > 0 ? ppo_target_kl_hard_consecutive_updates : 1,
@@ -3022,13 +3047,14 @@ static int train_from_input_file(
         }
 
         if (ppo_early_stop) {
-            printf("[train-ppo] early stop after epoch=%d episodes=%zu/%zu reason=%s kl_trigger=%.4f target_kl=%.4f\n",
+            printf("[train-ppo] early stop after epoch=%d episodes=%zu/%zu reason=%s kl_trigger=%.4f target_kl=%.4f kl_source=%s\n",
                 epoch,
                 trained_in_epoch,
                 train_sessions,
                 rl_summary.target_kl_hard_stop ? "target_kl_hard_limit" : "target_kl_running_mean",
                 rl_summary.target_kl_trigger,
-                trainer.target_kl);
+                trainer.target_kl,
+                gru_ppo_target_kl_source_name(trainer.target_kl_source));
         }
 
         if (val_sessions > 0 && !rl_mode) {

@@ -10,6 +10,11 @@ typedef enum {
     GRU_SUPERVISED_OPTIMIZER_ADAM = 1
 } GruSupervisedOptimizer;
 
+typedef enum {
+    GRU_PPO_TARGET_KL_SAMPLED_ACTION = 0,
+    GRU_PPO_TARGET_KL_EXACT_LEGAL_POLICY = 1
+} GruPpoTargetKlSource;
+
 typedef struct {
     size_t step;
     float learning_rate;
@@ -55,6 +60,7 @@ typedef struct {
     float ppo_clip_epsilon;
     float ppo_value_clip_epsilon;
     float target_kl;
+    GruPpoTargetKlSource target_kl_source;
     float gae_lambda;
     float adam_beta1;
     float adam_beta2;
@@ -99,11 +105,13 @@ int gru_trainer_compare_ppo_episode(
     size_t comparison_count
 );
 int gru_trainer_ppo_hard_kl_stop_update(
-    float approx_kl,
+    float observed_kl,
     float target_kl,
     float hard_multiplier,
     int required_consecutive_updates,
     int* consecutive_breaches);
+float gru_trainer_ppo_target_kl_observation(const GruTrainer* trainer);
+const char* gru_ppo_target_kl_source_name(GruPpoTargetKlSource source);
 double gru_trainer_critic_explained_variance(const GruTrainer* trainer);
 double gru_trainer_return_value_correlation(const GruTrainer* trainer);
 const char* gru_supervised_optimizer_name(GruSupervisedOptimizer optimizer);

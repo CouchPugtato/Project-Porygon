@@ -106,6 +106,12 @@ and `--gae-lambda` as the training run to reproduce its selected episode set
 and return calculation. The JSON records the standardized-advantage bin edges
 used for the five bands.
 
+PPO KL stopping uses the exact distribution over legal actions when the anchor
+checkpoint is byte-identical to the behavior parent. The sampled action
+log-ratio remains in `approx_kl` for diagnosis, but does not stop those runs.
+Training summaries identify the active measurement in `target_kl_source`. Runs
+without a matching frozen reference retain the sampled-log-ratio fallback.
+
 Current implementation notes:
 
 - The repository now includes the protocol/session/raw-state/trainer/checkpoint path.

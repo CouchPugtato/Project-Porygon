@@ -3254,6 +3254,37 @@ static int test_ppo_hard_kl_requires_consecutive_breaches(void) {
     return ok;
 }
 
+static int test_ppo_kl_guard_prefers_exact_behavior_policy_kl(void) {
+    GruTrainer trainer;
+    int breaches = 0;
+    int ok = 1;
+
+    gru_trainer_init(&trainer, 1.0e-5f, 16u, 1.0f, 71u);
+    trainer.target_kl = 0.01f;
+    trainer.last_approx_kl = 0.015446f;
+    trainer.last_anchor_kl_mean = 0.000024f;
+    trainer.target_kl_source = GRU_PPO_TARGET_KL_EXACT_LEGAL_POLICY;
+    ok &= assert_true(
+        gru_trainer_ppo_target_kl_observation(&trainer) < trainer.target_kl,
+        "exact behavior-policy KL avoids the observed run 0153 soft-stop false positive");
+
+    trainer.last_approx_kl = 0.10f;
+    ok &= assert_true(
+        !gru_trainer_ppo_hard_kl_stop_update(
+            gru_trainer_ppo_target_kl_observation(&trainer),
+            trainer.target_kl,
+            4.0f,
+            2,
+            &breaches) && breaches == 0,
+        "exact behavior-policy KL avoids a sampled hard-stop false positive");
+
+    trainer.target_kl_source = GRU_PPO_TARGET_KL_SAMPLED_ACTION;
+    ok &= assert_true(
+        gru_trainer_ppo_target_kl_observation(&trainer) == trainer.last_approx_kl,
+        "PPO KL guard retains sampled-log-ratio fallback without a behavior reference");
+    return ok;
+}
+
 static int test_symmetric_joint_action_training(void) {
     GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     float sequence[4] = {0};
@@ -4808,6 +4839,7 @@ int main(int argc, char** argv) {
     if (!test_factorized_target_head_training()) return 1;
     if (!test_factorized_ppo_anchor_regularization()) return 1;
     if (!test_ppo_hard_kl_requires_consecutive_breaches()) return 1;
+    if (!test_ppo_kl_guard_prefers_exact_behavior_policy_kl()) return 1;
     if (!test_symmetric_joint_action_training()) return 1;
     if (!test_shared_entity_encoder_training_and_migration()) return 1;
     if (!test_active_slot_schema_migrates_legacy_checkpoint()) return 1;
