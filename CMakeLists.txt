@@ -45,6 +45,7 @@ set(SHOWDOWN_CLIENT_SOURCES
 	src/env_session.c
 	src/checkpoint.c
 	src/gru_trainer.c
+	src/action_value.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c
 	src/validation_split.c
@@ -72,6 +73,7 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/episode.c
 	src/gru_model.c
 	src/gru_trainer.c
+	src/action_value.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c
 	src/validation_split.c

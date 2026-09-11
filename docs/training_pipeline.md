@@ -91,6 +91,30 @@ completed, or failed, along with the selected trainer step. A rejected or
 failed publication returns a nonzero exit code without replacing the requested
 checkpoint.
 
+`--check-action-q-fit` is the next diagnostic after the state critic passes but
+PPO and AWR remain flat. It freezes the checkpoint completely and trains a
+small sidecar to predict one-step TD targets for the demonstrated action. The
+sidecar has a 16-unit latent projection, separate values for all 196 ordered
+doubles action pairs and 28 single-slot actions, and target-specific values for
+selectable move targets. Illegal action pairs never enter its expectation or
+gradient.
+
+The learned action advantage is centered by its exact expectation under the
+checkpoint's legal live-play policy. Its expected contribution is therefore
+zero, leaving the existing state value as the baseline. A fit must improve
+untouched holdout loss by at least 2%, correlate with the frozen critic's TD
+residual by at least 0.10, agree with the residual sign at least 53% of the
+time, avoid a large train/holdout gap, and keep finite bounded advantages.
+These thresholds detect a possible action-level signal; they do not establish
+playing strength.
+
+`--check-action-q-fit-manifest` uses the same multiple-training-batch and
+separate-holdout arrangement as the critic diagnostic. `--action-q-output`
+writes a sidecar only when every holdout gate passes. The sidecar is not read by
+live play and cannot be promoted as a normal checkpoint. A later actor update
+should be added only after this diagnostic succeeds, so a failed action model
+cannot silently steer the policy.
+
 `--audit-ppo-update` compares the behavior checkpoint with an already-trained
 PPO checkpoint on the episode batch that produced the update. It does not train
 or publish a model. The audit reports value loss, explained variance, legal

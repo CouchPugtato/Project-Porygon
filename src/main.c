@@ -55,6 +55,9 @@ typedef struct {
     int awr_minibatch_episodes;
     float awr_temperature;
     float awr_max_weight;
+    int action_q_latent_dim;
+    int action_q_minibatch_episodes;
+    float action_q_l2_coefficient;
     float adam_beta1;
     float adam_beta2;
     float adam_epsilon;
@@ -773,6 +776,9 @@ static void rl_defaults_config_init(RlDefaultsConfig* config) {
     config->awr_minibatch_episodes = 8;
     config->awr_temperature = 1.0f;
     config->awr_max_weight = 20.0f;
+    config->action_q_latent_dim = 16;
+    config->action_q_minibatch_episodes = 8;
+    config->action_q_l2_coefficient = 0.0001f;
     config->adam_beta1 = 0.90f;
     config->adam_beta2 = 0.999f;
     config->adam_epsilon = 1.0e-8f;
@@ -816,6 +822,9 @@ static int assign_rl_default_value(RlDefaultsConfig* config, const char* key, co
     else if (strcmp(key, "awr_minibatch_episodes") == 0) config->awr_minibatch_episodes = (int)value;
     else if (strcmp(key, "awr_temperature") == 0) config->awr_temperature = value;
     else if (strcmp(key, "awr_max_weight") == 0) config->awr_max_weight = value;
+    else if (strcmp(key, "action_q_latent_dim") == 0) config->action_q_latent_dim = (int)value;
+    else if (strcmp(key, "action_q_minibatch_episodes") == 0) config->action_q_minibatch_episodes = (int)value;
+    else if (strcmp(key, "action_q_l2_coefficient") == 0) config->action_q_l2_coefficient = value;
     else if (strcmp(key, "adam_beta1") == 0) config->adam_beta1 = value;
     else if (strcmp(key, "adam_beta2") == 0) config->adam_beta2 = value;
     else if (strcmp(key, "adam_epsilon") == 0) config->adam_epsilon = value;
@@ -3463,9 +3472,9 @@ typedef struct {
     size_t runtime_count;
     const Episode** episodes;
     size_t episode_count;
-} CriticEpisodeSet;
+} DiagnosticEpisodeSet;
 
-static void critic_episode_set_free(CriticEpisodeSet* set) {
+static void diagnostic_episode_set_free(DiagnosticEpisodeSet* set) {
     size_t i;
     if (!set) return;
     for (i = 0; i < set->runtime_count; ++i) {
@@ -3476,8 +3485,8 @@ static void critic_episode_set_free(CriticEpisodeSet* set) {
     memset(set, 0, sizeof(*set));
 }
 
-static int critic_episode_set_add_batch(
-    CriticEpisodeSet* set,
+static int diagnostic_episode_set_add_batch(
+    DiagnosticEpisodeSet* set,
     const char* path,
     GruModel* model,
     EnvRewardMode reward_mode,
@@ -3516,13 +3525,13 @@ static int critic_episode_set_add_batch(
         }
     }
     ++set->runtime_count;
-    printf("[critic-fit] loaded source=%s labeled_episodes=%zu total_episodes=%zu\n",
+    printf("[diagnostic-data] loaded source=%s labeled_episodes=%zu total_episodes=%zu\n",
         path, labeled_count, set->episode_count);
     return 1;
 }
 
-static int critic_episode_set_load_manifest(
-    CriticEpisodeSet* set,
+static int diagnostic_episode_set_load_manifest(
+    DiagnosticEpisodeSet* set,
     const char* manifest_path,
     GruModel* model,
     EnvRewardMode reward_mode,
@@ -3535,14 +3544,14 @@ static int critic_episode_set_load_manifest(
     if (!set || !manifest_path || !*manifest_path) return 0;
     manifest = fopen(manifest_path, "r");
     if (!manifest) {
-        fprintf(stderr, "Failed to open critic batch manifest '%s': %s\n",
+        fprintf(stderr, "Failed to open diagnostic batch manifest '%s': %s\n",
             manifest_path, strerror(errno));
         return 0;
     }
     while (fgets(line, sizeof(line), manifest)) {
         char* path = trim_manifest_line(line);
         if (!*path || *path == '#') continue;
-        if (!critic_episode_set_add_batch(
+        if (!diagnostic_episode_set_add_batch(
                 set, path, model, reward_mode, dense_reward_config)) {
             fclose(manifest);
             return 0;
@@ -3551,7 +3560,7 @@ static int critic_episode_set_load_manifest(
     }
     fclose(manifest);
     if (paths_loaded == 0) {
-        fprintf(stderr, "Critic batch manifest contains no paths: %s\n", manifest_path);
+        fprintf(stderr, "Diagnostic batch manifest contains no paths: %s\n", manifest_path);
         return 0;
     }
     return 1;
@@ -3584,8 +3593,8 @@ static int run_critic_fit_check(
     CheckpointLoadResult checkpoint_result;
     EnvRewardMode reward_mode;
     EnvRuntime runtime;
-    CriticEpisodeSet training_set;
-    CriticEpisodeSet holdout_set;
+    DiagnosticEpisodeSet training_set;
+    DiagnosticEpisodeSet holdout_set;
     const Episode** train_episodes = NULL;
     const Episode** selection_episodes = NULL;
     const Episode** holdout_episodes = NULL;
@@ -3622,13 +3631,13 @@ static int run_critic_fit_check(
         goto cleanup;
     }
     if (training_source_is_manifest) {
-        if (!critic_episode_set_load_manifest(
+        if (!diagnostic_episode_set_load_manifest(
                 &training_set,
                 episode_batch_path,
                 head_model,
                 reward_mode,
                 &reward_config->dense_additive) ||
-                !critic_episode_set_add_batch(
+                !diagnostic_episode_set_add_batch(
                     &holdout_set,
                     holdout_batch_path,
                     head_model,
@@ -3769,11 +3778,182 @@ cleanup:
     if (!training_source_is_manifest) free(holdout_episodes);
     free(selection_episodes);
     free(train_episodes);
-    critic_episode_set_free(&holdout_set);
-    critic_episode_set_free(&training_set);
+    diagnostic_episode_set_free(&holdout_set);
+    diagnostic_episode_set_free(&training_set);
     env_runtime_free(&runtime);
     gru_model_destroy(recurrent_model);
     gru_model_destroy(head_model);
+    return rc;
+}
+
+static int run_action_q_fit_check(
+    const char* episode_batch_path,
+    const char* holdout_batch_path,
+    int training_source_is_manifest,
+    const char* checkpoint_path,
+    const char* report_path,
+    const char* output_path,
+    size_t epochs,
+    size_t minibatch_episodes,
+    size_t latent_dim,
+    size_t early_stop_patience,
+    float learning_rate,
+    float gamma,
+    float l2_coefficient,
+    unsigned int validation_seed,
+    unsigned int shuffle_seed,
+    float adam_beta1,
+    float adam_beta2,
+    float adam_epsilon,
+    const char* reward_mode_name,
+    const RewardConfig* reward_config
+) {
+    GruModel* policy_model = NULL;
+    ActionValueModel* action_value_model = NULL;
+    TrainerCheckpointState checkpoint_state;
+    CheckpointLoadResult checkpoint_result;
+    EnvRewardMode reward_mode;
+    EnvRuntime runtime;
+    DiagnosticEpisodeSet training_set;
+    DiagnosticEpisodeSet holdout_set;
+    const Episode** train_episodes = NULL;
+    const Episode** selection_episodes = NULL;
+    const Episode** holdout_episodes = NULL;
+    size_t train_count = 0;
+    size_t selection_count = 0;
+    size_t holdout_count = 0;
+    ActionValueFitResult result;
+    size_t i;
+    int action_value_published = 0;
+    int publication_requested;
+    int rc = 1;
+
+    memset(&runtime, 0, sizeof(runtime));
+    memset(&training_set, 0, sizeof(training_set));
+    memset(&holdout_set, 0, sizeof(holdout_set));
+    if (!episode_batch_path || !checkpoint_path || !report_path || !reward_config ||
+            epochs == 0 || minibatch_episodes == 0 || latent_dim == 0 ||
+            early_stop_patience == 0 || learning_rate <= 0.0f || gamma < 0.0f ||
+            gamma > 1.0f || l2_coefficient < 0.0f ||
+            (training_source_is_manifest && (!holdout_batch_path || !*holdout_batch_path)) ||
+            !parse_reward_mode(reward_mode_name, &reward_mode)) {
+        fprintf(stderr, "[action-q] invalid diagnostic configuration\n");
+        return 1;
+    }
+    policy_model = load_current_checkpoint(
+        checkpoint_path, &checkpoint_state, &checkpoint_result);
+    if (!policy_model) {
+        report_checkpoint_load_failure(
+            "[action-q] failed to load encoder checkpoint", checkpoint_path, &checkpoint_result);
+        goto cleanup;
+    }
+    action_value_model = action_value_model_create(
+        gru_model_hidden_dim(policy_model), latent_dim, shuffle_seed);
+    if (!action_value_model) {
+        fprintf(stderr, "[action-q] failed to create action-value model\n");
+        goto cleanup;
+    }
+
+    if (training_source_is_manifest) {
+        if (!diagnostic_episode_set_load_manifest(
+                &training_set, episode_batch_path, policy_model, reward_mode,
+                &reward_config->dense_additive) ||
+                !diagnostic_episode_set_add_batch(
+                    &holdout_set, holdout_batch_path, policy_model, reward_mode,
+                    &reward_config->dense_additive)) goto cleanup;
+        train_episodes = (const Episode**)malloc(
+            training_set.episode_count * sizeof(*train_episodes));
+        selection_episodes = (const Episode**)malloc(
+            training_set.episode_count * sizeof(*selection_episodes));
+        if (!train_episodes || !selection_episodes) goto cleanup;
+        for (i = 0; i < training_set.runtime_count; ++i) {
+            const EnvRuntime* source_runtime = &training_set.runtimes[i];
+            size_t session_index;
+            for (session_index = 0; session_index < source_runtime->count; ++session_index) {
+                const EnvSession* session = &source_runtime->sessions[session_index];
+                if (!episode_has_labels(&session->episode)) continue;
+                if (validation_split_contains(session->battle_id, validation_seed)) {
+                    selection_episodes[selection_count++] = &session->episode;
+                } else {
+                    train_episodes[train_count++] = &session->episode;
+                }
+            }
+        }
+        holdout_episodes = holdout_set.episodes;
+        holdout_count = holdout_set.episode_count;
+    } else {
+        if (!load_runtime_from_episode_batch_file(
+                episode_batch_path, policy_model, &runtime, reward_mode,
+                &reward_config->dense_additive, "")) goto cleanup;
+        train_episodes = (const Episode**)malloc(runtime.count * sizeof(*train_episodes));
+        selection_episodes = (const Episode**)malloc(runtime.count * sizeof(*selection_episodes));
+        holdout_episodes = (const Episode**)malloc(runtime.count * sizeof(*holdout_episodes));
+        if (!train_episodes || !selection_episodes || !holdout_episodes) goto cleanup;
+        for (i = 0; i < runtime.count; ++i) {
+            const EnvSession* session = &runtime.sessions[i];
+            uint64_t bucket;
+            if (!episode_has_labels(&session->episode)) continue;
+            bucket = validation_split_hash(session->battle_id, validation_seed) % UINT64_C(10);
+            if (bucket == UINT64_C(0)) holdout_episodes[holdout_count++] = &session->episode;
+            else if (bucket == UINT64_C(1)) selection_episodes[selection_count++] = &session->episode;
+            else train_episodes[train_count++] = &session->episode;
+        }
+    }
+    if (train_count == 0 || selection_count == 0 || holdout_count == 0) {
+        fprintf(stderr,
+            "[action-q] stable split produced train=%zu selection=%zu holdout=%zu; use more episodes or another validation seed\n",
+            train_count, selection_count, holdout_count);
+        goto cleanup;
+    }
+    printf("[action-q] train=%zu selection=%zu holdout=%zu epochs=%zu minibatch_episodes=%zu latent_dim=%zu learning_rate=%.9g gamma=%.6g l2=%.6g\n",
+        train_count, selection_count, holdout_count, epochs, minibatch_episodes,
+        latent_dim, learning_rate, gamma, l2_coefficient);
+    if (!learning_diagnostic_run_action_value_fit(
+            action_value_model, policy_model,
+            train_episodes, train_count,
+            selection_episodes, selection_count,
+            holdout_episodes, holdout_count,
+            epochs, minibatch_episodes, early_stop_patience, shuffle_seed,
+            gamma, learning_rate, adam_beta1, adam_beta2, adam_epsilon,
+            1.0f, l2_coefficient, &result)) {
+        fprintf(stderr, "[action-q] diagnostic execution failed\n");
+        goto cleanup;
+    }
+    publication_requested = output_path && *output_path;
+    if (publication_requested && result.action_signal_detected) {
+        action_value_published = action_value_model_save(output_path, action_value_model);
+    }
+    if (!learning_diagnostic_write_action_value_report(
+            report_path, episode_batch_path,
+            training_source_is_manifest ? holdout_batch_path : episode_batch_path,
+            checkpoint_path, output_path, action_value_published,
+            validation_seed, shuffle_seed, epochs, minibatch_episodes,
+            early_stop_patience, gamma, learning_rate, l2_coefficient,
+            action_value_model, &result)) {
+        fprintf(stderr, "[action-q] failed to write report '%s': %s\n",
+            report_path, strerror(errno));
+        goto cleanup;
+    }
+    printf("[action-q] signal=%d holdout_loss=%.6f baseline_loss=%.6f residual_correlation=%.4f sign_accuracy=%.4f published=%d report=%s\n",
+        result.action_signal_detected, result.after_holdout.q_loss,
+        result.after_holdout.baseline_loss,
+        result.after_holdout.advantage_td_error_correlation,
+        result.after_holdout.advantage_sign_accuracy,
+        action_value_published, report_path);
+    if (publication_requested && !action_value_published) {
+        fprintf(stderr, "[action-q] sidecar publication rejected because the holdout action-signal gates did not pass\n");
+    }
+    rc = 0;
+
+cleanup:
+    if (!training_source_is_manifest) free(holdout_episodes);
+    free(selection_episodes);
+    free(train_episodes);
+    diagnostic_episode_set_free(&holdout_set);
+    diagnostic_episode_set_free(&training_set);
+    env_runtime_free(&runtime);
+    action_value_model_destroy(action_value_model);
+    gru_model_destroy(policy_model);
     return rc;
 }
 
@@ -3974,6 +4154,10 @@ static int showdown_client_main(int argc, char** argv) {
         strcmp(argv[1], "--check-critic-fit-manifest") == 0;
     int critic_fit_command = argc >= 2 &&
         (strcmp(argv[1], "--check-critic-fit") == 0 || critic_fit_manifest_command);
+    int action_q_manifest_command = argc >= 2 &&
+        strcmp(argv[1], "--check-action-q-fit-manifest") == 0;
+    int action_q_command = argc >= 2 &&
+        (strcmp(argv[1], "--check-action-q-fit") == 0 || action_q_manifest_command);
     int ppo_audit_command = argc >= 2 && strcmp(argv[1], "--audit-ppo-update") == 0;
     int overfit_epochs = parse_int_flag(argc, argv, "--epochs", 200);
     int overfit_seed = parse_int_flag(argc, argv, "--seed", 20260902);
@@ -3984,6 +4168,8 @@ static int showdown_client_main(int argc, char** argv) {
     float critic_policy_kl_coef = parse_float_flag(argc, argv, "--critic-policy-kl-coef", 0.0f);
     const char* critic_output_checkpoint_path = parse_string_flag(
         argc, argv, "--critic-output-checkpoint", "");
+    const char* action_q_output_path = parse_string_flag(
+        argc, argv, "--action-q-output", "");
     float learning_rate_override;
     const char* expected_policy_tag = parse_string_flag(argc, argv, "--policy-tag-expected", "");
     const char* training_summary_path = parse_string_flag(argc, argv, "--training-summary-path", "");
@@ -4007,6 +4193,12 @@ static int showdown_client_main(int argc, char** argv) {
     int awr_minibatch_episodes;
     float awr_temperature;
     float awr_max_weight;
+    int action_q_epochs;
+    int action_q_seed;
+    int action_q_minibatch_episodes;
+    int action_q_latent_dim;
+    int action_q_early_stop_patience;
+    float action_q_l2_coefficient;
     float adam_beta1;
     float adam_beta2;
     float adam_epsilon;
@@ -4032,7 +4224,7 @@ static int showdown_client_main(int argc, char** argv) {
     learning_rate_override = parse_float_flag(argc, argv, "--learning-rate", -1.0f);
     anchor_kl_coef = parse_float_flag(argc, argv, "--anchor-kl-coef", 0.0f);
     rl_gamma = parse_float_flag(argc, argv, "--gamma",
-        (ppo_command || awr_command || critic_fit_command || ppo_audit_command)
+        (ppo_command || awr_command || critic_fit_command || action_q_command || ppo_audit_command)
             ? rl_defaults.ppo_gamma
             : rl_defaults.policy_gradient_gamma);
     rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef",
@@ -4053,6 +4245,16 @@ static int showdown_client_main(int argc, char** argv) {
     awr_minibatch_episodes = parse_int_flag(argc, argv, "--awr-minibatch-episodes", rl_defaults.awr_minibatch_episodes);
     awr_temperature = parse_float_flag(argc, argv, "--awr-temperature", rl_defaults.awr_temperature);
     awr_max_weight = parse_float_flag(argc, argv, "--awr-max-weight", rl_defaults.awr_max_weight);
+    action_q_epochs = parse_int_flag(argc, argv, "--epochs", 20);
+    action_q_seed = parse_int_flag(argc, argv, "--seed", 20260911);
+    action_q_minibatch_episodes = parse_int_flag(
+        argc, argv, "--action-q-minibatch-episodes", rl_defaults.action_q_minibatch_episodes);
+    action_q_latent_dim = parse_int_flag(
+        argc, argv, "--action-q-latent-dim", rl_defaults.action_q_latent_dim);
+    action_q_early_stop_patience = parse_int_flag(
+        argc, argv, "--action-q-early-stop-patience", 3);
+    action_q_l2_coefficient = parse_float_flag(
+        argc, argv, "--action-q-l2", rl_defaults.action_q_l2_coefficient);
     adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", rl_defaults.adam_beta1);
     adam_beta2 = parse_float_flag(argc, argv, "--adam-beta2", rl_defaults.adam_beta2);
     adam_epsilon = parse_float_flag(argc, argv, "--adam-epsilon", rl_defaults.adam_epsilon);
@@ -4071,6 +4273,14 @@ static int showdown_client_main(int argc, char** argv) {
              critic_early_stop_patience < 0 || critic_policy_kl_coef < 0.0f)) {
         fprintf(stderr,
             "--check-critic-fit requires positive epochs/minibatch size and non-negative seed, patience, and policy KL coefficient\n");
+        return 1;
+    }
+    if (action_q_command &&
+            (action_q_epochs <= 0 || action_q_seed < 0 ||
+             action_q_minibatch_episodes <= 0 || action_q_latent_dim <= 0 ||
+             action_q_early_stop_patience <= 0 || action_q_l2_coefficient < 0.0f)) {
+        fprintf(stderr,
+            "--check-action-q-fit requires positive epochs, minibatch size, latent dimension, and early-stop patience plus non-negative seed and L2 coefficient\n");
         return 1;
     }
     if (ppo_audit_command && (ppo_episode_limit < 0 || ppo_shuffle_seed < 0)) {
@@ -4119,6 +4329,8 @@ static int showdown_client_main(int argc, char** argv) {
             strcmp(argv[1], "--check-supervised-overfit") == 0 ||
             strcmp(argv[1], "--check-critic-fit") == 0 ||
             strcmp(argv[1], "--check-critic-fit-manifest") == 0 ||
+            strcmp(argv[1], "--check-action-q-fit") == 0 ||
+            strcmp(argv[1], "--check-action-q-fit-manifest") == 0 ||
             strcmp(argv[1], "--audit-ppo-update") == 0 ||
             strcmp(argv[1], "--eval-supervised") == 0)) {
         training_or_eval_mode = 1;
@@ -4183,6 +4395,17 @@ static int showdown_client_main(int argc, char** argv) {
             rl_reward_mode,
             &reward_config);
     }
+    if (argc >= 6 && action_q_manifest_command) {
+        return run_action_q_fit_check(
+            argv[2], argv[3], 1, argv[4], argv[5], action_q_output_path,
+            (size_t)action_q_epochs, (size_t)action_q_minibatch_episodes,
+            (size_t)action_q_latent_dim, (size_t)action_q_early_stop_patience,
+            learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
+            rl_gamma, action_q_l2_coefficient,
+            (unsigned int)validation_seed, (unsigned int)action_q_seed,
+            adam_beta1, adam_beta2, adam_epsilon,
+            rl_reward_mode, &reward_config);
+    }
     if (argc >= 6 && ppo_audit_command) {
         return run_ppo_update_audit(
             argv[2],
@@ -4217,6 +4440,17 @@ static int showdown_client_main(int argc, char** argv) {
             critic_policy_kl_coef,
             rl_reward_mode,
             &reward_config);
+    }
+    if (argc >= 5 && action_q_command) {
+        return run_action_q_fit_check(
+            argv[2], NULL, 0, argv[3], argv[4], action_q_output_path,
+            (size_t)action_q_epochs, (size_t)action_q_minibatch_episodes,
+            (size_t)action_q_latent_dim, (size_t)action_q_early_stop_patience,
+            learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
+            rl_gamma, action_q_l2_coefficient,
+            (unsigned int)validation_seed, (unsigned int)action_q_seed,
+            adam_beta1, adam_beta2, adam_epsilon,
+            rl_reward_mode, &reward_config);
     }
     if (argc >= 4 && strcmp(argv[1], "--train-supervised") == 0) {
         return train_from_input_file(
@@ -4486,6 +4720,8 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
         "  showdown_client --check-critic-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --check-critic-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --check-action-q-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --check-action-q-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --audit-ppo-update <episode_batch.jsonl> <before.bin> <after.bin> <report.json> [--episode-limit N] [--shuffle-seed N] [--gamma F] [--gae-lambda F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"

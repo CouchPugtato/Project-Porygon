@@ -4440,6 +4440,155 @@ cleanup:
     return ok;
 }
 
+static int test_action_value_head_learns_legal_joint_and_target_credit(void) {
+    const char* sidecar_path = "action_value_test.bin";
+    GruModel* policy_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    ActionValueModel* joint_model = NULL;
+    ActionValueModel* target_model = NULL;
+    ActionValueModel* loaded_model = NULL;
+    float hidden[8] = {0};
+    unsigned char dual_legal[OBS_NUM_ACTIONS] = {0};
+    unsigned char single_legal[OBS_NUM_ACTIONS] = {0};
+    FactorizedActionChoice dual_choice;
+    FactorizedActionChoice target_choice;
+    FactorizedActionChoice alternate_target_choice;
+    ActionValuePrediction selected_before;
+    ActionValuePrediction selected_after;
+    ActionValuePrediction alternative_after;
+    ActionValuePrediction target_after;
+    ActionValuePrediction alternate_target_after;
+    float* policy_before = NULL;
+    float* policy_after = NULL;
+    size_t policy_parameter_count;
+    double centered_sum = 0.0;
+    int a0;
+    int a1;
+    int update;
+    int ok = 1;
+
+    remove(sidecar_path);
+    factorized_action_choice_init(&dual_choice);
+    factorized_action_choice_init(&target_choice);
+    factorized_action_choice_init(&alternate_target_choice);
+    if (!assert_true(policy_model && zero_model_parameters(policy_model),
+            "initialize action-value policy fixture")) {
+        ok = 0;
+        goto cleanup;
+    }
+    joint_model = action_value_model_create(8u, 4u, 91u);
+    target_model = action_value_model_create(8u, 4u, 92u);
+    if (!assert_true(joint_model && target_model,
+            "initialize action-value sidecars")) {
+        ok = 0;
+        goto cleanup;
+    }
+    policy_parameter_count = gru_model_parameter_count(policy_model);
+    policy_before = (float*)malloc(policy_parameter_count * sizeof(*policy_before));
+    policy_after = (float*)malloc(policy_parameter_count * sizeof(*policy_after));
+    ok &= assert_true(policy_before && policy_after &&
+            gru_model_export_parameters(policy_model, policy_before, policy_parameter_count),
+        "snapshot frozen policy before action-value fitting");
+
+    dual_legal[0] = dual_legal[1] = 1;
+    dual_legal[14] = dual_legal[15] = 1;
+    dual_choice.slot0_has_action = 1;
+    dual_choice.slot0_kind = FACTORIZED_ACTION_MOVE;
+    dual_choice.slot0_move_index = 0;
+    dual_choice.slot1_has_action = 1;
+    dual_choice.slot1_kind = FACTORIZED_ACTION_MOVE;
+    dual_choice.slot1_move_index = 0;
+    ok &= assert_true(action_value_model_predict(
+            joint_model, policy_model, hidden, dual_legal, &dual_choice,
+            0, 14, 0.0f, &selected_before),
+        "evaluate neutral joint action value");
+    for (update = 0; update < 20; ++update) {
+        action_value_model_clear_gradients(joint_model);
+        ok &= assert_true(action_value_model_accumulate(
+                joint_model, policy_model, hidden, dual_legal, &dual_choice,
+                0, 14, 0.0f, 1.0f, NULL) &&
+                action_value_model_apply_adam(
+                    joint_model, 0.03f, 0.9f, 0.999f, 1.0e-8f, 1.0f, 0.0f),
+            "fit selected legal joint action");
+    }
+    ok &= assert_true(action_value_model_predict(
+            joint_model, policy_model, hidden, dual_legal, &dual_choice,
+            0, 14, 0.0f, &selected_after) &&
+            action_value_model_predict(
+                joint_model, policy_model, hidden, dual_legal, &dual_choice,
+                1, 15, 0.0f, &alternative_after),
+        "evaluate fitted and competing joint actions");
+    ok &= assert_true(selected_after.q_value > selected_before.q_value &&
+            selected_after.q_value > alternative_after.q_value,
+        "action-value fitting gives credit to the demonstrated joint action");
+    for (a0 = 0; a0 < 2; ++a0) {
+        for (a1 = 0; a1 < 2; ++a1) {
+            ActionValuePrediction prediction;
+            ok &= assert_true(action_value_model_predict(
+                    joint_model, policy_model, hidden, dual_legal, &dual_choice,
+                    a0, 14 + a1, 0.0f, &prediction),
+                "evaluate legal joint action for centering");
+            centered_sum += prediction.advantage * 0.25;
+        }
+    }
+    ok &= assert_true(fabs(centered_sum) < 1.0e-5,
+        "joint advantages have zero expectation under the frozen legal policy");
+    ok &= assert_true(!action_value_model_predict(
+            joint_model, policy_model, hidden, dual_legal, &dual_choice,
+            2, 14, 0.0f, &alternative_after),
+        "action-value scoring rejects an illegal demonstrated action");
+    ok &= assert_true(action_value_model_save(sidecar_path, joint_model) &&
+            (loaded_model = action_value_model_load(sidecar_path, 8u)) != NULL &&
+            action_value_model_predict(
+                loaded_model, policy_model, hidden, dual_legal, &dual_choice,
+                0, 14, 0.0f, &alternative_after) &&
+            fabsf(alternative_after.q_value - selected_after.q_value) < 1.0e-6f,
+        "action-value sidecar round trips without changing its prediction");
+
+    single_legal[0] = single_legal[1] = 1;
+    target_choice.slot0_has_action = 1;
+    target_choice.slot0_kind = FACTORIZED_ACTION_MOVE;
+    target_choice.slot0_move_index = 0;
+    target_choice.slot0_target_mask =
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+    target_choice.slot0_target_index = FACTORIZED_TARGET_FOE_LEFT;
+    alternate_target_choice = target_choice;
+    alternate_target_choice.slot0_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    for (update = 0; update < 20; ++update) {
+        action_value_model_clear_gradients(target_model);
+        ok &= assert_true(action_value_model_accumulate(
+                target_model, policy_model, hidden, single_legal, &target_choice,
+                0, -1, 0.0f, 1.0f, NULL) &&
+                action_value_model_apply_adam(
+                    target_model, 0.03f, 0.9f, 0.999f, 1.0e-8f, 1.0f, 0.0f),
+            "fit selected move target value");
+    }
+    ok &= assert_true(action_value_model_predict(
+            target_model, policy_model, hidden, single_legal, &target_choice,
+            0, -1, 0.0f, &target_after) &&
+            action_value_model_predict(
+                target_model, policy_model, hidden, single_legal, &alternate_target_choice,
+                0, -1, 0.0f, &alternate_target_after),
+        "evaluate alternative move targets");
+    ok &= assert_true(target_after.q_value > alternate_target_after.q_value,
+        "action-value fitting assigns target-specific credit");
+    ok &= assert_true(gru_model_export_parameters(
+            policy_model, policy_after, policy_parameter_count) &&
+            memcmp(policy_before, policy_after,
+                policy_parameter_count * sizeof(*policy_before)) == 0,
+        "action-value fitting leaves the policy checkpoint unchanged");
+
+cleanup:
+    remove(sidecar_path);
+    free(policy_after);
+    free(policy_before);
+    action_value_model_destroy(target_model);
+    action_value_model_destroy(loaded_model);
+    action_value_model_destroy(joint_model);
+    gru_model_destroy(policy_model);
+    return ok;
+}
+
 static int test_ppo_clipped_policy_still_updates_value(void) {
     GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     Episode episode;
@@ -4927,6 +5076,7 @@ int main(int argc, char** argv) {
     if (!test_ppo_update_moves_policy_and_value_in_expected_directions()) return 1;
     if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
     if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
+    if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;
     if (!test_ppo_clipped_policy_still_updates_value()) return 1;
     if (!test_dual_action_turn_has_one_value_target()) return 1;
     if (!test_ppo_critic_diagnostics()) return 1;

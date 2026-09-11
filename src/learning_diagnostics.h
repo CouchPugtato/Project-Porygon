@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "episode.h"
+#include "action_value.h"
 #include "gru_model.h"
 #include "gru_trainer.h"
 #include "policy_evaluation.h"
@@ -71,6 +72,42 @@ typedef struct {
     int recurrent_generalizes;
     int critic_learnable;
 } CriticFitResult;
+
+typedef struct {
+    size_t episode_count;
+    size_t sample_count;
+    size_t nonfinite_count;
+    double q_loss;
+    double baseline_loss;
+    double q_explained_variance;
+    double baseline_explained_variance;
+    double target_q_correlation;
+    double advantage_td_error_correlation;
+    double advantage_sign_accuracy;
+    double mean_advantage;
+    double mean_absolute_advantage;
+    double max_absolute_advantage;
+    double mean_legal_action_spread;
+} ActionValueFitMetrics;
+
+typedef struct {
+    ActionValueFitMetrics before_train;
+    ActionValueFitMetrics before_selection;
+    ActionValueFitMetrics before_holdout;
+    ActionValueFitMetrics after_train;
+    ActionValueFitMetrics after_selection;
+    ActionValueFitMetrics after_holdout;
+    size_t epochs_completed;
+    size_t best_epoch;
+    int stopped_early;
+    int training_completed;
+    int holdout_loss_improved;
+    int residual_ranking_detected;
+    int advantage_direction_consistent;
+    int generalization_gap_acceptable;
+    double explained_variance_generalization_gap;
+    int action_signal_detected;
+} ActionValueFitResult;
 
 #define PPO_UPDATE_AUDIT_BIN_COUNT 5
 
@@ -169,6 +206,48 @@ int learning_diagnostic_write_critic_report(
     const GruTrainer* head_trainer,
     const GruTrainer* recurrent_trainer,
     const CriticFitResult* result
+);
+
+int learning_diagnostic_run_action_value_fit(
+    ActionValueModel* action_value_model,
+    const GruModel* policy_model,
+    const Episode* const* train_episodes,
+    size_t train_count,
+    const Episode* const* selection_episodes,
+    size_t selection_count,
+    const Episode* const* holdout_episodes,
+    size_t holdout_count,
+    size_t epochs,
+    size_t minibatch_episodes,
+    size_t early_stop_patience,
+    unsigned int shuffle_seed,
+    float gamma,
+    float learning_rate,
+    float adam_beta1,
+    float adam_beta2,
+    float adam_epsilon,
+    float gradient_clip,
+    float l2_coefficient,
+    ActionValueFitResult* result
+);
+
+int learning_diagnostic_write_action_value_report(
+    const char* report_path,
+    const char* training_source_path,
+    const char* holdout_source_path,
+    const char* checkpoint_path,
+    const char* action_value_path,
+    int action_value_published,
+    unsigned int validation_seed,
+    unsigned int shuffle_seed,
+    size_t epochs,
+    size_t minibatch_episodes,
+    size_t early_stop_patience,
+    float gamma,
+    float learning_rate,
+    float l2_coefficient,
+    const ActionValueModel* action_value_model,
+    const ActionValueFitResult* result
 );
 
 int learning_diagnostic_run_ppo_update_audit(
