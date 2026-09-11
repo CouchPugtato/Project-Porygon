@@ -4589,6 +4589,48 @@ cleanup:
     return ok;
 }
 
+static int test_action_value_target_modes(void) {
+    Episode episode;
+    float rewards[3] = {0.0f, 0.0f, 1.0f};
+    uint8_t dones[3] = {0u, 0u, 1u};
+    float values[3] = {0.2f, 0.3f, 0.4f};
+    float targets[3];
+    ActionValueTargetMode mode;
+    int ok = 1;
+
+    memset(&episode, 0, sizeof(episode));
+    episode.count = 3u;
+    episode.rewards = rewards;
+    episode.dones = dones;
+    ok &= assert_true(learning_diagnostic_parse_action_value_target(
+            "td0", &mode) && mode == ACTION_VALUE_TARGET_TD0 &&
+            learning_diagnostic_build_action_value_targets(
+                &episode, values, 0.9f, 0.5f, mode, targets) &&
+            fabsf(targets[0] - 0.27f) < 1.0e-6f &&
+            fabsf(targets[1] - 0.36f) < 1.0e-6f &&
+            fabsf(targets[2] - 1.0f) < 1.0e-6f,
+        "action-value TD(0) targets bootstrap one step");
+    ok &= assert_true(learning_diagnostic_parse_action_value_target(
+            "td_lambda", &mode) && mode == ACTION_VALUE_TARGET_TD_LAMBDA &&
+            learning_diagnostic_build_action_value_targets(
+                &episode, values, 0.9f, 0.5f, mode, targets) &&
+            fabsf(targets[0] - 0.4185f) < 1.0e-6f &&
+            fabsf(targets[1] - 0.63f) < 1.0e-6f &&
+            fabsf(targets[2] - 1.0f) < 1.0e-6f,
+        "action-value TD(lambda) targets blend bootstrapping and later rewards");
+    ok &= assert_true(learning_diagnostic_parse_action_value_target(
+            "monte_carlo", &mode) && mode == ACTION_VALUE_TARGET_MONTE_CARLO &&
+            learning_diagnostic_build_action_value_targets(
+                &episode, values, 0.9f, 0.5f, mode, targets) &&
+            fabsf(targets[0] - 0.81f) < 1.0e-6f &&
+            fabsf(targets[1] - 0.9f) < 1.0e-6f &&
+            fabsf(targets[2] - 1.0f) < 1.0e-6f,
+        "action-value Monte Carlo targets carry the terminal result backward");
+    return ok && assert_true(
+        !learning_diagnostic_parse_action_value_target("unknown", &mode),
+        "action-value target parsing rejects unsupported modes");
+}
+
 static int test_ppo_clipped_policy_still_updates_value(void) {
     GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     Episode episode;
@@ -5077,6 +5119,7 @@ int main(int argc, char** argv) {
     if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
     if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
     if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;
+    if (!test_action_value_target_modes()) return 1;
     if (!test_ppo_clipped_policy_still_updates_value()) return 1;
     if (!test_dual_action_turn_has_one_value_target()) return 1;
     if (!test_ppo_critic_diagnostics()) return 1;

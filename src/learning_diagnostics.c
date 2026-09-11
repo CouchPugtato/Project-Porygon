@@ -175,6 +175,7 @@ typedef struct {
     size_t sample_count;
     size_t nonfinite_count;
     size_t matching_sign_count;
+    size_t direction_sample_count;
     double target_sum;
     double target_square_sum;
     double q_sum;
@@ -273,9 +274,12 @@ static void action_value_metric_add(
     accumulator->td_error_square_sum += baseline_error * baseline_error;
     accumulator->advantage_td_error_product_sum += prediction->advantage * baseline_error;
     accumulator->legal_action_spread_sum += prediction->legal_action_spread;
-    if ((prediction->advantage >= 0.0 && baseline_error >= 0.0) ||
-            (prediction->advantage < 0.0 && baseline_error < 0.0)) {
-        ++accumulator->matching_sign_count;
+    if (absolute_advantage > 1.0e-6 && fabs(baseline_error) > 1.0e-6) {
+        ++accumulator->direction_sample_count;
+        if ((prediction->advantage > 0.0 && baseline_error > 0.0) ||
+                (prediction->advantage < 0.0 && baseline_error < 0.0)) {
+            ++accumulator->matching_sign_count;
+        }
     }
     if (absolute_advantage > accumulator->max_absolute_advantage) {
         accumulator->max_absolute_advantage = absolute_advantage;
@@ -308,16 +312,90 @@ static void action_value_metric_finish(
         accumulator->target_sum, accumulator->q_sum,
         accumulator->target_square_sum, accumulator->q_square_sum,
         accumulator->target_q_product_sum, accumulator->sample_count);
-    metrics->advantage_td_error_correlation = metric_correlation(
+    metrics->advantage_target_residual_correlation = metric_correlation(
         accumulator->advantage_sum, accumulator->td_error_sum,
         accumulator->advantage_square_sum, accumulator->td_error_square_sum,
         accumulator->advantage_td_error_product_sum, accumulator->sample_count);
-    metrics->advantage_sign_accuracy =
-        (double)accumulator->matching_sign_count / count;
+    metrics->advantage_direction_samples = accumulator->direction_sample_count;
+    if (accumulator->direction_sample_count > 0) {
+        metrics->advantage_sign_accuracy = (double)accumulator->matching_sign_count /
+            (double)accumulator->direction_sample_count;
+    }
     metrics->mean_advantage = accumulator->advantage_sum / count;
     metrics->mean_absolute_advantage = accumulator->advantage_abs_sum / count;
     metrics->max_absolute_advantage = accumulator->max_absolute_advantage;
     metrics->mean_legal_action_spread = accumulator->legal_action_spread_sum / count;
+}
+
+const char* learning_diagnostic_action_value_target_name(ActionValueTargetMode mode) {
+    switch (mode) {
+        case ACTION_VALUE_TARGET_TD0: return "td0";
+        case ACTION_VALUE_TARGET_TD_LAMBDA: return "td_lambda";
+        case ACTION_VALUE_TARGET_MONTE_CARLO: return "monte_carlo";
+        default: return "unknown";
+    }
+}
+
+int learning_diagnostic_parse_action_value_target(
+    const char* name,
+    ActionValueTargetMode* mode_out
+) {
+    if (!name || !mode_out) return 0;
+    if (strcmp(name, "td0") == 0) *mode_out = ACTION_VALUE_TARGET_TD0;
+    else if (strcmp(name, "td_lambda") == 0 || strcmp(name, "gae") == 0) {
+        *mode_out = ACTION_VALUE_TARGET_TD_LAMBDA;
+    } else if (strcmp(name, "monte_carlo") == 0 || strcmp(name, "mc") == 0) {
+        *mode_out = ACTION_VALUE_TARGET_MONTE_CARLO;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+int learning_diagnostic_build_action_value_targets(
+    const Episode* episode,
+    const float* values,
+    float gamma,
+    float gae_lambda,
+    ActionValueTargetMode target_mode,
+    float* targets
+) {
+    size_t t;
+    if (!episode || !values || !targets || gamma < 0.0f || gamma > 1.0f ||
+            gae_lambda < 0.0f || gae_lambda > 1.0f) return 0;
+    if (target_mode == ACTION_VALUE_TARGET_TD0) {
+        for (t = 0; t < episode->count; ++t) {
+            targets[t] = episode->rewards[t];
+            if (!episode->dones[t] && t + 1u < episode->count) {
+                targets[t] += gamma * values[t + 1u];
+            }
+        }
+        return 1;
+    }
+    if (target_mode == ACTION_VALUE_TARGET_MONTE_CARLO) {
+        float running_return = 0.0f;
+        for (t = episode->count; t > 0; --t) {
+            size_t index = t - 1u;
+            if (episode->dones[index]) running_return = 0.0f;
+            running_return = episode->rewards[index] + gamma * running_return;
+            targets[index] = running_return;
+        }
+        return 1;
+    }
+    if (target_mode == ACTION_VALUE_TARGET_TD_LAMBDA) {
+        float gae = 0.0f;
+        for (t = episode->count; t > 0; --t) {
+            size_t index = t - 1u;
+            float nonterminal = episode->dones[index] ? 0.0f : 1.0f;
+            float next_value = index + 1u < episode->count ? values[index + 1u] : 0.0f;
+            float delta = episode->rewards[index] + gamma * next_value * nonterminal -
+                values[index];
+            gae = delta + gamma * gae_lambda * nonterminal * gae;
+            targets[index] = values[index] + gae;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 static int evaluate_action_value(
@@ -326,6 +404,8 @@ static int evaluate_action_value(
     const Episode* const* episodes,
     size_t episode_count,
     float gamma,
+    float gae_lambda,
+    ActionValueTargetMode target_mode,
     ActionValueFitMetrics* metrics
 ) {
     ActionValueMetricAccumulator accumulator = {0};
@@ -339,6 +419,7 @@ static int evaluate_action_value(
         float* next_hidden;
         float* hidden_after;
         float* values;
+        float* targets;
         size_t t;
         if (!episode || episode->count == 0) continue;
         ++accumulator.episode_count;
@@ -346,8 +427,9 @@ static int evaluate_action_value(
         next_hidden = (float*)malloc(hidden_dim * sizeof(*next_hidden));
         hidden_after = (float*)malloc(episode->count * hidden_dim * sizeof(*hidden_after));
         values = (float*)malloc(episode->count * sizeof(*values));
-        if (!hidden || !next_hidden || !hidden_after || !values) {
-            free(hidden); free(next_hidden); free(hidden_after); free(values);
+        targets = (float*)malloc(episode->count * sizeof(*targets));
+        if (!hidden || !next_hidden || !hidden_after || !values || !targets) {
+            free(hidden); free(next_hidden); free(hidden_after); free(values); free(targets);
             return 0;
         }
         gru_model_zero_state(policy_model, hidden);
@@ -358,23 +440,25 @@ static int evaluate_action_value(
             memcpy(hidden_after + t * hidden_dim, next_hidden, hidden_dim * sizeof(float));
             memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
         }
+        if (!learning_diagnostic_build_action_value_targets(
+                episode, values, gamma, gae_lambda, target_mode, targets)) {
+            free(hidden); free(next_hidden); free(hidden_after); free(values); free(targets);
+            return 0;
+        }
         for (t = 0; t < episode->count; ++t) {
             ActionValuePrediction prediction;
-            float target;
             if (episode->actions[t] < 0 && episode->actions2[t] < 0) continue;
-            target = episode->rewards[t];
-            if (!episode->dones[t] && t + 1u < episode->count) target += gamma * values[t + 1u];
             if (!action_value_model_predict(
                     action_value_model, policy_model, hidden_after + t * hidden_dim,
                     episode->legal_masks + t * OBS_NUM_ACTIONS,
                     &episode->factorized_actions[t], episode->actions[t], episode->actions2[t],
                     values[t], &prediction)) {
-                free(hidden); free(next_hidden); free(hidden_after); free(values);
+                free(hidden); free(next_hidden); free(hidden_after); free(values); free(targets);
                 return 0;
             }
-            action_value_metric_add(&accumulator, target, &prediction);
+            action_value_metric_add(&accumulator, targets[t], &prediction);
         }
-        free(hidden); free(next_hidden); free(hidden_after); free(values);
+        free(hidden); free(next_hidden); free(hidden_after); free(values); free(targets);
     }
     action_value_metric_finish(&accumulator, metrics);
     return 1;
@@ -384,13 +468,16 @@ static int accumulate_action_value_episode(
     ActionValueModel* action_value_model,
     const GruModel* policy_model,
     const Episode* episode,
-    float gamma
+    float gamma,
+    float gae_lambda,
+    ActionValueTargetMode target_mode
 ) {
     size_t hidden_dim;
     float* hidden;
     float* next_hidden;
     float* hidden_after;
     float* values;
+    float* targets;
     size_t t;
     int ok = 0;
     if (!action_value_model || !policy_model || !episode || episode->count == 0) return 0;
@@ -399,12 +486,8 @@ static int accumulate_action_value_episode(
     next_hidden = (float*)malloc(hidden_dim * sizeof(*next_hidden));
     hidden_after = (float*)malloc(episode->count * hidden_dim * sizeof(*hidden_after));
     values = (float*)malloc(episode->count * sizeof(*values));
-    if (!hidden || !next_hidden || !hidden_after || !values) goto cleanup;
-    hidden = (float*)calloc(hidden_dim, sizeof(*hidden));
-    next_hidden = (float*)malloc(hidden_dim * sizeof(*next_hidden));
-    hidden_after = (float*)malloc(episode->count * hidden_dim * sizeof(*hidden_after));
-    values = (float*)malloc(episode->count * sizeof(*values));
-    if (!hidden || !next_hidden || !hidden_after || !values) goto cleanup;
+    targets = (float*)malloc(episode->count * sizeof(*targets));
+    if (!hidden || !next_hidden || !hidden_after || !values || !targets) goto cleanup;
     gru_model_zero_state(policy_model, hidden);
     for (t = 0; t < episode->count; ++t) {
         gru_model_forward_step(
@@ -413,21 +496,20 @@ static int accumulate_action_value_episode(
         memcpy(hidden_after + t * hidden_dim, next_hidden, hidden_dim * sizeof(float));
         memcpy(hidden, next_hidden, hidden_dim * sizeof(float));
     }
+    if (!learning_diagnostic_build_action_value_targets(
+            episode, values, gamma, gae_lambda, target_mode, targets)) goto cleanup;
     for (t = 0; t < episode->count; ++t) {
-        float target;
         if (episode->actions[t] < 0 && episode->actions2[t] < 0) continue;
-        target = episode->rewards[t];
-        if (!episode->dones[t] && t + 1u < episode->count) target += gamma * values[t + 1u];
         if (!action_value_model_accumulate(
                 action_value_model, policy_model, hidden_after + t * hidden_dim,
                 episode->legal_masks + t * OBS_NUM_ACTIONS,
                 &episode->factorized_actions[t], episode->actions[t], episode->actions2[t],
-                values[t], target, NULL)) goto cleanup;
+                values[t], targets[t], NULL)) goto cleanup;
     }
     ok = 1;
 
 cleanup:
-    free(hidden); free(next_hidden); free(hidden_after); free(values);
+    free(hidden); free(next_hidden); free(hidden_after); free(values); free(targets);
     return ok;
 }
 
@@ -809,6 +891,8 @@ int learning_diagnostic_run_action_value_fit(
     size_t early_stop_patience,
     unsigned int shuffle_seed,
     float gamma,
+    float gae_lambda,
+    ActionValueTargetMode target_mode,
     float learning_rate,
     float adam_beta1,
     float adam_beta2,
@@ -834,13 +918,13 @@ int learning_diagnostic_run_action_value_fit(
     memset(result, 0, sizeof(*result));
     if (!evaluate_action_value(
             action_value_model, policy_model, train_episodes, train_count,
-            gamma, &result->before_train) ||
+            gamma, gae_lambda, target_mode, &result->before_train) ||
             (selection_count > 0 && !evaluate_action_value(
                 action_value_model, policy_model, selection_episodes, selection_count,
-                gamma, &result->before_selection)) ||
+                gamma, gae_lambda, target_mode, &result->before_selection)) ||
             !evaluate_action_value(
                 action_value_model, policy_model, holdout_episodes, holdout_count,
-                gamma, &result->before_holdout)) return 0;
+                gamma, gae_lambda, target_mode, &result->before_holdout)) return 0;
 
     order = (size_t*)malloc(train_count * sizeof(*order));
     parameter_count = action_value_model_parameter_count(action_value_model);
@@ -865,7 +949,7 @@ int learning_diagnostic_run_action_value_fit(
             for (j = 0; j < batch_count; ++j) {
                 if (!accumulate_action_value_episode(
                         action_value_model, policy_model,
-                        train_episodes[order[i + j]], gamma)) {
+                        train_episodes[order[i + j]], gamma, gae_lambda, target_mode)) {
                     result->training_completed = 0;
                     goto failure;
                 }
@@ -881,7 +965,8 @@ int learning_diagnostic_run_action_value_fit(
         if (use_early_stopping) {
             if (!evaluate_action_value(
                     action_value_model, policy_model,
-                    selection_episodes, selection_count, gamma, &selection_metrics)) goto failure;
+                    selection_episodes, selection_count, gamma, gae_lambda,
+                    target_mode, &selection_metrics)) goto failure;
             if (selection_metrics.q_loss < best_selection_loss - 1.0e-6) {
                 best_selection_loss = selection_metrics.q_loss;
                 result->best_epoch = epoch + 1u;
@@ -914,20 +999,22 @@ int learning_diagnostic_run_action_value_fit(
             action_value_model, best_parameters, parameter_count)) goto failure;
     if (!evaluate_action_value(
             action_value_model, policy_model, train_episodes, train_count,
-            gamma, &result->after_train) ||
+            gamma, gae_lambda, target_mode, &result->after_train) ||
             (selection_count > 0 && !evaluate_action_value(
                 action_value_model, policy_model, selection_episodes, selection_count,
-                gamma, &result->after_selection)) ||
+                gamma, gae_lambda, target_mode, &result->after_selection)) ||
             !evaluate_action_value(
                 action_value_model, policy_model, holdout_episodes, holdout_count,
-                gamma, &result->after_holdout)) goto failure;
+                gamma, gae_lambda, target_mode, &result->after_holdout)) goto failure;
 
     result->holdout_loss_improved = result->after_holdout.sample_count > 0 &&
         result->after_holdout.nonfinite_count == 0 &&
         result->after_holdout.q_loss <= result->after_holdout.baseline_loss * 0.98;
     result->residual_ranking_detected =
-        result->after_holdout.advantage_td_error_correlation >= 0.10;
+        result->after_holdout.advantage_target_residual_correlation >= 0.10;
     result->advantage_direction_consistent =
+        result->after_holdout.advantage_direction_samples >=
+            result->after_holdout.sample_count / 2u &&
         result->after_holdout.advantage_sign_accuracy >= 0.53;
     result->explained_variance_generalization_gap =
         result->after_train.q_explained_variance - result->after_holdout.q_explained_variance;
@@ -982,8 +1069,10 @@ static void write_action_value_metrics(
     fprintf(out, "%s  \"q_explained_variance\": %.9g,\n", indent, metrics->q_explained_variance);
     fprintf(out, "%s  \"baseline_explained_variance\": %.9g,\n", indent, metrics->baseline_explained_variance);
     fprintf(out, "%s  \"target_q_correlation\": %.9g,\n", indent, metrics->target_q_correlation);
-    fprintf(out, "%s  \"advantage_td_error_correlation\": %.9g,\n", indent,
-        metrics->advantage_td_error_correlation);
+    fprintf(out, "%s  \"advantage_target_residual_correlation\": %.9g,\n", indent,
+        metrics->advantage_target_residual_correlation);
+    fprintf(out, "%s  \"advantage_direction_samples\": %zu,\n", indent,
+        metrics->advantage_direction_samples);
     fprintf(out, "%s  \"advantage_sign_accuracy\": %.9g,\n", indent,
         metrics->advantage_sign_accuracy);
     fprintf(out, "%s  \"mean_advantage\": %.9g,\n", indent, metrics->mean_advantage);
@@ -1009,6 +1098,8 @@ int learning_diagnostic_write_action_value_report(
     size_t minibatch_episodes,
     size_t early_stop_patience,
     float gamma,
+    float gae_lambda,
+    ActionValueTargetMode target_mode,
     float learning_rate,
     float l2_coefficient,
     const ActionValueModel* action_value_model,
@@ -1019,7 +1110,7 @@ int learning_diagnostic_write_action_value_report(
     out = fopen(report_path, "w");
     if (!out) return 0;
     fputs("{\n  \"diagnostic\": \"action_conditioned_joint_q_fit\",\n", out);
-    fputs("  \"metrics_version\": 1,\n  \"training_source\": ", out);
+    fputs("  \"metrics_version\": 2,\n  \"training_source\": ", out);
     write_json_string(out, training_source_path);
     fputs(",\n  \"holdout_source\": ", out);
     write_json_string(out, holdout_source_path);
@@ -1031,7 +1122,8 @@ int learning_diagnostic_write_action_value_report(
         ",\n  \"action_value_published\": %s,\n"
         "  \"encoder_frozen\": true,\n"
         "  \"policy_frozen\": true,\n"
-        "  \"target_mode\": \"one_step_td_with_frozen_state_value\",\n"
+        "  \"target_mode\": \"%s\",\n"
+        "  \"target_value_source\": \"%s\",\n"
         "  \"advantage_centering\": \"exact expectation under the frozen legal policy\",\n"
         "  \"hidden_dim\": %zu,\n"
         "  \"latent_dim\": %zu,\n"
@@ -1045,15 +1137,21 @@ int learning_diagnostic_write_action_value_report(
         "  \"early_stop_patience\": %zu,\n"
         "  \"minibatch_episodes\": %zu,\n"
         "  \"gamma\": %.9g,\n"
+        "  \"gae_lambda\": %.9g,\n"
         "  \"learning_rate\": %.9g,\n"
         "  \"l2_coefficient\": %.9g,\n",
         action_value_published ? "true" : "false",
+        learning_diagnostic_action_value_target_name(target_mode),
+        target_mode == ACTION_VALUE_TARGET_MONTE_CARLO
+            ? "discounted_episode_rewards"
+            : "frozen_state_value_and_episode_rewards",
         action_value_model_hidden_dim(action_value_model),
         action_value_model_latent_dim(action_value_model),
         action_value_model_parameter_count(action_value_model),
         validation_seed, shuffle_seed, epochs, result->epochs_completed,
         result->best_epoch, result->stopped_early ? "true" : "false",
-        early_stop_patience, minibatch_episodes, gamma, learning_rate, l2_coefficient);
+        early_stop_patience, minibatch_episodes, gamma, gae_lambda,
+        learning_rate, l2_coefficient);
     fputs("  \"before\": {\n    \"train\": ", out);
     write_action_value_metrics(out, &result->before_train, "    ");
     fputs(",\n    \"selection\": ", out);
@@ -1082,7 +1180,7 @@ int learning_diagnostic_write_action_value_report(
         result->explained_variance_generalization_gap,
         result->generalization_gap_acceptable ? "true" : "false",
         result->action_signal_detected ? "true" : "false");
-    fputs("    \"pass_rule\": \"holdout Q loss improves at least 2% over frozen V, advantage/TD-error correlation >= 0.10, sign accuracy >= 0.53, train-holdout EV gap <= 0.25, and bounded finite advantages\"\n",
+    fputs("    \"pass_rule\": \"holdout Q loss improves at least 2% over frozen V, advantage/target-residual correlation >= 0.10, sign accuracy >= 0.53 on at least half of samples, train-holdout EV gap <= 0.25, and bounded finite advantages\"\n",
         out);
     fputs("  }\n}\n", out);
     return fclose(out) == 0;

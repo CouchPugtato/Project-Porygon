@@ -3799,6 +3799,8 @@ static int run_action_q_fit_check(
     size_t early_stop_patience,
     float learning_rate,
     float gamma,
+    float gae_lambda,
+    ActionValueTargetMode target_mode,
     float l2_coefficient,
     unsigned int validation_seed,
     unsigned int shuffle_seed,
@@ -3834,7 +3836,8 @@ static int run_action_q_fit_check(
     if (!episode_batch_path || !checkpoint_path || !report_path || !reward_config ||
             epochs == 0 || minibatch_episodes == 0 || latent_dim == 0 ||
             early_stop_patience == 0 || learning_rate <= 0.0f || gamma < 0.0f ||
-            gamma > 1.0f || l2_coefficient < 0.0f ||
+            gamma > 1.0f || gae_lambda < 0.0f || gae_lambda > 1.0f ||
+            l2_coefficient < 0.0f ||
             (training_source_is_manifest && (!holdout_batch_path || !*holdout_batch_path)) ||
             !parse_reward_mode(reward_mode_name, &reward_mode)) {
         fprintf(stderr, "[action-q] invalid diagnostic configuration\n");
@@ -3905,16 +3908,19 @@ static int run_action_q_fit_check(
             train_count, selection_count, holdout_count);
         goto cleanup;
     }
-    printf("[action-q] train=%zu selection=%zu holdout=%zu epochs=%zu minibatch_episodes=%zu latent_dim=%zu learning_rate=%.9g gamma=%.6g l2=%.6g\n",
+    printf("[action-q] train=%zu selection=%zu holdout=%zu epochs=%zu minibatch_episodes=%zu latent_dim=%zu learning_rate=%.9g gamma=%.6g target=%s lambda=%.6g l2=%.6g\n",
         train_count, selection_count, holdout_count, epochs, minibatch_episodes,
-        latent_dim, learning_rate, gamma, l2_coefficient);
+        latent_dim, learning_rate, gamma,
+        learning_diagnostic_action_value_target_name(target_mode), gae_lambda,
+        l2_coefficient);
     if (!learning_diagnostic_run_action_value_fit(
             action_value_model, policy_model,
             train_episodes, train_count,
             selection_episodes, selection_count,
             holdout_episodes, holdout_count,
             epochs, minibatch_episodes, early_stop_patience, shuffle_seed,
-            gamma, learning_rate, adam_beta1, adam_beta2, adam_epsilon,
+            gamma, gae_lambda, target_mode,
+            learning_rate, adam_beta1, adam_beta2, adam_epsilon,
             1.0f, l2_coefficient, &result)) {
         fprintf(stderr, "[action-q] diagnostic execution failed\n");
         goto cleanup;
@@ -3928,7 +3934,8 @@ static int run_action_q_fit_check(
             training_source_is_manifest ? holdout_batch_path : episode_batch_path,
             checkpoint_path, output_path, action_value_published,
             validation_seed, shuffle_seed, epochs, minibatch_episodes,
-            early_stop_patience, gamma, learning_rate, l2_coefficient,
+            early_stop_patience, gamma, gae_lambda, target_mode,
+            learning_rate, l2_coefficient,
             action_value_model, &result)) {
         fprintf(stderr, "[action-q] failed to write report '%s': %s\n",
             report_path, strerror(errno));
@@ -3937,7 +3944,7 @@ static int run_action_q_fit_check(
     printf("[action-q] signal=%d holdout_loss=%.6f baseline_loss=%.6f residual_correlation=%.4f sign_accuracy=%.4f published=%d report=%s\n",
         result.action_signal_detected, result.after_holdout.q_loss,
         result.after_holdout.baseline_loss,
-        result.after_holdout.advantage_td_error_correlation,
+        result.after_holdout.advantage_target_residual_correlation,
         result.after_holdout.advantage_sign_accuracy,
         action_value_published, report_path);
     if (publication_requested && !action_value_published) {
@@ -4170,6 +4177,8 @@ static int showdown_client_main(int argc, char** argv) {
         argc, argv, "--critic-output-checkpoint", "");
     const char* action_q_output_path = parse_string_flag(
         argc, argv, "--action-q-output", "");
+    const char* action_q_target_name = parse_string_flag(
+        argc, argv, "--action-q-target", "td0");
     float learning_rate_override;
     const char* expected_policy_tag = parse_string_flag(argc, argv, "--policy-tag-expected", "");
     const char* training_summary_path = parse_string_flag(argc, argv, "--training-summary-path", "");
@@ -4199,6 +4208,7 @@ static int showdown_client_main(int argc, char** argv) {
     int action_q_latent_dim;
     int action_q_early_stop_patience;
     float action_q_l2_coefficient;
+    ActionValueTargetMode action_q_target_mode;
     float adam_beta1;
     float adam_beta2;
     float adam_epsilon;
@@ -4255,6 +4265,13 @@ static int showdown_client_main(int argc, char** argv) {
         argc, argv, "--action-q-early-stop-patience", 3);
     action_q_l2_coefficient = parse_float_flag(
         argc, argv, "--action-q-l2", rl_defaults.action_q_l2_coefficient);
+    if (!learning_diagnostic_parse_action_value_target(
+            action_q_target_name, &action_q_target_mode)) {
+        fprintf(stderr,
+            "Unsupported --action-q-target '%s'. Supported targets: td0, td_lambda, monte_carlo.\n",
+            action_q_target_name);
+        return 1;
+    }
     adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", rl_defaults.adam_beta1);
     adam_beta2 = parse_float_flag(argc, argv, "--adam-beta2", rl_defaults.adam_beta2);
     adam_epsilon = parse_float_flag(argc, argv, "--adam-epsilon", rl_defaults.adam_epsilon);
@@ -4401,7 +4418,7 @@ static int showdown_client_main(int argc, char** argv) {
             (size_t)action_q_epochs, (size_t)action_q_minibatch_episodes,
             (size_t)action_q_latent_dim, (size_t)action_q_early_stop_patience,
             learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
-            rl_gamma, action_q_l2_coefficient,
+            rl_gamma, gae_lambda, action_q_target_mode, action_q_l2_coefficient,
             (unsigned int)validation_seed, (unsigned int)action_q_seed,
             adam_beta1, adam_beta2, adam_epsilon,
             rl_reward_mode, &reward_config);
@@ -4447,7 +4464,7 @@ static int showdown_client_main(int argc, char** argv) {
             (size_t)action_q_epochs, (size_t)action_q_minibatch_episodes,
             (size_t)action_q_latent_dim, (size_t)action_q_early_stop_patience,
             learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
-            rl_gamma, action_q_l2_coefficient,
+            rl_gamma, gae_lambda, action_q_target_mode, action_q_l2_coefficient,
             (unsigned int)validation_seed, (unsigned int)action_q_seed,
             adam_beta1, adam_beta2, adam_epsilon,
             rl_reward_mode, &reward_config);
@@ -4720,8 +4737,8 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
         "  showdown_client --check-critic-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --check-critic-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
-        "  showdown_client --check-action-q-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
-        "  showdown_client --check-action-q-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --check-action-q-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--action-q-target td0|td_lambda|monte_carlo] [--epochs N] [--learning-rate F] [--gamma F] [--gae-lambda F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --check-action-q-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--action-q-target td0|td_lambda|monte_carlo] [--epochs N] [--learning-rate F] [--gamma F] [--gae-lambda F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --audit-ppo-update <episode_batch.jsonl> <before.bin> <after.bin> <report.json> [--episode-limit N] [--shuffle-seed N] [--gamma F] [--gae-lambda F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"

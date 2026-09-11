@@ -93,18 +93,28 @@ checkpoint.
 
 `--check-action-q-fit` is the next diagnostic after the state critic passes but
 PPO and AWR remain flat. It freezes the checkpoint completely and trains a
-small sidecar to predict one-step TD targets for the demonstrated action. The
+small sidecar to predict return targets for the demonstrated action. The
 sidecar has a 16-unit latent projection, separate values for all 196 ordered
 doubles action pairs and 28 single-slot actions, and target-specific values for
 selectable move targets. Illegal action pairs never enter its expectation or
 gradient.
 
+`--action-q-target td0|td_lambda|monte_carlo` selects the credit horizon. TD(0)
+uses the next frozen state value, TD(lambda) uses `--gae-lambda` to blend
+bootstrapped and later rewards, and Monte Carlo uses the complete discounted
+episode return. TD(0) has the least variance but may leave too little action
+signal; Monte Carlo has the most outcome noise; TD(lambda) is the intended
+middle ground. Reports use `metrics_version = 2` and name the selected target
+and lambda explicitly.
+
 The learned action advantage is centered by its exact expectation under the
 checkpoint's legal live-play policy. Its expected contribution is therefore
 zero, leaving the existing state value as the baseline. A fit must improve
 untouched holdout loss by at least 2%, correlate with the frozen critic's TD
-residual by at least 0.10, agree with the residual sign at least 53% of the
-time, avoid a large train/holdout gap, and keep finite bounded advantages.
+or return residual by at least 0.10, agree with the residual sign at least 53%
+of the time on at least half the samples, avoid a large train/holdout gap, and
+keep finite bounded advantages. Zero advantages are excluded from direction
+accuracy rather than being counted as positive predictions.
 These thresholds detect a possible action-level signal; they do not establish
 playing strength.
 

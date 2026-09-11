@@ -82,7 +82,8 @@ typedef struct {
     double q_explained_variance;
     double baseline_explained_variance;
     double target_q_correlation;
-    double advantage_td_error_correlation;
+    double advantage_target_residual_correlation;
+    size_t advantage_direction_samples;
     double advantage_sign_accuracy;
     double mean_advantage;
     double mean_absolute_advantage;
@@ -108,6 +109,26 @@ typedef struct {
     double explained_variance_generalization_gap;
     int action_signal_detected;
 } ActionValueFitResult;
+
+typedef enum {
+    ACTION_VALUE_TARGET_TD0 = 0,
+    ACTION_VALUE_TARGET_TD_LAMBDA = 1,
+    ACTION_VALUE_TARGET_MONTE_CARLO = 2
+} ActionValueTargetMode;
+
+const char* learning_diagnostic_action_value_target_name(ActionValueTargetMode mode);
+int learning_diagnostic_parse_action_value_target(
+    const char* name,
+    ActionValueTargetMode* mode_out
+);
+int learning_diagnostic_build_action_value_targets(
+    const Episode* episode,
+    const float* values,
+    float gamma,
+    float gae_lambda,
+    ActionValueTargetMode target_mode,
+    float* targets
+);
 
 #define PPO_UPDATE_AUDIT_BIN_COUNT 5
 
@@ -222,6 +243,8 @@ int learning_diagnostic_run_action_value_fit(
     size_t early_stop_patience,
     unsigned int shuffle_seed,
     float gamma,
+    float gae_lambda,
+    ActionValueTargetMode target_mode,
     float learning_rate,
     float adam_beta1,
     float adam_beta2,
@@ -244,6 +267,8 @@ int learning_diagnostic_write_action_value_report(
     size_t minibatch_episodes,
     size_t early_stop_patience,
     float gamma,
+    float gae_lambda,
+    ActionValueTargetMode target_mode,
     float learning_rate,
     float l2_coefficient,
     const ActionValueModel* action_value_model,
