@@ -8,7 +8,7 @@ Format:
 
 Files:
 - `rl_defaults.toml`
-  - shared stable defaults for policy-gradient/PPO training and collapse guardrails
+  - shared policy-gradient/PPO defaults, collapse guardrails, and AWR diagnostic controls
   - consumed by the C trainer and Python orchestration tools
   - experiment TOMLs should only override values intentionally
 - `showdown_client.toml`

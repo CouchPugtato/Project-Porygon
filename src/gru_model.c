@@ -2342,7 +2342,8 @@ static int recurrent_update_sequence(
     float* accuracy_out,
     const FactorizedActionChoice* factorized_choice,
     const FactorizedPolicySnapshot* factorized_anchor_policy,
-    float factorized_anchor_kl_coef
+    float factorized_anchor_kl_coef,
+    float shared_value_gradient_scale
 ) {
     size_t hdim;
     size_t xdim;
@@ -2686,7 +2687,7 @@ static int recurrent_update_sequence(
         }
     }
 
-    dv = value - target_value;
+    dv = (value - target_value) * shared_value_gradient_scale;
     /* The critic predicts one value for the turn, even when doubles requires
        two actions. Policy targets are per slot; the value target is not. */
     grad_value_bias += dv;
@@ -2698,10 +2699,19 @@ static int recurrent_update_sequence(
         *action_loss_out = action_loss_sum / (float)target_count;
     }
     if (value_loss_out) {
-        *value_loss_out = 0.5f * dv * dv;
+        float value_error = value - target_value;
+        *value_loss_out = 0.5f * value_error * value_error;
     }
     if (accuracy_out) {
         *accuracy_out = accuracy_sum / (float)target_count;
+    }
+
+    /* A zero scale leaves the recurrent representation and value head fixed,
+       while still allowing the policy heads accumulated above to learn. */
+    if (shared_value_gradient_scale != 1.0f) {
+        for (h = 0; h < hdim; ++h) {
+            grad_h[h] *= shared_value_gradient_scale;
+        }
     }
 
     for (t = steps; t-- > 0;) {
@@ -2930,7 +2940,7 @@ int gru_model_supervised_update_sequence(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, target_action, 1.0f, target_value, 0.0f,
-        NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
+        NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f, 1.0f);
 }
 
 int gru_model_supervised_update_sequence_window(
@@ -2947,7 +2957,7 @@ int gru_model_supervised_update_sequence_window(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, NULL, -1, legal_mask, target_action,
-        1.0f, target_value, 0.0f, NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
+        1.0f, target_value, 0.0f, NULL, 0.0f, learning_rate, 0, action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f, 1.0f);
 }
 
 int gru_model_supervised_update_sequence_window_dual(
@@ -2967,7 +2977,7 @@ int gru_model_supervised_update_sequence_window_dual(
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, legal_mask_b, target_action_b,
         legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, NULL, 0.0f, learning_rate, 0,
-        action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
+        action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f, 1.0f);
 }
 
 int gru_model_supervised_accumulate_sequence_window(
@@ -2983,7 +2993,7 @@ int gru_model_supervised_accumulate_sequence_window(
     float* accuracy_out
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, NULL, -1, legal_mask, target_action,
-        1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1, action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
+        1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1, action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f, 1.0f);
 }
 
 int gru_model_supervised_accumulate_sequence_window_dual(
@@ -3002,7 +3012,7 @@ int gru_model_supervised_accumulate_sequence_window_dual(
 ) {
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state, legal_mask_b, target_action_b,
         legal_mask_a, target_action_a, 1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1,
-        action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f);
+        action_loss_out, value_loss_out, accuracy_out, NULL, NULL, 0.0f, 1.0f);
 }
 
 int gru_model_supervised_accumulate_sequence_window_factorized(
@@ -3043,7 +3053,7 @@ int gru_model_supervised_accumulate_sequence_window_factorized(
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state,
         secondary_mask, secondary_action, primary_mask, primary_action,
         1.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1,
-        action_loss_out, value_loss_out, accuracy_out, choice, NULL, 0.0f);
+        action_loss_out, value_loss_out, accuracy_out, choice, NULL, 0.0f, 1.0f);
 }
 
 int gru_model_supervised_update_heads(
@@ -3188,7 +3198,7 @@ int gru_model_policy_gradient_update_sequence(
     float learning_rate
 ) {
     return recurrent_update_sequence(model, sequence, steps, NULL, NULL, -1, legal_mask, action, advantage, target_value, entropy_coef,
-        NULL, 0.0f, learning_rate, 0, NULL, NULL, NULL, NULL, NULL, 0.0f);
+        NULL, 0.0f, learning_rate, 0, NULL, NULL, NULL, NULL, NULL, 0.0f, 1.0f);
 }
 
 int gru_model_policy_gradient_update_sequence_window(
@@ -3224,7 +3234,8 @@ int gru_model_policy_gradient_update_sequence_window(
         NULL,
         NULL,
         NULL,
-        0.0f);
+        0.0f,
+        1.0f);
 }
 
 int gru_model_policy_gradient_accumulate_sequence_window(
@@ -3259,7 +3270,8 @@ int gru_model_policy_gradient_accumulate_sequence_window(
         NULL,
         NULL,
         NULL,
-        0.0f);
+        0.0f,
+        1.0f);
 }
 
 int gru_model_policy_gradient_update_sequence_window_anchored(
@@ -3297,7 +3309,8 @@ int gru_model_policy_gradient_update_sequence_window_anchored(
         NULL,
         NULL,
         NULL,
-        0.0f);
+        0.0f,
+        1.0f);
 }
 
 int gru_model_policy_gradient_accumulate_sequence_window_anchored(
@@ -3334,7 +3347,8 @@ int gru_model_policy_gradient_accumulate_sequence_window_anchored(
         NULL,
         NULL,
         NULL,
-        0.0f);
+        0.0f,
+        1.0f);
 }
 
 int gru_model_policy_gradient_update_sequence_window_dual(
@@ -3372,7 +3386,8 @@ int gru_model_policy_gradient_update_sequence_window_dual(
         NULL,
         NULL,
         NULL,
-        0.0f);
+        0.0f,
+        1.0f);
 }
 
 int gru_model_policy_gradient_accumulate_sequence_window_dual(
@@ -3409,7 +3424,8 @@ int gru_model_policy_gradient_accumulate_sequence_window_dual(
         NULL,
         NULL,
         NULL,
-        0.0f);
+        0.0f,
+        1.0f);
 }
 
 int gru_model_policy_gradient_accumulate_sequence_window_factorized(
@@ -3449,7 +3465,7 @@ int gru_model_policy_gradient_accumulate_sequence_window_factorized(
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state,
         secondary_mask, secondary_action, primary_mask, primary_action,
         advantage, target_value, entropy_coef, NULL, 0.0f, 0.0f, 1,
-        NULL, NULL, NULL, choice, NULL, 0.0f);
+        NULL, NULL, NULL, choice, NULL, 0.0f, 1.0f);
 }
 
 int gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
@@ -3492,7 +3508,86 @@ int gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
     return recurrent_update_sequence(model, sequence, steps, initial_hidden_state,
         secondary_mask, secondary_action, primary_mask, primary_action,
         advantage, target_value, entropy_coef, NULL, 0.0f, 0.0f, 1,
-        NULL, NULL, NULL, choice, anchor_policy, anchor_kl_coef);
+        NULL, NULL, NULL, choice, anchor_policy, anchor_kl_coef, 1.0f);
+}
+
+static int advantage_weighted_accumulate_factorized(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    const unsigned char* legal_mask_b,
+    const FactorizedActionChoice* choice,
+    float imitation_weight,
+    float entropy_coef,
+    const FactorizedPolicySnapshot* anchor_policy,
+    float anchor_kl_coef
+) {
+    int action_a = -1;
+    int action_b = -1;
+    const unsigned char* primary_mask;
+    const unsigned char* secondary_mask = NULL;
+    int primary_action;
+    int secondary_action = -1;
+
+    if (!choice || !isfinite(imitation_weight) || imitation_weight < 0.0f ||
+            !factorized_action_choice_to_flat_actions(choice, &action_a, &action_b)) {
+        return 0;
+    }
+    if (anchor_kl_coef > 0.0f && !anchor_policy) return 0;
+    if (action_a >= 0) {
+        primary_mask = legal_mask_a;
+        primary_action = action_a;
+        if (action_b >= 0) {
+            secondary_mask = legal_mask_b;
+            secondary_action = action_b;
+        }
+    } else if (action_b >= 0) {
+        primary_mask = legal_mask_b;
+        primary_action = action_b;
+    } else {
+        return 0;
+    }
+    return recurrent_update_sequence(
+        model, sequence, steps, initial_hidden_state,
+        secondary_mask, secondary_action, primary_mask, primary_action,
+        imitation_weight, 0.0f, entropy_coef, NULL, 0.0f, 0.0f, 1,
+        NULL, NULL, NULL, choice, anchor_policy, anchor_kl_coef, 0.0f);
+}
+
+int gru_model_advantage_weighted_accumulate_sequence_window_factorized(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    const unsigned char* legal_mask_b,
+    const FactorizedActionChoice* choice,
+    float imitation_weight,
+    float entropy_coef
+) {
+    return advantage_weighted_accumulate_factorized(
+        model, sequence, steps, initial_hidden_state, legal_mask_a, legal_mask_b,
+        choice, imitation_weight, entropy_coef, NULL, 0.0f);
+}
+
+int gru_model_advantage_weighted_accumulate_sequence_window_factorized_anchored(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    const unsigned char* legal_mask_b,
+    const FactorizedActionChoice* choice,
+    float imitation_weight,
+    float entropy_coef,
+    const FactorizedPolicySnapshot* anchor_policy,
+    float anchor_kl_coef
+) {
+    return advantage_weighted_accumulate_factorized(
+        model, sequence, steps, initial_hidden_state, legal_mask_a, legal_mask_b,
+        choice, imitation_weight, entropy_coef, anchor_policy, anchor_kl_coef);
 }
 
 int gru_model_critic_head_accumulate_hidden(
@@ -3533,7 +3628,7 @@ int gru_model_critic_recurrent_accumulate_sequence_window(
         model, sequence, steps, initial_hidden_state,
         NULL, -1, legal_mask, 0,
         0.0f, target_value, 0.0f, NULL, 0.0f, 0.0f, 1,
-        NULL, value_loss_out, NULL, NULL, NULL, 0.0f);
+        NULL, value_loss_out, NULL, NULL, NULL, 0.0f, 1.0f);
 }
 
 int gru_model_policy_gradient_update_sequence_window_dual_anchored(

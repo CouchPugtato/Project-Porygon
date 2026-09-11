@@ -31,6 +31,8 @@ void gru_trainer_init(GruTrainer* trainer, float learning_rate, size_t bptt_wind
     trainer->target_kl = 0.02f;
     trainer->target_kl_source = GRU_PPO_TARGET_KL_SAMPLED_ACTION;
     trainer->gae_lambda = 0.95f;
+    trainer->awr_temperature = 1.0f;
+    trainer->awr_max_weight = 20.0f;
     trainer->adam_beta1 = 0.9f;
     trainer->adam_beta2 = 0.999f;
     trainer->adam_epsilon = 1.0e-8f;
@@ -900,6 +902,10 @@ int gru_trainer_policy_gradient_episode(GruTrainer* trainer, GruModel* model, co
         trainer->last_anchor_kl_mean = 0.0f;
         trainer->last_anchor_kl_max = 0.0f;
         trainer->last_anchor_loss = 0.0f;
+        trainer->last_awr_weight_sum = 0.0;
+        trainer->last_awr_weight_square_sum = 0.0;
+        trainer->last_awr_weight_min = 0.0f;
+        trainer->last_awr_weight_max = 0.0f;
         trainer->last_rl_labels = 0;
         free(returns);
         free(advantages);
@@ -1281,9 +1287,9 @@ typedef struct {
     int enabled;
     float mean;
     float standard_deviation;
-} PpoAdvantageNormalization;
+} AdvantageNormalization;
 
-static void compute_ppo_returns_and_advantages(
+static void compute_gae_returns_and_advantages(
     const GruTrainer* trainer,
     const Episode* episode,
     float* returns,
@@ -1343,7 +1349,7 @@ int gru_trainer_compare_ppo_episode(
             !before_next || !after_next) {
         goto cleanup;
     }
-    compute_ppo_returns_and_advantages(trainer, episode, returns, advantages);
+    compute_gae_returns_and_advantages(trainer, episode, returns, advantages);
 
     for (t = 0; t < episode->count; ++t) {
         GruPpoStepComparison* comparison = &comparisons[t];
@@ -1409,11 +1415,11 @@ cleanup:
     return ok;
 }
 
-static int ppo_minibatch_advantage_normalization(
+static int minibatch_advantage_normalization(
     const GruTrainer* trainer,
     const Episode* const* episodes,
     size_t episode_count,
-    PpoAdvantageNormalization* normalization
+    AdvantageNormalization* normalization
 ) {
     double sum = 0.0;
     double square_sum = 0.0;
@@ -1434,7 +1440,7 @@ static int ppo_minibatch_advantage_normalization(
             free(advantages);
             return 0;
         }
-        compute_ppo_returns_and_advantages(trainer, episode, NULL, advantages);
+        compute_gae_returns_and_advantages(trainer, episode, NULL, advantages);
         for (t = 0; t < episode->count; ++t) {
             if (episode->actions[t] < 0 && episode->actions2[t] < 0) continue;
             sum += advantages[t];
@@ -1455,11 +1461,30 @@ static int ppo_minibatch_advantage_normalization(
     return 1;
 }
 
-static int gru_trainer_ppo_episode_accumulate(
+float gru_trainer_advantage_weighted_imitation_weight(
+    float advantage,
+    float temperature,
+    float max_weight
+) {
+    float scaled;
+    float upper;
+    if (!isfinite(advantage) || !isfinite(temperature) || !isfinite(max_weight) ||
+            temperature <= 0.0f || max_weight < 1.0f) {
+        return NAN;
+    }
+    scaled = advantage / temperature;
+    upper = logf(max_weight);
+    if (scaled > upper) scaled = upper;
+    if (scaled < -20.0f) scaled = -20.0f;
+    return expf(scaled);
+}
+
+static int gru_trainer_policy_episode_accumulate(
     GruTrainer* trainer,
     GruModel* model,
     const Episode* episode,
-    const PpoAdvantageNormalization* normalization,
+    const AdvantageNormalization* normalization,
+    int advantage_weighted,
     int clear_before,
     int apply_after
 ) {
@@ -1492,6 +1517,10 @@ static int gru_trainer_ppo_episode_accumulate(
     float clip_fraction_sum = 0.0f;
     float anchor_kl_sum = 0.0f;
     float anchor_kl_max = 0.0f;
+    double awr_weight_sum = 0.0;
+    double awr_weight_square_sum = 0.0;
+    float awr_weight_min = 0.0f;
+    float awr_weight_max = 0.0f;
     uint8_t slot_mask_a[OBS_NUM_ACTIONS];
     uint8_t slot_mask_b[OBS_NUM_ACTIONS];
     int anchor_enabled;
@@ -1527,6 +1556,10 @@ static int gru_trainer_ppo_episode_accumulate(
         trainer->last_anchor_kl_mean = 0.0f;
         trainer->last_anchor_kl_max = 0.0f;
         trainer->last_anchor_loss = 0.0f;
+        trainer->last_awr_weight_sum = 0.0;
+        trainer->last_awr_weight_square_sum = 0.0;
+        trainer->last_awr_weight_min = 0.0f;
+        trainer->last_awr_weight_max = 0.0f;
         trainer->last_rl_labels = 0;
         return 1;
     }
@@ -1593,7 +1626,7 @@ static int gru_trainer_ppo_episode_accumulate(
         }
     }
 
-    compute_ppo_returns_and_advantages(trainer, episode, returns, advantages);
+    compute_gae_returns_and_advantages(trainer, episode, returns, advantages);
     if (normalization && normalization->enabled) {
         for (t = 0; t < episode->count; ++t) {
             if (episode->actions[t] < 0 && episode->actions2[t] < 0) continue;
@@ -1617,6 +1650,8 @@ static int gru_trainer_ppo_episode_accumulate(
         float unclipped_value_loss;
         float clipped_value_loss;
         float value_target;
+        float imitation_weight = 0.0f;
+        int update_ok;
         size_t start;
         size_t steps;
         const float* initial_hidden;
@@ -1669,7 +1704,20 @@ static int gru_trainer_ppo_episode_accumulate(
         surrogate_a = ratio * advantages[t];
         surrogate_b = clipped_ratio * advantages[t];
         effective_advantage = 0.0f;
-        if ((advantages[t] >= 0.0f && ratio <= 1.0f + trainer->ppo_clip_epsilon) ||
+        if (advantage_weighted) {
+            imitation_weight = gru_trainer_advantage_weighted_imitation_weight(
+                advantages[t], trainer->awr_temperature, trainer->awr_max_weight);
+            if (!isfinite(imitation_weight)) {
+                free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
+                free(anchor_hidden); free(anchor_next_hidden); free(anchor_hidden_after);
+                return 0;
+            }
+            effective_advantage = imitation_weight;
+            awr_weight_sum += imitation_weight;
+            awr_weight_square_sum += (double)imitation_weight * imitation_weight;
+            if (labeled_steps == 0 || imitation_weight < awr_weight_min) awr_weight_min = imitation_weight;
+            if (labeled_steps == 0 || imitation_weight > awr_weight_max) awr_weight_max = imitation_weight;
+        } else if ((advantages[t] >= 0.0f && ratio <= 1.0f + trainer->ppo_clip_epsilon) ||
                 (advantages[t] < 0.0f && ratio >= 1.0f - trainer->ppo_clip_epsilon)) {
             effective_advantage = ratio * advantages[t];
         }
@@ -1686,12 +1734,17 @@ static int gru_trainer_ppo_episode_accumulate(
         clipped_value_loss = 0.5f * (current_value - clipped_value_target) * (current_value - clipped_value_target);
         value_target = unclipped_value_loss >= clipped_value_loss ? returns[t] : clipped_value_target;
         approx_kl_sum += approx_kl;
-        if ((advantages[t] >= 0.0f && surrogate_b < surrogate_a) ||
-                (advantages[t] < 0.0f && surrogate_b < surrogate_a)) {
-            clip_fraction_sum += 1.0f;
+        if (advantage_weighted) {
+            policy_loss_sum += -imitation_weight * current_log_prob;
+            value_loss_sum += unclipped_value_loss;
+        } else {
+            if ((advantages[t] >= 0.0f && surrogate_b < surrogate_a) ||
+                    (advantages[t] < 0.0f && surrogate_b < surrogate_a)) {
+                clip_fraction_sum += 1.0f;
+            }
+            policy_loss_sum += -(surrogate_a < surrogate_b ? surrogate_a : surrogate_b);
+            value_loss_sum += unclipped_value_loss >= clipped_value_loss ? unclipped_value_loss : clipped_value_loss;
         }
-        policy_loss_sum += -(surrogate_a < surrogate_b ? surrogate_a : surrogate_b);
-        value_loss_sum += unclipped_value_loss >= clipped_value_loss ? unclipped_value_loss : clipped_value_loss;
         entropy_sum += current_entropy;
         advantage_sum += advantages[t];
         abs_advantage_sum += fabsf(advantages[t]);
@@ -1713,8 +1766,33 @@ static int gru_trainer_ppo_episode_accumulate(
         if (episode->actions2[t] >= 0) {
             build_step_slot_legal_mask(episode, t, 1, slot_mask_b);
         }
-        if (!(anchor_enabled ?
-                gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
+        if (advantage_weighted) {
+            update_ok = anchor_enabled
+                ? gru_model_advantage_weighted_accumulate_sequence_window_factorized_anchored(
+                    model,
+                    episode->observations + (start * episode->obs_dim),
+                    steps,
+                    initial_hidden,
+                    slot_mask_a,
+                    slot_mask_b,
+                    &episode->factorized_actions[t],
+                    imitation_weight,
+                    trainer->entropy_coef,
+                    &anchor_snapshot,
+                    trainer->anchor_kl_coef)
+                : gru_model_advantage_weighted_accumulate_sequence_window_factorized(
+                    model,
+                    episode->observations + (start * episode->obs_dim),
+                    steps,
+                    initial_hidden,
+                    slot_mask_a,
+                    slot_mask_b,
+                    &episode->factorized_actions[t],
+                    imitation_weight,
+                    trainer->entropy_coef);
+        } else {
+            update_ok = anchor_enabled
+                ? gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
                     model,
                     episode->observations + (start * episode->obs_dim),
                     steps,
@@ -1726,8 +1804,8 @@ static int gru_trainer_ppo_episode_accumulate(
                     value_target,
                     trainer->entropy_coef,
                     &anchor_snapshot,
-                    trainer->anchor_kl_coef) :
-                gru_model_policy_gradient_accumulate_sequence_window_factorized(
+                    trainer->anchor_kl_coef)
+                : gru_model_policy_gradient_accumulate_sequence_window_factorized(
                     model,
                     episode->observations + (start * episode->obs_dim),
                     steps,
@@ -1737,7 +1815,9 @@ static int gru_trainer_ppo_episode_accumulate(
                     &episode->factorized_actions[t],
                     effective_advantage,
                     value_target,
-                    trainer->entropy_coef))) {
+                    trainer->entropy_coef);
+        }
+        if (!update_ok) {
             free(advantages); free(returns); free(labeled_indices); free(hidden); free(next_hidden); free(hidden_after);
             free(anchor_hidden); free(anchor_next_hidden); free(anchor_hidden_after);
             return 0;
@@ -1786,6 +1866,10 @@ static int gru_trainer_ppo_episode_accumulate(
     trainer->last_anchor_kl_mean = labeled_steps > 0 ? anchor_kl_sum / (float)labeled_steps : 0.0f;
     trainer->last_anchor_kl_max = anchor_kl_max;
     trainer->last_anchor_loss = trainer->anchor_kl_coef * trainer->last_anchor_kl_mean;
+    trainer->last_awr_weight_sum = awr_weight_sum;
+    trainer->last_awr_weight_square_sum = awr_weight_square_sum;
+    trainer->last_awr_weight_min = awr_weight_min;
+    trainer->last_awr_weight_max = awr_weight_max;
     trainer->last_rl_labels = trained_labels;
 
     free(advantages);
@@ -1802,9 +1886,9 @@ static int gru_trainer_ppo_episode_accumulate(
 
 int gru_trainer_ppo_episode(GruTrainer* trainer, GruModel* model, const Episode* episode) {
     const Episode* episodes[1] = {episode};
-    PpoAdvantageNormalization normalization;
-    if (!ppo_minibatch_advantage_normalization(trainer, episodes, 1u, &normalization)) return 0;
-    return gru_trainer_ppo_episode_accumulate(trainer, model, episode, &normalization, 1, 1);
+    AdvantageNormalization normalization;
+    if (!minibatch_advantage_normalization(trainer, episodes, 1u, &normalization)) return 0;
+    return gru_trainer_policy_episode_accumulate(trainer, model, episode, &normalization, 0, 1, 1);
 }
 
 int gru_trainer_ppo_hard_kl_stop_update(
@@ -1876,11 +1960,12 @@ double gru_trainer_return_value_correlation(const GruTrainer* trainer) {
     return covariance / sqrt(return_variance * value_variance);
 }
 
-int gru_trainer_ppo_minibatch(
+static int gru_trainer_policy_minibatch(
     GruTrainer* trainer,
     GruModel* model,
     const Episode* const* episodes,
-    size_t episode_count
+    size_t episode_count,
+    int advantage_weighted
 ) {
     size_t i;
     size_t labels = 0;
@@ -1903,20 +1988,24 @@ int gru_trainer_ppo_minibatch(
     double anchor_kl_sum = 0.0;
     double anchor_loss_sum = 0.0;
     float anchor_kl_max = 0.0f;
-    PpoAdvantageNormalization normalization;
+    double awr_weight_sum = 0.0;
+    double awr_weight_square_sum = 0.0;
+    float awr_weight_min = 0.0f;
+    float awr_weight_max = 0.0f;
+    AdvantageNormalization normalization;
 
     if (!trainer || !model || !episodes || episode_count == 0) {
         return 0;
     }
-    if (!ppo_minibatch_advantage_normalization(
+    if (!minibatch_advantage_normalization(
             trainer, episodes, episode_count, &normalization)) {
         return 0;
     }
     gru_model_clear_accumulated_supervised_updates(model);
     for (i = 0; i < episode_count; ++i) {
         size_t episode_labels;
-        if (!episodes[i] || !gru_trainer_ppo_episode_accumulate(
-                trainer, model, episodes[i], &normalization, 0, 0)) {
+        if (!episodes[i] || !gru_trainer_policy_episode_accumulate(
+                trainer, model, episodes[i], &normalization, advantage_weighted, 0, 0)) {
             gru_model_clear_accumulated_supervised_updates(model);
             return 0;
         }
@@ -1940,6 +2029,14 @@ int gru_trainer_ppo_minibatch(
         clip_fraction_sum += (double)trainer->last_clip_fraction * episode_labels;
         anchor_kl_sum += (double)trainer->last_anchor_kl_mean * episode_labels;
         anchor_loss_sum += (double)trainer->last_anchor_loss * episode_labels;
+        awr_weight_sum += trainer->last_awr_weight_sum;
+        awr_weight_square_sum += trainer->last_awr_weight_square_sum;
+        if (episode_labels > 0 && (labels == episode_labels || trainer->last_awr_weight_min < awr_weight_min)) {
+            awr_weight_min = trainer->last_awr_weight_min;
+        }
+        if (trainer->last_awr_weight_max > awr_weight_max) {
+            awr_weight_max = trainer->last_awr_weight_max;
+        }
         if (trainer->last_anchor_kl_max > anchor_kl_max) {
             anchor_kl_max = trainer->last_anchor_kl_max;
         }
@@ -1974,6 +2071,28 @@ int gru_trainer_ppo_minibatch(
     trainer->last_anchor_kl_mean = labels > 0 ? (float)(anchor_kl_sum / labels) : 0.0f;
     trainer->last_anchor_kl_max = anchor_kl_max;
     trainer->last_anchor_loss = labels > 0 ? (float)(anchor_loss_sum / labels) : 0.0f;
+    trainer->last_awr_weight_sum = awr_weight_sum;
+    trainer->last_awr_weight_square_sum = awr_weight_square_sum;
+    trainer->last_awr_weight_min = awr_weight_min;
+    trainer->last_awr_weight_max = awr_weight_max;
     trainer->last_rl_labels = labels;
     return 1;
+}
+
+int gru_trainer_ppo_minibatch(
+    GruTrainer* trainer,
+    GruModel* model,
+    const Episode* const* episodes,
+    size_t episode_count
+) {
+    return gru_trainer_policy_minibatch(trainer, model, episodes, episode_count, 0);
+}
+
+int gru_trainer_advantage_weighted_minibatch(
+    GruTrainer* trainer,
+    GruModel* model,
+    const Episode* const* episodes,
+    size_t episode_count
+) {
+    return gru_trainer_policy_minibatch(trainer, model, episodes, episode_count, 1);
 }

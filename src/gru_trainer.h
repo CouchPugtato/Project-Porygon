@@ -62,6 +62,12 @@ typedef struct {
     float target_kl;
     GruPpoTargetKlSource target_kl_source;
     float gae_lambda;
+    float awr_temperature;
+    float awr_max_weight;
+    double last_awr_weight_sum;
+    double last_awr_weight_square_sum;
+    float last_awr_weight_min;
+    float last_awr_weight_max;
     float adam_beta1;
     float adam_beta2;
     float adam_epsilon;
@@ -96,6 +102,15 @@ int gru_trainer_ppo_minibatch(
     GruModel* model,
     const Episode* const* episodes,
     size_t episode_count);
+int gru_trainer_advantage_weighted_minibatch(
+    GruTrainer* trainer,
+    GruModel* model,
+    const Episode* const* episodes,
+    size_t episode_count);
+float gru_trainer_advantage_weighted_imitation_weight(
+    float advantage,
+    float temperature,
+    float max_weight);
 int gru_trainer_compare_ppo_episode(
     const GruTrainer* trainer,
     const GruModel* before_model,

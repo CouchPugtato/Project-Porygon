@@ -4363,6 +4363,83 @@ cleanup:
     return ok;
 }
 
+static int test_advantage_weighted_imitation_updates_only_policy_heads(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    Episode winning_episode;
+    Episode losing_episode;
+    const Episode* minibatch[2];
+    GruTrainer trainer;
+    float winning_probability_before;
+    float winning_probability_after;
+    float losing_probability_before;
+    float losing_probability_after;
+    float winning_value_before;
+    float winning_value_after;
+    float losing_value_before;
+    float losing_value_after;
+    float capped_weight;
+    int ok = 1;
+
+    memset(&winning_episode, 0, sizeof(winning_episode));
+    memset(&losing_episode, 0, sizeof(losing_episode));
+    capped_weight = gru_trainer_advantage_weighted_imitation_weight(10.0f, 1.0f, 3.0f);
+    ok &= assert_true(fabsf(capped_weight - 3.0f) < 1.0e-5f,
+        "advantage-weighted imitation caps extreme weights");
+    ok &= assert_true(
+        gru_trainer_advantage_weighted_imitation_weight(1.0f, 1.0f, 20.0f) > 1.0f &&
+        gru_trainer_advantage_weighted_imitation_weight(-1.0f, 1.0f, 20.0f) < 1.0f,
+        "advantage-weighted imitation ranks better actions above worse actions");
+    if (!assert_true(model && zero_model_parameters(model) &&
+            initialize_two_step_ppo_episode(&winning_episode, 2, 1.0f) &&
+            initialize_two_step_ppo_episode(&losing_episode, 1, -1.0f) &&
+            populate_ppo_behavior_predictions(model, &winning_episode) &&
+            populate_ppo_behavior_predictions(model, &losing_episode),
+            "initialize advantage-weighted imitation fixture")) {
+        ok = 0;
+        goto cleanup;
+    }
+    ok &= assert_true(selected_joint_probability_and_value_at(
+        model, &winning_episode, 0u, &winning_probability_before, &winning_value_before),
+        "evaluate winning action before advantage-weighted imitation");
+    ok &= assert_true(selected_joint_probability_and_value_at(
+        model, &losing_episode, 0u, &losing_probability_before, &losing_value_before),
+        "evaluate losing action before advantage-weighted imitation");
+
+    gru_trainer_init(&trainer, 0.01f, 16u, 1.0f, 71u);
+    trainer.advantage_norm = 1;
+    trainer.entropy_coef = 0.0f;
+    trainer.awr_temperature = 1.0f;
+    trainer.awr_max_weight = 20.0f;
+    minibatch[0] = &winning_episode;
+    minibatch[1] = &losing_episode;
+    ok &= assert_true(gru_trainer_advantage_weighted_minibatch(
+            &trainer, model, minibatch, 2u),
+        "apply advantage-weighted imitation minibatch");
+    ok &= assert_true(trainer.last_awr_weight_min < 1.0f &&
+            trainer.last_awr_weight_max > 1.0f &&
+            trainer.last_awr_weight_max <= trainer.awr_max_weight,
+        "advantage-weighted imitation reports bounded weight spread");
+    ok &= assert_true(selected_joint_probability_and_value_at(
+        model, &winning_episode, 0u, &winning_probability_after, &winning_value_after),
+        "evaluate winning action after advantage-weighted imitation");
+    ok &= assert_true(selected_joint_probability_and_value_at(
+        model, &losing_episode, 0u, &losing_probability_after, &losing_value_after),
+        "evaluate losing action after advantage-weighted imitation");
+    ok &= assert_true(winning_probability_after > winning_probability_before,
+        "advantage-weighted imitation reinforces the better joint action");
+    ok &= assert_true(losing_probability_after < losing_probability_before,
+        "advantage-weighted imitation suppresses the competing worse joint action");
+    ok &= assert_true(fabsf(winning_value_after - winning_value_before) < 1.0e-7f &&
+            fabsf(losing_value_after - losing_value_before) < 1.0e-7f,
+        "advantage-weighted imitation leaves the critic and shared representation fixed");
+
+cleanup:
+    episode_free(&losing_episode);
+    episode_free(&winning_episode);
+    gru_model_destroy(model);
+    return ok;
+}
+
 static int test_ppo_clipped_policy_still_updates_value(void) {
     GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     Episode episode;
@@ -4849,6 +4926,7 @@ int main(int argc, char** argv) {
     if (!test_real_batch_ppo_update_audit_tracks_actor_direction()) return 1;
     if (!test_ppo_update_moves_policy_and_value_in_expected_directions()) return 1;
     if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
+    if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
     if (!test_ppo_clipped_policy_still_updates_value()) return 1;
     if (!test_dual_action_turn_has_one_value_target()) return 1;
     if (!test_ppo_critic_diagnostics()) return 1;

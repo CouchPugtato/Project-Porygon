@@ -344,6 +344,30 @@ int gru_model_policy_gradient_accumulate_sequence_window_factorized_anchored(
     const FactorizedPolicySnapshot* anchor_policy,
     float anchor_kl_coef
 );
+int gru_model_advantage_weighted_accumulate_sequence_window_factorized(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    const unsigned char* legal_mask_b,
+    const FactorizedActionChoice* choice,
+    float imitation_weight,
+    float entropy_coef
+);
+int gru_model_advantage_weighted_accumulate_sequence_window_factorized_anchored(
+    GruModel* model,
+    const float* sequence,
+    size_t steps,
+    const float* initial_hidden_state,
+    const unsigned char* legal_mask_a,
+    const unsigned char* legal_mask_b,
+    const FactorizedActionChoice* choice,
+    float imitation_weight,
+    float entropy_coef,
+    const FactorizedPolicySnapshot* anchor_policy,
+    float anchor_kl_coef
+);
 int gru_model_critic_head_accumulate_hidden(
     GruModel* model,
     const float* hidden_state,

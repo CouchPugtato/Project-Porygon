@@ -52,12 +52,16 @@ typedef struct {
     int ppo_target_kl_hard_consecutive_updates;
     int ppo_shuffle_seed;
     int ppo_minibatch_episodes;
+    int awr_minibatch_episodes;
+    float awr_temperature;
+    float awr_max_weight;
     float adam_beta1;
     float adam_beta2;
     float adam_epsilon;
 } RlDefaultsConfig;
 
 typedef struct {
+    const char* training_method;
     size_t move_slot_counts[4];
     size_t switch_slot_counts[6];
     size_t move_count;
@@ -103,6 +107,10 @@ typedef struct {
     size_t critic_sample_count;
     double advantage_mean_sum;
     double abs_advantage_mean_sum;
+    double awr_weight_sum;
+    double awr_weight_square_sum;
+    float awr_weight_min;
+    float awr_weight_max;
     size_t label_weight_sum;
 } RlTrainingSummary;
 
@@ -111,6 +119,13 @@ typedef enum {
     TRAIN_INPUT_EPISODE_BATCH = 1,
     TRAIN_INPUT_REPLAY_MANIFEST = 2
 } TrainInputKind;
+
+typedef enum {
+    TRAIN_METHOD_SUPERVISED = 0,
+    TRAIN_METHOD_POLICY_GRADIENT = 1,
+    TRAIN_METHOD_PPO = 2,
+    TRAIN_METHOD_ADVANTAGE_WEIGHTED_IMITATION = 3
+} TrainMethod;
 
 static GruModel* create_default_model(void) {
     return gru_model_create(observation_flat_size(), 128, OBS_NUM_ACTIONS);
@@ -254,9 +269,11 @@ static void rl_training_summary_record_episode(RlTrainingSummary* summary, const
 }
 
 static void rl_training_summary_record_trainer(RlTrainingSummary* summary, const GruTrainer* trainer) {
+    int first_awr_weights;
     if (!summary || !trainer || trainer->last_rl_labels == 0) {
         return;
     }
+    first_awr_weights = summary->label_weight_sum == 0;
     summary->policy_loss_sum += (double)trainer->last_policy_loss * (double)trainer->last_rl_labels;
     summary->value_loss_sum += (double)trainer->last_value_loss * (double)trainer->last_rl_labels;
     summary->entropy_sum += (double)trainer->last_entropy * (double)trainer->last_rl_labels;
@@ -275,6 +292,14 @@ static void rl_training_summary_record_trainer(RlTrainingSummary* summary, const
     summary->critic_sample_count += trainer->last_critic_samples;
     summary->advantage_mean_sum += (double)trainer->last_mean_advantage * (double)trainer->last_rl_labels;
     summary->abs_advantage_mean_sum += (double)trainer->last_mean_abs_advantage * (double)trainer->last_rl_labels;
+    summary->awr_weight_sum += trainer->last_awr_weight_sum;
+    summary->awr_weight_square_sum += trainer->last_awr_weight_square_sum;
+    if (first_awr_weights || trainer->last_awr_weight_min < summary->awr_weight_min) {
+        summary->awr_weight_min = trainer->last_awr_weight_min;
+    }
+    if (first_awr_weights || trainer->last_awr_weight_max > summary->awr_weight_max) {
+        summary->awr_weight_max = trainer->last_awr_weight_max;
+    }
     summary->label_weight_sum += trainer->last_rl_labels;
     if (trainer->last_anchor_kl_max > summary->anchor_kl_max) {
         summary->anchor_kl_max = trainer->last_anchor_kl_max;
@@ -745,6 +770,9 @@ static void rl_defaults_config_init(RlDefaultsConfig* config) {
     config->ppo_target_kl_hard_consecutive_updates = 2;
     config->ppo_shuffle_seed = 1337;
     config->ppo_minibatch_episodes = 8;
+    config->awr_minibatch_episodes = 8;
+    config->awr_temperature = 1.0f;
+    config->awr_max_weight = 20.0f;
     config->adam_beta1 = 0.90f;
     config->adam_beta2 = 0.999f;
     config->adam_epsilon = 1.0e-8f;
@@ -785,6 +813,9 @@ static int assign_rl_default_value(RlDefaultsConfig* config, const char* key, co
     else if (strcmp(key, "ppo_target_kl_hard_consecutive_updates") == 0) config->ppo_target_kl_hard_consecutive_updates = (int)value;
     else if (strcmp(key, "ppo_shuffle_seed") == 0) config->ppo_shuffle_seed = (int)value;
     else if (strcmp(key, "ppo_minibatch_episodes") == 0) config->ppo_minibatch_episodes = (int)value;
+    else if (strcmp(key, "awr_minibatch_episodes") == 0) config->awr_minibatch_episodes = (int)value;
+    else if (strcmp(key, "awr_temperature") == 0) config->awr_temperature = value;
+    else if (strcmp(key, "awr_max_weight") == 0) config->awr_max_weight = value;
     else if (strcmp(key, "adam_beta1") == 0) config->adam_beta1 = value;
     else if (strcmp(key, "adam_beta2") == 0) config->adam_beta2 = value;
     else if (strcmp(key, "adam_epsilon") == 0) config->adam_epsilon = value;
@@ -1437,6 +1468,9 @@ static int write_rl_training_summary_json(
     fputs("{\n", out);
     fprintf(out, "  \"status\": \"%s\",\n", checkpoint_published ? "completed" : "rejected");
     fprintf(out, "  \"checkpoint_published\": %s,\n", checkpoint_published ? "true" : "false");
+    fputs("  \"training_method\": ", out);
+    json_write_escaped(out, summary->training_method ? summary->training_method : "");
+    fputs(",\n", out);
     fputs("  \"input_episode_batch\": ", out); json_write_escaped(out, input_path ? input_path : ""); fputs(",\n", out);
     fputs("  \"parent_checkpoint\": ", out); json_write_escaped(out, parent_checkpoint ? parent_checkpoint : ""); fputs(",\n", out);
     fputs("  \"output_checkpoint\": ", out); json_write_escaped(out, output_checkpoint ? output_checkpoint : ""); fputs(",\n", out);
@@ -1447,6 +1481,11 @@ static int write_rl_training_summary_json(
     fprintf(out, "  \"entropy_coef\": %.9g,\n", trainer->entropy_coef);
     fprintf(out, "  \"advantage_norm\": %s,\n", trainer->advantage_norm ? "true" : "false");
     fprintf(out, "  \"gae_lambda\": %.9g,\n", trainer->gae_lambda);
+    fprintf(out, "  \"awr_temperature\": %.9g,\n", trainer->awr_temperature);
+    fprintf(out, "  \"awr_max_weight\": %.9g,\n", trainer->awr_max_weight);
+    fprintf(out, "  \"critic_updated\": %s,\n",
+        summary->training_method && strcmp(summary->training_method, "advantage_weighted_imitation") == 0
+            ? "false" : "true");
     fprintf(out, "  \"ppo_clip_epsilon\": %.9g,\n", trainer->ppo_clip_epsilon);
     fprintf(out, "  \"ppo_value_clip_epsilon\": %.9g,\n", trainer->ppo_value_clip_epsilon);
     fputs("  \"reward_mode\": ", out); json_write_escaped(out, reward_mode); fputs(",\n", out);
@@ -1490,6 +1529,13 @@ static int write_rl_training_summary_json(
     fprintf(out, "  \"critic_samples\": %zu,\n", summary->critic_sample_count);
     fprintf(out, "  \"mean_advantage\": %.6f,\n", summary->label_weight_sum > 0 ? summary->advantage_mean_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"mean_absolute_advantage\": %.6f,\n", summary->label_weight_sum > 0 ? summary->abs_advantage_mean_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"awr_weight_mean\": %.6f,\n", summary->label_weight_sum > 0 ? summary->awr_weight_sum / (double)summary->label_weight_sum : 0.0);
+    fprintf(out, "  \"awr_weight_min\": %.6f,\n", summary->awr_weight_min);
+    fprintf(out, "  \"awr_weight_max_observed\": %.6f,\n", summary->awr_weight_max);
+    fprintf(out, "  \"awr_effective_labels\": %.6f,\n",
+        summary->awr_weight_square_sum > 0.0
+            ? summary->awr_weight_sum * summary->awr_weight_sum / summary->awr_weight_square_sum
+            : 0.0);
     fprintf(out, "  \"policy_loss\": %.6f,\n", summary->label_weight_sum > 0 ? summary->policy_loss_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"value_loss\": %.6f,\n", summary->label_weight_sum > 0 ? summary->value_loss_sum / (double)summary->label_weight_sum : 0.0);
     fprintf(out, "  \"entropy\": %.6f,\n", summary->label_weight_sum > 0 ? summary->entropy_sum / (double)summary->label_weight_sum : 0.0);
@@ -2509,8 +2555,7 @@ static int train_from_input_file(
     const char* input_path,
     const char* checkpoint_path,
     TrainInputKind input_kind,
-    int rl_mode,
-    int ppo_mode,
+    TrainMethod method,
     int epochs,
     float learning_rate_override,
     float rl_gamma,
@@ -2526,7 +2571,9 @@ static int train_from_input_file(
     int ppo_target_kl_hard_consecutive_updates,
     int ppo_shuffle_seed,
     int ppo_episode_limit,
-    int ppo_minibatch_episodes,
+    int policy_minibatch_episodes,
+    float awr_temperature,
+    float awr_max_weight,
     float adam_beta1,
     float adam_beta2,
     float adam_epsilon,
@@ -2569,6 +2616,10 @@ static int train_from_input_file(
     size_t starting_step;
     int output_checkpoint_loaded;
     int anchor_is_behavior_parent = 0;
+    int rl_mode = method != TRAIN_METHOD_SUPERVISED;
+    int ppo_mode = method == TRAIN_METHOD_PPO;
+    int awr_mode = method == TRAIN_METHOD_ADVANTAGE_WEIGHTED_IMITATION;
+    int guarded_policy_mode = ppo_mode || awr_mode;
 
     if (!input_path || !checkpoint_path || epochs <= 0) {
         return 1;
@@ -2578,6 +2629,11 @@ static int train_from_input_file(
         return 1;
     }
     rl_training_summary_init(&rl_summary);
+    rl_summary.training_method = method == TRAIN_METHOD_ADVANTAGE_WEIGHTED_IMITATION
+        ? "advantage_weighted_imitation"
+        : (method == TRAIN_METHOD_PPO
+            ? "ppo"
+            : (method == TRAIN_METHOD_POLICY_GRADIENT ? "policy_gradient" : "supervised"));
     if (rl_mode) {
         if (!parse_reward_mode(rl_reward_mode, &reward_mode)) {
             fprintf(stderr, "Unsupported --reward-mode '%s'. Supported modes: terminal, dense_additive.\n",
@@ -2645,11 +2701,11 @@ static int train_from_input_file(
         free(resolved_checkpoint_path);
         return 1;
     }
-    if (output_checkpoint_loaded && ppo_mode && input_kind == TRAIN_INPUT_EPISODE_BATCH) {
+    if (output_checkpoint_loaded && guarded_policy_mode && input_kind == TRAIN_INPUT_EPISODE_BATCH) {
         char* resolved_parent_path;
         if (!parent_checkpoint_metadata || !*parent_checkpoint_metadata) {
             fprintf(stderr,
-                "[train-live-ppo] --parent-checkpoint is required to verify behavior-policy initialization\n");
+                "[train-live-policy] --parent-checkpoint is required to verify behavior-policy initialization\n");
             gru_model_destroy(model);
             free(resolved_checkpoint_path);
             return 1;
@@ -2658,7 +2714,7 @@ static int train_from_input_file(
         if (!resolved_parent_path ||
                 !files_have_same_bytes(resolved_checkpoint_path, resolved_parent_path)) {
             fprintf(stderr,
-                "[train-live-ppo] output checkpoint does not match --parent-checkpoint; refusing off-policy initialization\n");
+                "[train-live-policy] output checkpoint does not match --parent-checkpoint; refusing off-policy initialization\n");
             free(resolved_parent_path);
             gru_model_destroy(model);
             free(resolved_checkpoint_path);
@@ -2693,7 +2749,7 @@ static int train_from_input_file(
             free(resolved_checkpoint_path);
             return 1;
         }
-        if (ppo_mode && input_kind == TRAIN_INPUT_EPISODE_BATCH &&
+        if (guarded_policy_mode && input_kind == TRAIN_INPUT_EPISODE_BATCH &&
                 parent_checkpoint_metadata && *parent_checkpoint_metadata) {
             char* resolved_parent_path = resolve_checkpoint_path(parent_checkpoint_metadata);
             if (resolved_parent_path) {
@@ -2717,6 +2773,8 @@ static int train_from_input_file(
         trainer.entropy_coef = rl_entropy_coef;
         trainer.advantage_norm = rl_advantage_norm ? 1 : 0;
         trainer.gae_lambda = gae_lambda;
+        trainer.awr_temperature = awr_temperature;
+        trainer.awr_max_weight = awr_max_weight;
         trainer.ppo_clip_epsilon = ppo_clip_epsilon;
         trainer.ppo_value_clip_epsilon = ppo_value_clip_epsilon;
         trainer.target_kl = ppo_target_kl;
@@ -2728,8 +2786,9 @@ static int train_from_input_file(
         trainer.adam_epsilon = adam_epsilon;
         trainer.anchor_model = anchor_model;
         trainer.anchor_kl_coef = anchor_kl_coef;
-        if (ppo_mode) {
-            printf("[train-ppo] target_kl_source=%s\n",
+        if (guarded_policy_mode) {
+            printf("[train-%s] target_kl_source=%s\n",
+                awr_mode ? "awr" : "ppo",
                 gru_ppo_target_kl_source_name(trainer.target_kl_source));
         }
     } else {
@@ -2817,7 +2876,7 @@ static int train_from_input_file(
         rl_summary.available_episode_count = train_sessions;
         rl_summary.episode_limit = ppo_episode_limit;
         rl_summary.shuffle_seed = ppo_shuffle_seed;
-        rl_summary.minibatch_episodes = ppo_minibatch_episodes > 0 ? ppo_minibatch_episodes : 1;
+        rl_summary.minibatch_episodes = policy_minibatch_episodes > 0 ? policy_minibatch_episodes : 1;
         rl_summary.target_kl_min_episodes = ppo_target_kl_min_episodes;
         rl_summary.target_kl_min_labels = ppo_target_kl_min_labels;
         rl_summary.target_kl_hard_multiplier = ppo_target_kl_hard_multiplier;
@@ -2858,7 +2917,7 @@ static int train_from_input_file(
 
     for (epoch = 1; epoch <= epochs; ++epoch) {
         size_t trained_in_epoch = 0;
-        int ppo_early_stop = 0;
+        int policy_early_stop = 0;
         int consecutive_hard_kl_updates = 0;
         PolicyEvaluationMetrics val_metrics;
         clock_t val_eval_start_clock = 0;
@@ -2874,14 +2933,14 @@ static int train_from_input_file(
             size_t session_index = train_indices[order_i];
             size_t episodes_this_update = 1;
             if (rl_mode) {
-                if (ppo_mode) {
-                    size_t configured_batch = (size_t)(ppo_minibatch_episodes > 0 ? ppo_minibatch_episodes : 1);
+                if (guarded_policy_mode) {
+                    size_t configured_batch = (size_t)(policy_minibatch_episodes > 0 ? policy_minibatch_episodes : 1);
                     size_t remaining = train_sessions - order_i;
                     const Episode** minibatch;
                     episodes_this_update = configured_batch < remaining ? configured_batch : remaining;
                     minibatch = (const Episode**)malloc(episodes_this_update * sizeof(*minibatch));
                     if (!minibatch) {
-                        fprintf(stderr, "Failed to allocate PPO minibatch\n");
+                        fprintf(stderr, "Failed to allocate policy minibatch\n");
                         free(train_indices);
                         free(val_indices);
                         env_runtime_free(&runtime);
@@ -2893,9 +2952,13 @@ static int train_from_input_file(
                         size_t batch_session_index = train_indices[order_i + batch_i];
                         minibatch[batch_i] = &runtime.sessions[batch_session_index].episode;
                     }
-                    if (!gru_trainer_ppo_minibatch(&trainer, model, minibatch, episodes_this_update)) {
+                    if (!(awr_mode
+                            ? gru_trainer_advantage_weighted_minibatch(
+                                &trainer, model, minibatch, episodes_this_update)
+                            : gru_trainer_ppo_minibatch(
+                                &trainer, model, minibatch, episodes_this_update))) {
                         free(minibatch);
-                        fprintf(stderr, "Failed PPO minibatch update\n");
+                        fprintf(stderr, "Failed %s minibatch update\n", awr_mode ? "AWR" : "PPO");
                         free(train_indices);
                         free(val_indices);
                         env_runtime_free(&runtime);
@@ -2919,7 +2982,7 @@ static int train_from_input_file(
                     rl_training_summary_record_episode(&rl_summary, &runtime.sessions[batch_session_index].episode);
                 }
                 rl_training_summary_record_trainer(&rl_summary, &trainer);
-                if (ppo_mode && trainer.target_kl > 0.0f) {
+                if (guarded_policy_mode && trainer.target_kl > 0.0f) {
                     float observed_kl = gru_trainer_ppo_target_kl_observation(&trainer);
                     float running_target_kl = rl_summary.label_weight_sum > 0
                         ? (float)((trainer.target_kl_source == GRU_PPO_TARGET_KL_EXACT_LEGAL_POLICY
@@ -2942,7 +3005,7 @@ static int train_from_input_file(
                         rl_summary.target_kl_hard_breach_count = consecutive_hard_kl_updates;
                     }
                     if ((minimum_reached && running_target_kl > trainer.target_kl) || hard_stop) {
-                        ppo_early_stop = 1;
+                        policy_early_stop = 1;
                         rl_summary.target_kl_exceeded = 1;
                         rl_summary.target_kl_hard_stop = hard_stop ? 1 : 0;
                         rl_summary.target_kl_trigger = hard_stop ? observed_kl : running_target_kl;
@@ -2974,7 +3037,7 @@ static int train_from_input_file(
                 }
                 if (rl_mode) {
                     printf("[train-%s] epoch=%d episodes=%zu/%zu step=%zu mean_return=%.4f policy_loss=%.4f value_loss=%.4f explained_variance=%.4f return_value_correlation=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f anchor_kl_mean=%.4f anchor_kl_max=%.4f kl_guard=%.4f kl_source=%s clip_fraction=%.4f hard_kl_breaches=%d/%d labels=%zu\n",
-                        ppo_mode ? "ppo" : "rl",
+                        awr_mode ? "awr" : (ppo_mode ? "ppo" : "rl"),
                         epoch,
                         trained_in_epoch,
                         train_sessions,
@@ -2995,6 +3058,19 @@ static int train_from_input_file(
                         consecutive_hard_kl_updates,
                         ppo_target_kl_hard_consecutive_updates > 0 ? ppo_target_kl_hard_consecutive_updates : 1,
                         trainer.last_rl_labels);
+                    if (awr_mode) {
+                        double effective_labels = trainer.last_awr_weight_square_sum > 0.0
+                            ? trainer.last_awr_weight_sum * trainer.last_awr_weight_sum /
+                                trainer.last_awr_weight_square_sum
+                            : 0.0;
+                        printf("[train-awr] weight_mean=%.4f weight_min=%.4f weight_max=%.4f effective_labels=%.1f critic_updated=0\n",
+                            trainer.last_rl_labels > 0
+                                ? trainer.last_awr_weight_sum / (double)trainer.last_rl_labels
+                                : 0.0,
+                            trainer.last_awr_weight_min,
+                            trainer.last_awr_weight_max,
+                            effective_labels);
+                    }
                 } else {
                     printf("[train] epoch=%d episodes=%zu/%zu step=%zu action_loss=%.4f value_loss=%.4f accuracy=%.4f\n",
                         epoch,
@@ -3041,13 +3117,14 @@ static int train_from_input_file(
                     free(periodic_path);
                 }
             }
-            if (ppo_early_stop) {
+            if (policy_early_stop) {
                 break;
             }
         }
 
-        if (ppo_early_stop) {
-            printf("[train-ppo] early stop after epoch=%d episodes=%zu/%zu reason=%s kl_trigger=%.4f target_kl=%.4f kl_source=%s\n",
+        if (policy_early_stop) {
+            printf("[train-%s] early stop after epoch=%d episodes=%zu/%zu reason=%s kl_trigger=%.4f target_kl=%.4f kl_source=%s\n",
+                awr_mode ? "awr" : "ppo",
                 epoch,
                 trained_in_epoch,
                 train_sessions,
@@ -3161,7 +3238,7 @@ static int train_from_input_file(
             }
         }
 
-        if (ppo_early_stop) {
+        if (policy_early_stop) {
             break;
         }
     }
@@ -3185,7 +3262,8 @@ static int train_from_input_file(
             fprintf(stderr, "Failed to write rejected RL training summary '%s'\n", training_summary_path);
         }
         fprintf(stderr,
-            "[train-ppo] rejected update; checkpoint was not published after hard KL stop\n");
+            "[train-%s] rejected update; checkpoint was not published after hard KL stop\n",
+            awr_mode ? "awr" : "ppo");
         free(train_indices);
         free(val_indices);
         env_runtime_free(&runtime);
@@ -3208,7 +3286,7 @@ static int train_from_input_file(
     }
     if (rl_mode) {
         printf("trained mode=%s step=%zu policy_loss=%.4f value_loss=%.4f mean_return=%.4f mean_advantage=%.4f entropy=%.4f approx_kl=%.4f clip_fraction=%.4f labels=%zu sessions=%zu\n",
-            ppo_mode ? "ppo" : "rl",
+            awr_mode ? "awr" : (ppo_mode ? "ppo" : "rl"),
             trainer.step,
             trainer.last_policy_loss,
             trainer.last_value_loss,
@@ -3926,6 +4004,9 @@ static int showdown_client_main(int argc, char** argv) {
     int ppo_shuffle_seed;
     int ppo_episode_limit;
     int ppo_minibatch_episodes;
+    int awr_minibatch_episodes;
+    float awr_temperature;
+    float awr_max_weight;
     float adam_beta1;
     float adam_beta2;
     float adam_epsilon;
@@ -3939,6 +4020,7 @@ static int showdown_client_main(int argc, char** argv) {
     RewardConfig reward_config;
     RlDefaultsConfig rl_defaults;
     int ppo_command = argc >= 2 && strcmp(argv[1], "--train-live-ppo") == 0;
+    int awr_command = argc >= 2 && strcmp(argv[1], "--train-live-awr") == 0;
     int training_or_eval_mode = 0;
     srand((unsigned int)time(NULL));
     if (!load_reward_config_file(SHOWDOWN_CLIENT_REWARD_CONFIG_PATH, &reward_config)) {
@@ -3950,11 +4032,11 @@ static int showdown_client_main(int argc, char** argv) {
     learning_rate_override = parse_float_flag(argc, argv, "--learning-rate", -1.0f);
     anchor_kl_coef = parse_float_flag(argc, argv, "--anchor-kl-coef", 0.0f);
     rl_gamma = parse_float_flag(argc, argv, "--gamma",
-        (ppo_command || critic_fit_command || ppo_audit_command)
+        (ppo_command || awr_command || critic_fit_command || ppo_audit_command)
             ? rl_defaults.ppo_gamma
             : rl_defaults.policy_gradient_gamma);
     rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef",
-        ppo_command ? rl_defaults.ppo_entropy_coef : rl_defaults.policy_gradient_entropy_coef);
+        (ppo_command || awr_command) ? rl_defaults.ppo_entropy_coef : rl_defaults.policy_gradient_entropy_coef);
     rl_advantage_norm = parse_int_flag(argc, argv, "--advantage-norm", rl_defaults.advantage_norm);
     gae_lambda = parse_float_flag(argc, argv, "--gae-lambda", rl_defaults.gae_lambda);
     ppo_clip_epsilon = parse_float_flag(argc, argv, "--ppo-clip-epsilon", rl_defaults.ppo_clip_epsilon);
@@ -3968,6 +4050,9 @@ static int showdown_client_main(int argc, char** argv) {
     ppo_shuffle_seed = parse_int_flag(argc, argv, "--shuffle-seed", rl_defaults.ppo_shuffle_seed);
     ppo_episode_limit = parse_int_flag(argc, argv, "--episode-limit", 0);
     ppo_minibatch_episodes = parse_int_flag(argc, argv, "--ppo-minibatch-episodes", rl_defaults.ppo_minibatch_episodes);
+    awr_minibatch_episodes = parse_int_flag(argc, argv, "--awr-minibatch-episodes", rl_defaults.awr_minibatch_episodes);
+    awr_temperature = parse_float_flag(argc, argv, "--awr-temperature", rl_defaults.awr_temperature);
+    awr_max_weight = parse_float_flag(argc, argv, "--awr-max-weight", rl_defaults.awr_max_weight);
     adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", rl_defaults.adam_beta1);
     adam_beta2 = parse_float_flag(argc, argv, "--adam-beta2", rl_defaults.adam_beta2);
     adam_epsilon = parse_float_flag(argc, argv, "--adam-epsilon", rl_defaults.adam_epsilon);
@@ -3990,6 +4075,12 @@ static int showdown_client_main(int argc, char** argv) {
     }
     if (ppo_audit_command && (ppo_episode_limit < 0 || ppo_shuffle_seed < 0)) {
         fprintf(stderr, "--audit-ppo-update requires non-negative episode limit and seed\n");
+        return 1;
+    }
+    if (awr_command &&
+            (awr_minibatch_episodes <= 0 || awr_temperature <= 0.0f || awr_max_weight < 1.0f)) {
+        fprintf(stderr,
+            "--train-live-awr requires --awr-minibatch-episodes > 0, --awr-temperature > 0, and --awr-max-weight >= 1\n");
         return 1;
     }
     if (validation_seed < 0) {
@@ -4024,6 +4115,7 @@ static int showdown_client_main(int argc, char** argv) {
              strcmp(argv[1], "--train-supervised-manifest") == 0 ||
             strcmp(argv[1], "--train-live-rl") == 0 ||
             strcmp(argv[1], "--train-live-ppo") == 0 ||
+            strcmp(argv[1], "--train-live-awr") == 0 ||
             strcmp(argv[1], "--check-supervised-overfit") == 0 ||
             strcmp(argv[1], "--check-critic-fit") == 0 ||
             strcmp(argv[1], "--check-critic-fit-manifest") == 0 ||
@@ -4131,8 +4223,7 @@ static int showdown_client_main(int argc, char** argv) {
             argv[2],
             argv[3],
             TRAIN_INPUT_REPLAY,
-            0,
-            0,
+            TRAIN_METHOD_SUPERVISED,
             epochs,
             learning_rate_override,
             rl_gamma,
@@ -4149,6 +4240,8 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_shuffle_seed,
             ppo_episode_limit,
             ppo_minibatch_episodes,
+            awr_temperature,
+            awr_max_weight,
             adam_beta1,
             adam_beta2,
             adam_epsilon,
@@ -4169,8 +4262,7 @@ static int showdown_client_main(int argc, char** argv) {
             argv[2],
             argv[3],
             TRAIN_INPUT_REPLAY_MANIFEST,
-            0,
-            0,
+            TRAIN_METHOD_SUPERVISED,
             epochs,
             learning_rate_override,
             rl_gamma,
@@ -4187,6 +4279,8 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_shuffle_seed,
             ppo_episode_limit,
             ppo_minibatch_episodes,
+            awr_temperature,
+            awr_max_weight,
             adam_beta1,
             adam_beta2,
             adam_epsilon,
@@ -4207,8 +4301,7 @@ static int showdown_client_main(int argc, char** argv) {
             argv[2],
             argv[3],
             TRAIN_INPUT_REPLAY,
-            1,
-            0,
+            TRAIN_METHOD_POLICY_GRADIENT,
             epochs,
             learning_rate_override,
             rl_gamma,
@@ -4225,6 +4318,8 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_shuffle_seed,
             ppo_episode_limit,
             ppo_minibatch_episodes,
+            awr_temperature,
+            awr_max_weight,
             adam_beta1,
             adam_beta2,
             adam_epsilon,
@@ -4245,8 +4340,7 @@ static int showdown_client_main(int argc, char** argv) {
             argv[2],
             argv[3],
             TRAIN_INPUT_EPISODE_BATCH,
-            1,
-            0,
+            TRAIN_METHOD_POLICY_GRADIENT,
             epochs,
             learning_rate_override,
             rl_gamma,
@@ -4263,6 +4357,8 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_shuffle_seed,
             ppo_episode_limit,
             ppo_minibatch_episodes,
+            awr_temperature,
+            awr_max_weight,
             adam_beta1,
             adam_beta2,
             adam_epsilon,
@@ -4283,8 +4379,7 @@ static int showdown_client_main(int argc, char** argv) {
             argv[2],
             argv[3],
             TRAIN_INPUT_EPISODE_BATCH,
-            1,
-            1,
+            TRAIN_METHOD_PPO,
             epochs,
             learning_rate_override,
             rl_gamma,
@@ -4301,6 +4396,47 @@ static int showdown_client_main(int argc, char** argv) {
             ppo_shuffle_seed,
             ppo_episode_limit,
             ppo_minibatch_episodes,
+            awr_temperature,
+            awr_max_weight,
+            adam_beta1,
+            adam_beta2,
+            adam_epsilon,
+            supervised_profile,
+            supervised_optimizer,
+            (unsigned int)validation_seed,
+            aux_checkpoints,
+            rl_reward_mode,
+            &reward_config,
+            expected_policy_tag,
+            training_summary_path,
+            parent_checkpoint_metadata,
+            anchor_checkpoint_path,
+            anchor_kl_coef);
+    }
+    if (argc >= 4 && strcmp(argv[1], "--train-live-awr") == 0) {
+        return train_from_input_file(
+            argv[2],
+            argv[3],
+            TRAIN_INPUT_EPISODE_BATCH,
+            TRAIN_METHOD_ADVANTAGE_WEIGHTED_IMITATION,
+            epochs,
+            learning_rate_override,
+            rl_gamma,
+            rl_entropy_coef,
+            rl_advantage_norm,
+            gae_lambda,
+            ppo_clip_epsilon,
+            ppo_value_clip_epsilon,
+            ppo_target_kl,
+            ppo_target_kl_min_episodes,
+            ppo_target_kl_min_labels,
+            ppo_target_kl_hard_multiplier,
+            ppo_target_kl_hard_consecutive_updates,
+            ppo_shuffle_seed,
+            ppo_episode_limit,
+            awr_minibatch_episodes,
+            awr_temperature,
+            awr_max_weight,
             adam_beta1,
             adam_beta2,
             adam_epsilon,
@@ -4354,6 +4490,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --train-live-ppo <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--ppo-minibatch-episodes N] [--target-kl F] [--shuffle-seed N] [--episode-limit N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
+        "  showdown_client --train-live-awr <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--awr-minibatch-episodes N] [--awr-temperature F] [--awr-max-weight F] [--target-kl F] [--shuffle-seed N] [--episode-limit N] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"
         "  showdown_client --eval-supervised <replay.jsonl> <checkpoint.bin> [--validation-seed N]\n"
         "  showdown_client --clean-replay <input.jsonl> <output.jsonl>\n"
         "  showdown_client --export-battle <replay.jsonl> <battle_id> <output.json>\n"
