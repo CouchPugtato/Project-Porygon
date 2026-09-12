@@ -1,4 +1,5 @@
 #include "checkpoint.h"
+#include "counterfactual_data.h"
 #include "env_session.h"
 #include "gru_model.h"
 #include "gru_trainer.h"
@@ -2319,7 +2320,10 @@ static int run_demo_gru(void) {
 static int run_runtime_mode(
     const char* checkpoint_path,
     const char* reward_mode_name,
-    const EnvDenseRewardConfig* dense_reward_config
+    const EnvDenseRewardConfig* dense_reward_config,
+    int inference_seed,
+    int counterfactual_decision_index,
+    int counterfactual_action_rank
 ) {
     GruModel* model = NULL;
     TrainerCheckpointState state;
@@ -2336,6 +2340,7 @@ static int run_runtime_mode(
         fprintf(stderr, "[runtime] unsupported reward mode '%s'\n", reward_mode_name ? reward_mode_name : "");
         return 1;
     }
+    if (inference_seed >= 0) srand((unsigned int)inference_seed);
 
     memset(&state, 0, sizeof(state));
     memset(&checkpoint_result, 0, sizeof(checkpoint_result));
@@ -2369,6 +2374,16 @@ static int run_runtime_mode(
         fprintf(stderr, "Failed to initialize runtime\n");
         fclose(replay_file);
         gru_model_destroy(model);
+        return 1;
+    }
+    if (counterfactual_decision_index >= 0 &&
+            !env_runtime_set_counterfactual_intervention(
+                &runtime, counterfactual_decision_index, counterfactual_action_rank)) {
+        fprintf(stderr, "[runtime] invalid counterfactual intervention\n");
+        env_runtime_free(&runtime);
+        if (replay_file) fclose(replay_file);
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
         return 1;
     }
     runtime_emit_ready_json(json, sizeof(json));
@@ -3964,6 +3979,147 @@ cleanup:
     return rc;
 }
 
+static int run_counterfactual_q_fit_check(
+    const char* batch_path,
+    const char* checkpoint_path,
+    const char* report_path,
+    const char* output_path,
+    size_t epochs,
+    size_t minibatch_pairs,
+    size_t latent_dim,
+    size_t early_stop_patience,
+    float learning_rate,
+    float l2_coefficient,
+    unsigned int validation_seed,
+    unsigned int shuffle_seed,
+    float adam_beta1,
+    float adam_beta2,
+    float adam_epsilon
+) {
+    GruModel* policy_model = NULL;
+    ActionValueModel* action_value_model = NULL;
+    TrainerCheckpointState checkpoint_state;
+    CheckpointLoadResult checkpoint_result;
+    CounterfactualDataset dataset;
+    CounterfactualSample** train_samples = NULL;
+    CounterfactualSample** selection_samples = NULL;
+    CounterfactualSample** holdout_samples = NULL;
+    size_t train_count = 0;
+    size_t selection_count = 0;
+    size_t holdout_count = 0;
+    ActionValueFitResult result;
+    size_t pair_index;
+    int action_value_published = 0;
+    int publication_requested;
+    int rc = 1;
+
+    memset(&dataset, 0, sizeof(dataset));
+    if (!batch_path || !checkpoint_path || !report_path || epochs == 0 ||
+            minibatch_pairs == 0 || latent_dim == 0 || early_stop_patience == 0 ||
+            learning_rate <= 0.0f || l2_coefficient < 0.0f) {
+        fprintf(stderr, "[counterfactual-q] invalid diagnostic configuration\n");
+        return 1;
+    }
+    policy_model = load_current_checkpoint(
+        checkpoint_path, &checkpoint_state, &checkpoint_result);
+    if (!policy_model) {
+        report_checkpoint_load_failure(
+            "[counterfactual-q] failed to load encoder checkpoint",
+            checkpoint_path, &checkpoint_result);
+        goto cleanup;
+    }
+    if (!counterfactual_dataset_load(
+            &dataset, batch_path, gru_model_hidden_dim(policy_model), checkpoint_path)) {
+        fprintf(stderr,
+            "[counterfactual-q] failed to load paired batch '%s'; verify its policy tag and pair integrity\n",
+            batch_path);
+        goto cleanup;
+    }
+    action_value_model = action_value_model_create(
+        gru_model_hidden_dim(policy_model), latent_dim, shuffle_seed);
+    if (!action_value_model) {
+        fprintf(stderr, "[counterfactual-q] failed to create action-value model\n");
+        goto cleanup;
+    }
+    train_samples = (CounterfactualSample**)malloc(dataset.count * sizeof(*train_samples));
+    selection_samples = (CounterfactualSample**)malloc(
+        dataset.count * sizeof(*selection_samples));
+    holdout_samples = (CounterfactualSample**)malloc(dataset.count * sizeof(*holdout_samples));
+    if (!train_samples || !selection_samples || !holdout_samples) goto cleanup;
+    for (pair_index = 0; pair_index < dataset.pair_count; ++pair_index) {
+        CounterfactualSample* first = &dataset.samples[pair_index * 2u];
+        CounterfactualSample* second = first + 1;
+        uint64_t bucket = validation_split_hash(first->pair_id, validation_seed) % UINT64_C(10);
+        CounterfactualSample** destination;
+        size_t* count;
+        if (bucket == UINT64_C(0)) {
+            destination = holdout_samples;
+            count = &holdout_count;
+        } else if (bucket == UINT64_C(1)) {
+            destination = selection_samples;
+            count = &selection_count;
+        } else {
+            destination = train_samples;
+            count = &train_count;
+        }
+        destination[(*count)++] = first;
+        destination[(*count)++] = second;
+    }
+    if (train_count == 0 || selection_count == 0 || holdout_count == 0) {
+        fprintf(stderr,
+            "[counterfactual-q] stable pair split produced train=%zu selection=%zu holdout=%zu pairs; collect more pairs or use another validation seed\n",
+            train_count / 2u, selection_count / 2u, holdout_count / 2u);
+        goto cleanup;
+    }
+    printf("[counterfactual-q] train=%zu selection=%zu holdout=%zu pairs epochs=%zu minibatch_pairs=%zu latent_dim=%zu learning_rate=%.9g l2=%.6g\n",
+        train_count / 2u, selection_count / 2u, holdout_count / 2u,
+        epochs, minibatch_pairs, latent_dim, learning_rate, l2_coefficient);
+    if (!learning_diagnostic_run_counterfactual_action_value_fit(
+            action_value_model, policy_model,
+            train_samples, train_count,
+            selection_samples, selection_count,
+            holdout_samples, holdout_count,
+            epochs, minibatch_pairs, early_stop_patience, shuffle_seed,
+            learning_rate, adam_beta1, adam_beta2, adam_epsilon,
+            1.0f, l2_coefficient, &result)) {
+        fprintf(stderr, "[counterfactual-q] diagnostic execution failed\n");
+        goto cleanup;
+    }
+    publication_requested = output_path && *output_path;
+    if (publication_requested && result.action_signal_detected) {
+        action_value_published = action_value_model_save(output_path, action_value_model);
+    }
+    if (!learning_diagnostic_write_counterfactual_action_value_report(
+            report_path, batch_path, checkpoint_path, output_path,
+            action_value_published, validation_seed, shuffle_seed,
+            epochs, minibatch_pairs, early_stop_patience,
+            learning_rate, l2_coefficient, action_value_model, &result)) {
+        fprintf(stderr, "[counterfactual-q] failed to write report '%s': %s\n",
+            report_path, strerror(errno));
+        goto cleanup;
+    }
+    printf("[counterfactual-q] signal=%d holdout_loss=%.6f baseline_loss=%.6f paired_ranking=%.4f discordant_pairs=%zu published=%d report=%s\n",
+        result.action_signal_detected, result.after_holdout.q_loss,
+        result.after_holdout.baseline_loss,
+        result.after_holdout.pair_ranking_accuracy,
+        result.after_holdout.discordant_pair_count,
+        action_value_published, report_path);
+    if (publication_requested && !action_value_published) {
+        fprintf(stderr,
+            "[counterfactual-q] sidecar publication rejected because the holdout signal gates did not pass\n");
+    }
+    rc = 0;
+
+cleanup:
+    free(holdout_samples);
+    free(selection_samples);
+    free(train_samples);
+    counterfactual_dataset_free(&dataset);
+    action_value_model_destroy(action_value_model);
+    gru_model_destroy(policy_model);
+    return rc;
+}
+
 static int run_ppo_update_audit(
     const char* episode_batch_path,
     const char* before_checkpoint_path,
@@ -4165,6 +4321,8 @@ static int showdown_client_main(int argc, char** argv) {
         strcmp(argv[1], "--check-action-q-fit-manifest") == 0;
     int action_q_command = argc >= 2 &&
         (strcmp(argv[1], "--check-action-q-fit") == 0 || action_q_manifest_command);
+    int counterfactual_q_command = argc >= 2 &&
+        strcmp(argv[1], "--check-counterfactual-q-fit") == 0;
     int ppo_audit_command = argc >= 2 && strcmp(argv[1], "--audit-ppo-update") == 0;
     int overfit_epochs = parse_int_flag(argc, argv, "--epochs", 200);
     int overfit_seed = parse_int_flag(argc, argv, "--seed", 20260902);
@@ -4215,6 +4373,11 @@ static int showdown_client_main(int argc, char** argv) {
     int supervised_profile = parse_bool01_flag(argc, argv, "--supervised-profile", 1);
     int validation_seed = parse_int_flag(argc, argv, "--validation-seed", 1337);
     int aux_checkpoints = parse_bool01_flag(argc, argv, "--aux-checkpoints", 1);
+    int inference_seed = parse_int_flag(argc, argv, "--inference-seed", -1);
+    int counterfactual_decision_index = parse_int_flag(
+        argc, argv, "--counterfactual-decision", -1);
+    int counterfactual_action_rank = parse_int_flag(
+        argc, argv, "--counterfactual-rank", -1);
     GruSupervisedOptimizer supervised_optimizer;
     const char* supervised_optimizer_name = parse_string_flag(
         argc, argv, "--supervised-optimizer", overfit_command ? "adam" : "sgd");
@@ -4234,7 +4397,8 @@ static int showdown_client_main(int argc, char** argv) {
     learning_rate_override = parse_float_flag(argc, argv, "--learning-rate", -1.0f);
     anchor_kl_coef = parse_float_flag(argc, argv, "--anchor-kl-coef", 0.0f);
     rl_gamma = parse_float_flag(argc, argv, "--gamma",
-        (ppo_command || awr_command || critic_fit_command || action_q_command || ppo_audit_command)
+        (ppo_command || awr_command || critic_fit_command || action_q_command ||
+         counterfactual_q_command || ppo_audit_command)
             ? rl_defaults.ppo_gamma
             : rl_defaults.policy_gradient_gamma);
     rl_entropy_coef = parse_float_flag(argc, argv, "--entropy-coef",
@@ -4258,7 +4422,11 @@ static int showdown_client_main(int argc, char** argv) {
     action_q_epochs = parse_int_flag(argc, argv, "--epochs", 20);
     action_q_seed = parse_int_flag(argc, argv, "--seed", 20260911);
     action_q_minibatch_episodes = parse_int_flag(
-        argc, argv, "--action-q-minibatch-episodes", rl_defaults.action_q_minibatch_episodes);
+        argc, argv,
+        counterfactual_q_command
+            ? "--action-q-minibatch-pairs"
+            : "--action-q-minibatch-episodes",
+        rl_defaults.action_q_minibatch_episodes);
     action_q_latent_dim = parse_int_flag(
         argc, argv, "--action-q-latent-dim", rl_defaults.action_q_latent_dim);
     action_q_early_stop_patience = parse_int_flag(
@@ -4292,12 +4460,12 @@ static int showdown_client_main(int argc, char** argv) {
             "--check-critic-fit requires positive epochs/minibatch size and non-negative seed, patience, and policy KL coefficient\n");
         return 1;
     }
-    if (action_q_command &&
+    if ((action_q_command || counterfactual_q_command) &&
             (action_q_epochs <= 0 || action_q_seed < 0 ||
              action_q_minibatch_episodes <= 0 || action_q_latent_dim <= 0 ||
              action_q_early_stop_patience <= 0 || action_q_l2_coefficient < 0.0f)) {
         fprintf(stderr,
-            "--check-action-q-fit requires positive epochs, minibatch size, latent dimension, and early-stop patience plus non-negative seed and L2 coefficient\n");
+            "action-Q diagnostics require positive epochs, minibatch size, latent dimension, and early-stop patience plus non-negative seed and L2 coefficient\n");
         return 1;
     }
     if (ppo_audit_command && (ppo_episode_limit < 0 || ppo_shuffle_seed < 0)) {
@@ -4312,6 +4480,11 @@ static int showdown_client_main(int argc, char** argv) {
     }
     if (validation_seed < 0) {
         fprintf(stderr, "--validation-seed must be >= 0\n");
+        return 1;
+    }
+    if ((counterfactual_decision_index >= 0) != (counterfactual_action_rank >= 0)) {
+        fprintf(stderr,
+            "--counterfactual-decision and --counterfactual-rank must be provided together\n");
         return 1;
     }
     {
@@ -4348,6 +4521,7 @@ static int showdown_client_main(int argc, char** argv) {
             strcmp(argv[1], "--check-critic-fit-manifest") == 0 ||
             strcmp(argv[1], "--check-action-q-fit") == 0 ||
             strcmp(argv[1], "--check-action-q-fit-manifest") == 0 ||
+            strcmp(argv[1], "--check-counterfactual-q-fit") == 0 ||
             strcmp(argv[1], "--audit-ppo-update") == 0 ||
             strcmp(argv[1], "--eval-supervised") == 0)) {
         training_or_eval_mode = 1;
@@ -4375,7 +4549,10 @@ static int showdown_client_main(int argc, char** argv) {
         return run_runtime_mode(
             argc >= 3 ? argv[2] : NULL,
             rl_reward_mode,
-            &reward_config.dense_additive);
+            &reward_config.dense_additive,
+            inference_seed,
+            counterfactual_decision_index,
+            counterfactual_action_rank);
     }
     if (argc >= 4 && overfit_command) {
         return run_supervised_overfit_check(
@@ -4435,6 +4612,16 @@ static int showdown_client_main(int argc, char** argv) {
             gae_lambda,
             rl_reward_mode,
             &reward_config);
+    }
+    if (argc >= 5 && counterfactual_q_command) {
+        return run_counterfactual_q_fit_check(
+            argv[2], argv[3], argv[4], action_q_output_path,
+            (size_t)action_q_epochs, (size_t)action_q_minibatch_episodes,
+            (size_t)action_q_latent_dim, (size_t)action_q_early_stop_patience,
+            learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
+            action_q_l2_coefficient,
+            (unsigned int)validation_seed, (unsigned int)action_q_seed,
+            adam_beta1, adam_beta2, adam_epsilon);
     }
     if (argc >= 5 && critic_fit_command) {
         return run_critic_fit_check(
@@ -4731,7 +4918,7 @@ static int showdown_client_main(int argc, char** argv) {
 #else
         fprintf(stderr,
         "Usage:\n"
-        "  showdown_client --battle-agent [checkpoint] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
+        "  showdown_client --battle-agent [checkpoint] [--inference-seed N] [--counterfactual-decision N --counterfactual-rank N] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
@@ -4739,6 +4926,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --check-critic-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --check-action-q-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--action-q-target td0|td_lambda|monte_carlo] [--epochs N] [--learning-rate F] [--gamma F] [--gae-lambda F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --check-action-q-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--action-q-target td0|td_lambda|monte_carlo] [--epochs N] [--learning-rate F] [--gamma F] [--gae-lambda F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
+        "  showdown_client --check-counterfactual-q-fit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F]\n"
         "  showdown_client --audit-ppo-update <episode_batch.jsonl> <before.bin> <after.bin> <report.json> [--episode-limit N] [--shuffle-seed N] [--gamma F] [--gae-lambda F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"

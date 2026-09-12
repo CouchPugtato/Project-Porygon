@@ -49,6 +49,9 @@ typedef struct {
     int prev_opp_fainted_count;
     int pending_action;
     int pending_action2;
+    size_t decision_count;
+    int pending_counterfactual;
+    int pending_counterfactual_rank;
     float pending_old_log_prob;
     float pending_old_value;
     FactorizedActionChoice pending_factorized_choice;
@@ -66,6 +69,8 @@ typedef struct {
     EnvRewardMode reward_mode;
     EnvDenseRewardConfig dense_reward_config;
     char policy_tag[ENV_POLICY_TAG_LEN];
+    int counterfactual_decision_index;
+    int counterfactual_action_rank;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;
@@ -79,6 +84,11 @@ int env_runtime_init(
     EnvRewardMode reward_mode,
     const EnvDenseRewardConfig* dense_reward_config,
     const char* policy_tag
+);
+int env_runtime_set_counterfactual_intervention(
+    EnvRuntime* runtime,
+    int decision_index,
+    int action_rank
 );
 void env_runtime_free(EnvRuntime* runtime);
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);

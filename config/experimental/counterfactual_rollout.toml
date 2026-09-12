@@ -1,0 +1,9 @@
+format = "gen9randomdoublesbattle"
+pairs = 500
+concurrency = 4
+decision_min = 0
+decision_max = 7
+seed = 20260911
+battle_timeout_seconds = 180
+max_attempt_multiplier = 3
+resume = true

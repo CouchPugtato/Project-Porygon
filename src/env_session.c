@@ -90,6 +90,153 @@ static int sample_small_masked(const float* policy, const unsigned char* mask, s
     return -1;
 }
 
+static int ranked_masked_index(
+    const float* scores,
+    const unsigned char* mask,
+    size_t count,
+    int rank
+) {
+    unsigned char chosen[FACTORIZED_JOINT_DIM] = {0};
+    int selected = -1;
+    int current_rank;
+    size_t i;
+    if (!scores || !mask || count > sizeof(chosen) || rank < 0) return -1;
+    for (current_rank = 0; current_rank <= rank; ++current_rank) {
+        float best_score = -INFINITY;
+        selected = -1;
+        for (i = 0; i < count; ++i) {
+            if (!mask[i] || chosen[i]) continue;
+            if (selected < 0 || scores[i] > best_score) {
+                selected = (int)i;
+                best_score = scores[i];
+            }
+        }
+        if (selected < 0) return -1;
+        chosen[selected] = 1u;
+    }
+    return selected;
+}
+
+static void choose_best_move_target(
+    const ParsedRequest* request,
+    int slot,
+    const float* target_policy,
+    FactorizedActionChoice* choice
+) {
+    unsigned char target_mask[FACTORIZED_TARGET_DIM];
+    int target_index;
+    unsigned char* choice_target_index;
+    unsigned char* choice_target_mask;
+    unsigned char move_index;
+    if (!request || !target_policy || !choice) return;
+    if (slot == 0) {
+        if (!choice->slot0_has_action || choice->slot0_kind != FACTORIZED_ACTION_MOVE) return;
+        move_index = choice->slot0_move_index;
+        choice_target_index = &choice->slot0_target_index;
+        choice_target_mask = &choice->slot0_target_mask;
+    } else {
+        if (!choice->slot1_has_action || choice->slot1_kind != FACTORIZED_ACTION_MOVE) return;
+        move_index = choice->slot1_move_index;
+        choice_target_index = &choice->slot1_target_index;
+        choice_target_mask = &choice->slot1_target_mask;
+    }
+    *choice_target_mask = build_move_target_mask(request, slot, move_index);
+    if (*choice_target_mask == 0u) return;
+    factorized_target_mask_to_array(*choice_target_mask, target_mask);
+    target_index = ranked_masked_index(
+        target_policy, target_mask, FACTORIZED_TARGET_DIM, 0);
+    if (target_index >= 0) *choice_target_index = (unsigned char)target_index;
+}
+
+static int choose_ranked_counterfactual(
+    const EnvSession* session,
+    int use_joint_policy,
+    const float* joint_policy,
+    const unsigned char* joint_mask,
+    const float* flat_policy,
+    const float* slot0_target_policy,
+    const float* slot1_target_policy,
+    int rank,
+    FactorizedActionChoice* choice
+) {
+    int action = -1;
+    int action2 = -1;
+    int selected;
+    unsigned char flat_mask[OBS_NUM_ACTIONS] = {0};
+    int i;
+    if (!session || !choice || rank < 0) return 0;
+    if (use_joint_policy) {
+        selected = ranked_masked_index(
+            joint_policy, joint_mask, FACTORIZED_JOINT_DIM, rank);
+        if (selected < 0) return 0;
+        action = selected / FACTORIZED_LOCAL_ACTION_DIM;
+        action2 = 14 + (selected % FACTORIZED_LOCAL_ACTION_DIM);
+    } else {
+        int start = parsed_request_slot_needs_choice(&session->parsed_request, 0) ? 0 : 14;
+        int end = start + FACTORIZED_LOCAL_ACTION_DIM;
+        for (i = start; i < end; ++i) {
+            flat_mask[i] = session->observation.legal_mask[i];
+        }
+        selected = ranked_masked_index(flat_policy, flat_mask, OBS_NUM_ACTIONS, rank);
+        if (selected < 0) return 0;
+        if (start == 0) action = selected;
+        else action2 = selected;
+    }
+    factorized_action_choice_from_flat_actions(choice, action, action2);
+    choose_best_move_target(
+        &session->parsed_request, 0, slot0_target_policy, choice);
+    choose_best_move_target(
+        &session->parsed_request, 1, slot1_target_policy, choice);
+    return 1;
+}
+
+static void write_counterfactual_action(
+    FILE* out,
+    const EnvRuntime* runtime,
+    const EnvSession* session,
+    int action,
+    int action2,
+    const char* command
+) {
+    size_t i;
+    size_t hidden_dim = gru_model_hidden_dim(runtime->model);
+    const FactorizedActionChoice* choice = &session->pending_factorized_choice;
+    fprintf(out,
+        "{\"type\":\"action\",\"battle_id\":\"%s\",\"request_id\":%d,"
+        "\"action\":%d,\"action2\":%d,\"command\":\"%s\","
+        "\"counterfactual\":{\"decision_index\":%zu,\"action_rank\":%d},"
+        "\"baseline_value\":%.9g,\"behavior_log_prob\":%.9g,"
+        "\"slot0_has_action\":%u,\"slot0_kind\":%u,\"slot0_move_index\":%u,"
+        "\"slot0_switch_index\":%u,\"slot0_use_tera\":%u,"
+        "\"slot0_target_index\":%u,\"slot0_target_mask\":%u,"
+        "\"slot1_has_action\":%u,\"slot1_kind\":%u,\"slot1_move_index\":%u,"
+        "\"slot1_switch_index\":%u,\"slot1_use_tera\":%u,"
+        "\"slot1_target_index\":%u,\"slot1_target_mask\":%u,"
+        "\"hidden_dim\":%zu,\"hidden_state\":[",
+        session->battle_id, session->last_request_id, action, action2, command,
+        session->decision_count, session->pending_counterfactual_rank,
+        session->pending_old_value, session->pending_old_log_prob,
+        (unsigned int)choice->slot0_has_action, (unsigned int)choice->slot0_kind,
+        (unsigned int)choice->slot0_move_index, (unsigned int)choice->slot0_switch_index,
+        (unsigned int)choice->slot0_use_tera, (unsigned int)choice->slot0_target_index,
+        (unsigned int)choice->slot0_target_mask,
+        (unsigned int)choice->slot1_has_action, (unsigned int)choice->slot1_kind,
+        (unsigned int)choice->slot1_move_index, (unsigned int)choice->slot1_switch_index,
+        (unsigned int)choice->slot1_use_tera, (unsigned int)choice->slot1_target_index,
+        (unsigned int)choice->slot1_target_mask, hidden_dim);
+    for (i = 0; i < hidden_dim; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%.9g", session->hidden_state[i]);
+    }
+    fputs("],\"legal_mask\":[", out);
+    for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%u", (unsigned int)session->observation.legal_mask[i]);
+    }
+    fputs("]}\n", out);
+    fflush(out);
+}
+
 static void build_runtime_factor_masks(const unsigned char* legal_mask, int slot, unsigned char* kind_mask, unsigned char* move_mask, unsigned char* switch_mask) {
     int base = slot == 0 ? 0 : 14;
     int i;
@@ -147,6 +294,7 @@ static EnvSession* ensure_session(EnvRuntime* runtime, const char* battle_id, in
     parsed_request_init(&session->parsed_request);
     session->pending_action = -1;
     session->pending_action2 = -1;
+    session->pending_counterfactual_rank = -1;
     if (!episode_init(&session->episode, 32, runtime->obs_dim)) {
         return NULL;
     }
@@ -301,6 +449,8 @@ int env_runtime_init(
     runtime->replay_file = replay_file;
     runtime->replay_only = replay_only;
     runtime->reward_mode = reward_mode;
+    runtime->counterfactual_decision_index = -1;
+    runtime->counterfactual_action_rank = -1;
     runtime->policy_tag[0] = '\0';
     if (policy_tag && *policy_tag) {
         snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "%s", policy_tag);
@@ -308,6 +458,17 @@ int env_runtime_init(
     runtime->dense_reward_config.hp_swing_weight = dense_reward_config ? dense_reward_config->hp_swing_weight : ENV_DENSE_HP_SWING_WEIGHT_DEFAULT;
     runtime->dense_reward_config.faint_swing_weight = dense_reward_config ? dense_reward_config->faint_swing_weight : ENV_DENSE_FAINT_SWING_WEIGHT_DEFAULT;
     runtime->dense_reward_config.reward_clip = dense_reward_config ? dense_reward_config->reward_clip : ENV_DENSE_REWARD_CLIP_DEFAULT;
+    return 1;
+}
+
+int env_runtime_set_counterfactual_intervention(
+    EnvRuntime* runtime,
+    int decision_index,
+    int action_rank
+) {
+    if (!runtime || decision_index < 0 || action_rank < 0) return 0;
+    runtime->counterfactual_decision_index = decision_index;
+    runtime->counterfactual_action_rank = action_rank;
     return 1;
 }
 
@@ -484,6 +645,26 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             sampled_choice.slot1_switch_index = (unsigned char)sw;
         }
     }
+    session->pending_counterfactual = 0;
+    session->pending_counterfactual_rank = -1;
+    if (runtime->counterfactual_decision_index >= 0 &&
+            session->decision_count == (size_t)runtime->counterfactual_decision_index) {
+        if (!choose_ranked_counterfactual(
+                session, use_joint_policy, joint_policy, joint_mask, pair_policy,
+                slot0_target_policy, slot1_target_policy,
+                runtime->counterfactual_action_rank, &sampled_choice)) {
+            free(pair_policy);
+            runtime_emit_error_json(
+                json, sizeof(json), session->battle_id,
+                "counterfactual action rank is unavailable");
+            fputs(json, out);
+            fputc('\n', out);
+            fflush(out);
+            return 0;
+        }
+        session->pending_counterfactual = 1;
+        session->pending_counterfactual_rank = runtime->counterfactual_action_rank;
+    }
     if (!factorized_action_choice_to_flat_actions(&sampled_choice, &action, &action2)) {
         free(pair_policy);
         return 0;
@@ -613,10 +794,16 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     session->pending_action2 = action2;
     strncpy(session->pending_command, command, sizeof(session->pending_command) - 1);
     session->pending_command[sizeof(session->pending_command) - 1] = '\0';
-    runtime_emit_action_json(json, sizeof(json), session->battle_id, session->last_request_id, action, action2, command);
-    fputs(json, out);
-    fputc('\n', out);
-    fflush(out);
+    if (session->pending_counterfactual) {
+        write_counterfactual_action(out, runtime, session, action, action2, command);
+    } else {
+        runtime_emit_action_json(
+            json, sizeof(json), session->battle_id, session->last_request_id,
+            action, action2, command);
+        fputs(json, out);
+        fputc('\n', out);
+        fflush(out);
+    }
     return 1;
 }
 
@@ -822,8 +1009,11 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 session->episode.factorized_actions[session->episode.count - 1] = accepted_choice;
                 session->episode.old_log_probs[session->episode.count - 1] = session->pending_old_log_prob;
                 session->episode.old_values[session->episode.count - 1] = session->pending_old_value;
+                session->decision_count += 1u;
                 session->pending_action = -1;
                 session->pending_action2 = -1;
+                session->pending_counterfactual = 0;
+                session->pending_counterfactual_rank = -1;
                 session->pending_old_log_prob = 0.0f;
                 session->pending_old_value = 0.0f;
                 factorized_action_choice_init(&session->pending_factorized_choice);
@@ -831,6 +1021,8 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
             } else if (msg->accepted == 0) {
                 session->pending_action = -1;
                 session->pending_action2 = -1;
+                session->pending_counterfactual = 0;
+                session->pending_counterfactual_rank = -1;
                 session->pending_old_log_prob = 0.0f;
                 session->pending_old_value = 0.0f;
                 factorized_action_choice_init(&session->pending_factorized_choice);

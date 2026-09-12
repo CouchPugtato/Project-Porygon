@@ -118,6 +118,39 @@ accuracy rather than being counted as positive predictions.
 These thresholds detect a possible action-level signal; they do not establish
 playing strength.
 
+### Counterfactual rollout batches
+
+When TD(0), TD(lambda), and Monte Carlo targets all fail on ordinary rollout
+data, `tools/counterfactual_rollout.js` creates paired evidence instead of
+tuning the same optimizer again. For each pair it starts two in-process
+Pokemon Showdown battles with identical battle, team, and agent seeds. The
+candidate follows the same policy prefix in both branches, then takes its
+highest-ranked legal action in one branch and its second-ranked legal action in
+the other. Both branches play to completion against the same frozen opponent.
+
+The collector verifies that the frozen recurrent state and legal mask are
+identical at the intervention. It rejects pairs whose decision was not reached
+or whose actions are not distinct. Each accepted branch becomes one compact
+`counterfactual_sample` record containing the 128-value recurrent state, legal
+mask, joint action, and terminal return. This avoids copying the very large raw
+observation prefix into both branches.
+
+Pass `counterfactual_action_batch.jsonl` to
+`--check-counterfactual-q-fit`. The C diagnostic assigns whole pairs to stable
+train, selection, and holdout splits, trains the small action-Q sidecar over the
+frozen recurrent state, and restores the best selection epoch. In addition to
+the ordinary action-Q gates, publication requires at least ten holdout pairs
+with different outcomes and at least 55% correct within-pair ranking. A `.qv`
+sidecar is written only when every gate passes.
+
+This is a causal diagnostic, not a strength claim. Full-game continuations are
+still noisy, and the first comparison covers only policy ranks zero and one.
+The summary reports how often paired returns disagree; a very low disagreement
+rate means more pairs or broader action ranks are needed before training a
+policy from the result. Collector manifests and per-pair files are updated
+atomically, so `--resume true` continues after interruption without replaying
+completed pairs. Elapsed time and ETA include time from earlier resumed runs.
+
 `--check-action-q-fit-manifest` uses the same multiple-training-batch and
 separate-holdout arrangement as the critic diagnostic. `--action-q-output`
 writes a sidecar only when every holdout gate passes. The sidecar is not read by

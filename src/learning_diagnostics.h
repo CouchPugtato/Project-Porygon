@@ -5,6 +5,7 @@
 
 #include "episode.h"
 #include "action_value.h"
+#include "counterfactual_data.h"
 #include "gru_model.h"
 #include "gru_trainer.h"
 #include "policy_evaluation.h"
@@ -85,6 +86,11 @@ typedef struct {
     double advantage_target_residual_correlation;
     size_t advantage_direction_samples;
     double advantage_sign_accuracy;
+    size_t pair_count;
+    size_t discordant_pair_count;
+    double pair_ranking_accuracy;
+    double mean_absolute_target_gap;
+    double mean_absolute_predicted_gap;
     double mean_advantage;
     double mean_absolute_advantage;
     double max_absolute_advantage;
@@ -105,6 +111,7 @@ typedef struct {
     int holdout_loss_improved;
     int residual_ranking_detected;
     int advantage_direction_consistent;
+    int counterfactual_pair_signal_detected;
     int generalization_gap_acceptable;
     double explained_variance_generalization_gap;
     int action_signal_detected;
@@ -254,6 +261,28 @@ int learning_diagnostic_run_action_value_fit(
     ActionValueFitResult* result
 );
 
+int learning_diagnostic_run_counterfactual_action_value_fit(
+    ActionValueModel* action_value_model,
+    const GruModel* policy_model,
+    CounterfactualSample* const* train_samples,
+    size_t train_count,
+    CounterfactualSample* const* selection_samples,
+    size_t selection_count,
+    CounterfactualSample* const* holdout_samples,
+    size_t holdout_count,
+    size_t epochs,
+    size_t minibatch_pairs,
+    size_t early_stop_patience,
+    unsigned int shuffle_seed,
+    float learning_rate,
+    float adam_beta1,
+    float adam_beta2,
+    float adam_epsilon,
+    float gradient_clip,
+    float l2_coefficient,
+    ActionValueFitResult* result
+);
+
 int learning_diagnostic_write_action_value_report(
     const char* report_path,
     const char* training_source_path,
@@ -269,6 +298,23 @@ int learning_diagnostic_write_action_value_report(
     float gamma,
     float gae_lambda,
     ActionValueTargetMode target_mode,
+    float learning_rate,
+    float l2_coefficient,
+    const ActionValueModel* action_value_model,
+    const ActionValueFitResult* result
+);
+
+int learning_diagnostic_write_counterfactual_action_value_report(
+    const char* report_path,
+    const char* batch_path,
+    const char* checkpoint_path,
+    const char* action_value_path,
+    int action_value_published,
+    unsigned int validation_seed,
+    unsigned int shuffle_seed,
+    size_t epochs,
+    size_t minibatch_pairs,
+    size_t early_stop_patience,
     float learning_rate,
     float l2_coefficient,
     const ActionValueModel* action_value_model,

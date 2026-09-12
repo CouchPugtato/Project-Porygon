@@ -46,6 +46,7 @@ set(SHOWDOWN_CLIENT_SOURCES
 	src/checkpoint.c
 	src/gru_trainer.c
 	src/action_value.c
+	src/counterfactual_data.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c
 	src/validation_split.c
@@ -56,6 +57,12 @@ if(BUILD_LEGACY_NATIVE_SHOWDOWN)
 endif()
 
 add_executable(showdown_client ${SHOWDOWN_CLIENT_SOURCES})
+
+# GCC 15 can ICE while optimizing the large command dispatcher at -O3.
+# Keep the rest of the Release build at its normal optimization level.
+set_source_files_properties(src/main.c PROPERTIES
+    COMPILE_OPTIONS "$<$<AND:$<CONFIG:Release>,$<C_COMPILER_ID:GNU>>:-O2>"
+)
 
 set(SHOWDOWN_LEGALITY_TEST_SOURCES
 	src/legality_tests.c
@@ -74,6 +81,7 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/gru_model.c
 	src/gru_trainer.c
 	src/action_value.c
+	src/counterfactual_data.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c
 	src/validation_split.c

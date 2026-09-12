@@ -2,6 +2,7 @@
 #include "id_tables.h"
 #include "observation_builder.h"
 #include "checkpoint.h"
+#include "counterfactual_data.h"
 #include "gru_trainer.h"
 #include "learning_diagnostics.h"
 #include "policy_evaluation.h"
@@ -700,6 +701,181 @@ static int test_runtime_request_session_not_forced_doubles(void) {
     env_runtime_free(&runtime);
     gru_model_destroy(model);
     return 1;
+}
+
+static int send_counterfactual_test_state(EnvRuntime* runtime, FILE* output) {
+    const char* request_payload =
+        "{\"active\":["
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false},{\"id\":\"tackle\",\"pp\":35,\"maxpp\":35,\"target\":\"normal\",\"disabled\":false}],\"trapped\":false},"
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false},{\"id\":\"tackle\",\"pp\":35,\"maxpp\":35,\"target\":\"normal\",\"disabled\":false}],\"trapped\":false}"
+        "],\"side\":{\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/100\",\"active\":true},"
+        "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77, M\",\"condition\":\"100/100\",\"active\":true}"
+        "]}}";
+    static const char* const events[] = {
+        "|switch|p1a: A|Sawsbuck, L91, M|100/100",
+        "|switch|p1b: B|Kingambit, L77, M|100/100",
+        "|switch|p2a: X|Armarouge, L80, M|100/100",
+        "|switch|p2b: Y|Dodrio, L85, M|100/100"
+    };
+    RuntimeMessage message;
+    size_t i;
+    runtime_message_init(&message);
+    message.type = RUNTIME_MSG_BATTLE_START;
+    strcpy(message.battle_id, "battle-counterfactual-test");
+    message.is_doubles = 1;
+    if (!env_runtime_handle_message(runtime, &message, output)) return 0;
+    for (i = 0; i < sizeof(events) / sizeof(events[0]); ++i) {
+        runtime_message_init(&message);
+        message.type = RUNTIME_MSG_EVENT;
+        strcpy(message.battle_id, "battle-counterfactual-test");
+        message.is_doubles = 1;
+        strncpy(message.line, events[i], sizeof(message.line) - 1u);
+        if (!env_runtime_handle_message(runtime, &message, output)) return 0;
+    }
+    runtime_message_init(&message);
+    message.type = RUNTIME_MSG_REQUEST;
+    strcpy(message.battle_id, "battle-counterfactual-test");
+    message.is_doubles = 1;
+    message.request_id = 17;
+    strncpy(message.payload, request_payload, sizeof(message.payload) - 1u);
+    return env_runtime_handle_message(runtime, &message, output);
+}
+
+static int test_runtime_counterfactual_ranks_are_distinct_and_reported(void) {
+    const char* rank0_path = "counterfactual_rank0_test.jsonl";
+    const char* rank1_path = "counterfactual_rank1_test.jsonl";
+    GruModel* model = gru_model_create(observation_flat_size(), 8u, OBS_NUM_ACTIONS);
+    EnvRuntime rank0_runtime;
+    EnvRuntime rank1_runtime;
+    FILE* rank0_output = NULL;
+    FILE* rank1_output = NULL;
+    char rank0_json[1024];
+    char rank1_json[1024];
+    int rank0_action = -1;
+    int rank0_action2 = -1;
+    int rank1_action = -1;
+    int rank1_action2 = -1;
+    int ok = 1;
+    memset(&rank0_runtime, 0, sizeof(rank0_runtime));
+    memset(&rank1_runtime, 0, sizeof(rank1_runtime));
+    if (!assert_true(model != NULL, "create model for counterfactual runtime")) return 0;
+    remove(rank0_path);
+    remove(rank1_path);
+    rank0_output = fopen(rank0_path, "w+");
+    rank1_output = fopen(rank1_path, "w+");
+    ok &= assert_true(rank0_output && rank1_output, "create counterfactual runtime output files");
+    ok &= assert_true(env_runtime_init(
+        &rank0_runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "test.chk"),
+        "initialize rank-zero counterfactual runtime");
+    ok &= assert_true(env_runtime_init(
+        &rank1_runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "test.chk"),
+        "initialize rank-one counterfactual runtime");
+    ok &= assert_true(env_runtime_set_counterfactual_intervention(&rank0_runtime, 0, 0),
+        "configure rank-zero counterfactual intervention");
+    ok &= assert_true(env_runtime_set_counterfactual_intervention(&rank1_runtime, 0, 1),
+        "configure rank-one counterfactual intervention");
+    if (ok) {
+        srand(123u);
+        ok &= assert_true(send_counterfactual_test_state(&rank0_runtime, rank0_output),
+            "produce rank-zero counterfactual action");
+        srand(123u);
+        ok &= assert_true(send_counterfactual_test_state(&rank1_runtime, rank1_output),
+            "produce rank-one counterfactual action");
+    }
+    if (ok) {
+        rewind(rank0_output);
+        rewind(rank1_output);
+        ok &= assert_true(fgets(rank0_json, sizeof(rank0_json), rank0_output) != NULL &&
+            fgets(rank1_json, sizeof(rank1_json), rank1_output) != NULL,
+            "read counterfactual runtime actions");
+    }
+    if (ok) {
+        const char* rank0_action_text = strstr(rank0_json, "\"action\":");
+        const char* rank0_action2_text = strstr(rank0_json, "\"action2\":");
+        const char* rank1_action_text = strstr(rank1_json, "\"action\":");
+        const char* rank1_action2_text = strstr(rank1_json, "\"action2\":");
+        ok &= assert_true(rank0_action_text && rank0_action2_text &&
+            rank1_action_text && rank1_action2_text &&
+            sscanf(rank0_action_text, "\"action\":%d", &rank0_action) == 1 &&
+            sscanf(rank0_action2_text, "\"action2\":%d", &rank0_action2) == 1 &&
+            sscanf(rank1_action_text, "\"action\":%d", &rank1_action) == 1 &&
+            sscanf(rank1_action2_text, "\"action2\":%d", &rank1_action2) == 1,
+            "read counterfactual runtime action indices");
+        ok &= assert_true(rank0_action != rank1_action || rank0_action2 != rank1_action2,
+            "counterfactual ranks select distinct legal action pairs");
+        ok &= assert_true(strstr(rank0_json, "\"action_rank\":0") != NULL &&
+            strstr(rank1_json, "\"action_rank\":1") != NULL,
+            "counterfactual action metadata identifies each rank");
+    }
+    if (rank0_output) fclose(rank0_output);
+    if (rank1_output) fclose(rank1_output);
+    remove(rank0_path);
+    remove(rank1_path);
+    env_runtime_free(&rank0_runtime);
+    env_runtime_free(&rank1_runtime);
+    gru_model_destroy(model);
+    return ok;
+}
+
+static void write_counterfactual_dataset_sample(
+    FILE* output,
+    int rank,
+    int action,
+    float target,
+    float second_hidden
+) {
+    fprintf(output,
+        "{\"type\":\"counterfactual_sample\",\"pair_id\":\"pair-test\","
+        "\"policy_tag\":\"F:/repo/models/parent.chk\",\"action_rank\":%d,"
+        "\"decision_index\":2,\"action\":%d,\"action2\":-1,"
+        "\"slot0_has_action\":1,\"slot0_kind\":0,\"slot0_move_index\":%d,"
+        "\"slot0_switch_index\":0,\"slot0_use_tera\":0,"
+        "\"slot0_target_index\":0,\"slot0_target_mask\":0,"
+        "\"slot1_has_action\":0,\"slot1_kind\":0,\"slot1_move_index\":0,"
+        "\"slot1_switch_index\":0,\"slot1_use_tera\":0,"
+        "\"slot1_target_index\":0,\"slot1_target_mask\":0,"
+        "\"baseline_value\":0.1,\"target_value\":%.1f,\"hidden_dim\":2,"
+        "\"hidden_state\":[0.25,%.2f],"
+        "\"legal_mask\":[1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}\n",
+        rank, action, action, target, second_hidden);
+}
+
+static int test_counterfactual_dataset_preserves_whole_pairs(void) {
+    const char* path = "counterfactual_dataset_test.jsonl";
+    CounterfactualDataset dataset;
+    FILE* output;
+    int ok = 1;
+    memset(&dataset, 0, sizeof(dataset));
+    remove(path);
+    output = fopen(path, "w");
+    if (!assert_true(output != NULL, "create counterfactual dataset fixture")) return 0;
+    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f);
+    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f);
+    fclose(output);
+    ok &= assert_true(counterfactual_dataset_load(
+        &dataset, path, 2, ".\\models\\parent.chk"),
+        "load valid compact counterfactual pair");
+    ok &= assert_true(dataset.pair_count == 1 && dataset.count == 2,
+        "counterfactual loader retains two samples as one pair");
+    if (dataset.count == 2) {
+        ok &= assert_true(dataset.samples[0].action_rank == 0 &&
+            dataset.samples[1].action_rank == 1,
+            "counterfactual pair retains ranked branch order");
+    }
+    counterfactual_dataset_free(&dataset);
+
+    output = fopen(path, "w");
+    if (!assert_true(output != NULL, "rewrite counterfactual dataset fixture")) return 0;
+    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f);
+    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, 0.5f);
+    fclose(output);
+    ok &= assert_true(!counterfactual_dataset_load(
+        &dataset, path, 2, ".\\models\\parent.chk"),
+        "reject counterfactual branches with different recurrent states");
+    counterfactual_dataset_free(&dataset);
+    remove(path);
+    return ok;
 }
 
 static int test_runtime_dense_additive_rewards(void) {
@@ -5137,6 +5313,8 @@ int main(int argc, char** argv) {
     if (!test_condition_status_without_hp_preserves_hp()) return 1;
     if (!test_turn_number_not_overwritten_by_request()) return 1;
     if (!test_runtime_request_session_not_forced_doubles()) return 1;
+    if (!test_runtime_counterfactual_ranks_are_distinct_and_reported()) return 1;
+    if (!test_counterfactual_dataset_preserves_whole_pairs()) return 1;
     if (!test_runtime_dense_additive_rewards()) return 1;
     if (!test_single_turn_side_guards_reconstructed()) return 1;
     if (!test_switch_clears_volatile_state()) return 1;
