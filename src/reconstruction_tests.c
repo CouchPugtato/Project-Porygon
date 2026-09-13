@@ -837,7 +837,8 @@ static void write_counterfactual_dataset_sample(
         "\"slot1_target_index\":0,\"slot1_target_mask\":0,"
         "\"baseline_value\":0.1,\"target_value\":%.1f,\"hidden_dim\":2,"
         "\"hidden_state\":[0.25,%.2f],"
-        "\"legal_mask\":[1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}\n",
+        "\"legal_mask\":[1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"
+        "\"rollout_count\":12,\"rollout_variance\":0.75}\n",
         rank, action, action, target, second_hidden);
 }
 
@@ -862,6 +863,10 @@ static int test_counterfactual_dataset_preserves_whole_pairs(void) {
         ok &= assert_true(dataset.samples[0].action_rank == 0 &&
             dataset.samples[1].action_rank == 1,
             "counterfactual pair retains ranked branch order");
+        ok &= assert_true(dataset.samples[0].has_rollout_statistics &&
+            dataset.samples[0].rollout_count == 12u &&
+            fabsf(dataset.samples[0].rollout_variance - 0.75f) < 1.0e-6f,
+            "counterfactual loader retains repeated-rollout uncertainty");
     }
     counterfactual_dataset_free(&dataset);
 
@@ -875,6 +880,46 @@ static int test_counterfactual_dataset_preserves_whole_pairs(void) {
         "reject counterfactual branches with different recurrent states");
     counterfactual_dataset_free(&dataset);
     remove(path);
+    return ok;
+}
+
+static int test_counterfactual_preference_confidence_uses_repeat_uncertainty(void) {
+    CounterfactualSample strong;
+    CounterfactualSample weak;
+    CounterfactualSample baseline;
+    float strong_weight;
+    float weak_weight;
+    int ok = 1;
+
+    memset(&strong, 0, sizeof(strong));
+    memset(&weak, 0, sizeof(weak));
+    memset(&baseline, 0, sizeof(baseline));
+    strong.target_value = 0.5f;
+    strong.has_rollout_statistics = 1;
+    strong.rollout_count = 12u;
+    strong.rollout_variance = 0.05f;
+    weak.target_value = 0.1f;
+    weak.has_rollout_statistics = 1;
+    weak.rollout_count = 3u;
+    weak.rollout_variance = 1.0f;
+    baseline.has_rollout_statistics = 1;
+    baseline.rollout_count = 12u;
+    baseline.rollout_variance = 0.05f;
+
+    strong_weight = counterfactual_pair_preference_weight(&strong, &baseline);
+    weak_weight = counterfactual_pair_preference_weight(&weak, &baseline);
+    ok &= assert_true(strong_weight > 0.99f,
+        "well-separated repeated outcomes receive high confidence");
+    ok &= assert_true(weak_weight > 0.0f && weak_weight < strong_weight,
+        "noisy small return gaps receive less confidence");
+    baseline.has_rollout_statistics = 0;
+    ok &= assert_true(fabsf(counterfactual_pair_preference_weight(
+            &strong, &baseline) - 1.0f) < 1.0e-6f,
+        "legacy counterfactual pairs keep compatibility weight");
+    baseline.target_value = strong.target_value;
+    ok &= assert_true(counterfactual_pair_preference_weight(
+            &strong, &baseline) == 0.0f,
+        "tied counterfactual outcomes receive no preference weight");
     return ok;
 }
 
@@ -4891,6 +4936,7 @@ static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
     ActionValuePrediction worse_after;
     float loss_before = 0.0f;
     float loss_after = 0.0f;
+    float weighted_loss = 0.0f;
     int preference_used = 0;
     int update;
     int ok = 1;
@@ -4927,6 +4973,12 @@ static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
             value_model, policy_model, &better, &worse,
             &loss_before, &preference_used) && preference_used,
         "measure initial pairwise preference loss");
+    action_value_model_clear_gradients(value_model);
+    ok &= assert_true(action_value_model_accumulate_weighted_preference(
+            value_model, policy_model, &better, &worse, 0.25f,
+            &weighted_loss, &preference_used) && preference_used &&
+            fabsf(weighted_loss - 0.25f * loss_before) < 1.0e-6f,
+        "pair confidence scales the preference contribution");
     action_value_model_clear_gradients(value_model);
     for (update = 0; update < 20; ++update) {
         ok &= assert_true(action_value_model_accumulate_preference(
@@ -5516,6 +5568,7 @@ int main(int argc, char** argv) {
     if (!test_runtime_request_session_not_forced_doubles()) return 1;
     if (!test_runtime_counterfactual_ranks_are_distinct_and_reported()) return 1;
     if (!test_counterfactual_dataset_preserves_whole_pairs()) return 1;
+    if (!test_counterfactual_preference_confidence_uses_repeat_uncertainty()) return 1;
     if (!test_counterfactual_external_holdout_stays_separate()) return 1;
     if (!test_runtime_dense_additive_rewards()) return 1;
     if (!test_single_turn_side_guards_reconstructed()) return 1;

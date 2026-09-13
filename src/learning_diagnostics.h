@@ -90,6 +90,11 @@ typedef struct {
     size_t discordant_pair_count;
     double pair_ranking_accuracy;
     double pairwise_preference_loss;
+    size_t repeated_pair_count;
+    double pair_confidence_sum;
+    double mean_pair_confidence;
+    double confidence_weighted_pair_ranking_accuracy;
+    double confidence_weighted_pairwise_preference_loss;
     double mean_absolute_target_gap;
     double mean_absolute_predicted_gap;
     double mean_advantage;

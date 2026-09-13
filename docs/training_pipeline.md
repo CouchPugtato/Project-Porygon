@@ -166,10 +166,16 @@ and whether the holdout was external.
 The diagnostic trains the small action-Q sidecar over the frozen recurrent
 state. Counterfactual fitting uses a pairwise logistic objective: it increases
 the Q gap toward the branch with the better terminal result and omits tied
-pairs. Early stopping follows selection-set pairwise loss. Publication requires
-at least a 1% pairwise-loss improvement on the holdout, at least ten holdout
-pairs with different outcomes, and at least 55% correct within-pair ranking. A
-`.qv` sidecar is written only when every gate passes.
+pairs. Repeated pairs are weighted continuously using the mean return gap and
+its standard error. Clear, repeatable preferences approach weight one; noisy
+small gaps approach zero. Older one-shot batches retain weight one for
+compatibility. The report keeps both raw and confidence-weighted metrics.
+
+Early stopping follows confidence-weighted selection loss. Publication
+requires at least a 1% weighted-loss improvement on the holdout, at least ten
+holdout pairs with different outcomes, and at least 55% confidence-weighted
+within-pair ranking accuracy. A `.qv` sidecar is written only when every gate
+passes.
 
 An external batch can be used repeatedly for development with the default
 `--counterfactual-final-confirmation 0`. Such reports explicitly require a

@@ -189,7 +189,11 @@ static int parse_sample(
 ) {
     char type[48];
     int encoded_hidden_dim;
+    int rollout_count;
+    int has_rollout_count;
+    int has_rollout_variance;
     memset(sample, 0, sizeof(*sample));
+    sample->rollout_count = 1u;
     factorized_action_choice_init(&sample->choice);
     if (!read_string(line, "type", type, sizeof(type)) ||
             strcmp(type, "counterfactual_sample") != 0 ||
@@ -205,6 +209,17 @@ static int parse_sample(
             !read_float(line, "target_value", &sample->target_value) ||
             !read_choice(line, sample) ||
             !read_mask(line, "legal_mask", sample->legal_mask, OBS_NUM_ACTIONS)) return 0;
+    has_rollout_count = find_value(line, "rollout_count") != NULL;
+    has_rollout_variance = find_value(line, "rollout_variance") != NULL;
+    if (has_rollout_count != has_rollout_variance) return 0;
+    if (has_rollout_count) {
+        if (!read_int(line, "rollout_count", &rollout_count) || rollout_count < 2 ||
+                !read_float(line, "rollout_variance", &sample->rollout_variance) ||
+                !isfinite(sample->rollout_variance) ||
+                sample->rollout_variance < 0.0f) return 0;
+        sample->rollout_count = (size_t)rollout_count;
+        sample->has_rollout_statistics = 1;
+    }
     sample->hidden_state = (float*)malloc(hidden_dim * sizeof(*sample->hidden_state));
     if (!sample->hidden_state ||
             !read_float_array(line, "hidden_state", sample->hidden_state, hidden_dim)) {
@@ -266,6 +281,9 @@ static int samples_form_pair(
             !path_tags_match(first->policy_tag, second->policy_tag) ||
             first->action_rank != 0 || second->action_rank != 1 ||
             first->decision_index != second->decision_index ||
+            first->has_rollout_statistics != second->has_rollout_statistics ||
+            (first->has_rollout_statistics &&
+                first->rollout_count != second->rollout_count) ||
             memcmp(first->hidden_state, second->hidden_state,
                 hidden_dim * sizeof(*first->hidden_state)) != 0 ||
             memcmp(first->legal_mask, second->legal_mask, OBS_NUM_ACTIONS) != 0) return 0;
@@ -404,4 +422,24 @@ void counterfactual_dataset_split_free(CounterfactualDatasetSplit* split) {
     free(split->selection);
     free(split->train);
     memset(split, 0, sizeof(*split));
+}
+
+float counterfactual_pair_preference_weight(
+    const CounterfactualSample* first,
+    const CounterfactualSample* second
+) {
+    float target_gap;
+    float variance;
+    float z_score;
+    if (!first || !second) return 0.0f;
+    target_gap = fabsf(first->target_value - second->target_value);
+    if (!isfinite(target_gap) || target_gap <= 1.0e-6f) return 0.0f;
+    if (!first->has_rollout_statistics || !second->has_rollout_statistics ||
+            first->rollout_count < 2u || second->rollout_count < 2u) return 1.0f;
+    variance = first->rollout_variance / (float)first->rollout_count +
+        second->rollout_variance / (float)second->rollout_count;
+    if (!isfinite(variance)) return 0.0f;
+    if (variance <= 1.0e-12f) return 1.0f;
+    z_score = target_gap / sqrtf(variance);
+    return erff(z_score * 0.7071067811865475f);
 }

@@ -80,6 +80,15 @@ int action_value_model_accumulate_preference(
     float* loss_out,
     int* preference_used
 );
+int action_value_model_accumulate_weighted_preference(
+    ActionValueModel* model,
+    const GruModel* policy_model,
+    const ActionValueExample* first,
+    const ActionValueExample* second,
+    float preference_weight,
+    float* loss_out,
+    int* preference_used
+);
 int action_value_model_apply_adam(
     ActionValueModel* model,
     float learning_rate,

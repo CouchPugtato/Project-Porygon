@@ -19,6 +19,9 @@ typedef struct {
     FactorizedActionChoice choice;
     float baseline_value;
     float target_value;
+    size_t rollout_count;
+    float rollout_variance;
+    int has_rollout_statistics;
     float* hidden_state;
     unsigned char legal_mask[OBS_NUM_ACTIONS];
 } CounterfactualSample;
@@ -55,5 +58,9 @@ int counterfactual_dataset_split(
     CounterfactualDatasetSplit* split
 );
 void counterfactual_dataset_split_free(CounterfactualDatasetSplit* split);
+float counterfactual_pair_preference_weight(
+    const CounterfactualSample* first,
+    const CounterfactualSample* second
+);
 
 #endif

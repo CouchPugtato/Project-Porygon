@@ -488,11 +488,12 @@ cleanup:
     return ok;
 }
 
-int action_value_model_accumulate_preference(
+int action_value_model_accumulate_weighted_preference(
     ActionValueModel* model,
     const GruModel* policy_model,
     const ActionValueExample* first,
     const ActionValueExample* second,
+    float preference_weight,
     float* loss_out,
     int* preference_used
 ) {
@@ -509,9 +510,10 @@ int action_value_model_accumulate_preference(
     if (!model || !policy_model || !first || !second ||
             !first->hidden_state || !second->hidden_state ||
             !first->legal_mask || !second->legal_mask ||
-            !first->choice || !second->choice) return 0;
+            !first->choice || !second->choice ||
+            !isfinite(preference_weight) || preference_weight < 0.0f) return 0;
     target_gap = first->target_value - second->target_value;
-    if (fabsf(target_gap) <= 1.0e-6f) return 1;
+    if (fabsf(target_gap) <= 1.0e-6f || preference_weight <= 1.0e-6f) return 1;
     if (!prepare_work(
             model, policy_model, first->hidden_state, first->legal_mask,
             first->choice, first->action0, first->action1, &first_work) ||
@@ -525,13 +527,14 @@ int action_value_model_accumulate_preference(
         (second->baseline_value + second_work.selected_raw - second_work.expected_raw);
     signed_margin = direction * predicted_gap;
     if (loss_out) {
-        *loss_out = signed_margin >= 0.0f
+        *loss_out = preference_weight * (signed_margin >= 0.0f
             ? log1pf(expf(-signed_margin))
-            : -signed_margin + log1pf(expf(signed_margin));
+            : -signed_margin + log1pf(expf(signed_margin)));
     }
     gradient = signed_margin >= 0.0f
         ? -direction * expf(-signed_margin) / (1.0f + expf(-signed_margin))
         : -direction / (1.0f + expf(signed_margin));
+    gradient *= preference_weight;
     if (!accumulate_work_gradient(
             model, &first_work, first->choice, first->hidden_state, gradient) ||
             !accumulate_work_gradient(
@@ -545,6 +548,19 @@ cleanup:
     free_work(&second_work);
     free_work(&first_work);
     return ok;
+}
+
+int action_value_model_accumulate_preference(
+    ActionValueModel* model,
+    const GruModel* policy_model,
+    const ActionValueExample* first,
+    const ActionValueExample* second,
+    float* loss_out,
+    int* preference_used
+) {
+    return action_value_model_accumulate_weighted_preference(
+        model, policy_model, first, second, 1.0f,
+        loss_out, preference_used);
 }
 
 int action_value_model_apply_adam(
