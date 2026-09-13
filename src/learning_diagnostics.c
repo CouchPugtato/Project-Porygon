@@ -1273,6 +1273,14 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
             break;
         }
     }
+    result->last_attempted_epoch = result->epochs_completed;
+    if (!evaluate_counterfactual_action_value(
+            action_value_model, policy_model, train_samples, train_count,
+            &result->last_attempted_train) ||
+            !evaluate_counterfactual_action_value(
+                action_value_model, policy_model,
+                selection_samples, selection_count,
+                &result->last_attempted_selection)) goto failure;
     if (!action_value_model_import_parameters(
             action_value_model, best_parameters, parameter_count) ||
             !evaluate_counterfactual_action_value(
@@ -1474,6 +1482,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     const char* holdout_batch_path,
     int external_holdout,
     int final_confirmation,
+    size_t overfit_pair_count,
     const char* checkpoint_path,
     const char* action_value_path,
     int action_value_published,
@@ -1491,23 +1500,30 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     if (!report_path || !*report_path || !action_value_model || !result) return 0;
     out = fopen(report_path, "w");
     if (!out) return 0;
-    fputs("{\n  \"diagnostic\": \"paired_counterfactual_joint_q_fit\",\n", out);
-    fputs("  \"metrics_version\": 4,\n  \"counterfactual_batch\": ", out);
+    fprintf(out, "{\n  \"diagnostic\": \"%s\",\n",
+        overfit_pair_count > 0
+            ? "counterfactual_q_real_data_overfit"
+            : "paired_counterfactual_joint_q_fit");
+    fputs("  \"metrics_version\": 5,\n  \"counterfactual_batch\": ", out);
     write_json_string(out, batch_path);
     fputs(",\n  \"holdout_batch\": ", out);
     write_json_string(out, holdout_batch_path);
     fprintf(out, ",\n  \"holdout_source\": \"%s\"",
-        external_holdout ? "external_batch" : "stable_pair_split");
+        overfit_pair_count > 0 ? "reused_training_subset" :
+        (external_holdout ? "external_batch" : "stable_pair_split"));
     fprintf(out, ",\n  \"holdout_role\": \"%s\"",
-        final_confirmation ? "final_confirmation" : "development");
+        overfit_pair_count > 0 ? "overfit_only" :
+        (final_confirmation ? "final_confirmation" : "development"));
     fprintf(out, ",\n  \"fresh_holdout_required_for_final_claim\": %s",
-        final_confirmation ? "false" : "true");
+        final_confirmation && overfit_pair_count == 0 ? "false" : "true");
+    fprintf(out, ",\n  \"overfit_pair_count\": %zu", overfit_pair_count);
     fputs(",\n  \"encoder_checkpoint\": ", out);
     write_json_string(out, checkpoint_path);
     fputs(",\n  \"action_value_path\": ", out);
     write_json_string(out, action_value_path);
     fprintf(out,
         ",\n  \"action_value_published\": %s,\n"
+        "  \"publication_allowed\": %s,\n"
         "  \"encoder_frozen\": true,\n"
         "  \"policy_frozen\": true,\n"
         "  \"target_value_source\": \"matched_terminal_counterfactual_rollouts\",\n"
@@ -1523,17 +1539,20 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"epochs_requested\": %zu,\n"
         "  \"epochs_completed\": %zu,\n"
         "  \"best_epoch\": %zu,\n"
+        "  \"last_attempted_epoch\": %zu,\n"
         "  \"stopped_early\": %s,\n"
         "  \"early_stop_patience\": %zu,\n"
         "  \"minibatch_pairs\": %zu,\n"
         "  \"learning_rate\": %.9g,\n"
         "  \"l2_coefficient\": %.9g,\n",
         action_value_published ? "true" : "false",
+        overfit_pair_count > 0 ? "false" : "true",
         action_value_model_hidden_dim(action_value_model),
         action_value_model_latent_dim(action_value_model),
         action_value_model_parameter_count(action_value_model),
         validation_seed, shuffle_seed, epochs, result->epochs_completed,
-        result->best_epoch, result->stopped_early ? "true" : "false",
+        result->best_epoch, result->last_attempted_epoch,
+        result->stopped_early ? "true" : "false",
         early_stop_patience, minibatch_pairs, learning_rate, l2_coefficient);
     fputs("  \"before\": {\n    \"train\": ", out);
     write_action_value_metrics(out, &result->before_train, "    ");
@@ -1547,18 +1566,27 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     write_action_value_metrics(out, &result->after_selection, "    ");
     fputs(",\n    \"holdout\": ", out);
     write_action_value_metrics(out, &result->after_holdout, "    ");
+    fputs("\n  },\n  \"last_attempted\": {\n    \"train\": ", out);
+    write_action_value_metrics(out, &result->last_attempted_train, "    ");
+    fputs(",\n    \"selection\": ", out);
+    write_action_value_metrics(out, &result->last_attempted_selection, "    ");
     fputs("\n  },\n  \"assessment\": {\n", out);
     fprintf(out,
         "    \"training_completed\": %s,\n"
         "    \"pairwise_holdout_loss_improved\": %s,\n"
         "    \"counterfactual_pair_signal_detected\": %s,\n"
-        "    \"action_signal_detected\": %s,\n",
+        "    \"action_signal_detected\": %s,\n"
+        "    \"overfit_passed\": %s,\n",
         result->training_completed ? "true" : "false",
         result->pairwise_holdout_loss_improved ? "true" : "false",
         result->counterfactual_pair_signal_detected ? "true" : "false",
-        result->action_signal_detected ? "true" : "false");
-    fputs("    \"pass_rule\": \"confidence-weighted pairwise holdout loss improves at least 1%, at least 10 discordant holdout pairs achieve at least 55% confidence-weighted ranking accuracy, outputs remain finite, and advantages remain bounded\"\n",
-        out);
+        result->action_signal_detected ? "true" : "false",
+        result->counterfactual_overfit_passed ? "true" : "false");
+    if (overfit_pair_count > 0) {
+        fputs("    \"pass_rule\": \"on the reused real-data subset, confidence-weighted pairwise loss falls at least 50%, weighted ranking accuracy reaches at least 90%, at least 10 discordant pairs contribute, and outputs remain finite\"\n", out);
+    } else {
+        fputs("    \"pass_rule\": \"confidence-weighted pairwise holdout loss improves at least 1%, at least 10 discordant holdout pairs achieve at least 55% confidence-weighted ranking accuracy, outputs remain finite, and advantages remain bounded\"\n", out);
+    }
     fputs("  }\n}\n", out);
     return fclose(out) == 0;
 }

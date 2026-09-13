@@ -110,8 +110,11 @@ typedef struct {
     ActionValueFitMetrics after_train;
     ActionValueFitMetrics after_selection;
     ActionValueFitMetrics after_holdout;
+    ActionValueFitMetrics last_attempted_train;
+    ActionValueFitMetrics last_attempted_selection;
     size_t epochs_completed;
     size_t best_epoch;
+    size_t last_attempted_epoch;
     int stopped_early;
     int training_completed;
     int holdout_loss_improved;
@@ -122,6 +125,7 @@ typedef struct {
     int generalization_gap_acceptable;
     double explained_variance_generalization_gap;
     int action_signal_detected;
+    int counterfactual_overfit_passed;
 } ActionValueFitResult;
 
 typedef enum {
@@ -317,6 +321,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     const char* holdout_batch_path,
     int external_holdout,
     int final_confirmation,
+    size_t overfit_pair_count,
     const char* checkpoint_path,
     const char* action_value_path,
     int action_value_published,

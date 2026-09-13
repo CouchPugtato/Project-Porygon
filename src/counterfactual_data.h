@@ -57,6 +57,11 @@ int counterfactual_dataset_split(
     unsigned int validation_seed,
     CounterfactualDatasetSplit* split
 );
+int counterfactual_dataset_overfit_subset(
+    CounterfactualDataset* dataset,
+    size_t requested_pair_count,
+    CounterfactualDatasetSplit* split
+);
 void counterfactual_dataset_split_free(CounterfactualDatasetSplit* split);
 float counterfactual_pair_preference_weight(
     const CounterfactualSample* first,

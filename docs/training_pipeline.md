@@ -177,6 +177,15 @@ holdout pairs with different outcomes, and at least 55% confidence-weighted
 within-pair ranking accuracy. A `.qv` sidecar is written only when every gate
 passes.
 
+If a generalization run selects epoch zero, use
+`--check-counterfactual-q-overfit` before collecting more data. It reuses a
+deterministic prefix of real pairs for training and evaluation, cannot publish
+a sidecar, and passes only when weighted preference loss falls by at least 50%
+and weighted ranking accuracy reaches 90% on at least ten discordant pairs.
+This is a trainer-capacity check, not evidence of generalization or playing
+strength. Counterfactual reports also retain metrics from the last attempted
+epoch before restoring the best selection checkpoint.
+
 An external batch can be used repeatedly for development with the default
 `--counterfactual-final-confirmation 0`. Such reports explicitly require a
 fresh holdout before making a final claim. Set

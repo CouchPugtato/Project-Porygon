@@ -975,6 +975,17 @@ static int test_counterfactual_external_holdout_stays_separate(void) {
         "internal split keeps each pair in one partition");
     counterfactual_dataset_split_free(&split);
 
+    ok &= assert_true(counterfactual_dataset_overfit_subset(
+            &training, 2u, &split),
+        "build deterministic counterfactual overfit subset");
+    ok &= assert_true(split.train_count == 4 && split.selection_count == 4 &&
+            split.holdout_count == 4 &&
+            split.train[0] == &training.samples[0] &&
+            split.selection[0] == split.train[0] &&
+            split.holdout[3] == split.train[3],
+        "overfit subset reuses only the requested leading pairs");
+    counterfactual_dataset_split_free(&split);
+
     ok &= assert_true(counterfactual_dataset_split(
         &training, &holdout, seed, &split), "build external counterfactual holdout");
     ok &= assert_true(split.train_count == 4 && split.selection_count == 2 &&
@@ -5018,6 +5029,73 @@ static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
     return ok;
 }
 
+static int test_counterfactual_q_overfits_repeated_real_shape_pairs(void) {
+    enum { PAIR_COUNT = 12 };
+    GruModel* policy_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    ActionValueModel* value_model = NULL;
+    CounterfactualSample samples[PAIR_COUNT * 2];
+    CounterfactualSample* sample_pointers[PAIR_COUNT * 2];
+    ActionValueFitResult result;
+    float hidden[8] = {0.1f, -0.2f, 0.3f, -0.4f};
+    unsigned char legal[OBS_NUM_ACTIONS] = {0};
+    size_t pair_index;
+    int ok = 1;
+
+    if (!assert_true(policy_model && zero_model_parameters(policy_model),
+            "initialize counterfactual overfit policy fixture")) {
+        gru_model_destroy(policy_model);
+        return 0;
+    }
+    value_model = action_value_model_create(8u, 8u, 197u);
+    if (!assert_true(value_model != NULL,
+            "initialize counterfactual overfit sidecar")) {
+        gru_model_destroy(policy_model);
+        return 0;
+    }
+    legal[0] = legal[1] = legal[14] = legal[15] = 1;
+    memset(samples, 0, sizeof(samples));
+    for (pair_index = 0; pair_index < PAIR_COUNT; ++pair_index) {
+        CounterfactualSample* preferred = &samples[pair_index * 2u];
+        CounterfactualSample* rejected = preferred + 1;
+        snprintf(preferred->pair_id, sizeof(preferred->pair_id),
+            "overfit-pair-%zu", pair_index);
+        snprintf(rejected->pair_id, sizeof(rejected->pair_id),
+            "overfit-pair-%zu", pair_index);
+        preferred->hidden_state = hidden;
+        rejected->hidden_state = hidden;
+        memcpy(preferred->legal_mask, legal, sizeof(legal));
+        memcpy(rejected->legal_mask, legal, sizeof(legal));
+        factorized_action_choice_from_flat_actions(&preferred->choice, 0, 14);
+        factorized_action_choice_from_flat_actions(&rejected->choice, 1, 15);
+        preferred->action = 0;
+        preferred->action2 = 14;
+        preferred->target_value = 1.0f;
+        rejected->action = 1;
+        rejected->action2 = 15;
+        rejected->target_value = -1.0f;
+        sample_pointers[pair_index * 2u] = preferred;
+        sample_pointers[pair_index * 2u + 1u] = rejected;
+    }
+    ok &= assert_true(learning_diagnostic_run_counterfactual_action_value_fit(
+            value_model, policy_model,
+            sample_pointers, PAIR_COUNT * 2u,
+            sample_pointers, PAIR_COUNT * 2u,
+            sample_pointers, PAIR_COUNT * 2u,
+            40u, 4u, 5u, 197u,
+            0.03f, 0.9f, 0.999f, 1.0e-8f, 1.0f, 0.0f, &result),
+        "run counterfactual real-shape overfit fixture");
+    ok &= assert_true(result.best_epoch > 0u &&
+            result.last_attempted_epoch == result.epochs_completed &&
+            result.after_train.confidence_weighted_pairwise_preference_loss <
+                result.before_train.confidence_weighted_pairwise_preference_loss * 0.5 &&
+            result.after_train.confidence_weighted_pair_ranking_accuracy > 0.9,
+        "counterfactual sidecar can memorize repeated pair preferences");
+
+    action_value_model_destroy(value_model);
+    gru_model_destroy(policy_model);
+    return ok;
+}
+
 static int test_action_value_target_modes(void) {
     Episode episode;
     float rewards[3] = {0.0f, 0.0f, 1.0f};
@@ -5650,6 +5728,7 @@ int main(int argc, char** argv) {
     if (!test_synthetic_sideend_clears_sticky_web()) return 1;
     if (!test_synthetic_weather_clear_sets_unknown_duration()) return 1;
     if (!test_action_value_pairwise_preference_moves_the_value_gap()) return 1;
+    if (!test_counterfactual_q_overfits_repeated_real_shape_pairs()) return 1;
     printf("reconstruction tests passed\n");
     return 0;
 }

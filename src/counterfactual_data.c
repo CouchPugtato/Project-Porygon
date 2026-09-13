@@ -416,6 +416,42 @@ int counterfactual_dataset_split(
     return 1;
 }
 
+int counterfactual_dataset_overfit_subset(
+    CounterfactualDataset* dataset,
+    size_t requested_pair_count,
+    CounterfactualDatasetSplit* split
+) {
+    size_t sample_count;
+    size_t sample_index;
+    if (!dataset || !split || requested_pair_count == 0 ||
+            dataset->pair_count == 0) return 0;
+    memset(split, 0, sizeof(*split));
+    if (requested_pair_count > dataset->pair_count) {
+        requested_pair_count = dataset->pair_count;
+    }
+    sample_count = requested_pair_count * 2u;
+    split->train = (CounterfactualSample**)malloc(
+        sample_count * sizeof(*split->train));
+    split->selection = (CounterfactualSample**)malloc(
+        sample_count * sizeof(*split->selection));
+    split->holdout = (CounterfactualSample**)malloc(
+        sample_count * sizeof(*split->holdout));
+    if (!split->train || !split->selection || !split->holdout) {
+        counterfactual_dataset_split_free(split);
+        return 0;
+    }
+    for (sample_index = 0; sample_index < sample_count; ++sample_index) {
+        CounterfactualSample* sample = &dataset->samples[sample_index];
+        split->train[sample_index] = sample;
+        split->selection[sample_index] = sample;
+        split->holdout[sample_index] = sample;
+    }
+    split->train_count = sample_count;
+    split->selection_count = sample_count;
+    split->holdout_count = sample_count;
+    return 1;
+}
+
 void counterfactual_dataset_split_free(CounterfactualDatasetSplit* split) {
     if (!split) return;
     free(split->holdout);
