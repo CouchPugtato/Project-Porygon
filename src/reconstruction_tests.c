@@ -5496,7 +5496,6 @@ int main(int argc, char** argv) {
     if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
     if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
     if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;
-    if (!test_action_value_pairwise_preference_moves_the_value_gap()) return 1;
     if (!test_action_value_target_modes()) return 1;
     if (!test_ppo_clipped_policy_still_updates_value()) return 1;
     if (!test_dual_action_turn_has_one_value_target()) return 1;
@@ -5597,6 +5596,7 @@ int main(int argc, char** argv) {
     if (!test_synthetic_sideend_clears_tailwind()) return 1;
     if (!test_synthetic_sideend_clears_sticky_web()) return 1;
     if (!test_synthetic_weather_clear_sets_unknown_duration()) return 1;
+    if (!test_action_value_pairwise_preference_moves_the_value_gap()) return 1;
     printf("reconstruction tests passed\n");
     return 0;
 }

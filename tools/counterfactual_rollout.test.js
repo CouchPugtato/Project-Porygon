@@ -14,10 +14,12 @@ const {
     buildCounterfactualSample,
     choiceRejectionReason,
     choicesDiffer,
+    continuationSeed,
     drivePlayer,
     equalPrefix,
     recoverManifestFromPairFiles,
     seedTuple,
+    summarizeCounterfactualSignal,
     summarizeFailureLog,
     writeJsonAtomic,
 } = require('./counterfactual_rollout');
@@ -50,13 +52,19 @@ function sampleAction() {
 }
 
 test('counterfactual records store the compact recurrent state and intervention', () => {
-    const record = buildCounterfactualSample(sampleAction(), 'pair-7', 'parent.chk', -1);
+    const record = buildCounterfactualSample(
+        sampleAction(), 'pair-7', 'parent.chk', -1 / 3,
+        {returns: [-1, -1, 1], variance: 4 / 3,
+            continuationSeeds: ['1,2,3,4', '5,6,7,8', '9,10,11,12']});
     assert.equal(record.type, 'counterfactual_sample');
     assert.equal(record.pair_id, 'pair-7');
     assert.equal(record.action_rank, 1);
     assert.equal(record.decision_index, 3);
     assert.equal(record.action2, 17);
-    assert.equal(record.target_value, -1);
+    assert.equal(record.target_value, -1 / 3);
+    assert.deepEqual(record.rollout_returns, [-1, -1, 1]);
+    assert.equal(record.rollout_count, 3);
+    assert.equal(record.continuation_seeds.length, 3);
     assert.deepEqual(record.hidden_state, [0.1, 0.2, 0.3]);
     assert.equal(record.legal_mask.length, 28);
 });
@@ -78,11 +86,13 @@ test('manifest recovery keeps complete pairs and skips crash-damaged files', asy
     const rank0Action = sampleAction();
     rank0Action.counterfactual.action_rank = 0;
     const rank0 = buildCounterfactualSample(
-        rank0Action, 'counterfactual-pair-0', 'parent.chk', 1);
+        rank0Action, 'counterfactual-pair-0', 'parent.chk', 1 / 3,
+        {returns: [1, 1, -1], variance: 4 / 3});
     const rank1Action = sampleAction();
     rank1Action.action = 4;
     const rank1 = buildCounterfactualSample(
-        rank1Action, 'counterfactual-pair-0', 'parent.chk', -1);
+        rank1Action, 'counterfactual-pair-0', 'parent.chk', -1 / 3,
+        {returns: [-1, -1, 1], variance: 4 / 3});
     await fsp.writeFile(
         path.join(pairs, 'pair_000000.jsonl'),
         `${JSON.stringify(rank0)}\n${JSON.stringify(rank1)}\n`
@@ -92,13 +102,17 @@ test('manifest recovery keeps complete pairs and skips crash-damaged files', asy
     const options = {
         runName: 'recovery-test', format: 'gen9randomdoublesbattle',
         checkpoint: 'parent.chk', opponentCheckpoint: 'opponent.chk', pairs: 5,
-        seed: 7, decisionMin: 0, decisionMax: 7, battleTimeoutSeconds: 180,
+        repeatsPerAction: 3, seed: 7, decisionMin: 0, decisionMax: 7,
+        battleTimeoutSeconds: 180,
     };
     const manifest = await recoverManifestFromPairFiles(pairs, options);
     assert.equal(manifest.completed_pairs, 1);
+    assert.equal(manifest.schema_version, 3);
+    assert.equal(manifest.repeats_per_action, 3);
     assert.equal(manifest.attempts, 3);
     assert.equal(manifest.invalid_attempts, 2);
     assert.equal(manifest.rank0_better, 1);
+    assert.deepEqual(manifest.pairs[0].rank0_returns, [1, 1, -1]);
     assert.equal(manifest.recovery.unreadable_pair_files, 1);
 });
 
@@ -213,4 +227,40 @@ test('Showdown seed tuples are deterministic and attempt-specific', () => {
     assert.equal(seedTuple(17, 4, 2), seedTuple(17, 4, 2));
     assert.notEqual(seedTuple(17, 4, 2), seedTuple(17, 5, 2));
     assert.match(seedTuple(17, 4, 2), /^\d+,\d+,\d+,\d+$/);
+    assert.equal(continuationSeed(17, 4, 0), continuationSeed(17, 4, 0));
+    assert.notEqual(continuationSeed(17, 4, 0), continuationSeed(17, 4, 1));
+});
+
+test('signal audit separates action effects from same-action rollout noise', () => {
+    const strongSignal = Array.from({length: 30}, (_, attempt) => ({
+        attempt,
+        rank0_returns: [1, 1, 1],
+        rank1_returns: [-1, -1, -1],
+    }));
+    const signal = summarizeCounterfactualSignal(strongSignal, 3);
+    assert.equal(signal.treatment_disagreement_rate, 1);
+    assert.equal(signal.same_action_disagreement_rate, 0);
+    assert.equal(signal.reliable_decision_rate, 1);
+    assert.equal(signal.assessment.signal_above_rollout_noise, true);
+
+    const noisy = Array.from({length: 30}, (_, attempt) => ({
+        attempt,
+        rank0_returns: [1, -1, 1],
+        rank1_returns: [-1, 1, -1],
+    }));
+    const noise = summarizeCounterfactualSignal(noisy, 3);
+    assert.equal(noise.estimated_action_effect_variance, 0);
+    assert.equal(noise.reliable_decision_rate, 0);
+    assert.equal(noise.assessment.signal_above_rollout_noise, false);
+
+    const smallConsistentLift = Array.from({length: 100}, (_, attempt) => ({
+        attempt,
+        rank0_returns: [1, 1, 1],
+        rank1_returns: attempt < 4 ? [-1, -1, -1] : [1, 1, 1],
+    }));
+    const confidenceBased = summarizeCounterfactualSignal(smallConsistentLift, 3);
+    assert.ok(confidenceBased.disagreement_rate_lift < 0.05);
+    assert.ok(confidenceBased.paired_disagreement_lift_lower_95 > 0);
+    assert.equal(
+        confidenceBased.assessment.treatment_exceeds_same_action_noise, true);
 });

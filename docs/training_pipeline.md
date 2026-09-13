@@ -122,18 +122,38 @@ playing strength.
 
 When TD(0), TD(lambda), and Monte Carlo targets all fail on ordinary rollout
 data, `tools/counterfactual_rollout.js` creates paired evidence instead of
-tuning the same optimizer again. For each pair it starts two in-process
-Pokemon Showdown battles with identical battle, team, and agent seeds. The
-candidate follows the same policy prefix in both branches, then takes its
-highest-ranked legal action in one branch and its second-ranked legal action in
-the other. Both branches play to completion against the same frozen opponent.
+tuning the same optimizer again. For each decision it starts repeated
+in-process Pokemon Showdown branches with identical battle, team, and agent
+seeds through the intervention. The candidate takes its highest-ranked legal
+action in half of the branches and its second-ranked legal action in the other
+half. Each matched rank-zero/rank-one repeat receives the same continuation
+seed; different repeats receive different continuation seeds. This keeps the
+decision state fixed while exposing outcome variance after the action.
+`branch_concurrency` bounds simultaneous branch battles independently of the
+number of repeats, so a larger noise audit does not multiply the collector's
+peak process count.
 
 The collector verifies that the frozen recurrent state and legal mask are
 identical at the intervention. It rejects pairs whose decision was not reached
 or whose actions are not distinct. Each accepted branch becomes one compact
 `counterfactual_sample` record containing the 128-value recurrent state, legal
-mask, joint action, and terminal return. This avoids copying the very large raw
-observation prefix into both branches.
+mask, joint action, individual rollout returns, their variance, and the mean
+terminal return used as the target. This avoids copying the very large raw
+observation prefix into every branch.
+
+The default three repeats per action provide the control used to judge the
+labels. Rank-zero versus rank-one outcomes under a shared continuation seed
+measure the action treatment; repeated outcomes for the same action measure the
+rollout noise floor. The separate `*_signal_audit.json` reports disagreement
+rates, within-action variance, estimated action-effect variance,
+signal-to-noise ratio, repeat-direction consistency, and the fraction of
+decisions with a reliable preference. Fewer than 30 repeated decisions are
+reported as insufficient evidence. The disagreement comparison is paired by
+decision and reports a normal-approximation 95% confidence interval; its lower
+bound must exceed zero. The audit calls the action effect separated from noise
+only when that bound is positive, the estimated signal-to-noise ratio reaches
+1.25, and at least 20% of decisions have a stable preference. These are
+diagnostic thresholds, not a playing-strength claim.
 
 Pass `counterfactual_action_batch.jsonl` to
 `--check-counterfactual-q-fit`. Without another batch, the C diagnostic assigns
@@ -159,9 +179,8 @@ collected, untouched external batch.
 
 This is a causal diagnostic, not a strength claim. Full-game continuations are
 still noisy, and the first comparison covers only policy ranks zero and one.
-The summary reports how often paired returns disagree; a very low disagreement
-rate means more pairs or broader action ranks are needed before training a
-policy from the result. Collector manifests and per-pair files are updated
+The summary reports how often mean paired returns disagree and links the signal
+audit. Collector manifests and per-pair files are updated
 atomically, so `--resume true` continues after interruption without replaying
 completed pairs. Elapsed time and ETA include time from earlier resumed runs.
 

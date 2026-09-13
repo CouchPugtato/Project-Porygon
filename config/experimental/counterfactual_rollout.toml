@@ -1,5 +1,7 @@
 format = "gen9randomdoublesbattle"
 pairs = 500
+repeats_per_action = 3
+branch_concurrency = 6
 concurrency = 2
 decision_min = 0
 decision_max = 7

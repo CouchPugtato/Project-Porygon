@@ -72,7 +72,7 @@ Files:
   - example templates for common collection/training regimes
   - intended as copy/rename starting points rather than auto-loaded defaults
   - `ppo_data_scale_sweep.toml` fixes PPO settings and compares 128/256/512/1018 episodes over three seeds
-  - `counterfactual_rollout.toml` configures paired in-process Showdown rollouts; run names and checkpoints remain explicit CLI arguments
+  - `counterfactual_rollout.toml` configures repeated, seed-matched in-process Showdown rollouts and same-action noise controls; run names and checkpoints remain explicit CLI arguments
 
 Example:
 
