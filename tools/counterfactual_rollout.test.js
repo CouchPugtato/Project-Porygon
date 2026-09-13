@@ -1,13 +1,20 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const fsp = fs.promises;
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 
 const {
+    acquireRunLock,
     buildCounterfactualSample,
     choicesDiffer,
     equalPrefix,
+    recoverManifestFromPairFiles,
     seedTuple,
+    writeJsonAtomic,
 } = require('./counterfactual_rollout');
 
 function sampleAction() {
@@ -56,6 +63,64 @@ test('paired-state and action comparisons are strict', () => {
         {action: 1, action2: 15, slot0_target: 0, slot1_target: 1},
         {action: 1, action2: 15, slot0_target: 0, slot1_target: 2}
     ), true);
+});
+
+test('manifest recovery keeps complete pairs and skips crash-damaged files', async t => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'porygon-counterfactual-'));
+    t.after(() => fsp.rm(root, {recursive: true, force: true}));
+    const pairs = path.join(root, 'pairs');
+    await fsp.mkdir(pairs);
+    const rank0Action = sampleAction();
+    rank0Action.counterfactual.action_rank = 0;
+    const rank0 = buildCounterfactualSample(
+        rank0Action, 'counterfactual-pair-0', 'parent.chk', 1);
+    const rank1Action = sampleAction();
+    rank1Action.action = 4;
+    const rank1 = buildCounterfactualSample(
+        rank1Action, 'counterfactual-pair-0', 'parent.chk', -1);
+    await fsp.writeFile(
+        path.join(pairs, 'pair_000000.jsonl'),
+        `${JSON.stringify(rank0)}\n${JSON.stringify(rank1)}\n`
+    );
+    await fsp.writeFile(path.join(pairs, 'pair_000002.jsonl'), Buffer.alloc(128));
+
+    const options = {
+        runName: 'recovery-test', format: 'gen9randomdoublesbattle',
+        checkpoint: 'parent.chk', opponentCheckpoint: 'opponent.chk', pairs: 5,
+        seed: 7, decisionMin: 0, decisionMax: 7, battleTimeoutSeconds: 180,
+    };
+    const manifest = await recoverManifestFromPairFiles(pairs, options);
+    assert.equal(manifest.completed_pairs, 1);
+    assert.equal(manifest.attempts, 3);
+    assert.equal(manifest.invalid_attempts, 2);
+    assert.equal(manifest.rank0_better, 1);
+    assert.equal(manifest.recovery.unreadable_pair_files, 1);
+});
+
+test('atomic JSON writes retain the previous valid document as a backup', async t => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'porygon-manifest-'));
+    t.after(() => fsp.rm(root, {recursive: true, force: true}));
+    const target = path.join(root, 'manifest.json');
+    await writeJsonAtomic(target, {generation: 1});
+    await writeJsonAtomic(target, {generation: 2});
+    assert.deepEqual(JSON.parse(await fsp.readFile(target, 'utf8')), {generation: 2});
+    assert.deepEqual(JSON.parse(await fsp.readFile(`${target}.bak`, 'utf8')), {generation: 1});
+    await writeJsonAtomic(target, {generation: 3});
+    assert.deepEqual(JSON.parse(await fsp.readFile(target, 'utf8')), {generation: 3});
+    assert.deepEqual(JSON.parse(await fsp.readFile(`${target}.bak`, 'utf8')), {generation: 2});
+});
+
+test('run lock excludes a second collector and releases cleanly', async t => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'porygon-run-lock-'));
+    t.after(() => fsp.rm(root, {recursive: true, force: true}));
+    const lock = await acquireRunLock(root);
+    await assert.rejects(
+        acquireRunLock(root),
+        /another counterfactual collector is already running/
+    );
+    await lock.release();
+    const nextLock = await acquireRunLock(root);
+    await nextLock.release();
 });
 
 test('Showdown seed tuples are deterministic and attempt-specific', () => {

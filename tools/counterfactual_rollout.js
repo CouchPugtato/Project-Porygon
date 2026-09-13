@@ -101,6 +101,8 @@ function resolveOptions(argv) {
         seed: integerOption(options, 'seed', 20260911, 0),
         battleTimeoutSeconds: integerOption(options, 'battle-timeout-seconds', 180, 1),
         maxAttemptMultiplier: integerOption(options, 'max-attempt-multiplier', 3, 1),
+        manifestCheckpointResults: integerOption(
+            options, 'manifest-checkpoint-results', 10, 1),
         resume: booleanOption(options, 'resume', true),
         configPath: options.config,
     };
@@ -453,10 +455,37 @@ async function runPair(sim, options, attempt) {
     };
 }
 
-async function writeJsonAtomic(filePath, value) {
+async function syncFile(filePath) {
+    const handle = await fsp.open(filePath, 'r+');
+    try {
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
+}
+
+async function writeTextAtomic(filePath, content, keepBackup = false) {
     const temporary = `${filePath}.tmp`;
-    await fsp.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    const handle = await fsp.open(temporary, 'w');
+    try {
+        await handle.writeFile(content, 'utf8');
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
+
+    if (keepBackup && fs.existsSync(filePath)) {
+        const backup = `${filePath}.bak`;
+        const backupTemporary = `${backup}.tmp`;
+        await fsp.copyFile(filePath, backupTemporary);
+        await syncFile(backupTemporary);
+        await fsp.rename(backupTemporary, backup);
+    }
     await fsp.rename(temporary, filePath);
+}
+
+async function writeJsonAtomic(filePath, value) {
+    await writeTextAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`, true);
 }
 
 function emptyManifest(options) {
@@ -499,6 +528,149 @@ function assertResumeCompatible(manifest, options) {
     }
 }
 
+function choiceFromRecord(record) {
+    return {
+        action: record.action,
+        action2: record.action2,
+        slot0_target: record.slot0_target_index,
+        slot1_target: record.slot1_target_index,
+    };
+}
+
+function pairEntryFromRecords(filename, attempt, records) {
+    if (records.length !== 2) return null;
+    const byRank = new Map(records.map(record => [record.action_rank, record]));
+    const rank0 = byRank.get(0);
+    const rank1 = byRank.get(1);
+    if (!rank0 || !rank1 || rank0.type !== 'counterfactual_sample' ||
+            rank1.type !== 'counterfactual_sample' ||
+            rank0.pair_id !== rank1.pair_id ||
+            rank0.decision_index !== rank1.decision_index ||
+            !Number.isFinite(rank0.target_value) || !Number.isFinite(rank1.target_value)) {
+        return null;
+    }
+    return {
+        pair_id: rank0.pair_id,
+        attempt,
+        file: `pairs/${filename}`,
+        decision_index: rank0.decision_index,
+        rank0_return: rank0.target_value,
+        rank1_return: rank1.target_value,
+        rank0_choice: choiceFromRecord(rank0),
+        rank1_choice: choiceFromRecord(rank1),
+    };
+}
+
+async function readJsonIfValid(filePath) {
+    try {
+        const text = await fsp.readFile(filePath, 'utf8');
+        if (!text.trim()) return null;
+        const value = JSON.parse(text);
+        return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function processIsRunning(pid) {
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return error.code === 'EPERM';
+    }
+}
+
+async function acquireRunLock(runDir) {
+    const lockPath = path.join(runDir, '.counterfactual_rollout.lock');
+    const token = `${process.pid}-${Date.now()}`;
+    for (let attempt = 0; attempt < 2; ++attempt) {
+        try {
+            const handle = await fsp.open(lockPath, 'wx');
+            await handle.writeFile(`${JSON.stringify({pid: process.pid, token})}\n`, 'utf8');
+            await handle.sync();
+            let released = false;
+            return {
+                async release() {
+                    if (released) return;
+                    released = true;
+                    await handle.close();
+                    const current = await readJsonIfValid(lockPath);
+                    if (current?.token === token) await fsp.unlink(lockPath);
+                },
+            };
+        } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+            const owner = await readJsonIfValid(lockPath);
+            if (owner && processIsRunning(owner.pid)) {
+                throw new Error(
+                    `another counterfactual collector is already running for this run (pid ${owner.pid})`
+                );
+            }
+            await fsp.unlink(lockPath).catch(unlinkError => {
+                if (unlinkError.code !== 'ENOENT') throw unlinkError;
+            });
+        }
+    }
+    throw new Error(`could not acquire counterfactual run lock: ${lockPath}`);
+}
+
+async function recoverManifestFromPairFiles(pairDir, options, priorManifest = null) {
+    const manifest = emptyManifest(options);
+    const filenames = (await fsp.readdir(pairDir))
+        .filter(name => /^pair_\d+\.jsonl$/.test(name))
+        .sort();
+    let highestAttempt = -1;
+    let unreadablePairFiles = 0;
+
+    for (const filename of filenames) {
+        const attempt = Number.parseInt(filename.slice(5, -6), 10);
+        highestAttempt = Math.max(highestAttempt, attempt);
+        try {
+            const text = await fsp.readFile(path.join(pairDir, filename), 'utf8');
+            const lines = text.split(/\r?\n/).filter(line => line.trim());
+            const entry = pairEntryFromRecords(
+                filename, attempt, lines.map(line => JSON.parse(line)));
+            if (entry) manifest.pairs.push(entry);
+            else ++unreadablePairFiles;
+        } catch (_) {
+            ++unreadablePairFiles;
+        }
+    }
+
+    manifest.pairs.sort((left, right) => left.attempt - right.attempt);
+    manifest.completed_pairs = manifest.pairs.length;
+    manifest.attempts = Math.max(
+        highestAttempt + 1,
+        Number.isSafeInteger(priorManifest?.attempts) ? priorManifest.attempts : 0
+    );
+    for (const pair of manifest.pairs) {
+        if (pair.rank0_return > pair.rank1_return) ++manifest.rank0_better;
+        else if (pair.rank1_return > pair.rank0_return) ++manifest.rank1_better;
+        else ++manifest.equal_returns;
+    }
+
+    manifest.invalid_attempts = Math.max(0, manifest.attempts - manifest.completed_pairs);
+    const knownReasons = priorManifest?.invalid_reasons;
+    if (knownReasons && typeof knownReasons === 'object' && !Array.isArray(knownReasons)) {
+        manifest.invalid_reasons = {...knownReasons};
+    }
+    const classified = Object.values(manifest.invalid_reasons)
+        .reduce((total, count) => total + (Number.isSafeInteger(count) ? count : 0), 0);
+    if (classified < manifest.invalid_attempts) {
+        manifest.invalid_reasons.recovered_unclassified = manifest.invalid_attempts - classified;
+    }
+    manifest.elapsed_seconds = Number(priorManifest?.elapsed_seconds) || 0;
+    manifest.recovery = {
+        recovered_at: new Date().toISOString(),
+        pair_files_found: filenames.length,
+        valid_pair_files: manifest.completed_pairs,
+        unreadable_pair_files: unreadablePairFiles,
+    };
+    return manifest;
+}
+
 function formatDuration(seconds) {
     if (!Number.isFinite(seconds)) return 'unknown';
     if (seconds < 60) return `${Math.ceil(seconds)}s`;
@@ -519,20 +691,24 @@ async function combinePairFiles(runDir, manifest) {
     return output;
 }
 
-async function main(argv = process.argv.slice(2)) {
-    const options = resolveOptions(argv);
-    const sim = require(path.join(SHOWDOWN_DIR, 'dist', 'sim'));
-    const runDir = path.join(REPO_ROOT, 'matches', 'runs', options.runName);
-    const pairDir = path.join(runDir, 'pairs');
-    const manifestPath = path.join(runDir, `${options.runName}_counterfactual_manifest.json`);
-    const summaryPath = path.join(runDir, `${options.runName}_counterfactual_summary.json`);
-    await fsp.mkdir(pairDir, {recursive: true});
-
+async function collect(sim, options, runDir, pairDir, manifestPath, summaryPath) {
     let manifest = emptyManifest(options);
     if (options.resume && fs.existsSync(manifestPath)) {
-        manifest = JSON.parse(await fsp.readFile(manifestPath, 'utf8'));
-        assertResumeCompatible(manifest, options);
+        let priorManifest = await readJsonIfValid(manifestPath);
+        let recoverySource = 'manifest';
+        if (!priorManifest) {
+            priorManifest = await readJsonIfValid(`${manifestPath}.bak`);
+            recoverySource = priorManifest ? 'backup' : 'pair files';
+        }
+        if (priorManifest) assertResumeCompatible(priorManifest, options);
+        manifest = await recoverManifestFromPairFiles(pairDir, options, priorManifest);
+        manifest.recovery.source = recoverySource;
         manifest.status = 'running';
+        console.log(
+            `[counterfactual] resume source=${recoverySource} ` +
+            `pairs=${manifest.completed_pairs} attempts=${manifest.attempts} ` +
+            `unreadable_pair_files=${manifest.recovery.unreadable_pair_files}`
+        );
     } else if (!options.resume && fs.existsSync(manifestPath)) {
         throw new Error(`run already exists; use --resume true or a new run name: ${runDir}`);
     }
@@ -542,6 +718,7 @@ async function main(argv = process.argv.slice(2)) {
     const maximumAttempts = options.pairs * options.maxAttemptMultiplier;
     let nextAttempt = manifest.attempts;
     let writeLock = Promise.resolve();
+    let resultsSinceCheckpoint = 0;
 
     async function recordResult(attempt, result) {
         const previous = writeLock;
@@ -558,8 +735,7 @@ async function main(argv = process.argv.slice(2)) {
                 const filename = `pairs/pair_${String(attempt).padStart(6, '0')}.jsonl`;
                 const pairPath = path.join(runDir, filename);
                 const records = `${result.records.map(record => JSON.stringify(record)).join('\n')}\n`;
-                await fsp.writeFile(`${pairPath}.tmp`, records, 'utf8');
-                await fsp.rename(`${pairPath}.tmp`, pairPath);
+                await writeTextAtomic(pairPath, records);
                 manifest.pairs.push({
                     pair_id: result.pairId,
                     attempt,
@@ -577,7 +753,10 @@ async function main(argv = process.argv.slice(2)) {
             }
             const elapsed = initialElapsed + (Date.now() - startedAt) / 1000;
             manifest.elapsed_seconds = elapsed;
-            await writeJsonAtomic(manifestPath, manifest);
+            if (++resultsSinceCheckpoint >= options.manifestCheckpointResults) {
+                await writeJsonAtomic(manifestPath, manifest);
+                resultsSinceCheckpoint = 0;
+            }
             const newPairs = Math.max(1, manifest.completed_pairs);
             const remaining = Math.max(0, options.pairs - manifest.completed_pairs);
             const eta = elapsed * remaining / newPairs;
@@ -626,6 +805,23 @@ async function main(argv = process.argv.slice(2)) {
     if (manifest.status !== 'completed') process.exitCode = 1;
 }
 
+async function main(argv = process.argv.slice(2)) {
+    const options = resolveOptions(argv);
+    const sim = require(path.join(SHOWDOWN_DIR, 'dist', 'sim'));
+    const runDir = path.join(REPO_ROOT, 'matches', 'runs', options.runName);
+    const pairDir = path.join(runDir, 'pairs');
+    const manifestPath = path.join(runDir, `${options.runName}_counterfactual_manifest.json`);
+    const summaryPath = path.join(runDir, `${options.runName}_counterfactual_summary.json`);
+    await fsp.mkdir(runDir, {recursive: true});
+    const runLock = await acquireRunLock(runDir);
+    try {
+        await fsp.mkdir(pairDir, {recursive: true});
+        await collect(sim, options, runDir, pairDir, manifestPath, summaryPath);
+    } finally {
+        await runLock.release();
+    }
+}
+
 if (require.main === module) {
     main().catch(error => {
         console.error(`[counterfactual] ${error.stack || error.message}`);
@@ -637,8 +833,13 @@ module.exports = {
     buildCounterfactualSample,
     choicesDiffer,
     equalPrefix,
+    acquireRunLock,
     inferenceSeed,
     mix32,
+    pairEntryFromRecords,
     parseToml,
+    readJsonIfValid,
+    recoverManifestFromPairFiles,
     seedTuple,
+    writeJsonAtomic,
 };
