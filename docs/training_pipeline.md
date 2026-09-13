@@ -136,12 +136,18 @@ mask, joint action, and terminal return. This avoids copying the very large raw
 observation prefix into both branches.
 
 Pass `counterfactual_action_batch.jsonl` to
-`--check-counterfactual-q-fit`. The C diagnostic assigns whole pairs to stable
-train, selection, and holdout splits, trains the small action-Q sidecar over the
-frozen recurrent state, and restores the best selection epoch. In addition to
-the ordinary action-Q gates, publication requires at least ten holdout pairs
-with different outcomes and at least 55% correct within-pair ranking. A `.qv`
-sidecar is written only when every gate passes.
+`--check-counterfactual-q-fit`. Without another batch, the C diagnostic assigns
+whole pairs to stable train, selection, and holdout splits. For an independent
+test, pass `--counterfactual-holdout-batch PATH`; the training batch is then
+split only into training and model-selection data, while every pair in `PATH`
+is reserved for the final holdout metrics. The JSON report records both paths
+and whether the holdout was external.
+
+The diagnostic trains the small action-Q sidecar over the frozen recurrent
+state and restores the best selection epoch. Publication requires the ordinary
+action-Q gates, at least ten holdout pairs with different outcomes, and at least
+55% correct within-pair ranking. A `.qv` sidecar is written only when every gate
+passes.
 
 This is a causal diagnostic, not a strength claim. Full-game continuations are
 still noisy, and the first comparison covers only policy ranks zero and one.

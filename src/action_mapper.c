@@ -450,7 +450,8 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
         int m;
         for (m = 0; m < PARSED_REQUEST_MOVE_SLOTS; ++m) {
             int legal = parsed_request_slot_can_move(req, i) &&
-                req->active[i].move_id[m] > 0 &&
+                (req->active[i].move_id[m] > 0 ||
+                 req->active[i].move_forced_noop[m]) &&
                 !req->active[i].move_disabled[m] &&
                 move_has_available_required_target(req, i, m);
             if (i == 0) {
@@ -464,12 +465,13 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
     }
 
     for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
-        int bench_switch_legal = req->switch_available[i] && !req->switch_fainted[i] && !req->switch_active[i];
-        if (bench_switch_legal) {
-            if (parsed_request_slot_can_switch(req, 0)) {
+        if (!req->forced_switch_any) {
+            if (parsed_request_slot_can_switch(req, 0) &&
+                    parsed_request_switch_target_legal(req, 0, i)) {
                 out->legal[OBS_A1_SWITCH1 + i] = 1;
             }
-            if (parsed_request_slot_can_switch(req, 1)) {
+            if (parsed_request_slot_can_switch(req, 1) &&
+                    parsed_request_switch_target_legal(req, 1, i)) {
                 out->legal[OBS_A2_SWITCH1 + i] = 1;
             }
         }
@@ -481,9 +483,12 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
             out->legal[OBS_A2_MOVE1 + i] = 0;
         }
         for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
-            int bench_switch_legal = req->switch_available[i] && !req->switch_fainted[i] && !req->switch_active[i];
-            out->legal[OBS_A1_SWITCH1 + i] = (req->force_switch[0] && bench_switch_legal) ? 1 : 0;
-            out->legal[OBS_A2_SWITCH1 + i] = (req->force_switch[1] && bench_switch_legal) ? 1 : 0;
+            out->legal[OBS_A1_SWITCH1 + i] = (unsigned char)(
+                req->force_switch[0] &&
+                parsed_request_switch_target_legal(req, 0, i));
+            out->legal[OBS_A2_SWITCH1 + i] = (unsigned char)(
+                req->force_switch[1] &&
+                parsed_request_switch_target_legal(req, 1, i));
         }
     }
 

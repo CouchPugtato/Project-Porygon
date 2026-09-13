@@ -257,6 +257,69 @@ static int test_double_force_switch_one_bench_degrades_to_pass(void) {
     return 1;
 }
 
+static int test_recharge_is_a_forced_move_choice(void) {
+    const char* json =
+        "{\"active\":["
+        "{\"moves\":[{\"move\":\"Recharge\",\"id\":\"recharge\"}],\"trapped\":true},"
+        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\"}]}"
+        "],\"side\":{\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Slaking, L89, M\",\"condition\":\"300/400\",\"active\":true},"
+        "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77, M\",\"condition\":\"100/100\",\"active\":true}"
+        "]}}";
+    ParsedRequest req;
+    ActionMask mask;
+    char command[256];
+
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 301, 1),
+            "parse recharge request")) return 0;
+    if (!assert_true(req.active[0].move_forced_noop[0] == 1,
+            "recognize Showdown recharge placeholder")) return 0;
+    if (!assert_true(build_action_mask_from_request(&mask, &req),
+            "build recharge mask")) return 0;
+    if (!assert_true(mask.legal[OBS_A1_MOVE1] == 1,
+            "recharge placeholder selects move one")) return 0;
+    if (!assert_true(request_choice_to_command(
+            &req, 1, OBS_A1_MOVE1, 1, OBS_A2_MOVE1, command, sizeof(command)),
+            "format recharge turn")) return 0;
+    if (!assert_true(strcmp(command, "/choose move 1, move 1") == 0,
+            "recharge command shape")) return 0;
+    return 1;
+}
+
+static int test_revival_blessing_selects_a_fainted_teammate(void) {
+    const char* json =
+        "{\"forceSwitch\":[true,false],\"side\":{\"pokemon\":["
+        "{\"ident\":\"p1: Pawmot\",\"details\":\"Pawmot, L80, F\",\"condition\":\"98/243\",\"active\":true,\"reviving\":true},"
+        "{\"ident\":\"p1: Vivillon\",\"details\":\"Vivillon, L88, F\",\"condition\":\"284/284\",\"active\":true,\"reviving\":false},"
+        "{\"ident\":\"p1: Terapagos\",\"details\":\"Terapagos, L73\",\"condition\":\"0 fnt\",\"active\":false},"
+        "{\"ident\":\"p1: Dudunsparce\",\"details\":\"Dudunsparce, L86\",\"condition\":\"0 fnt\",\"active\":false},"
+        "{\"ident\":\"p1: Armarouge\",\"details\":\"Armarouge, L80\",\"condition\":\"100/100\",\"active\":false}"
+        "]}}";
+    ParsedRequest req;
+    ActionMask mask;
+    char command[256];
+
+    parsed_request_init(&req);
+    if (!assert_true(parse_request_payload(&req, json, 302, 1),
+            "parse Revival Blessing request")) return 0;
+    if (!assert_true(req.revival_switch[0] == 1 && req.revival_switch[1] == 0,
+            "identify the reviving active slot")) return 0;
+    if (!assert_true(build_action_mask_from_request(&mask, &req),
+            "build Revival Blessing mask")) return 0;
+    if (!assert_true(mask.legal[OBS_A1_SWITCH3] == 1 &&
+            mask.legal[OBS_A1_SWITCH4] == 1,
+            "fainted teammates are legal revival choices")) return 0;
+    if (!assert_true(mask.legal[OBS_A1_SWITCH5] == 0,
+            "living bench is not a revival choice")) return 0;
+    if (!assert_true(request_choice_to_command(
+            &req, 1, OBS_A1_SWITCH3, 0, OBS_A2_MOVE1, command, sizeof(command)),
+            "format Revival Blessing choice")) return 0;
+    if (!assert_true(strcmp(command, "/choose switch 3") == 0,
+            "Revival Blessing command shape")) return 0;
+    return 1;
+}
+
 int main(void) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
@@ -281,6 +344,8 @@ int main(void) {
     if (!test_double_force_switch_one_bench_degrades_to_pass()) {
         return 1;
     }
+    if (!test_recharge_is_a_forced_move_choice()) return 1;
+    if (!test_revival_blessing_selects_a_fainted_teammate()) return 1;
     printf("legality tests passed\n");
     return 0;
 }

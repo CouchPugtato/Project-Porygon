@@ -188,10 +188,11 @@ static const char* skip_json_object_text(const char* start) {
     return NULL;
 }
 
-static int parse_move_id_from_object(const char* obj) {
+static int parse_move_id_from_object(const char* obj, int* forced_noop) {
     const char* p = strstr(obj, "\"id\":");
     char token[64];
     size_t i = 0;
+    if (forced_noop) *forced_noop = 0;
     if (!p) {
         return 0;
     }
@@ -212,6 +213,10 @@ static int parse_move_id_from_object(const char* obj) {
         token[i++] = *p++;
     }
     token[i] = '\0';
+    if (strcmp(token, "recharge") == 0) {
+        if (forced_noop) *forced_noop = 1;
+        return 0;
+    }
     return move_id_from_name(token);
 }
 
@@ -365,14 +370,15 @@ static void finalize_slot_semantics(ParsedRequest* req) {
         req->choice_kind[slot] = REQUEST_SLOT_NONE;
 
         for (i = 0; i < PARSED_REQUEST_TEAM_SIZE; ++i) {
-            if (req->switch_available[i] && !req->switch_fainted[i] && !req->switch_active[i]) {
+            if (parsed_request_switch_target_legal(req, slot, i)) {
                 bench_switch_exists = 1;
                 break;
             }
         }
         for (i = 0; i < PARSED_REQUEST_MOVE_SLOTS; ++i) {
             if (slot < req->active_count &&
-                    req->active[slot].move_id[i] > 0 &&
+                    (req->active[slot].move_id[i] > 0 ||
+                     req->active[slot].move_forced_noop[i]) &&
                     !req->active[slot].move_disabled[i]) {
                 move_exists = 1;
                 break;
@@ -409,6 +415,33 @@ static void finalize_slot_semantics(ParsedRequest* req) {
         req->slot_can_switch[slot] = !req->active[slot].trapped && bench_switch_exists;
         if (req->slot_can_move[slot] || req->slot_can_switch[slot]) {
             req->choice_kind[slot] = REQUEST_SLOT_MOVE_OR_SWITCH;
+        }
+    }
+}
+
+static void detect_revival_switches(ParsedRequest* req) {
+    int active_revivers = 0;
+    int forced_slots = 0;
+    int slot;
+    int team_index;
+    if (!req) return;
+    for (team_index = 0; team_index < PARSED_REQUEST_TEAM_SIZE; ++team_index) {
+        if (req->switch_active[team_index] && req->side_reviving[team_index]) {
+            ++active_revivers;
+        }
+    }
+    for (slot = 0; slot < PARSED_REQUEST_ACTIVE_SLOTS; ++slot) {
+        if (req->force_switch[slot]) ++forced_slots;
+    }
+    for (slot = 0; slot < PARSED_REQUEST_ACTIVE_SLOTS; ++slot) {
+        int active_index = req->active_team_idx[slot];
+        if (!req->force_switch[slot]) continue;
+        if (active_index >= 0 && req->side_reviving[active_index]) {
+            req->revival_switch[slot] = 1;
+        } else if (active_revivers == forced_slots && forced_slots > 0) {
+            req->revival_switch[slot] = 1;
+        } else if (forced_slots == 1 && active_revivers > 0) {
+            req->revival_switch[slot] = 1;
         }
     }
 }
@@ -548,7 +581,8 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
                         if (!extract_json_object(move_cursor, move_obj, sizeof(move_obj))) {
                             return 0;
                         }
-                        req->active[slot].move_id[move_slot] = parse_move_id_from_object(move_obj);
+                        req->active[slot].move_id[move_slot] = parse_move_id_from_object(
+                            move_obj, &req->active[slot].move_forced_noop[move_slot]);
                         req->active[slot].move_disabled[move_slot] = parse_bool_after(move_obj, "disabled", 0);
                         req->active[slot].move_maybe_disabled[move_slot] = parse_bool_after(move_obj, "maybeDisabled", 0);
                         req->active[slot].move_pp[move_slot] = parse_int_after(move_obj, "pp", 0);
@@ -696,6 +730,7 @@ int parse_request_payload(ParsedRequest* req, const char* json, int request_id, 
     }
 
     sync_active_fainted_state_from_side(req);
+    detect_revival_switches(req);
     finalize_slot_semantics(req);
 
     return 1;
@@ -727,4 +762,20 @@ ParsedSlotChoiceKind parsed_request_slot_choice_kind(const ParsedRequest* req, i
         return REQUEST_SLOT_NONE;
     }
     return req->choice_kind[slot];
+}
+
+int parsed_request_switch_target_legal(
+    const ParsedRequest* req,
+    int slot,
+    int team_index
+) {
+    if (!req || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS ||
+            team_index < 0 || team_index >= PARSED_REQUEST_TEAM_SIZE ||
+            req->switch_active[team_index]) {
+        return 0;
+    }
+    if (req->revival_switch[slot]) {
+        return req->switch_fainted[team_index] ? 1 : 0;
+    }
+    return req->switch_available[team_index] && !req->switch_fainted[team_index];
 }

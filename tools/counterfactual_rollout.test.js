@@ -182,6 +182,9 @@ test('failure categories and durable JSONL retain exact messages', async t => {
         'missing_move_target');
     assert.equal(battleFailureReason(new Error('battle branch exceeded timeout')),
         'battle_timeout');
+    assert.equal(battleFailureReason(
+        new Error('counterfactual action rank is unavailable')),
+        'counterfactual_rank_unavailable');
     assert.equal(battleFailureReason(new Error('showdown_client exited with 1')),
         'agent_process_error');
 

@@ -307,6 +307,8 @@ int learning_diagnostic_write_action_value_report(
 int learning_diagnostic_write_counterfactual_action_value_report(
     const char* report_path,
     const char* batch_path,
+    const char* holdout_batch_path,
+    int external_holdout,
     const char* checkpoint_path,
     const char* action_value_path,
     int action_value_published,

@@ -31,6 +31,16 @@ typedef struct {
     size_t pair_count;
 } CounterfactualDataset;
 
+typedef struct {
+    CounterfactualSample** train;
+    size_t train_count;
+    CounterfactualSample** selection;
+    size_t selection_count;
+    CounterfactualSample** holdout;
+    size_t holdout_count;
+    int external_holdout;
+} CounterfactualDatasetSplit;
+
 int counterfactual_dataset_load(
     CounterfactualDataset* dataset,
     const char* path,
@@ -38,5 +48,12 @@ int counterfactual_dataset_load(
     const char* expected_policy_tag
 );
 void counterfactual_dataset_free(CounterfactualDataset* dataset);
+int counterfactual_dataset_split(
+    CounterfactualDataset* training,
+    CounterfactualDataset* external_holdout,
+    unsigned int validation_seed,
+    CounterfactualDatasetSplit* split
+);
+void counterfactual_dataset_split_free(CounterfactualDatasetSplit* split);
 
 #endif

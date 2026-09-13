@@ -31,6 +31,7 @@ typedef enum {
 
 typedef struct {
     int move_id[PARSED_REQUEST_MOVE_SLOTS];
+    int move_forced_noop[PARSED_REQUEST_MOVE_SLOTS];
     int move_disabled[PARSED_REQUEST_MOVE_SLOTS];
     int move_maybe_disabled[PARSED_REQUEST_MOVE_SLOTS];
     int move_pp[PARSED_REQUEST_MOVE_SLOTS];
@@ -57,6 +58,7 @@ typedef struct {
     int switch_fainted[PARSED_REQUEST_TEAM_SIZE];
     int switch_active[PARSED_REQUEST_TEAM_SIZE];
     int force_switch[PARSED_REQUEST_ACTIVE_SLOTS];
+    int revival_switch[PARSED_REQUEST_ACTIVE_SLOTS];
     int can_tera;
     int forced_switch_any;
     int slot_present[PARSED_REQUEST_ACTIVE_SLOTS];
@@ -96,5 +98,6 @@ int parsed_request_slot_needs_choice(const ParsedRequest* req, int slot);
 int parsed_request_slot_can_move(const ParsedRequest* req, int slot);
 int parsed_request_slot_can_switch(const ParsedRequest* req, int slot);
 ParsedSlotChoiceKind parsed_request_slot_choice_kind(const ParsedRequest* req, int slot);
+int parsed_request_switch_target_legal(const ParsedRequest* req, int slot, int team_index);
 
 #endif

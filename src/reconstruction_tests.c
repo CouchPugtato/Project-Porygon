@@ -878,6 +878,74 @@ static int test_counterfactual_dataset_preserves_whole_pairs(void) {
     return ok;
 }
 
+static int test_counterfactual_external_holdout_stays_separate(void) {
+    CounterfactualDataset training;
+    CounterfactualDataset holdout;
+    CounterfactualDatasetSplit split;
+    const unsigned int seed = 20260913u;
+    int bucket;
+    int candidate = 0;
+    int ok = 1;
+
+    memset(&training, 0, sizeof(training));
+    memset(&holdout, 0, sizeof(holdout));
+    memset(&split, 0, sizeof(split));
+    training.count = 6;
+    training.pair_count = 3;
+    training.samples = (CounterfactualSample*)calloc(
+        training.count, sizeof(*training.samples));
+    holdout.count = 4;
+    holdout.pair_count = 2;
+    holdout.samples = (CounterfactualSample*)calloc(
+        holdout.count, sizeof(*holdout.samples));
+    if (!assert_true(training.samples && holdout.samples,
+            "allocate counterfactual split fixtures")) {
+        counterfactual_dataset_free(&training);
+        counterfactual_dataset_free(&holdout);
+        return 0;
+    }
+    for (bucket = 0; bucket < 3; ++bucket) {
+        char pair_id[COUNTERFACTUAL_PAIR_ID_LEN];
+        do {
+            snprintf(pair_id, sizeof(pair_id), "split-pair-%d", candidate++);
+        } while ((int)(validation_split_hash(pair_id, seed) % UINT64_C(10)) != bucket);
+        snprintf(training.samples[bucket * 2].pair_id,
+            sizeof(training.samples[bucket * 2].pair_id), "%s", pair_id);
+        snprintf(training.samples[bucket * 2 + 1].pair_id,
+            sizeof(training.samples[bucket * 2 + 1].pair_id), "%s", pair_id);
+    }
+    snprintf(holdout.samples[0].pair_id, sizeof(holdout.samples[0].pair_id),
+        "external-pair-0");
+    snprintf(holdout.samples[1].pair_id, sizeof(holdout.samples[1].pair_id),
+        "external-pair-0");
+    snprintf(holdout.samples[2].pair_id, sizeof(holdout.samples[2].pair_id),
+        "external-pair-1");
+    snprintf(holdout.samples[3].pair_id, sizeof(holdout.samples[3].pair_id),
+        "external-pair-1");
+
+    ok &= assert_true(counterfactual_dataset_split(
+        &training, NULL, seed, &split), "build stable internal pair split");
+    ok &= assert_true(split.train_count == 2 && split.selection_count == 2 &&
+        split.holdout_count == 2 && !split.external_holdout,
+        "internal split keeps each pair in one partition");
+    counterfactual_dataset_split_free(&split);
+
+    ok &= assert_true(counterfactual_dataset_split(
+        &training, &holdout, seed, &split), "build external counterfactual holdout");
+    ok &= assert_true(split.train_count == 4 && split.selection_count == 2 &&
+        split.holdout_count == holdout.count && split.external_holdout,
+        "external mode reserves only training data for model selection");
+    if (split.holdout_count == holdout.count) {
+        ok &= assert_true(split.holdout[0] == &holdout.samples[0] &&
+            split.holdout[3] == &holdout.samples[3],
+            "external holdout contains no training-batch samples");
+    }
+    counterfactual_dataset_split_free(&split);
+    counterfactual_dataset_free(&holdout);
+    counterfactual_dataset_free(&training);
+    return ok;
+}
+
 static int test_runtime_dense_additive_rewards(void) {
     const char* request_payload =
         "{\"active\":["
@@ -5358,6 +5426,7 @@ int main(int argc, char** argv) {
     if (!test_runtime_request_session_not_forced_doubles()) return 1;
     if (!test_runtime_counterfactual_ranks_are_distinct_and_reported()) return 1;
     if (!test_counterfactual_dataset_preserves_whole_pairs()) return 1;
+    if (!test_counterfactual_external_holdout_stays_separate()) return 1;
     if (!test_runtime_dense_additive_rewards()) return 1;
     if (!test_single_turn_side_guards_reconstructed()) return 1;
     if (!test_switch_clears_volatile_state()) return 1;

@@ -1394,6 +1394,8 @@ int learning_diagnostic_write_action_value_report(
 int learning_diagnostic_write_counterfactual_action_value_report(
     const char* report_path,
     const char* batch_path,
+    const char* holdout_batch_path,
+    int external_holdout,
     const char* checkpoint_path,
     const char* action_value_path,
     int action_value_published,
@@ -1412,8 +1414,12 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     out = fopen(report_path, "w");
     if (!out) return 0;
     fputs("{\n  \"diagnostic\": \"paired_counterfactual_joint_q_fit\",\n", out);
-    fputs("  \"metrics_version\": 1,\n  \"counterfactual_batch\": ", out);
+    fputs("  \"metrics_version\": 2,\n  \"counterfactual_batch\": ", out);
     write_json_string(out, batch_path);
+    fputs(",\n  \"holdout_batch\": ", out);
+    write_json_string(out, holdout_batch_path);
+    fprintf(out, ",\n  \"holdout_source\": \"%s\"",
+        external_holdout ? "external_batch" : "stable_pair_split");
     fputs(",\n  \"encoder_checkpoint\": ", out);
     write_json_string(out, checkpoint_path);
     fputs(",\n  \"action_value_path\": ", out);

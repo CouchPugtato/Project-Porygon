@@ -569,7 +569,11 @@ function choiceRejectionReason(message) {
 
 function battleFailureReason(error) {
     const message = String(error?.message || error || '');
-    if (message.toLowerCase().includes('timeout')) return 'battle_timeout';
+    const normalized = message.toLowerCase();
+    if (normalized.includes('counterfactual action rank is unavailable')) {
+        return 'counterfactual_rank_unavailable';
+    }
+    if (normalized.includes('timeout')) return 'battle_timeout';
     if (message.includes('showdown_client exited')) return 'agent_process_error';
     return 'battle_error';
 }

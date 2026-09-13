@@ -1,4 +1,5 @@
 #include "counterfactual_data.h"
+#include "validation_split.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -329,4 +330,78 @@ void counterfactual_dataset_free(CounterfactualDataset* dataset) {
     for (i = 0; i < dataset->count; ++i) free(dataset->samples[i].hidden_state);
     free(dataset->samples);
     memset(dataset, 0, sizeof(*dataset));
+}
+
+static void append_pair(
+    CounterfactualSample** destination,
+    size_t* count,
+    CounterfactualSample* first
+) {
+    destination[(*count)++] = first;
+    destination[(*count)++] = first + 1;
+}
+
+int counterfactual_dataset_split(
+    CounterfactualDataset* training,
+    CounterfactualDataset* external_holdout,
+    unsigned int validation_seed,
+    CounterfactualDatasetSplit* split
+) {
+    size_t pair_index;
+    int use_external;
+    if (!training || !split || training->pair_count == 0) return 0;
+    memset(split, 0, sizeof(*split));
+    use_external = external_holdout && external_holdout->pair_count > 0;
+    split->train = (CounterfactualSample**)malloc(
+        training->count * sizeof(*split->train));
+    split->selection = (CounterfactualSample**)malloc(
+        training->count * sizeof(*split->selection));
+    split->holdout = (CounterfactualSample**)malloc(
+        (use_external ? external_holdout->count : training->count) *
+        sizeof(*split->holdout));
+    if (!split->train || !split->selection || !split->holdout) {
+        counterfactual_dataset_split_free(split);
+        return 0;
+    }
+
+    for (pair_index = 0; pair_index < training->pair_count; ++pair_index) {
+        CounterfactualSample* first = &training->samples[pair_index * 2u];
+        uint64_t bucket = validation_split_hash(
+            first->pair_id, validation_seed) % UINT64_C(10);
+        if (use_external) {
+            if (bucket == UINT64_C(0)) {
+                append_pair(split->selection, &split->selection_count, first);
+            } else {
+                append_pair(split->train, &split->train_count, first);
+            }
+        } else if (bucket == UINT64_C(0)) {
+            append_pair(split->holdout, &split->holdout_count, first);
+        } else if (bucket == UINT64_C(1)) {
+            append_pair(split->selection, &split->selection_count, first);
+        } else {
+            append_pair(split->train, &split->train_count, first);
+        }
+    }
+    if (use_external) {
+        for (pair_index = 0; pair_index < external_holdout->pair_count; ++pair_index) {
+            append_pair(
+                split->holdout, &split->holdout_count,
+                &external_holdout->samples[pair_index * 2u]);
+        }
+        split->external_holdout = 1;
+    }
+    if (split->train_count == 0 || split->selection_count == 0 ||
+            split->holdout_count == 0) {
+        counterfactual_dataset_split_free(split);
+        return 0;
+    }
+    return 1;
+}
+
+void counterfactual_dataset_split_free(CounterfactualDatasetSplit* split) {
+    if (!split) return;
+    free(split->holdout);
+    free(split->selection);
+    free(split->train);
+    memset(split, 0, sizeof(*split));
 }
