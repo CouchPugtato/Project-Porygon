@@ -89,6 +89,7 @@ typedef struct {
     size_t pair_count;
     size_t discordant_pair_count;
     double pair_ranking_accuracy;
+    double pairwise_preference_loss;
     double mean_absolute_target_gap;
     double mean_absolute_predicted_gap;
     double mean_advantage;
@@ -112,6 +113,7 @@ typedef struct {
     int residual_ranking_detected;
     int advantage_direction_consistent;
     int counterfactual_pair_signal_detected;
+    int pairwise_holdout_loss_improved;
     int generalization_gap_acceptable;
     double explained_variance_generalization_gap;
     int action_signal_detected;
@@ -309,6 +311,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     const char* batch_path,
     const char* holdout_batch_path,
     int external_holdout,
+    int final_confirmation,
     const char* checkpoint_path,
     const char* action_value_path,
     int action_value_published,

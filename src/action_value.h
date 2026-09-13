@@ -16,6 +16,16 @@ typedef struct {
     size_t legal_action_count;
 } ActionValuePrediction;
 
+typedef struct {
+    const float* hidden_state;
+    const unsigned char* legal_mask;
+    const FactorizedActionChoice* choice;
+    int action0;
+    int action1;
+    float baseline_value;
+    float target_value;
+} ActionValueExample;
+
 ActionValueModel* action_value_model_create(
     size_t hidden_dim,
     size_t latent_dim,
@@ -61,6 +71,14 @@ int action_value_model_accumulate(
     float baseline_value,
     float target_value,
     float* loss_out
+);
+int action_value_model_accumulate_preference(
+    ActionValueModel* model,
+    const GruModel* policy_model,
+    const ActionValueExample* first,
+    const ActionValueExample* second,
+    float* loss_out,
+    int* preference_used
 );
 int action_value_model_apply_adam(
     ActionValueModel* model,

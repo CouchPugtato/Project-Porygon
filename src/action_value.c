@@ -419,6 +419,41 @@ static int accumulate_target_rows(
     return 1;
 }
 
+static int accumulate_work_gradient(
+    ActionValueModel* model,
+    const ActionValueWork* work,
+    const FactorizedActionChoice* choice,
+    const float* hidden_state,
+    float coefficient
+) {
+    float latent_gradient[ACTION_VALUE_MAX_LATENT_DIM] = {0};
+    size_t i;
+    int dual = choice->slot0_has_action && choice->slot1_has_action;
+    for (i = 0; i < work->probability_count; ++i) {
+        size_t row = dual ? i : ACTION_VALUE_JOINT_ROWS +
+            (size_t)(choice->slot0_has_action ? 0 : FACTORIZED_LOCAL_ACTION_DIM) + i;
+        float row_coefficient = ((row == work->selected_row) ? 1.0f : 0.0f) -
+            work->probabilities[i];
+        accumulate_head_row(
+            model, work, row, coefficient * row_coefficient, latent_gradient);
+    }
+    if (!accumulate_target_rows(
+            model, work, choice, 0, coefficient, latent_gradient) ||
+            !accumulate_target_rows(
+                model, work, choice, 1, coefficient, latent_gradient)) return 0;
+    for (i = 0; i < model->latent_dim; ++i) {
+        float projection_gradient = latent_gradient[i] *
+            (1.0f - work->latent[i] * work->latent[i]);
+        size_t h;
+        model->gradients[model->projection_bias_offset + i] += projection_gradient;
+        for (h = 0; h < model->hidden_dim; ++h) {
+            model->gradients[projection_index(model, i, h)] +=
+                projection_gradient * hidden_state[h];
+        }
+    }
+    return 1;
+}
+
 int action_value_model_accumulate(
     ActionValueModel* model,
     const GruModel* policy_model,
@@ -432,11 +467,8 @@ int action_value_model_accumulate(
     float* loss_out
 ) {
     ActionValueWork work;
-    float latent_gradient[ACTION_VALUE_MAX_LATENT_DIM] = {0};
     float advantage;
     float error;
-    size_t i;
-    int dual;
     int ok = 0;
     if (!model || !policy_model || !hidden_state || !legal_mask || !choice) return 0;
     if (!prepare_work(model, policy_model, hidden_state, legal_mask, choice, action0, action1, &work)) {
@@ -446,31 +478,72 @@ int action_value_model_accumulate(
     advantage = work.selected_raw - work.expected_raw;
     error = baseline_value + advantage - target_value;
     if (loss_out) *loss_out = 0.5f * error * error;
-    dual = choice->slot0_has_action && choice->slot1_has_action;
-    for (i = 0; i < work.probability_count; ++i) {
-        size_t row = dual ? i : ACTION_VALUE_JOINT_ROWS +
-            (size_t)(choice->slot0_has_action ? 0 : FACTORIZED_LOCAL_ACTION_DIM) + i;
-        float coefficient = ((row == work.selected_row) ? 1.0f : 0.0f) -
-            work.probabilities[i];
-        accumulate_head_row(model, &work, row, error * coefficient, latent_gradient);
-    }
-    if (!accumulate_target_rows(model, &work, choice, 0, error, latent_gradient) ||
-            !accumulate_target_rows(model, &work, choice, 1, error, latent_gradient)) goto cleanup;
-    for (i = 0; i < model->latent_dim; ++i) {
-        float projection_gradient = latent_gradient[i] *
-            (1.0f - work.latent[i] * work.latent[i]);
-        size_t h;
-        model->gradients[model->projection_bias_offset + i] += projection_gradient;
-        for (h = 0; h < model->hidden_dim; ++h) {
-            model->gradients[projection_index(model, i, h)] +=
-                projection_gradient * hidden_state[h];
-        }
-    }
+    if (!accumulate_work_gradient(
+            model, &work, choice, hidden_state, error)) goto cleanup;
     ++model->gradient_samples;
     ok = 1;
 
 cleanup:
     free_work(&work);
+    return ok;
+}
+
+int action_value_model_accumulate_preference(
+    ActionValueModel* model,
+    const GruModel* policy_model,
+    const ActionValueExample* first,
+    const ActionValueExample* second,
+    float* loss_out,
+    int* preference_used
+) {
+    ActionValueWork first_work;
+    ActionValueWork second_work;
+    float target_gap;
+    float predicted_gap;
+    float signed_margin;
+    float direction;
+    float gradient;
+    int ok = 0;
+    if (loss_out) *loss_out = 0.0f;
+    if (preference_used) *preference_used = 0;
+    if (!model || !policy_model || !first || !second ||
+            !first->hidden_state || !second->hidden_state ||
+            !first->legal_mask || !second->legal_mask ||
+            !first->choice || !second->choice) return 0;
+    target_gap = first->target_value - second->target_value;
+    if (fabsf(target_gap) <= 1.0e-6f) return 1;
+    if (!prepare_work(
+            model, policy_model, first->hidden_state, first->legal_mask,
+            first->choice, first->action0, first->action1, &first_work) ||
+            !prepare_work(
+                model, policy_model, second->hidden_state, second->legal_mask,
+                second->choice, second->action0, second->action1,
+                &second_work)) goto cleanup;
+    direction = target_gap > 0.0f ? 1.0f : -1.0f;
+    predicted_gap =
+        first->baseline_value + first_work.selected_raw - first_work.expected_raw -
+        (second->baseline_value + second_work.selected_raw - second_work.expected_raw);
+    signed_margin = direction * predicted_gap;
+    if (loss_out) {
+        *loss_out = signed_margin >= 0.0f
+            ? log1pf(expf(-signed_margin))
+            : -signed_margin + log1pf(expf(signed_margin));
+    }
+    gradient = signed_margin >= 0.0f
+        ? -direction * expf(-signed_margin) / (1.0f + expf(-signed_margin))
+        : -direction / (1.0f + expf(signed_margin));
+    if (!accumulate_work_gradient(
+            model, &first_work, first->choice, first->hidden_state, gradient) ||
+            !accumulate_work_gradient(
+                model, &second_work, second->choice, second->hidden_state,
+                -gradient)) goto cleanup;
+    ++model->gradient_samples;
+    if (preference_used) *preference_used = 1;
+    ok = 1;
+
+cleanup:
+    free_work(&second_work);
+    free_work(&first_work);
     return ok;
 }
 

@@ -3982,6 +3982,7 @@ cleanup:
 static int run_counterfactual_q_fit_check(
     const char* batch_path,
     const char* holdout_batch_path,
+    int final_confirmation,
     const char* checkpoint_path,
     const char* report_path,
     const char* output_path,
@@ -4015,7 +4016,9 @@ static int run_counterfactual_q_fit_check(
     memset(&split, 0, sizeof(split));
     if (!batch_path || !checkpoint_path || !report_path || epochs == 0 ||
             minibatch_pairs == 0 || latent_dim == 0 || early_stop_patience == 0 ||
-            learning_rate <= 0.0f || l2_coefficient < 0.0f) {
+            learning_rate <= 0.0f || l2_coefficient < 0.0f ||
+            (final_confirmation &&
+             (!holdout_batch_path || !*holdout_batch_path))) {
         fprintf(stderr, "[counterfactual-q] invalid diagnostic configuration\n");
         return 1;
     }
@@ -4080,6 +4083,7 @@ static int run_counterfactual_q_fit_check(
             report_path, batch_path,
             split.external_holdout ? holdout_batch_path : batch_path,
             split.external_holdout,
+            final_confirmation,
             checkpoint_path, output_path,
             action_value_published, validation_seed, shuffle_seed,
             epochs, minibatch_pairs, early_stop_patience,
@@ -4326,6 +4330,8 @@ static int showdown_client_main(int argc, char** argv) {
         argc, argv, "--action-q-output", "");
     const char* counterfactual_holdout_batch_path = parse_string_flag(
         argc, argv, "--counterfactual-holdout-batch", "");
+    int counterfactual_final_confirmation = parse_bool01_flag(
+        argc, argv, "--counterfactual-final-confirmation", 0);
     const char* action_q_target_name = parse_string_flag(
         argc, argv, "--action-q-target", "td0");
     float learning_rate_override;
@@ -4607,6 +4613,7 @@ static int showdown_client_main(int argc, char** argv) {
     if (argc >= 5 && counterfactual_q_command) {
         return run_counterfactual_q_fit_check(
             argv[2], counterfactual_holdout_batch_path,
+            counterfactual_final_confirmation,
             argv[3], argv[4], action_q_output_path,
             (size_t)action_q_epochs, (size_t)action_q_minibatch_episodes,
             (size_t)action_q_latent_dim, (size_t)action_q_early_stop_patience,
@@ -4918,7 +4925,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --check-critic-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --check-action-q-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--action-q-target td0|td_lambda|monte_carlo] [--epochs N] [--learning-rate F] [--gamma F] [--gae-lambda F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --check-action-q-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--action-q-target td0|td_lambda|monte_carlo] [--epochs N] [--learning-rate F] [--gamma F] [--gae-lambda F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
-        "  showdown_client --check-counterfactual-q-fit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-holdout-batch PATH] [--action-q-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F]\n"
+        "  showdown_client --check-counterfactual-q-fit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-holdout-batch PATH] [--counterfactual-final-confirmation 0|1] [--action-q-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F]\n"
         "  showdown_client --audit-ppo-update <episode_batch.jsonl> <before.bin> <after.bin> <report.json> [--episode-limit N] [--shuffle-seed N] [--gamma F] [--gae-lambda F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"

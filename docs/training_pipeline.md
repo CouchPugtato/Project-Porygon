@@ -140,14 +140,22 @@ Pass `counterfactual_action_batch.jsonl` to
 whole pairs to stable train, selection, and holdout splits. For an independent
 test, pass `--counterfactual-holdout-batch PATH`; the training batch is then
 split only into training and model-selection data, while every pair in `PATH`
-is reserved for the final holdout metrics. The JSON report records both paths
+is reserved from optimization for holdout metrics. The JSON report records both paths
 and whether the holdout was external.
 
 The diagnostic trains the small action-Q sidecar over the frozen recurrent
-state and restores the best selection epoch. Publication requires the ordinary
-action-Q gates, at least ten holdout pairs with different outcomes, and at least
-55% correct within-pair ranking. A `.qv` sidecar is written only when every gate
-passes.
+state. Counterfactual fitting uses a pairwise logistic objective: it increases
+the Q gap toward the branch with the better terminal result and omits tied
+pairs. Early stopping follows selection-set pairwise loss. Publication requires
+at least a 1% pairwise-loss improvement on the holdout, at least ten holdout
+pairs with different outcomes, and at least 55% correct within-pair ranking. A
+`.qv` sidecar is written only when every gate passes.
+
+An external batch can be used repeatedly for development with the default
+`--counterfactual-final-confirmation 0`. Such reports explicitly require a
+fresh holdout before making a final claim. Set
+`--counterfactual-final-confirmation 1` only for the first evaluation of a newly
+collected, untouched external batch.
 
 This is a causal diagnostic, not a strength claim. Full-game continuations are
 still noisy, and the first comparison covers only policy ranks zero and one.

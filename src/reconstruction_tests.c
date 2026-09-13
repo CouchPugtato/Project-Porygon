@@ -4876,6 +4876,96 @@ cleanup:
     return ok;
 }
 
+static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
+    GruModel* policy_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    ActionValueModel* value_model = NULL;
+    float hidden[8] = {0};
+    unsigned char legal[OBS_NUM_ACTIONS] = {0};
+    FactorizedActionChoice better_choice;
+    FactorizedActionChoice worse_choice;
+    ActionValueExample better;
+    ActionValueExample worse;
+    ActionValuePrediction better_before;
+    ActionValuePrediction worse_before;
+    ActionValuePrediction better_after;
+    ActionValuePrediction worse_after;
+    float loss_before = 0.0f;
+    float loss_after = 0.0f;
+    int preference_used = 0;
+    int update;
+    int ok = 1;
+
+    if (!assert_true(policy_model && zero_model_parameters(policy_model),
+            "initialize pairwise action-value policy fixture")) {
+        gru_model_destroy(policy_model);
+        return 0;
+    }
+    value_model = action_value_model_create(8u, 4u, 93u);
+    if (!assert_true(value_model != NULL,
+            "initialize pairwise action-value sidecar")) {
+        gru_model_destroy(policy_model);
+        return 0;
+    }
+    legal[0] = legal[1] = legal[14] = legal[15] = 1;
+    factorized_action_choice_from_flat_actions(&better_choice, 0, 14);
+    factorized_action_choice_from_flat_actions(&worse_choice, 1, 15);
+    better = (ActionValueExample){
+        hidden, legal, &better_choice, 0, 14, 0.0f, 1.0f
+    };
+    worse = (ActionValueExample){
+        hidden, legal, &worse_choice, 1, 15, 0.0f, -1.0f
+    };
+    ok &= assert_true(action_value_model_predict(
+            value_model, policy_model, hidden, legal, &better_choice,
+            0, 14, 0.0f, &better_before) &&
+        action_value_model_predict(
+            value_model, policy_model, hidden, legal, &worse_choice,
+            1, 15, 0.0f, &worse_before),
+        "evaluate pairwise values before fitting");
+    action_value_model_clear_gradients(value_model);
+    ok &= assert_true(action_value_model_accumulate_preference(
+            value_model, policy_model, &better, &worse,
+            &loss_before, &preference_used) && preference_used,
+        "measure initial pairwise preference loss");
+    action_value_model_clear_gradients(value_model);
+    for (update = 0; update < 20; ++update) {
+        ok &= assert_true(action_value_model_accumulate_preference(
+                value_model, policy_model, &better, &worse, NULL,
+                &preference_used) && preference_used &&
+            action_value_model_apply_adam(
+                value_model, 0.03f, 0.9f, 0.999f, 1.0e-8f,
+                1.0f, 0.0f),
+            "fit pairwise action preference");
+    }
+    ok &= assert_true(action_value_model_predict(
+            value_model, policy_model, hidden, legal, &better_choice,
+            0, 14, 0.0f, &better_after) &&
+        action_value_model_predict(
+            value_model, policy_model, hidden, legal, &worse_choice,
+            1, 15, 0.0f, &worse_after),
+        "evaluate pairwise values after fitting");
+    action_value_model_clear_gradients(value_model);
+    ok &= assert_true(action_value_model_accumulate_preference(
+            value_model, policy_model, &better, &worse,
+            &loss_after, &preference_used) && preference_used,
+        "measure fitted pairwise preference loss");
+    ok &= assert_true(
+        better_after.q_value - worse_after.q_value >
+            better_before.q_value - worse_before.q_value &&
+        loss_after < loss_before,
+        "pairwise fitting increases the preferred action gap");
+    worse.target_value = better.target_value;
+    action_value_model_clear_gradients(value_model);
+    ok &= assert_true(action_value_model_accumulate_preference(
+            value_model, policy_model, &better, &worse,
+            &loss_after, &preference_used) && !preference_used,
+        "pairwise fitting ignores tied outcomes");
+
+    action_value_model_destroy(value_model);
+    gru_model_destroy(policy_model);
+    return ok;
+}
+
 static int test_action_value_target_modes(void) {
     Episode episode;
     float rewards[3] = {0.0f, 0.0f, 1.0f};
@@ -5406,6 +5496,7 @@ int main(int argc, char** argv) {
     if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
     if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
     if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;
+    if (!test_action_value_pairwise_preference_moves_the_value_gap()) return 1;
     if (!test_action_value_target_modes()) return 1;
     if (!test_ppo_clipped_policy_still_updates_value()) return 1;
     if (!test_dual_action_turn_has_one_value_target()) return 1;
