@@ -4991,6 +4991,13 @@ static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
             fabsf(weighted_loss - 0.25f * loss_before) < 1.0e-6f,
         "pair confidence scales the preference contribution");
     action_value_model_clear_gradients(value_model);
+    ok &= assert_true(action_value_model_accumulate_weighted_gap_regression(
+            value_model, policy_model, &better, &worse, 0.25f,
+            ACTION_VALUE_GAP_HUBER_DELTA, &weighted_loss,
+            &preference_used) && preference_used &&
+            fabsf(weighted_loss - 0.375f) < 1.0e-6f,
+        "pair confidence scales the calibrated gap loss");
+    action_value_model_clear_gradients(value_model);
     for (update = 0; update < 20; ++update) {
         ok &= assert_true(action_value_model_accumulate_preference(
                 value_model, policy_model, &better, &worse, NULL,
@@ -5086,10 +5093,11 @@ static int test_counterfactual_q_overfits_repeated_real_shape_pairs(void) {
         "run counterfactual real-shape overfit fixture");
     ok &= assert_true(result.best_epoch > 0u &&
             result.last_attempted_epoch == result.epochs_completed &&
-            result.after_train.confidence_weighted_pairwise_preference_loss <
-                result.before_train.confidence_weighted_pairwise_preference_loss * 0.5 &&
+            result.after_train.confidence_weighted_pair_gap_huber_loss <
+                result.before_train.confidence_weighted_pair_gap_huber_loss * 0.5 &&
+            fabs(result.after_train.mean_absolute_predicted_gap - 2.0) < 0.25 &&
             result.after_train.confidence_weighted_pair_ranking_accuracy > 0.9,
-        "counterfactual sidecar can memorize repeated pair preferences");
+        "counterfactual sidecar can memorize calibrated pair gaps");
 
     action_value_model_destroy(value_model);
     gru_model_destroy(policy_model);

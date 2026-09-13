@@ -95,6 +95,9 @@ typedef struct {
     double mean_pair_confidence;
     double confidence_weighted_pair_ranking_accuracy;
     double confidence_weighted_pairwise_preference_loss;
+    double pair_gap_huber_loss;
+    double confidence_weighted_pair_gap_huber_loss;
+    double mean_absolute_pair_gap_error;
     double mean_absolute_target_gap;
     double mean_absolute_predicted_gap;
     double mean_advantage;
@@ -122,6 +125,7 @@ typedef struct {
     int advantage_direction_consistent;
     int counterfactual_pair_signal_detected;
     int pairwise_holdout_loss_improved;
+    int pair_gap_holdout_loss_improved;
     int generalization_gap_acceptable;
     double explained_variance_generalization_gap;
     int action_signal_detected;

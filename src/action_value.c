@@ -563,6 +563,71 @@ int action_value_model_accumulate_preference(
         loss_out, preference_used);
 }
 
+int action_value_model_accumulate_weighted_gap_regression(
+    ActionValueModel* model,
+    const GruModel* policy_model,
+    const ActionValueExample* first,
+    const ActionValueExample* second,
+    float pair_weight,
+    float huber_delta,
+    float* loss_out,
+    int* pair_used
+) {
+    ActionValueWork first_work;
+    ActionValueWork second_work;
+    float target_gap;
+    float predicted_gap;
+    float error;
+    float absolute_error;
+    float gradient;
+    int ok = 0;
+    if (loss_out) *loss_out = 0.0f;
+    if (pair_used) *pair_used = 0;
+    if (!model || !policy_model || !first || !second ||
+            !first->hidden_state || !second->hidden_state ||
+            !first->legal_mask || !second->legal_mask ||
+            !first->choice || !second->choice ||
+            !isfinite(pair_weight) || pair_weight < 0.0f ||
+            !isfinite(huber_delta) || huber_delta <= 0.0f) return 0;
+    target_gap = first->target_value - second->target_value;
+    if (fabsf(target_gap) <= 1.0e-6f || pair_weight <= 1.0e-6f) return 1;
+    if (!prepare_work(
+            model, policy_model, first->hidden_state, first->legal_mask,
+            first->choice, first->action0, first->action1, &first_work) ||
+            !prepare_work(
+                model, policy_model, second->hidden_state, second->legal_mask,
+                second->choice, second->action0, second->action1,
+                &second_work)) goto cleanup;
+    predicted_gap =
+        first->baseline_value + first_work.selected_raw - first_work.expected_raw -
+        (second->baseline_value + second_work.selected_raw - second_work.expected_raw);
+    error = predicted_gap - target_gap;
+    absolute_error = fabsf(error);
+    if (absolute_error <= huber_delta) {
+        if (loss_out) *loss_out = pair_weight * 0.5f * error * error;
+        gradient = pair_weight * error;
+    } else {
+        if (loss_out) {
+            *loss_out = pair_weight * huber_delta *
+                (absolute_error - 0.5f * huber_delta);
+        }
+        gradient = pair_weight * huber_delta * (error > 0.0f ? 1.0f : -1.0f);
+    }
+    if (!accumulate_work_gradient(
+            model, &first_work, first->choice, first->hidden_state, gradient) ||
+            !accumulate_work_gradient(
+                model, &second_work, second->choice, second->hidden_state,
+                -gradient)) goto cleanup;
+    ++model->gradient_samples;
+    if (pair_used) *pair_used = 1;
+    ok = 1;
+
+cleanup:
+    free_work(&second_work);
+    free_work(&first_work);
+    return ok;
+}
+
 int action_value_model_apply_adam(
     ActionValueModel* model,
     float learning_rate,

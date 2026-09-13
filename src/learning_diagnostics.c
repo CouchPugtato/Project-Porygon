@@ -464,6 +464,15 @@ static int evaluate_action_value(
     return 1;
 }
 
+static double action_value_gap_huber_loss(double error) {
+    double absolute_error = fabs(error);
+    if (absolute_error <= ACTION_VALUE_GAP_HUBER_DELTA) {
+        return 0.5 * error * error;
+    }
+    return ACTION_VALUE_GAP_HUBER_DELTA *
+        (absolute_error - 0.5 * ACTION_VALUE_GAP_HUBER_DELTA);
+}
+
 static int evaluate_counterfactual_action_value(
     const ActionValueModel* action_value_model,
     const GruModel* policy_model,
@@ -482,6 +491,9 @@ static int evaluate_counterfactual_action_value(
     double confidence_sum = 0.0;
     double confidence_correct_sum = 0.0;
     double confidence_loss_sum = 0.0;
+    double gap_loss_sum = 0.0;
+    double confidence_gap_loss_sum = 0.0;
+    double absolute_gap_error_sum = 0.0;
     if (!action_value_model || !policy_model || !samples || !metrics) return 0;
     memset(metrics, 0, sizeof(*metrics));
     if (sample_count % 2u != 0) return 0;
@@ -516,6 +528,8 @@ static int evaluate_counterfactual_action_value(
         if (fabs(target_gap) > 1.0e-6) {
             double direction = target_gap > 0.0 ? 1.0 : -1.0;
             double signed_margin = direction * predicted_gap;
+            double gap_error = predicted_gap - target_gap;
+            double gap_loss = action_value_gap_huber_loss(gap_error);
             ++discordant_pairs;
             {
                 double loss = signed_margin >= 0.0
@@ -525,6 +539,9 @@ static int evaluate_counterfactual_action_value(
                 confidence_loss_sum += confidence * loss;
             }
             confidence_sum += confidence;
+            gap_loss_sum += gap_loss;
+            confidence_gap_loss_sum += confidence * gap_loss;
+            absolute_gap_error_sum += fabs(gap_error);
             if ((target_gap > 0.0 && predicted_gap > 0.0) ||
                     (target_gap < 0.0 && predicted_gap < 0.0)) {
                 ++correct_rankings;
@@ -548,12 +565,18 @@ static int evaluate_counterfactual_action_value(
             preference_loss_sum / (double)metrics->discordant_pair_count;
         metrics->mean_pair_confidence =
             confidence_sum / (double)metrics->discordant_pair_count;
+        metrics->pair_gap_huber_loss =
+            gap_loss_sum / (double)metrics->discordant_pair_count;
+        metrics->mean_absolute_pair_gap_error =
+            absolute_gap_error_sum / (double)metrics->discordant_pair_count;
     }
     if (confidence_sum > 0.0) {
         metrics->confidence_weighted_pair_ranking_accuracy =
             confidence_correct_sum / confidence_sum;
         metrics->confidence_weighted_pairwise_preference_loss =
             confidence_loss_sum / confidence_sum;
+        metrics->confidence_weighted_pair_gap_huber_loss =
+            confidence_gap_loss_sum / confidence_sum;
     }
     return 1;
 }
@@ -578,13 +601,17 @@ static void assess_action_value_fit(
         result->after_holdout.discordant_pair_count >= 10u &&
         result->after_holdout.confidence_weighted_pairwise_preference_loss <=
             result->before_holdout.confidence_weighted_pairwise_preference_loss * 0.99;
+    result->pair_gap_holdout_loss_improved =
+        result->after_holdout.discordant_pair_count >= 10u &&
+        result->after_holdout.confidence_weighted_pair_gap_huber_loss <=
+            result->before_holdout.confidence_weighted_pair_gap_huber_loss * 0.99;
     result->explained_variance_generalization_gap =
         result->after_train.q_explained_variance - result->after_holdout.q_explained_variance;
     result->generalization_gap_acceptable =
         result->explained_variance_generalization_gap <= 0.25;
     if (require_counterfactual_pair_signal) {
         result->action_signal_detected = result->training_completed &&
-            result->pairwise_holdout_loss_improved &&
+            result->pair_gap_holdout_loss_improved &&
             result->counterfactual_pair_signal_detected &&
             result->after_holdout.nonfinite_count == 0 &&
             result->after_holdout.mean_absolute_advantage > 1.0e-4 &&
@@ -1206,14 +1233,14 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
             action_value_model, best_parameters, parameter_count)) goto failure;
     for (i = 0; i < train_count / 2u; ++i) order[i] = i;
     best_selection_loss =
-        result->before_selection.confidence_weighted_pairwise_preference_loss;
+        result->before_selection.confidence_weighted_pair_gap_huber_loss;
     result->training_completed = 1;
     for (epoch = 0; epoch < epochs; ++epoch) {
         ActionValueFitMetrics selection_metrics;
         critic_shuffle(order, train_count / 2u, &shuffle_state);
         for (i = 0; i < train_count / 2u; i += minibatch_pairs) {
             size_t batch_count = train_count / 2u - i;
-            size_t batch_preferences = 0;
+            size_t batch_pairs = 0;
             size_t j;
             if (batch_count > minibatch_pairs) batch_count = minibatch_pairs;
             action_value_model_clear_gradients(action_value_model);
@@ -1231,16 +1258,17 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
                     second->action, second->action2,
                     second->baseline_value, second->target_value
                 };
-                int preference_used = 0;
-                float preference_weight =
+                int pair_used = 0;
+                float pair_weight =
                     counterfactual_pair_preference_weight(first, second);
-                if (!action_value_model_accumulate_weighted_preference(
+                if (!action_value_model_accumulate_weighted_gap_regression(
                         action_value_model, policy_model,
-                        &first_example, &second_example, preference_weight, NULL,
-                        &preference_used)) goto failure;
-                batch_preferences += (size_t)preference_used;
+                        &first_example, &second_example, pair_weight,
+                        ACTION_VALUE_GAP_HUBER_DELTA, NULL,
+                        &pair_used)) goto failure;
+                batch_pairs += (size_t)pair_used;
             }
-            if (batch_preferences > 0 && !action_value_model_apply_adam(
+            if (batch_pairs > 0 && !action_value_model_apply_adam(
                     action_value_model, learning_rate, adam_beta1, adam_beta2,
                     adam_epsilon, gradient_clip, l2_coefficient)) goto failure;
         }
@@ -1248,10 +1276,10 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
         if (!evaluate_counterfactual_action_value(
                 action_value_model, policy_model, selection_samples, selection_count,
                 &selection_metrics)) goto failure;
-        if (selection_metrics.confidence_weighted_pairwise_preference_loss <
+        if (selection_metrics.confidence_weighted_pair_gap_huber_loss <
                 best_selection_loss - 1.0e-6) {
             best_selection_loss =
-                selection_metrics.confidence_weighted_pairwise_preference_loss;
+                selection_metrics.confidence_weighted_pair_gap_huber_loss;
             result->best_epoch = epoch + 1u;
             stale_epochs = 0;
             if (!action_value_model_export_parameters(
@@ -1262,9 +1290,9 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
         {
             double elapsed = critic_wall_seconds() - started_at;
             double eta = elapsed / (double)(epoch + 1u) * (double)(epochs - epoch - 1u);
-            printf("[counterfactual-q] epoch=%zu/%zu selection_weighted_loss=%.6f selection_weighted_ranking=%.4f best_epoch=%zu elapsed=%.1fs eta=%.1fs\n",
+            printf("[counterfactual-q] epoch=%zu/%zu selection_weighted_gap_loss=%.6f selection_weighted_ranking=%.4f best_epoch=%zu elapsed=%.1fs eta=%.1fs\n",
                 epoch + 1u, epochs,
-                selection_metrics.confidence_weighted_pairwise_preference_loss,
+                selection_metrics.confidence_weighted_pair_gap_huber_loss,
                 selection_metrics.confidence_weighted_pair_ranking_accuracy,
                 result->best_epoch, elapsed, eta);
         }
@@ -1361,6 +1389,12 @@ static void write_action_value_metrics(
         indent, metrics->confidence_weighted_pair_ranking_accuracy);
     fprintf(out, "%s  \"confidence_weighted_pairwise_preference_loss\": %.9g,\n",
         indent, metrics->confidence_weighted_pairwise_preference_loss);
+    fprintf(out, "%s  \"pair_gap_huber_loss\": %.9g,\n", indent,
+        metrics->pair_gap_huber_loss);
+    fprintf(out, "%s  \"confidence_weighted_pair_gap_huber_loss\": %.9g,\n",
+        indent, metrics->confidence_weighted_pair_gap_huber_loss);
+    fprintf(out, "%s  \"mean_absolute_pair_gap_error\": %.9g,\n", indent,
+        metrics->mean_absolute_pair_gap_error);
     fprintf(out, "%s  \"mean_absolute_target_gap\": %.9g,\n", indent,
         metrics->mean_absolute_target_gap);
     fprintf(out, "%s  \"mean_absolute_predicted_gap\": %.9g,\n", indent,
@@ -1504,7 +1538,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         overfit_pair_count > 0
             ? "counterfactual_q_real_data_overfit"
             : "paired_counterfactual_joint_q_fit");
-    fputs("  \"metrics_version\": 5,\n  \"counterfactual_batch\": ", out);
+    fputs("  \"metrics_version\": 6,\n  \"counterfactual_batch\": ", out);
     write_json_string(out, batch_path);
     fputs(",\n  \"holdout_batch\": ", out);
     write_json_string(out, holdout_batch_path);
@@ -1527,7 +1561,8 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"encoder_frozen\": true,\n"
         "  \"policy_frozen\": true,\n"
         "  \"target_value_source\": \"matched_terminal_counterfactual_rollouts\",\n"
-        "  \"training_objective\": \"rollout_confidence_weighted_pairwise_logistic_preference\",\n"
+        "  \"training_objective\": \"rollout_confidence_weighted_pair_gap_huber_regression\",\n"
+        "  \"pair_gap_huber_delta\": %.9g,\n"
         "  \"pair_weight_definition\": \"normal confidence from the mean return gap and repeated-rollout standard error\",\n"
         "  \"tied_pairs_in_training\": false,\n"
         "  \"advantage_centering\": \"exact expectation under the frozen legal policy\",\n"
@@ -1547,6 +1582,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"l2_coefficient\": %.9g,\n",
         action_value_published ? "true" : "false",
         overfit_pair_count > 0 ? "false" : "true",
+        (double)ACTION_VALUE_GAP_HUBER_DELTA,
         action_value_model_hidden_dim(action_value_model),
         action_value_model_latent_dim(action_value_model),
         action_value_model_parameter_count(action_value_model),
@@ -1574,18 +1610,20 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     fprintf(out,
         "    \"training_completed\": %s,\n"
         "    \"pairwise_holdout_loss_improved\": %s,\n"
+        "    \"pair_gap_holdout_loss_improved\": %s,\n"
         "    \"counterfactual_pair_signal_detected\": %s,\n"
         "    \"action_signal_detected\": %s,\n"
         "    \"overfit_passed\": %s,\n",
         result->training_completed ? "true" : "false",
         result->pairwise_holdout_loss_improved ? "true" : "false",
+        result->pair_gap_holdout_loss_improved ? "true" : "false",
         result->counterfactual_pair_signal_detected ? "true" : "false",
         result->action_signal_detected ? "true" : "false",
         result->counterfactual_overfit_passed ? "true" : "false");
     if (overfit_pair_count > 0) {
-        fputs("    \"pass_rule\": \"on the reused real-data subset, confidence-weighted pairwise loss falls at least 50%, weighted ranking accuracy reaches at least 90%, at least 10 discordant pairs contribute, and outputs remain finite\"\n", out);
+        fputs("    \"pass_rule\": \"on the reused real-data subset, confidence-weighted pair-gap Huber loss falls at least 50%, weighted ranking accuracy reaches at least 90%, at least 10 discordant pairs contribute, and outputs remain finite\"\n", out);
     } else {
-        fputs("    \"pass_rule\": \"confidence-weighted pairwise holdout loss improves at least 1%, at least 10 discordant holdout pairs achieve at least 55% confidence-weighted ranking accuracy, outputs remain finite, and advantages remain bounded\"\n", out);
+        fputs("    \"pass_rule\": \"confidence-weighted pair-gap Huber loss improves at least 1% on holdout, at least 10 discordant holdout pairs achieve at least 55% confidence-weighted ranking accuracy, outputs remain finite, and advantages remain bounded\"\n", out);
     }
     fputs("  }\n}\n", out);
     return fclose(out) == 0;

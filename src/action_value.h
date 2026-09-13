@@ -6,6 +6,8 @@
 #include "episode.h"
 #include "gru_model.h"
 
+#define ACTION_VALUE_GAP_HUBER_DELTA 1.0f
+
 typedef struct ActionValueModel ActionValueModel;
 
 typedef struct {
@@ -88,6 +90,16 @@ int action_value_model_accumulate_weighted_preference(
     float preference_weight,
     float* loss_out,
     int* preference_used
+);
+int action_value_model_accumulate_weighted_gap_regression(
+    ActionValueModel* model,
+    const GruModel* policy_model,
+    const ActionValueExample* first,
+    const ActionValueExample* second,
+    float pair_weight,
+    float huber_delta,
+    float* loss_out,
+    int* pair_used
 );
 int action_value_model_apply_adam(
     ActionValueModel* model,

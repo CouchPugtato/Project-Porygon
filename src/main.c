@@ -4093,8 +4093,8 @@ static int run_counterfactual_q_fit_check(
     if (overfit_pair_count > 0) {
         result.counterfactual_overfit_passed =
             result.after_train.discordant_pair_count >= 10u &&
-            result.after_train.confidence_weighted_pairwise_preference_loss <=
-                result.before_train.confidence_weighted_pairwise_preference_loss * 0.5 &&
+            result.after_train.confidence_weighted_pair_gap_huber_loss <=
+                result.before_train.confidence_weighted_pair_gap_huber_loss * 0.5 &&
             result.after_train.confidence_weighted_pair_ranking_accuracy >= 0.90 &&
             result.after_train.nonfinite_count == 0u;
     }
@@ -4116,12 +4116,12 @@ static int run_counterfactual_q_fit_check(
             report_path, strerror(errno));
         goto cleanup;
     }
-    printf("[counterfactual-q] signal=%d overfit_passed=%d q_loss=%.6f baseline_q_loss=%.6f weighted_pair_loss=%.6f before_weighted_pair_loss=%.6f weighted_ranking=%.4f effective_pair_weight=%.1f discordant_pairs=%zu published=%d report=%s\n",
+    printf("[counterfactual-q] signal=%d overfit_passed=%d q_loss=%.6f baseline_q_loss=%.6f weighted_gap_loss=%.6f before_weighted_gap_loss=%.6f weighted_ranking=%.4f effective_pair_weight=%.1f discordant_pairs=%zu published=%d report=%s\n",
         result.action_signal_detected, result.counterfactual_overfit_passed,
         result.after_holdout.q_loss,
         result.after_holdout.baseline_loss,
-        result.after_holdout.confidence_weighted_pairwise_preference_loss,
-        result.before_holdout.confidence_weighted_pairwise_preference_loss,
+        result.after_holdout.confidence_weighted_pair_gap_huber_loss,
+        result.before_holdout.confidence_weighted_pair_gap_huber_loss,
         result.after_holdout.confidence_weighted_pair_ranking_accuracy,
         result.after_holdout.pair_confidence_sum,
         result.after_holdout.discordant_pair_count,
