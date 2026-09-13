@@ -243,7 +243,9 @@ async function drivePlayer(stream, agent, battleId, playerName, format) {
     let sequence = 0;
     let episode = null;
     let intervention = null;
+    let pendingDecision = null;
     let result = null;
+    const choiceRejections = [];
     agent.send({
         type: 'battle_start',
         battle_id: battleId,
@@ -253,6 +255,29 @@ async function drivePlayer(stream, agent, battleId, playerName, format) {
     for await (const chunk of stream) {
         for (const line of chunk.split('\n')) {
             if (!line) continue;
+            if (line.startsWith('|error|')) {
+                if (!pendingDecision) {
+                    throw new Error(`Showdown reported an unexpected choice error: ${line}`);
+                }
+                agent.send({
+                    ...pendingDecision,
+                    type: 'decision_rejected',
+                    reason: line,
+                });
+                choiceRejections.push({
+                    player: playerName,
+                    request_id: pendingDecision.request_id,
+                    command: pendingDecision.command,
+                    message: line,
+                });
+                pendingDecision = null;
+                ++sequence;
+                continue;
+            }
+            if (pendingDecision) {
+                agent.send(pendingDecision);
+                pendingDecision = null;
+            }
             if (line.startsWith('|request|')) {
                 const request = JSON.parse(line.slice('|request|'.length));
                 if (!request || request.wait) continue;
@@ -262,9 +287,15 @@ async function drivePlayer(stream, agent, battleId, playerName, format) {
                     request_id: sequence,
                     payload: request,
                 });
-                const action = await agent.nextMessage('action');
+                let action;
+                try {
+                    action = await agent.nextMessage('action');
+                } catch (error) {
+                    error.message = `${error.message}; battle_id=${battleId}; request=${JSON.stringify(request)}`;
+                    throw error;
+                }
                 if (action.counterfactual) intervention = action;
-                const decision = {
+                pendingDecision = {
                     type: 'decision_accepted',
                     battle_id: battleId,
                     request_id: sequence,
@@ -272,13 +303,9 @@ async function drivePlayer(stream, agent, battleId, playerName, format) {
                     action2: action.action2,
                     command: action.command,
                 };
-                agent.send(decision);
                 const command = String(action.command).replace(/^\/choose\s+/, '');
                 await stream.write(command);
             } else {
-                if (line.startsWith('|error|')) {
-                    throw new Error(`Showdown rejected a choice: ${line}`);
-                }
                 const terminal = terminalResult(line, playerName);
                 if (terminal && !result) {
                     result = terminal;
@@ -293,7 +320,7 @@ async function drivePlayer(stream, agent, battleId, playerName, format) {
         }
     }
     if (!episode || !result) throw new Error(`battle ${battleId} ended without an episode`);
-    return {episode, intervention, result};
+    return {episode, intervention, result, choiceRejections};
 }
 
 async function runBranch(sim, options, attempt, decisionIndex, actionRank) {
@@ -333,9 +360,21 @@ async function runBranch(sim, options, attempt, decisionIndex, actionRank) {
                 `>player p1 ${JSON.stringify(p1)}\n` +
                 `>player p2 ${JSON.stringify(p2)}`
             );
-            const [candidateResult] = await Promise.all([
+            const [candidateResult, opponentResult] = await Promise.all([
                 candidateDrive, opponentDrive, drain,
             ]);
+            candidateResult.choiceRejections = [
+                ...candidateResult.choiceRejections.map(rejection => ({
+                    ...rejection,
+                    role: 'candidate',
+                    action_rank: actionRank,
+                })),
+                ...opponentResult.choiceRejections.map(rejection => ({
+                    ...rejection,
+                    role: 'opponent',
+                    action_rank: actionRank,
+                })),
+            ];
             return candidateResult;
         })();
         const timedOut = new Promise((_, reject) => {
@@ -421,20 +460,39 @@ async function runPair(sim, options, attempt) {
         runBranch(sim, options, attempt, decisionIndex, 0),
         runBranch(sim, options, attempt, decisionIndex, 1),
     ]);
+    const choiceRejections = [
+        ...rank0.choiceRejections,
+        ...rank1.choiceRejections,
+    ];
     if (!rank0.intervention || !rank1.intervention) {
-        return {valid: false, reason: 'intervention_not_reached'};
+        return {
+            valid: false,
+            reason: 'intervention_not_reached',
+            message: 'one or both branches ended before reaching the requested intervention',
+            choiceRejections,
+        };
     }
     if (rank0.intervention.hidden_dim !== rank1.intervention.hidden_dim ||
             !equalPrefix(
                 rank0.intervention.hidden_state, rank1.intervention.hidden_state,
                 rank0.intervention.hidden_dim) ||
             !equalPrefix(rank0.intervention.legal_mask, rank1.intervention.legal_mask, 28)) {
-        return {valid: false, reason: 'pre_intervention_state_mismatch'};
+        return {
+            valid: false,
+            reason: 'pre_intervention_state_mismatch',
+            message: 'ranked branches did not expose the same pre-intervention state',
+            choiceRejections,
+        };
     }
     const choice0 = interventionChoice(rank0.intervention);
     const choice1 = interventionChoice(rank1.intervention);
     if (!choicesDiffer(choice0, choice1)) {
-        return {valid: false, reason: 'ranked_actions_not_distinct'};
+        return {
+            valid: false,
+            reason: 'ranked_actions_not_distinct',
+            message: 'rank zero and rank one resolved to the same action and targets',
+            choiceRejections,
+        };
     }
     const pairId = `counterfactual-pair-${attempt}`;
     return {
@@ -446,6 +504,7 @@ async function runPair(sim, options, attempt) {
         rank1Return: rank1.result.reward,
         choice0,
         choice1,
+        choiceRejections,
         records: [
             buildCounterfactualSample(
                 rank0.intervention, pairId, options.checkpoint, rank0.result.reward),
@@ -488,6 +547,85 @@ async function writeJsonAtomic(filePath, value) {
     await writeTextAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`, true);
 }
 
+async function appendJsonLineDurably(filePath, value) {
+    const handle = await fsp.open(filePath, 'a');
+    try {
+        await handle.writeFile(`${JSON.stringify(value)}\n`, 'utf8');
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
+}
+
+function choiceRejectionReason(message) {
+    const normalized = String(message || '').toLowerCase();
+    if (normalized.includes("can't switch") && normalized.includes('trapped')) {
+        return 'trapped_switch';
+    }
+    if (normalized.includes('needs a target')) return 'missing_move_target';
+    if (normalized.includes('invalid target')) return 'invalid_move_target';
+    return 'other_choice_rejection';
+}
+
+function battleFailureReason(error) {
+    const message = String(error?.message || error || '');
+    if (message.toLowerCase().includes('timeout')) return 'battle_timeout';
+    if (message.includes('showdown_client exited')) return 'agent_process_error';
+    return 'battle_error';
+}
+
+async function summarizeFailureLog(filePath) {
+    const summary = {
+        choice_rejections_recovered: 0,
+        choice_rejection_reasons: {},
+        logged_attempt_failures: 0,
+        logged_failure_reasons: {},
+        highest_attempt: -1,
+    };
+    if (!fs.existsSync(filePath)) return summary;
+    const lines = (await fsp.readFile(filePath, 'utf8')).split(/\r?\n/);
+    const rejectionKeys = new Set();
+    const failedAttempts = new Map();
+    for (const line of lines) {
+        if (!line.trim()) continue;
+        let record;
+        try {
+            record = JSON.parse(line);
+        } catch (_) {
+            continue;
+        }
+        if (Number.isSafeInteger(record.attempt)) {
+            summary.highest_attempt = Math.max(summary.highest_attempt, record.attempt);
+        }
+        if (record.type === 'attempt_failure' && Number.isSafeInteger(record.attempt)) {
+            failedAttempts.set(record.attempt, record.reason || 'unknown');
+        } else if (record.type === 'choice_rejection_recovered') {
+            rejectionKeys.add(JSON.stringify([
+                record.attempt,
+                record.action_rank,
+                record.role,
+                record.player,
+                record.request_id,
+                record.command,
+                record.message,
+                record.reason,
+            ]));
+        }
+    }
+    for (const reason of failedAttempts.values()) {
+        ++summary.logged_attempt_failures;
+        summary.logged_failure_reasons[reason] =
+            (summary.logged_failure_reasons[reason] || 0) + 1;
+    }
+    for (const key of rejectionKeys) {
+        const reason = JSON.parse(key)[7] || 'other_choice_rejection';
+        ++summary.choice_rejections_recovered;
+        summary.choice_rejection_reasons[reason] =
+            (summary.choice_rejection_reasons[reason] || 0) + 1;
+    }
+    return summary;
+}
+
 function emptyManifest(options) {
     return {
         schema_version: 2,
@@ -505,6 +643,10 @@ function emptyManifest(options) {
         completed_pairs: 0,
         invalid_attempts: 0,
         invalid_reasons: {},
+        choice_rejections_recovered: 0,
+        choice_rejection_reasons: {},
+        logged_attempt_failures: 0,
+        logged_failure_reasons: {},
         rank0_better: 0,
         rank1_better: 0,
         equal_returns: 0,
@@ -662,6 +804,12 @@ async function recoverManifestFromPairFiles(pairDir, options, priorManifest = nu
         manifest.invalid_reasons.recovered_unclassified = manifest.invalid_attempts - classified;
     }
     manifest.elapsed_seconds = Number(priorManifest?.elapsed_seconds) || 0;
+    manifest.choice_rejections_recovered =
+        Number(priorManifest?.choice_rejections_recovered) || 0;
+    if (priorManifest?.choice_rejection_reasons &&
+            typeof priorManifest.choice_rejection_reasons === 'object') {
+        manifest.choice_rejection_reasons = {...priorManifest.choice_rejection_reasons};
+    }
     manifest.recovery = {
         recovered_at: new Date().toISOString(),
         pair_files_found: filenames.length,
@@ -691,7 +839,15 @@ async function combinePairFiles(runDir, manifest) {
     return output;
 }
 
-async function collect(sim, options, runDir, pairDir, manifestPath, summaryPath) {
+async function collect(
+    sim,
+    options,
+    runDir,
+    pairDir,
+    manifestPath,
+    summaryPath,
+    failureLogPath
+) {
     let manifest = emptyManifest(options);
     if (options.resume && fs.existsSync(manifestPath)) {
         let priorManifest = await readJsonIfValid(manifestPath);
@@ -713,6 +869,21 @@ async function collect(sim, options, runDir, pairDir, manifestPath, summaryPath)
         throw new Error(`run already exists; use --resume true or a new run name: ${runDir}`);
     }
 
+    const existingFailureSummary = await summarizeFailureLog(failureLogPath);
+    manifest.choice_rejections_recovered =
+        existingFailureSummary.choice_rejections_recovered;
+    manifest.choice_rejection_reasons =
+        existingFailureSummary.choice_rejection_reasons;
+    manifest.logged_attempt_failures = existingFailureSummary.logged_attempt_failures;
+    manifest.logged_failure_reasons = existingFailureSummary.logged_failure_reasons;
+    if (existingFailureSummary.highest_attempt >= manifest.attempts) {
+        manifest.attempts = existingFailureSummary.highest_attempt + 1;
+        manifest.invalid_attempts = Math.max(
+            manifest.invalid_attempts,
+            manifest.attempts - manifest.completed_pairs
+        );
+    }
+
     const initialElapsed = Number(manifest.elapsed_seconds) || 0;
     const startedAt = Date.now();
     const maximumAttempts = options.pairs * options.maxAttemptMultiplier;
@@ -727,10 +898,31 @@ async function collect(sim, options, runDir, pairDir, manifestPath, summaryPath)
         await previous;
         try {
             manifest.attempts = Math.max(manifest.attempts, attempt + 1);
+            for (const rejection of result.choiceRejections || []) {
+                const reason = choiceRejectionReason(rejection.message);
+                await appendJsonLineDurably(failureLogPath, {
+                    type: 'choice_rejection_recovered',
+                    attempt,
+                    reason,
+                    ...rejection,
+                });
+                ++manifest.choice_rejections_recovered;
+                manifest.choice_rejection_reasons[reason] =
+                    (manifest.choice_rejection_reasons[reason] || 0) + 1;
+            }
             if (!result.valid) {
+                await appendJsonLineDurably(failureLogPath, {
+                    type: 'attempt_failure',
+                    attempt,
+                    reason: result.reason,
+                    message: result.message || result.reason,
+                });
                 ++manifest.invalid_attempts;
                 manifest.invalid_reasons[result.reason] =
                     (manifest.invalid_reasons[result.reason] || 0) + 1;
+                ++manifest.logged_attempt_failures;
+                manifest.logged_failure_reasons[result.reason] =
+                    (manifest.logged_failure_reasons[result.reason] || 0) + 1;
             } else if (manifest.completed_pairs < options.pairs) {
                 const filename = `pairs/pair_${String(attempt).padStart(6, '0')}.jsonl`;
                 const pairPath = path.join(runDir, filename);
@@ -777,10 +969,12 @@ async function collect(sim, options, runDir, pairDir, manifestPath, summaryPath)
             try {
                 await recordResult(attempt, await runPair(sim, options, attempt));
             } catch (error) {
-                const reason = error.message.includes('timeout')
-                    ? 'battle_timeout'
-                    : 'battle_error';
-                await recordResult(attempt, {valid: false, reason});
+                const reason = battleFailureReason(error);
+                await recordResult(attempt, {
+                    valid: false,
+                    reason,
+                    message: String(error.stack || error.message || error),
+                });
                 console.error(`[counterfactual] attempt=${attempt} failed: ${error.message}`);
             }
         }
@@ -788,11 +982,17 @@ async function collect(sim, options, runDir, pairDir, manifestPath, summaryPath)
 
     await Promise.all(Array.from({length: options.concurrency}, () => worker()));
     await writeLock;
+    const finalFailureSummary = await summarizeFailureLog(failureLogPath);
+    manifest.choice_rejections_recovered = finalFailureSummary.choice_rejections_recovered;
+    manifest.choice_rejection_reasons = finalFailureSummary.choice_rejection_reasons;
+    manifest.logged_attempt_failures = finalFailureSummary.logged_attempt_failures;
+    manifest.logged_failure_reasons = finalFailureSummary.logged_failure_reasons;
     manifest.status = manifest.completed_pairs >= options.pairs ? 'completed' : 'insufficient_valid_pairs';
     const batchPath = await combinePairFiles(runDir, manifest);
     const summary = {
         ...manifest,
         batch_path: batchPath,
+        failure_log_path: failureLogPath,
         return_disagreement_pairs: manifest.rank0_better + manifest.rank1_better,
         return_disagreement_rate: manifest.completed_pairs > 0
             ? (manifest.rank0_better + manifest.rank1_better) / manifest.completed_pairs
@@ -812,11 +1012,13 @@ async function main(argv = process.argv.slice(2)) {
     const pairDir = path.join(runDir, 'pairs');
     const manifestPath = path.join(runDir, `${options.runName}_counterfactual_manifest.json`);
     const summaryPath = path.join(runDir, `${options.runName}_counterfactual_summary.json`);
+    const failureLogPath = path.join(runDir, 'counterfactual_failures.jsonl');
     await fsp.mkdir(runDir, {recursive: true});
     const runLock = await acquireRunLock(runDir);
     try {
         await fsp.mkdir(pairDir, {recursive: true});
-        await collect(sim, options, runDir, pairDir, manifestPath, summaryPath);
+        await collect(
+            sim, options, runDir, pairDir, manifestPath, summaryPath, failureLogPath);
     } finally {
         await runLock.release();
     }
@@ -830,8 +1032,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+    appendJsonLineDurably,
+    battleFailureReason,
     buildCounterfactualSample,
     choicesDiffer,
+    choiceRejectionReason,
+    drivePlayer,
     equalPrefix,
     acquireRunLock,
     inferenceSeed,
@@ -841,5 +1047,6 @@ module.exports = {
     readJsonIfValid,
     recoverManifestFromPairFiles,
     seedTuple,
+    summarizeFailureLog,
     writeJsonAtomic,
 };

@@ -271,6 +271,29 @@ unsigned char build_move_target_mask(const ParsedRequest* req, int active_slot, 
     return mask;
 }
 
+static int move_has_available_required_target(
+    const ParsedRequest* req,
+    int active_slot,
+    int move_slot
+) {
+    ParsedMoveTarget target;
+    if (!req || active_slot < 0 || active_slot >= PARSED_REQUEST_ACTIVE_SLOTS ||
+            move_slot < 0 || move_slot >= PARSED_REQUEST_MOVE_SLOTS) {
+        return 0;
+    }
+    target = req->active[active_slot].move_target[move_slot];
+    switch (target) {
+        case REQUEST_TARGET_NORMAL:
+        case REQUEST_TARGET_ADJACENT_FOE:
+        case REQUEST_TARGET_ANY:
+        case REQUEST_TARGET_ADJACENT_ALLY:
+        case REQUEST_TARGET_ADJACENT_ALLY_OR_SELF:
+            return build_move_target_mask(req, active_slot, move_slot) != 0u;
+        default:
+            return 1;
+    }
+}
+
 static int first_target_from_mask(unsigned char target_mask) {
     static const int preference[FACTORIZED_TARGET_DIM] = {
         FACTORIZED_TARGET_FOE_LEFT,
@@ -426,7 +449,10 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
     for (i = 0; i < req->active_count && i < PARSED_REQUEST_ACTIVE_SLOTS; ++i) {
         int m;
         for (m = 0; m < PARSED_REQUEST_MOVE_SLOTS; ++m) {
-            int legal = parsed_request_slot_can_move(req, i) && req->active[i].move_id[m] > 0 && !req->active[i].move_disabled[m];
+            int legal = parsed_request_slot_can_move(req, i) &&
+                req->active[i].move_id[m] > 0 &&
+                !req->active[i].move_disabled[m] &&
+                move_has_available_required_target(req, i, m);
             if (i == 0) {
                 out->legal[OBS_A1_MOVE1 + m] = (unsigned char)legal;
                 out->legal[OBS_A1_MOVE1_TERA + m] = (unsigned char)(legal && req->active[i].can_tera);
@@ -462,6 +488,33 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
     }
 
     return 1;
+}
+
+int request_has_legal_joint_action_pair(const ParsedRequest* req, const ActionMask* mask) {
+    enum ObsAction slot0_actions[OBS_NUM_ACTIONS];
+    enum ObsAction slot1_actions[OBS_NUM_ACTIONS];
+    size_t slot0_count;
+    size_t slot1_count;
+    size_t i;
+    size_t j;
+    if (!req || !mask ||
+            !parsed_request_slot_needs_choice(req, 0) ||
+            !parsed_request_slot_needs_choice(req, 1)) {
+        return 0;
+    }
+    slot0_count = collect_slot_legal_actions(
+        req, mask, 0, slot0_actions, OBS_NUM_ACTIONS);
+    slot1_count = collect_slot_legal_actions(
+        req, mask, 1, slot1_actions, OBS_NUM_ACTIONS);
+    for (i = 0; i < slot0_count; ++i) {
+        for (j = 0; j < slot1_count; ++j) {
+            if (request_choice_pair_is_valid(
+                    req, 1, slot0_actions[i], 1, slot1_actions[j])) {
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 int action_to_showdown_command(

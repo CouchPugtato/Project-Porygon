@@ -9,11 +9,16 @@ const test = require('node:test');
 
 const {
     acquireRunLock,
+    appendJsonLineDurably,
+    battleFailureReason,
     buildCounterfactualSample,
+    choiceRejectionReason,
     choicesDiffer,
+    drivePlayer,
     equalPrefix,
     recoverManifestFromPairFiles,
     seedTuple,
+    summarizeFailureLog,
     writeJsonAtomic,
 } = require('./counterfactual_rollout');
 
@@ -121,6 +126,84 @@ test('run lock excludes a second collector and releases cleanly', async t => {
     await lock.release();
     const nextLock = await acquireRunLock(root);
     await nextLock.release();
+});
+
+test('choice errors are rejected and retried before accepting a decision', async () => {
+    const actions = [
+        {type: 'action', action: 8, action2: 14, command: '/choose switch 3, move 1 -1'},
+        {type: 'action', action: 0, action2: 14, command: '/choose move 1 1, move 1 -1'},
+    ];
+    const sent = [];
+    const writes = [];
+    const agent = {
+        send(message) {
+            sent.push(message);
+        },
+        async nextMessage(type) {
+            if (type === 'action') return actions.shift();
+            if (type === 'episode_complete') return {steps: 1};
+            throw new Error(`unexpected message request: ${type}`);
+        },
+    };
+    const chunks = [
+        '|request|{"active":[{},{}]}\n',
+        '|error|[Invalid choice] Can\'t switch: The active Pokémon is trapped\n' +
+            '|request|{"active":[{"trapped":true},{}]}\n',
+        '|move|p1a: A|Tackle|p2a: B\n|win|Candidate\n',
+    ];
+    const stream = {
+        async *[Symbol.asyncIterator]() {
+            for (const chunk of chunks) yield chunk;
+        },
+        async write(command) {
+            writes.push(command);
+        },
+    };
+
+    const result = await drivePlayer(
+        stream, agent, 'retry-test', 'Candidate', 'gen9randomdoublesbattle');
+    const decisions = sent.filter(message => message.type.startsWith('decision_'));
+    assert.deepEqual(decisions.map(message => message.type), [
+        'decision_rejected',
+        'decision_accepted',
+    ]);
+    assert.deepEqual(writes, [
+        'switch 3, move 1 -1',
+        'move 1 1, move 1 -1',
+    ]);
+    assert.equal(result.choiceRejections.length, 1);
+    assert.equal(result.choiceRejections[0].request_id, 0);
+});
+
+test('failure categories and durable JSONL retain exact messages', async t => {
+    assert.equal(choiceRejectionReason("Can't switch: The active Pokémon is trapped"),
+        'trapped_switch');
+    assert.equal(choiceRejectionReason("Can't move: Helping Hand needs a target"),
+        'missing_move_target');
+    assert.equal(battleFailureReason(new Error('battle branch exceeded timeout')),
+        'battle_timeout');
+    assert.equal(battleFailureReason(new Error('showdown_client exited with 1')),
+        'agent_process_error');
+
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'porygon-failure-log-'));
+    t.after(() => fsp.rm(root, {recursive: true, force: true}));
+    const target = path.join(root, 'failures.jsonl');
+    await appendJsonLineDurably(target, {
+        type: 'attempt_failure', attempt: 7, reason: 'battle_error', message: 'exact error',
+    });
+    const record = JSON.parse((await fsp.readFile(target, 'utf8')).trim());
+    assert.equal(record.attempt, 7);
+    assert.equal(record.message, 'exact error');
+    await appendJsonLineDurably(target, {
+        type: 'choice_rejection_recovered', attempt: 8, action_rank: 0,
+        role: 'candidate', player: 'A', request_id: 4, command: '/choose switch 3',
+        reason: 'trapped_switch', message: "Can't switch: trapped",
+    });
+    const summary = await summarizeFailureLog(target);
+    assert.equal(summary.logged_attempt_failures, 1);
+    assert.deepEqual(summary.logged_failure_reasons, {battle_error: 1});
+    assert.equal(summary.choice_rejections_recovered, 1);
+    assert.deepEqual(summary.choice_rejection_reasons, {trapped_switch: 1});
 });
 
 test('Showdown seed tuples are deterministic and attempt-specific', () => {

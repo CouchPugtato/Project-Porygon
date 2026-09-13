@@ -18,7 +18,7 @@ static int test_normal_doubles_roundtrip(void) {
     const char* json =
         "{\"active\":["
         "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\"},{\"id\":\"leafstorm\",\"pp\":8,\"maxpp\":8,\"target\":\"normal\"}],\"canTerastallize\":\"Grass\",\"trapped\":false},"
-        "{\"moves\":[{\"id\":\"helpinghand\",\"pp\":32,\"maxpp\":32,\"target\":\"adjacentAllyOrSelf\"},{\"id\":\"suckerpunch\",\"pp\":8,\"maxpp\":8,\"target\":\"normal\"}],\"trapped\":false}"
+        "{\"moves\":[{\"id\":\"helpinghand\",\"pp\":32,\"maxpp\":32,\"target\":\"adjacentAlly\"},{\"id\":\"suckerpunch\",\"pp\":8,\"maxpp\":8,\"target\":\"normal\"}],\"trapped\":false}"
         "],"
         "\"side\":{\"pokemon\":["
         "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/100\",\"active\":true},"
@@ -39,10 +39,12 @@ static int test_normal_doubles_roundtrip(void) {
     if (!assert_true(parsed_request_slot_choice_kind(&req, 0) == REQUEST_SLOT_MOVE_OR_SWITCH, "slot0 move/switch kind")) return 0;
     if (!assert_true(parsed_request_slot_choice_kind(&req, 1) == REQUEST_SLOT_MOVE_OR_SWITCH, "slot1 move/switch kind")) return 0;
     if (!assert_true(build_action_mask_from_request(&mask, &req), "build action mask")) return 0;
+    if (!assert_true(request_has_legal_joint_action_pair(&req, &mask),
+            "normal doubles request has legal joint pairs")) return 0;
     if (!assert_true(mask.legal[OBS_A1_MOVE1] == 1, "slot0 protect legal")) return 0;
     if (!assert_true(mask.legal[OBS_A2_MOVE2] == 1, "slot1 sucker punch legal")) return 0;
     if (!assert_true(request_choice_to_command(&req, 1, OBS_A1_MOVE2, 1, OBS_A2_MOVE1, command, sizeof(command)), "map request choice to command")) return 0;
-    if (!assert_true(strcmp(command, "/choose move 2 1, move 1 -2") == 0, "expected command shape")) return 0;
+    if (!assert_true(strcmp(command, "/choose move 2 1, move 1 -1") == 0, "expected command shape")) return 0;
     if (!assert_true(command_to_request_choice(command, &req, &slot0_has_action, &action0, &slot1_has_action, &action1), "roundtrip command to actions")) return 0;
     if (!assert_true(slot0_has_action == 1 && action0 == OBS_A1_MOVE2, "roundtrip slot0")) return 0;
     if (!assert_true(slot1_has_action == 1 && action1 == OBS_A2_MOVE1, "roundtrip slot1")) return 0;
@@ -53,7 +55,7 @@ static int test_explicit_move_targets_roundtrip(void) {
     const char* json =
         "{\"active\":["
         "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\"},{\"id\":\"leafstorm\",\"pp\":8,\"maxpp\":8,\"target\":\"normal\"}],\"canTerastallize\":\"Grass\"},"
-        "{\"moves\":[{\"id\":\"helpinghand\",\"pp\":32,\"maxpp\":32,\"target\":\"adjacentAllyOrSelf\"},{\"id\":\"suckerpunch\",\"pp\":8,\"maxpp\":8,\"target\":\"adjacentFoe\"}]}"
+        "{\"moves\":[{\"id\":\"acupressure\",\"pp\":32,\"maxpp\":32,\"target\":\"adjacentAllyOrSelf\"},{\"id\":\"suckerpunch\",\"pp\":8,\"maxpp\":8,\"target\":\"adjacentFoe\"}]}"
         "],"
         "\"side\":{\"pokemon\":["
         "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/100\",\"active\":true},"
@@ -170,7 +172,7 @@ static int test_single_living_active_uses_single_choice(void) {
     const char* json =
         "{\"active\":["
         "{\"moves\":[{\"id\":\"dazzlinggleam\",\"pp\":16,\"maxpp\":16,\"target\":\"allAdjacentFoes\",\"disabled\":false},{\"id\":\"fireblast\",\"pp\":5,\"maxpp\":8,\"target\":\"normal\",\"disabled\":false}],\"canTerastallize\":\"Fire\"},"
-        "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false},{\"id\":\"iceshard\",\"pp\":47,\"maxpp\":48,\"target\":\"normal\",\"disabled\":false}],\"canTerastallize\":\"Water\"}"
+        "{\"moves\":[{\"id\":\"helpinghand\",\"pp\":16,\"maxpp\":16,\"target\":\"adjacentAlly\",\"disabled\":false},{\"id\":\"iceshard\",\"pp\":47,\"maxpp\":48,\"target\":\"normal\",\"disabled\":false}],\"canTerastallize\":\"Water\"}"
         "],"
         "\"side\":{\"pokemon\":["
         "{\"ident\":\"p1: Weezing\",\"details\":\"Weezing-Galar, L89, F\",\"condition\":\"0 fnt\",\"active\":true},"
@@ -192,7 +194,8 @@ static int test_single_living_active_uses_single_choice(void) {
     if (!assert_true(parsed_request_slot_needs_choice(&req, 1) == 1, "slot1 still needs choice")) return 0;
     if (!assert_true(build_action_mask_from_request(&mask, &req), "build single-living-active mask")) return 0;
     if (!assert_true(mask.legal[OBS_A1_MOVE1] == 0, "slot0 moves illegal")) return 0;
-    if (!assert_true(mask.legal[OBS_A2_MOVE1] == 1, "slot1 move legal")) return 0;
+    if (!assert_true(mask.legal[OBS_A2_MOVE1] == 0, "ally-only move illegal without a living ally")) return 0;
+    if (!assert_true(mask.legal[OBS_A2_MOVE2] == 1, "slot1 targeted attack remains legal")) return 0;
     if (!assert_true((build_move_target_mask(&req, 1, 1) & FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_ALLY)) == 0,
             "fainted ally is excluded from target mask")) return 0;
     if (!assert_true(request_choice_to_command(&req, 0, OBS_A1_MOVE1, 1, OBS_A2_MOVE2, command, sizeof(command)), "map single-living-active command")) return 0;
@@ -242,6 +245,8 @@ static int test_double_force_switch_one_bench_degrades_to_pass(void) {
     if (!assert_true(build_action_mask_from_request(&mask, &req), "build one-bench force-switch mask")) return 0;
     if (!assert_true(mask.legal[OBS_A1_SWITCH3] == 1, "slot0 only live bench legal")) return 0;
     if (!assert_true(mask.legal[OBS_A2_SWITCH3] == 1, "slot1 only live bench legal")) return 0;
+    if (!assert_true(!request_has_legal_joint_action_pair(&req, &mask),
+            "one-bench double replacement has no legal two-action pair")) return 0;
     policy[OBS_A1_SWITCH3] = 1.0f;
     policy[OBS_A2_SWITCH3] = 1.0f;
     if (!assert_true(validate_or_resample_request_choice(&req, &mask, policy, 1, OBS_A1_SWITCH3, 1, OBS_A2_SWITCH3, &validated), "degrade one-bench force-switch")) return 0;

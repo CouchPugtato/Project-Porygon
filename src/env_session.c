@@ -542,7 +542,9 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     }
     slot0_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 0);
     slot1_needs_action = parsed_request_slot_needs_choice(&session->parsed_request, 1);
-    use_joint_policy = slot0_needs_action && slot1_needs_action;
+    use_joint_policy = slot0_needs_action && slot1_needs_action &&
+        request_has_legal_joint_action_pair(
+            &session->parsed_request, &session->action_mask);
     build_slot_legal_mask(session->observation.legal_mask, 0, slot0_mask);
     build_slot_legal_mask(session->observation.legal_mask, 1, slot1_mask);
     build_runtime_factor_masks(session->observation.legal_mask, 0, slot0_kind_mask, slot0_move_mask, slot0_switch_mask);

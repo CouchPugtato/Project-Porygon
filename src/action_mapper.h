@@ -53,6 +53,7 @@ typedef struct {
 
 void action_mask_init(ActionMask* mask);
 int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req);
+int request_has_legal_joint_action_pair(const ParsedRequest* req, const ActionMask* mask);
 int obs_action_slot(enum ObsAction action);
 void factorized_action_choice_init(FactorizedActionChoice* choice);
 void factorized_action_choice_from_flat_actions(FactorizedActionChoice* choice, int action0, int action1);

@@ -2932,6 +2932,49 @@ static int test_full_battle_replay_2637505742_zeroes_fainted_reserve_hp(void) {
     return 1;
 }
 
+static int file_is_readable(const char* path) {
+    FILE* fp = fopen(path, "r");
+    if (!fp) {
+        return 0;
+    }
+    fclose(fp);
+    return 1;
+}
+
+static int test_saved_capture_replays(void) {
+    if (!file_is_readable(TEST_CAPTURE_PATH)) {
+        printf("skipping saved replay tests: %s is not available\n", TEST_CAPTURE_PATH);
+        return 1;
+    }
+    if (!test_multiturn_capture_replay_2632274530_turn2_request_state()) return 0;
+    if (!test_multiturn_capture_replay_2632288269_turn2_request_state()) return 0;
+    if (!test_multiturn_capture_replay_2632290515_turn2_request_state()) return 0;
+    if (!test_multiturn_capture_replay_2632293423_turn2_request_state()) return 0;
+    if (!test_multiturn_capture_replay_2632310612_turn2_request_state()) return 0;
+    if (!test_full_battle_replay_2632274530()) return 0;
+    if (!test_full_battle_replay_2632276902()) return 0;
+    if (!test_full_battle_replay_2632278612()) return 0;
+    if (!test_full_battle_replay_2632283886()) return 0;
+    if (!test_full_battle_replay_2632285682()) return 0;
+    if (!test_full_battle_replay_2632287191()) return 0;
+    if (!test_full_battle_replay_2632288269()) return 0;
+    if (!test_full_battle_replay_2632290515()) return 0;
+    if (!test_full_battle_replay_2632293423()) return 0;
+    if (!test_full_battle_replay_2632310612()) return 0;
+    return 1;
+}
+
+static int test_saved_random_capture_replays(void) {
+    if (!file_is_readable(TEST_RANDOM_CAPTURE_PATH)) {
+        printf("skipping saved random replay tests: %s is not available\n",
+            TEST_RANDOM_CAPTURE_PATH);
+        return 1;
+    }
+    if (!test_full_battle_replay_2636632844_gliscor_terminal_state()) return 0;
+    if (!test_full_battle_replay_2637505742_zeroes_fainted_reserve_hp()) return 0;
+    return 1;
+}
+
 static int test_synthetic_sideeffect_prefix_tailwind(void) {
     RawBattleState state;
     raw_battle_state_init(&state, 1);
@@ -5368,23 +5411,8 @@ int main(int argc, char** argv) {
     if (!test_multiturn_real_battle_2632295968_turn_one_and_two_continuity()) return 1;
     if (!test_multiturn_real_battle_2632300182_weather_tera_tailwind_sequence()) return 1;
     if (!test_multiturn_real_battle_2632302019_trick_room_carries_to_turn_ten()) return 1;
-    if (!test_multiturn_capture_replay_2632274530_turn2_request_state()) return 1;
-    if (!test_multiturn_capture_replay_2632288269_turn2_request_state()) return 1;
-    if (!test_multiturn_capture_replay_2632290515_turn2_request_state()) return 1;
-    if (!test_multiturn_capture_replay_2632293423_turn2_request_state()) return 1;
-    if (!test_multiturn_capture_replay_2632310612_turn2_request_state()) return 1;
-    if (!test_full_battle_replay_2632274530()) return 1;
-    if (!test_full_battle_replay_2632276902()) return 1;
-    if (!test_full_battle_replay_2632278612()) return 1;
-    if (!test_full_battle_replay_2632283886()) return 1;
-    if (!test_full_battle_replay_2632285682()) return 1;
-    if (!test_full_battle_replay_2632287191()) return 1;
-    if (!test_full_battle_replay_2632288269()) return 1;
-    if (!test_full_battle_replay_2632290515()) return 1;
-    if (!test_full_battle_replay_2632293423()) return 1;
-    if (!test_full_battle_replay_2632310612()) return 1;
-    if (!test_full_battle_replay_2636632844_gliscor_terminal_state()) return 1;
-    if (!test_full_battle_replay_2637505742_zeroes_fainted_reserve_hp()) return 1;
+    if (!test_saved_capture_replays()) return 1;
+    if (!test_saved_random_capture_replays()) return 1;
     if (!test_synthetic_sideeffect_prefix_tailwind()) return 1;
     if (!test_synthetic_sideeffect_prefix_reflect()) return 1;
     if (!test_synthetic_sideeffect_prefix_light_screen()) return 1;
