@@ -132,6 +132,47 @@ typedef struct {
     int counterfactual_overfit_passed;
 } ActionValueFitResult;
 
+typedef struct {
+    size_t pair_count;
+    size_t discordant_pair_count;
+    size_t repeated_pair_count;
+    size_t nonfinite_count;
+    double pair_confidence_sum;
+    double mean_pair_confidence;
+    double pair_ranking_accuracy;
+    double confidence_weighted_pair_ranking_accuracy;
+    double update_direction_accuracy;
+    double confidence_weighted_update_direction_accuracy;
+    double reference_adjusted_preference_loss;
+    double confidence_weighted_reference_adjusted_preference_loss;
+    double mean_policy_margin;
+    double mean_reference_adjusted_margin;
+    double mean_preferred_log_probability_delta;
+    double mean_rejected_log_probability_delta;
+    double mean_legal_policy_kl;
+    double max_legal_policy_kl;
+} CounterfactualPolicyPreferenceMetrics;
+
+typedef struct {
+    CounterfactualPolicyPreferenceMetrics before_train;
+    CounterfactualPolicyPreferenceMetrics before_selection;
+    CounterfactualPolicyPreferenceMetrics before_holdout;
+    CounterfactualPolicyPreferenceMetrics after_train;
+    CounterfactualPolicyPreferenceMetrics after_selection;
+    CounterfactualPolicyPreferenceMetrics after_holdout;
+    CounterfactualPolicyPreferenceMetrics last_attempted_train;
+    CounterfactualPolicyPreferenceMetrics last_attempted_selection;
+    size_t epochs_completed;
+    size_t best_epoch;
+    size_t last_attempted_epoch;
+    int stopped_early;
+    int training_completed;
+    int holdout_loss_improved;
+    int holdout_direction_consistent;
+    int holdout_kl_acceptable;
+    int policy_signal_detected;
+} CounterfactualPolicyPreferenceResult;
+
 typedef enum {
     ACTION_VALUE_TARGET_TD0 = 0,
     ACTION_VALUE_TARGET_TD_LAMBDA = 1,
@@ -322,6 +363,8 @@ int learning_diagnostic_write_action_value_report(
 int learning_diagnostic_write_counterfactual_action_value_report(
     const char* report_path,
     const char* batch_path,
+    const CounterfactualDataset* training_dataset,
+    int training_source_is_manifest,
     const char* holdout_batch_path,
     int external_holdout,
     int final_confirmation,
@@ -338,6 +381,52 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     float l2_coefficient,
     const ActionValueModel* action_value_model,
     const ActionValueFitResult* result
+);
+
+int learning_diagnostic_run_counterfactual_policy_preference_fit(
+    GruModel* model,
+    const GruModel* anchor_model,
+    CounterfactualSample* const* train_samples,
+    size_t train_count,
+    CounterfactualSample* const* selection_samples,
+    size_t selection_count,
+    CounterfactualSample* const* holdout_samples,
+    size_t holdout_count,
+    size_t epochs,
+    size_t minibatch_pairs,
+    size_t early_stop_patience,
+    unsigned int shuffle_seed,
+    float learning_rate,
+    float preference_beta,
+    float anchor_kl_coefficient,
+    float max_mean_policy_kl,
+    float adam_beta1,
+    float adam_beta2,
+    float adam_epsilon,
+    float gradient_clip,
+    CounterfactualPolicyPreferenceResult* result
+);
+
+int learning_diagnostic_write_counterfactual_policy_preference_report(
+    const char* report_path,
+    const char* batch_path,
+    const CounterfactualDataset* training_dataset,
+    int training_source_is_manifest,
+    const char* holdout_batch_path,
+    int external_holdout,
+    const char* checkpoint_path,
+    const char* output_checkpoint_path,
+    int checkpoint_published,
+    unsigned int validation_seed,
+    unsigned int shuffle_seed,
+    size_t epochs,
+    size_t minibatch_pairs,
+    size_t early_stop_patience,
+    float learning_rate,
+    float preference_beta,
+    float anchor_kl_coefficient,
+    float max_mean_policy_kl,
+    const CounterfactualPolicyPreferenceResult* result
 );
 
 int learning_diagnostic_run_ppo_update_audit(

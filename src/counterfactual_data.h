@@ -22,6 +22,7 @@ typedef struct {
     size_t rollout_count;
     float rollout_variance;
     int has_rollout_statistics;
+    size_t source_index;
     float* hidden_state;
     unsigned char legal_mask[OBS_NUM_ACTIONS];
 } CounterfactualSample;
@@ -32,6 +33,8 @@ typedef struct {
     size_t capacity;
     size_t hidden_dim;
     size_t pair_count;
+    char** source_paths;
+    size_t source_count;
 } CounterfactualDataset;
 
 typedef struct {
@@ -49,6 +52,16 @@ int counterfactual_dataset_load(
     const char* path,
     size_t expected_hidden_dim,
     const char* expected_policy_tag
+);
+int counterfactual_dataset_load_manifest(
+    CounterfactualDataset* dataset,
+    const char* manifest_path,
+    size_t expected_hidden_dim,
+    const char* expected_policy_tag
+);
+int counterfactual_dataset_contains_source(
+    const CounterfactualDataset* dataset,
+    const char* path
 );
 void counterfactual_dataset_free(CounterfactualDataset* dataset);
 int counterfactual_dataset_split(

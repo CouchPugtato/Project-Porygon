@@ -10,6 +10,11 @@
 
 typedef struct ActionValueModel ActionValueModel;
 
+typedef enum {
+    ACTION_VALUE_HEAD_JOINT = 0,
+    ACTION_VALUE_HEAD_FACTORIZED = 1
+} ActionValueHeadMode;
+
 typedef struct {
     float q_value;
     float baseline_value;
@@ -33,11 +38,20 @@ ActionValueModel* action_value_model_create(
     size_t latent_dim,
     unsigned int seed
 );
+ActionValueModel* action_value_model_create_with_head(
+    size_t hidden_dim,
+    size_t latent_dim,
+    unsigned int seed,
+    ActionValueHeadMode head_mode
+);
 void action_value_model_destroy(ActionValueModel* model);
 
 size_t action_value_model_hidden_dim(const ActionValueModel* model);
 size_t action_value_model_latent_dim(const ActionValueModel* model);
 size_t action_value_model_parameter_count(const ActionValueModel* model);
+ActionValueHeadMode action_value_model_head_mode(const ActionValueModel* model);
+const char* action_value_head_mode_name(ActionValueHeadMode mode);
+int action_value_parse_head_mode(const char* name, ActionValueHeadMode* mode);
 int action_value_model_export_parameters(
     const ActionValueModel* model,
     float* parameters,

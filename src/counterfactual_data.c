@@ -57,6 +57,34 @@ static int path_tags_match(const char* left, const char* right) {
         strcmp(longer + longer_length - shorter_length, shorter) == 0;
 }
 
+static char* duplicate_text(const char* text) {
+    size_t length;
+    char* copy;
+    if (!text) return NULL;
+    length = strlen(text) + 1u;
+    copy = (char*)malloc(length);
+    if (copy) memcpy(copy, text, length);
+    return copy;
+}
+
+static int path_tags_equal(const char* left, const char* right) {
+    if (!left || !right) return 0;
+    while (left[0] == '.' && (left[1] == '/' || left[1] == '\\')) left += 2;
+    while (right[0] == '.' && (right[1] == '/' || right[1] == '\\')) right += 2;
+    while (*left && *right) {
+        unsigned char left_ch = (unsigned char)*left++;
+        unsigned char right_ch = (unsigned char)*right++;
+        if (left_ch == '\\') left_ch = '/';
+        if (right_ch == '\\') right_ch = '/';
+#ifdef _WIN32
+        left_ch = (unsigned char)tolower(left_ch);
+        right_ch = (unsigned char)tolower(right_ch);
+#endif
+        if (left_ch != right_ch) return 0;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
 static const char* find_value(const char* json, const char* key) {
     char pattern[96];
     const char* found;
@@ -339,6 +367,117 @@ int counterfactual_dataset_load(
             return 0;
         }
     }
+    dataset->source_paths = (char**)malloc(sizeof(*dataset->source_paths));
+    if (!dataset->source_paths) {
+        counterfactual_dataset_free(dataset);
+        return 0;
+    }
+    dataset->source_paths[0] = duplicate_text(path);
+    if (!dataset->source_paths[0]) {
+        counterfactual_dataset_free(dataset);
+        return 0;
+    }
+    dataset->source_count = 1u;
+    return 1;
+}
+
+static char* trim_manifest_entry(char* line) {
+    char* start = line;
+    char* end;
+    while (*start && isspace((unsigned char)*start)) ++start;
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) --end;
+    *end = '\0';
+    return start;
+}
+
+int counterfactual_dataset_contains_source(
+    const CounterfactualDataset* dataset,
+    const char* path
+) {
+    size_t index;
+    for (index = 0; index < dataset->source_count; ++index) {
+        if (path_tags_equal(dataset->source_paths[index], path)) return 1;
+    }
+    return 0;
+}
+
+static int append_dataset(
+    CounterfactualDataset* destination,
+    CounterfactualDataset* source
+) {
+    CounterfactualSample* samples;
+    char** source_paths;
+    size_t index;
+    size_t source_index;
+    if (!destination || !source || source->source_count != 1u ||
+            source->hidden_dim != destination->hidden_dim ||
+            counterfactual_dataset_contains_source(destination, source->source_paths[0])) return 0;
+    samples = (CounterfactualSample*)realloc(
+        destination->samples,
+        (destination->count + source->count) * sizeof(*destination->samples));
+    if (!samples) return 0;
+    destination->samples = samples;
+    source_paths = (char**)realloc(
+        destination->source_paths,
+        (destination->source_count + 1u) * sizeof(*destination->source_paths));
+    if (!source_paths) return 0;
+    destination->source_paths = source_paths;
+
+    source_index = destination->source_count;
+    for (index = 0; index < source->count; ++index) {
+        source->samples[index].source_index = source_index;
+        destination->samples[destination->count + index] = source->samples[index];
+    }
+    destination->source_paths[source_index] = source->source_paths[0];
+    source->source_paths[0] = NULL;
+    destination->source_count++;
+    destination->count += source->count;
+    destination->capacity = destination->count;
+    destination->pair_count += source->pair_count;
+
+    free(source->source_paths);
+    free(source->samples);
+    memset(source, 0, sizeof(*source));
+    return 1;
+}
+
+int counterfactual_dataset_load_manifest(
+    CounterfactualDataset* dataset,
+    const char* manifest_path,
+    size_t expected_hidden_dim,
+    const char* expected_policy_tag
+) {
+    FILE* manifest;
+    char* line = NULL;
+    size_t line_capacity = 0;
+    int status;
+    if (!dataset || !manifest_path || !*manifest_path || expected_hidden_dim == 0) {
+        return 0;
+    }
+    memset(dataset, 0, sizeof(*dataset));
+    dataset->hidden_dim = expected_hidden_dim;
+    manifest = fopen(manifest_path, "r");
+    if (!manifest) return 0;
+    while ((status = read_line(manifest, &line, &line_capacity)) > 0) {
+        CounterfactualDataset batch;
+        char* path = trim_manifest_entry(line);
+        if (!*path || *path == '#') continue;
+        memset(&batch, 0, sizeof(batch));
+        if (!counterfactual_dataset_load(
+                &batch, path, expected_hidden_dim, expected_policy_tag) ||
+                !append_dataset(dataset, &batch)) {
+            counterfactual_dataset_free(&batch);
+            status = -1;
+            break;
+        }
+    }
+    free(line);
+    fclose(manifest);
+    if (status < 0 || dataset->source_count == 0 || dataset->pair_count == 0) {
+        counterfactual_dataset_free(dataset);
+        return 0;
+    }
     return 1;
 }
 
@@ -346,6 +485,8 @@ void counterfactual_dataset_free(CounterfactualDataset* dataset) {
     size_t i;
     if (!dataset) return;
     for (i = 0; i < dataset->count; ++i) free(dataset->samples[i].hidden_state);
+    for (i = 0; i < dataset->source_count; ++i) free(dataset->source_paths[i]);
+    free(dataset->source_paths);
     free(dataset->samples);
     memset(dataset, 0, sizeof(*dataset));
 }
@@ -357,6 +498,45 @@ static void append_pair(
 ) {
     destination[(*count)++] = first;
     destination[(*count)++] = first + 1;
+}
+
+static int pair_split_hash(
+    const CounterfactualDataset* dataset,
+    const CounterfactualSample* sample,
+    unsigned int validation_seed,
+    uint64_t* hash
+) {
+    const char* source_path;
+    char* key;
+    size_t source_length;
+    size_t pair_length;
+    size_t index;
+    if (!dataset || !sample || !hash) return 0;
+    if (dataset->source_count <= 1u) {
+        *hash = validation_split_hash(sample->pair_id, validation_seed);
+        return 1;
+    }
+    if (sample->source_index >= dataset->source_count) return 0;
+    source_path = dataset->source_paths[sample->source_index];
+    while (source_path[0] == '.' &&
+            (source_path[1] == '/' || source_path[1] == '\\')) source_path += 2;
+    source_length = strlen(source_path);
+    pair_length = strlen(sample->pair_id);
+    key = (char*)malloc(source_length + pair_length + 2u);
+    if (!key) return 0;
+    for (index = 0; index < source_length; ++index) {
+        unsigned char ch = (unsigned char)source_path[index];
+        if (ch == '\\') ch = '/';
+#ifdef _WIN32
+        ch = (unsigned char)tolower(ch);
+#endif
+        key[index] = (char)ch;
+    }
+    key[source_length] = '\n';
+    memcpy(key + source_length + 1u, sample->pair_id, pair_length + 1u);
+    *hash = validation_split_hash(key, validation_seed);
+    free(key);
+    return 1;
 }
 
 int counterfactual_dataset_split(
@@ -384,8 +564,13 @@ int counterfactual_dataset_split(
 
     for (pair_index = 0; pair_index < training->pair_count; ++pair_index) {
         CounterfactualSample* first = &training->samples[pair_index * 2u];
-        uint64_t bucket = validation_split_hash(
-            first->pair_id, validation_seed) % UINT64_C(10);
+        uint64_t hash;
+        uint64_t bucket;
+        if (!pair_split_hash(training, first, validation_seed, &hash)) {
+            counterfactual_dataset_split_free(split);
+            return 0;
+        }
+        bucket = hash % UINT64_C(10);
         if (use_external) {
             if (bucket == UINT64_C(0)) {
                 append_pair(split->selection, &split->selection_count, first);

@@ -883,6 +883,108 @@ static int test_counterfactual_dataset_preserves_whole_pairs(void) {
     return ok;
 }
 
+static int test_counterfactual_manifest_combines_owned_sources(void) {
+    const char* first_path = "counterfactual_manifest_first.jsonl";
+    const char* second_path = "counterfactual_manifest_second.jsonl";
+    const char* manifest_path = "counterfactual_training.manifest";
+    CounterfactualDataset dataset;
+    CounterfactualDataset holdout;
+    CounterfactualDatasetSplit split;
+    FILE* output;
+    unsigned int split_seed = 0u;
+    int ok = 1;
+
+    memset(&dataset, 0, sizeof(dataset));
+    memset(&holdout, 0, sizeof(holdout));
+    memset(&split, 0, sizeof(split));
+    remove(first_path);
+    remove(second_path);
+    remove(manifest_path);
+    output = fopen(first_path, "w");
+    if (!assert_true(output != NULL, "create first counterfactual manifest batch")) {
+        return 0;
+    }
+    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f);
+    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f);
+    fclose(output);
+    output = fopen(second_path, "w");
+    if (!assert_true(output != NULL, "create second counterfactual manifest batch")) {
+        remove(first_path);
+        return 0;
+    }
+    write_counterfactual_dataset_sample(output, 0, 1, 0.5f, 0.25f);
+    write_counterfactual_dataset_sample(output, 1, 0, -0.5f, 0.25f);
+    fclose(output);
+    output = fopen(manifest_path, "w");
+    if (!assert_true(output != NULL, "create counterfactual manifest")) {
+        remove(first_path);
+        remove(second_path);
+        return 0;
+    }
+    fprintf(output, "# independent collection batches\n%s\n\n%s\n",
+        first_path, second_path);
+    fclose(output);
+
+    ok &= assert_true(counterfactual_dataset_load_manifest(
+        &dataset, manifest_path, 2, ".\\models\\parent.chk"),
+        "load multiple counterfactual batches from manifest");
+    ok &= assert_true(dataset.source_count == 2u && dataset.pair_count == 2u &&
+        dataset.count == 4u,
+        "counterfactual manifest records every source and pair");
+    if (dataset.count == 4u) {
+        ok &= assert_true(dataset.samples[0].source_index == 0u &&
+            dataset.samples[1].source_index == 0u &&
+            dataset.samples[2].source_index == 1u &&
+            dataset.samples[3].source_index == 1u,
+            "counterfactual manifest retains pair source ownership");
+    }
+    while (split_seed < 10000u &&
+            ((validation_split_hash(
+                "counterfactual_manifest_first.jsonl\npair-test", split_seed) %
+                UINT64_C(10) == UINT64_C(0)) ==
+             (validation_split_hash(
+                "counterfactual_manifest_second.jsonl\npair-test", split_seed) %
+                UINT64_C(10) == UINT64_C(0)))) ++split_seed;
+    holdout.count = 2u;
+    holdout.pair_count = 1u;
+    holdout.samples = (CounterfactualSample*)calloc(
+        holdout.count, sizeof(*holdout.samples));
+    if (!assert_true(holdout.samples != NULL && split_seed < 10000u,
+            "prepare source-aware counterfactual split")) {
+        ok = 0;
+    } else {
+        snprintf(holdout.samples[0].pair_id,
+            sizeof(holdout.samples[0].pair_id), "external-pair");
+        snprintf(holdout.samples[1].pair_id,
+            sizeof(holdout.samples[1].pair_id), "external-pair");
+        ok &= assert_true(counterfactual_dataset_split(
+            &dataset, &holdout, split_seed, &split),
+            "split repeated pair IDs independently by source");
+        ok &= assert_true(split.train_count == 2u &&
+            split.selection_count == 2u && split.holdout_count == 2u,
+            "manifest source participates in stable pair split key");
+    }
+    counterfactual_dataset_split_free(&split);
+    counterfactual_dataset_free(&holdout);
+    counterfactual_dataset_free(&dataset);
+
+    output = fopen(manifest_path, "w");
+    if (!assert_true(output != NULL, "rewrite duplicate counterfactual manifest")) {
+        ok = 0;
+    } else {
+        fprintf(output, "%s\n%s\n", first_path, first_path);
+        fclose(output);
+        ok &= assert_true(!counterfactual_dataset_load_manifest(
+            &dataset, manifest_path, 2, ".\\models\\parent.chk"),
+            "reject duplicate counterfactual manifest sources");
+        counterfactual_dataset_free(&dataset);
+    }
+    remove(manifest_path);
+    remove(second_path);
+    remove(first_path);
+    return ok;
+}
+
 static int test_counterfactual_preference_confidence_uses_repeat_uncertainty(void) {
     CounterfactualSample strong;
     CounterfactualSample weak;
@@ -5036,6 +5138,197 @@ static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
     return ok;
 }
 
+static int test_factorized_action_value_head_shares_credit_and_models_interactions(void) {
+    const char* sidecar_path = "factorized_action_value_test.bin";
+    GruModel* policy_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    ActionValueModel* joint_model = NULL;
+    ActionValueModel* factorized_model = NULL;
+    ActionValueModel* loaded_model = NULL;
+    float hidden[8] = {0};
+    unsigned char legal[OBS_NUM_ACTIONS] = {0};
+    FactorizedActionChoice choices[4];
+    ActionValuePrediction prediction[4];
+    ActionValuePrediction loaded_prediction;
+    const int action0[4] = {0, 0, 1, 1};
+    const int action1[4] = {14, 15, 14, 15};
+    const float targets[4] = {1.0f, -1.0f, -1.0f, 1.0f};
+    int update;
+    int index;
+    int ok = 1;
+
+    remove(sidecar_path);
+    if (!assert_true(policy_model && zero_model_parameters(policy_model),
+            "initialize factorized action-value policy fixture")) {
+        gru_model_destroy(policy_model);
+        return 0;
+    }
+    joint_model = action_value_model_create(8u, 4u, 301u);
+    factorized_model = action_value_model_create_with_head(
+        8u, 4u, 301u, ACTION_VALUE_HEAD_FACTORIZED);
+    if (!assert_true(joint_model && factorized_model,
+            "initialize joint and factorized action-value heads")) {
+        ok = 0;
+        goto cleanup;
+    }
+    ok &= assert_true(
+        action_value_model_head_mode(factorized_model) ==
+            ACTION_VALUE_HEAD_FACTORIZED &&
+        action_value_model_parameter_count(factorized_model) <
+            action_value_model_parameter_count(joint_model),
+        "factorized head shares parameters across joint actions");
+    legal[0] = legal[1] = legal[14] = legal[15] = 1;
+    for (index = 0; index < 4; ++index) {
+        factorized_action_choice_from_flat_actions(
+            &choices[index], action0[index], action1[index]);
+    }
+    for (update = 0; update < 80; ++update) {
+        action_value_model_clear_gradients(factorized_model);
+        for (index = 0; index < 4; ++index) {
+            ok &= assert_true(action_value_model_accumulate(
+                factorized_model, policy_model, hidden, legal, &choices[index],
+                action0[index], action1[index], 0.0f, targets[index], NULL),
+                "accumulate factorized joint interaction target");
+        }
+        ok &= assert_true(action_value_model_apply_adam(
+            factorized_model, 0.03f, 0.9f, 0.999f, 1.0e-8f, 1.0f, 0.0f),
+            "fit factorized joint interaction targets");
+    }
+    for (index = 0; index < 4; ++index) {
+        ok &= assert_true(action_value_model_predict(
+            factorized_model, policy_model, hidden, legal, &choices[index],
+            action0[index], action1[index], 0.0f, &prediction[index]),
+            "evaluate factorized joint interaction");
+    }
+    ok &= assert_true(
+        prediction[0].q_value > prediction[1].q_value &&
+        prediction[0].q_value > prediction[2].q_value &&
+        prediction[3].q_value > prediction[1].q_value &&
+        prediction[3].q_value > prediction[2].q_value,
+        "factorized head retains ordered non-additive joint credit");
+    ok &= assert_true(action_value_model_save(sidecar_path, factorized_model) &&
+            (loaded_model = action_value_model_load(sidecar_path, 8u)) != NULL &&
+            action_value_model_head_mode(loaded_model) ==
+                ACTION_VALUE_HEAD_FACTORIZED &&
+            action_value_model_predict(
+                loaded_model, policy_model, hidden, legal, &choices[0],
+                action0[0], action1[0], 0.0f, &loaded_prediction) &&
+            fabsf(loaded_prediction.q_value - prediction[0].q_value) < 1.0e-6f,
+        "factorized action-value sidecar preserves its layout and prediction");
+
+cleanup:
+    remove(sidecar_path);
+    action_value_model_destroy(loaded_model);
+    action_value_model_destroy(factorized_model);
+    action_value_model_destroy(joint_model);
+    gru_model_destroy(policy_model);
+    return ok;
+}
+
+static int test_counterfactual_policy_preference_moves_policy_only(void) {
+    enum { PAIR_COUNT = 12, SAMPLE_COUNT = PAIR_COUNT * 2 };
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* anchor = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    CounterfactualSample samples[SAMPLE_COUNT];
+    CounterfactualSample* sample_pointers[SAMPLE_COUNT];
+    CounterfactualPolicyPreferenceResult result;
+    FactorizedActionChoice dual_preferred;
+    FactorizedActionChoice dual_rejected;
+    FactorizedActionChoice single_preferred;
+    FactorizedActionChoice single_rejected;
+    FactorizedPolicySnapshot snapshot;
+    float hidden[8] = {0.25f, -0.4f, 0.1f, 0.35f, -0.2f, 0.15f, 0.3f, -0.1f};
+    unsigned char dual_legal[OBS_NUM_ACTIONS] = {0};
+    unsigned char single_legal[OBS_NUM_ACTIONS] = {0};
+    float preferred_before;
+    float rejected_before;
+    float preferred_after;
+    float rejected_after;
+    float value_before;
+    float value_after;
+    int pair;
+    int ok = 1;
+
+    memset(samples, 0, sizeof(samples));
+    memset(&result, 0, sizeof(result));
+    if (!assert_true(model && anchor &&
+            zero_model_parameters(model) && zero_model_parameters(anchor),
+            "initialize counterfactual policy-preference fixture")) {
+        gru_model_destroy(anchor);
+        gru_model_destroy(model);
+        return 0;
+    }
+    dual_legal[0] = dual_legal[1] = dual_legal[14] = dual_legal[15] = 1u;
+    single_legal[24] = single_legal[25] = 1u;
+    factorized_action_choice_from_flat_actions(&dual_preferred, 0, 14);
+    factorized_action_choice_from_flat_actions(&dual_rejected, 1, 15);
+    factorized_action_choice_from_flat_actions(&single_preferred, -1, 24);
+    factorized_action_choice_from_flat_actions(&single_rejected, -1, 25);
+    for (pair = 0; pair < PAIR_COUNT; ++pair) {
+        CounterfactualSample* preferred = &samples[pair * 2];
+        CounterfactualSample* rejected = &samples[pair * 2 + 1];
+        int dual = pair % 2 == 0;
+        snprintf(preferred->pair_id, sizeof(preferred->pair_id),
+            "policy-preference-%d", pair);
+        memcpy(rejected->pair_id, preferred->pair_id, sizeof(rejected->pair_id));
+        preferred->hidden_state = hidden;
+        rejected->hidden_state = hidden;
+        memcpy(preferred->legal_mask, dual ? dual_legal : single_legal,
+            sizeof(preferred->legal_mask));
+        memcpy(rejected->legal_mask, preferred->legal_mask,
+            sizeof(rejected->legal_mask));
+        preferred->choice = dual ? dual_preferred : single_preferred;
+        rejected->choice = dual ? dual_rejected : single_rejected;
+        preferred->action = dual ? 0 : -1;
+        preferred->action2 = dual ? 14 : 24;
+        rejected->action = dual ? 1 : -1;
+        rejected->action2 = dual ? 15 : 25;
+        preferred->target_value = 1.0f;
+        rejected->target_value = -1.0f;
+        sample_pointers[pair * 2] = preferred;
+        sample_pointers[pair * 2 + 1] = rejected;
+    }
+    ok &= assert_true(
+        gru_model_factorized_choice_log_probability(
+            model, hidden, dual_legal, &dual_preferred, &preferred_before) &&
+        gru_model_factorized_choice_log_probability(
+            model, hidden, dual_legal, &dual_rejected, &rejected_before) &&
+        gru_model_evaluate_policy_snapshot(
+            model, hidden, dual_legal, 1, &snapshot, &value_before),
+        "evaluate policy before direct counterfactual preferences");
+    ok &= assert_true(learning_diagnostic_run_counterfactual_policy_preference_fit(
+            model, anchor,
+            sample_pointers, SAMPLE_COUNT,
+            sample_pointers, SAMPLE_COUNT,
+            sample_pointers, SAMPLE_COUNT,
+            20u, 4u, 5u, 313u,
+            0.01f, 1.0f, 0.1f, 10.0f,
+            0.9f, 0.999f, 1.0e-8f, 1.0f, &result),
+        "fit direct counterfactual policy preferences");
+    ok &= assert_true(
+        gru_model_factorized_choice_log_probability(
+            model, hidden, dual_legal, &dual_preferred, &preferred_after) &&
+        gru_model_factorized_choice_log_probability(
+            model, hidden, dual_legal, &dual_rejected, &rejected_after) &&
+        gru_model_evaluate_policy_snapshot(
+            model, hidden, dual_legal, 1, &snapshot, &value_after),
+        "evaluate policy after direct counterfactual preferences");
+    ok &= assert_true(
+        preferred_after - rejected_after > preferred_before - rejected_before,
+        "direct counterfactual preferences favor the demonstrated winner");
+    ok &= assert_true(
+        result.policy_signal_detected &&
+        result.after_holdout.confidence_weighted_update_direction_accuracy >= 0.99 &&
+        result.after_holdout.confidence_weighted_reference_adjusted_preference_loss <
+            result.before_holdout.confidence_weighted_reference_adjusted_preference_loss,
+        "direct counterfactual preference diagnostic detects held-out direction");
+    ok &= assert_true(fabsf(value_after - value_before) < 1.0e-7f,
+        "direct counterfactual preferences leave the critic unchanged");
+
+    gru_model_destroy(anchor);
+    gru_model_destroy(model);
+    return ok;
+}
+
 static int test_counterfactual_q_overfits_repeated_real_shape_pairs(void) {
     enum { PAIR_COUNT = 12 };
     GruModel* policy_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
@@ -5354,16 +5647,16 @@ static int test_critic_policy_anchor_reduces_drift(void) {
     const Episode* minibatch[1];
     GruTrainer unconstrained_trainer;
     GruTrainer constrained_trainer;
+    GruPpoStepComparison unconstrained_comparison[1];
+    GruPpoStepComparison constrained_comparison[1];
     float* parameters = NULL;
     size_t parameter_count;
-    float probability_before = 0.0f;
-    float unconstrained_probability = 0.0f;
-    float constrained_probability = 0.0f;
-    float ignored_value;
     int update;
     int ok = 1;
 
     memset(&episode, 0, sizeof(episode));
+    memset(unconstrained_comparison, 0, sizeof(unconstrained_comparison));
+    memset(constrained_comparison, 0, sizeof(constrained_comparison));
     if (!anchor || !unconstrained || !constrained) {
         ok = 0;
         goto cleanup;
@@ -5374,9 +5667,7 @@ static int test_critic_policy_anchor_reduces_drift(void) {
             gru_model_export_parameters(anchor, parameters, parameter_count) &&
             gru_model_import_parameters(unconstrained, parameters, parameter_count) &&
             gru_model_import_parameters(constrained, parameters, parameter_count) &&
-            initialize_learning_episode(&episode, 1.0f, -1.0f, 0) &&
-            selected_joint_probability_and_value(
-                anchor, &episode, &probability_before, &ignored_value),
+            initialize_learning_episode(&episode, 1.0f, -1.0f, 0),
             "initialize policy-anchored critic fixture")) {
         ok = 0;
         goto cleanup;
@@ -5395,17 +5686,21 @@ static int test_critic_policy_anchor_reduces_drift(void) {
             &constrained_trainer, constrained, minibatch, 1u, 1),
             "run policy-anchored recurrent critic update");
     }
-    ok &= assert_true(selected_joint_probability_and_value(
-        unconstrained, &episode, &unconstrained_probability, &ignored_value),
-        "evaluate unconstrained critic policy drift");
-    ok &= assert_true(selected_joint_probability_and_value(
-        constrained, &episode, &constrained_probability, &ignored_value),
-        "evaluate constrained critic policy drift");
+    ok &= assert_true(gru_trainer_compare_ppo_episode(
+            &unconstrained_trainer, anchor, unconstrained, &episode,
+            unconstrained_comparison, 1u) &&
+        unconstrained_comparison[0].has_action,
+        "evaluate unconstrained critic legal-policy drift");
+    ok &= assert_true(gru_trainer_compare_ppo_episode(
+            &constrained_trainer, anchor, constrained, &episode,
+            constrained_comparison, 1u) &&
+        constrained_comparison[0].has_action,
+        "evaluate constrained critic legal-policy drift");
     ok &= assert_true(constrained_trainer.last_anchor_kl_mean > 0.0f,
         "policy-anchored critic reports anchor divergence");
     ok &= assert_true(
-        fabsf(constrained_probability - probability_before) <
-            fabsf(unconstrained_probability - probability_before),
+        constrained_comparison[0].legal_policy_kl <
+            unconstrained_comparison[0].legal_policy_kl,
         "policy anchor reduces critic-induced policy drift");
 
 cleanup:
@@ -5634,6 +5929,8 @@ int main(int argc, char** argv) {
     if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
     if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
     if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;
+    if (!test_factorized_action_value_head_shares_credit_and_models_interactions()) return 1;
+    if (!test_counterfactual_policy_preference_moves_policy_only()) return 1;
     if (!test_action_value_target_modes()) return 1;
     if (!test_ppo_clipped_policy_still_updates_value()) return 1;
     if (!test_dual_action_turn_has_one_value_target()) return 1;
@@ -5654,6 +5951,7 @@ int main(int argc, char** argv) {
     if (!test_runtime_request_session_not_forced_doubles()) return 1;
     if (!test_runtime_counterfactual_ranks_are_distinct_and_reported()) return 1;
     if (!test_counterfactual_dataset_preserves_whole_pairs()) return 1;
+    if (!test_counterfactual_manifest_combines_owned_sources()) return 1;
     if (!test_counterfactual_preference_confidence_uses_repeat_uncertainty()) return 1;
     if (!test_counterfactual_external_holdout_stays_separate()) return 1;
     if (!test_runtime_dense_additive_rewards()) return 1;

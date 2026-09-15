@@ -120,6 +120,21 @@ int gru_model_evaluate_joint_hidden(
     float* joint_policy,
     float* value_out
 );
+int gru_model_factorized_choice_log_probability(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* choice,
+    float* log_probability_out
+);
+int gru_model_factorized_policy_kl(
+    const GruModel* model,
+    const GruModel* anchor_model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* choice,
+    float* kl_out
+);
 int gru_model_supervised_update_heads(
     GruModel* model,
     const float* hidden_state,
@@ -212,6 +227,14 @@ int gru_model_supervised_accumulate_sequence_window_factorized(
 );
 int gru_model_apply_accumulated_supervised_updates(GruModel* model, float learning_rate);
 int gru_model_apply_accumulated_adam_updates(
+    GruModel* model,
+    float learning_rate,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float gradient_clip
+);
+int gru_model_apply_accumulated_policy_adam_updates(
     GruModel* model,
     float learning_rate,
     float beta1,
@@ -366,6 +389,16 @@ int gru_model_advantage_weighted_accumulate_sequence_window_factorized_anchored(
     float imitation_weight,
     float entropy_coef,
     const FactorizedPolicySnapshot* anchor_policy,
+    float anchor_kl_coef
+);
+int gru_model_accumulate_factorized_preference_hidden(
+    GruModel* model,
+    const GruModel* anchor_model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* preferred,
+    const FactorizedActionChoice* rejected,
+    float preference_gradient,
     float anchor_kl_coef
 );
 int gru_model_critic_head_accumulate_hidden(

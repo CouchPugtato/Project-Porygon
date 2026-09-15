@@ -1332,6 +1332,327 @@ failure:
     return 0;
 }
 
+static double stable_preference_loss(double scaled_margin) {
+    return scaled_margin >= 0.0
+        ? log1p(exp(-scaled_margin))
+        : -scaled_margin + log1p(exp(scaled_margin));
+}
+
+static double preference_gradient_factor(double scaled_margin) {
+    if (scaled_margin >= 0.0) {
+        double exp_negative = exp(-scaled_margin);
+        return exp_negative / (1.0 + exp_negative);
+    }
+    return 1.0 / (1.0 + exp(scaled_margin));
+}
+
+static int evaluate_counterfactual_policy_preferences(
+    const GruModel* model,
+    const GruModel* anchor_model,
+    CounterfactualSample* const* samples,
+    size_t sample_count,
+    float preference_beta,
+    CounterfactualPolicyPreferenceMetrics* metrics
+) {
+    double confidence_sum = 0.0;
+    double weighted_ranking_sum = 0.0;
+    double weighted_direction_sum = 0.0;
+    double weighted_loss_sum = 0.0;
+    double ranking_sum = 0.0;
+    double direction_sum = 0.0;
+    double loss_sum = 0.0;
+    double margin_sum = 0.0;
+    double adjusted_margin_sum = 0.0;
+    double preferred_delta_sum = 0.0;
+    double rejected_delta_sum = 0.0;
+    double kl_sum = 0.0;
+    size_t pair_index;
+    if (!model || !anchor_model || !samples || sample_count == 0 ||
+            sample_count % 2u != 0 || !(preference_beta > 0.0f) || !metrics) return 0;
+    memset(metrics, 0, sizeof(*metrics));
+    metrics->pair_count = sample_count / 2u;
+    for (pair_index = 0; pair_index * 2u < sample_count; ++pair_index) {
+        const CounterfactualSample* first = samples[pair_index * 2u];
+        const CounterfactualSample* second = samples[pair_index * 2u + 1u];
+        const CounterfactualSample* preferred;
+        const CounterfactualSample* rejected;
+        float current_preferred;
+        float current_rejected;
+        float anchor_preferred;
+        float anchor_rejected;
+        float preferred_kl;
+        float rejected_kl;
+        double current_margin;
+        double anchor_margin;
+        double adjusted_margin;
+        double confidence;
+        double pair_kl;
+        double loss;
+        if (!first || !second || strcmp(first->pair_id, second->pair_id) != 0) return 0;
+        if (first->has_rollout_statistics && second->has_rollout_statistics) {
+            ++metrics->repeated_pair_count;
+        }
+        if (fabsf(first->target_value - second->target_value) <= 1.0e-6f) continue;
+        preferred = first->target_value > second->target_value ? first : second;
+        rejected = preferred == first ? second : first;
+        confidence = counterfactual_pair_preference_weight(first, second);
+        if (!(confidence > 0.0)) continue;
+        if (!gru_model_factorized_choice_log_probability(
+                model, preferred->hidden_state, preferred->legal_mask,
+                &preferred->choice, &current_preferred) ||
+                !gru_model_factorized_choice_log_probability(
+                    model, rejected->hidden_state, rejected->legal_mask,
+                    &rejected->choice, &current_rejected) ||
+                !gru_model_factorized_choice_log_probability(
+                    anchor_model, preferred->hidden_state, preferred->legal_mask,
+                    &preferred->choice, &anchor_preferred) ||
+                !gru_model_factorized_choice_log_probability(
+                    anchor_model, rejected->hidden_state, rejected->legal_mask,
+                    &rejected->choice, &anchor_rejected) ||
+                !gru_model_factorized_policy_kl(
+                    model, anchor_model, preferred->hidden_state,
+                    preferred->legal_mask, &preferred->choice, &preferred_kl) ||
+                !gru_model_factorized_policy_kl(
+                    model, anchor_model, rejected->hidden_state,
+                    rejected->legal_mask, &rejected->choice, &rejected_kl)) return 0;
+        current_margin = (double)current_preferred - current_rejected;
+        anchor_margin = (double)anchor_preferred - anchor_rejected;
+        adjusted_margin = current_margin - anchor_margin;
+        pair_kl = 0.5 * ((double)preferred_kl + rejected_kl);
+        loss = stable_preference_loss((double)preference_beta * adjusted_margin);
+        if (!isfinite(current_margin) || !isfinite(anchor_margin) ||
+                !isfinite(adjusted_margin) || !isfinite(pair_kl) ||
+                !isfinite(loss)) {
+            ++metrics->nonfinite_count;
+            continue;
+        }
+        ++metrics->discordant_pair_count;
+        confidence_sum += confidence;
+        ranking_sum += current_margin > 0.0 ? 1.0 : 0.0;
+        direction_sum += adjusted_margin > 0.0 ? 1.0 : 0.0;
+        weighted_ranking_sum += confidence * (current_margin > 0.0 ? 1.0 : 0.0);
+        weighted_direction_sum += confidence * (adjusted_margin > 0.0 ? 1.0 : 0.0);
+        loss_sum += loss;
+        weighted_loss_sum += confidence * loss;
+        margin_sum += current_margin;
+        adjusted_margin_sum += adjusted_margin;
+        preferred_delta_sum += (double)current_preferred - anchor_preferred;
+        rejected_delta_sum += (double)current_rejected - anchor_rejected;
+        kl_sum += pair_kl;
+        if (pair_kl > metrics->max_legal_policy_kl) {
+            metrics->max_legal_policy_kl = pair_kl;
+        }
+    }
+    metrics->pair_confidence_sum = confidence_sum;
+    if (metrics->discordant_pair_count > 0) {
+        double count = (double)metrics->discordant_pair_count;
+        metrics->mean_pair_confidence = confidence_sum / count;
+        metrics->pair_ranking_accuracy = ranking_sum / count;
+        metrics->update_direction_accuracy = direction_sum / count;
+        metrics->reference_adjusted_preference_loss = loss_sum / count;
+        metrics->mean_policy_margin = margin_sum / count;
+        metrics->mean_reference_adjusted_margin = adjusted_margin_sum / count;
+        metrics->mean_preferred_log_probability_delta = preferred_delta_sum / count;
+        metrics->mean_rejected_log_probability_delta = rejected_delta_sum / count;
+        metrics->mean_legal_policy_kl = kl_sum / count;
+    }
+    if (confidence_sum > 0.0) {
+        metrics->confidence_weighted_pair_ranking_accuracy =
+            weighted_ranking_sum / confidence_sum;
+        metrics->confidence_weighted_update_direction_accuracy =
+            weighted_direction_sum / confidence_sum;
+        metrics->confidence_weighted_reference_adjusted_preference_loss =
+            weighted_loss_sum / confidence_sum;
+    }
+    return 1;
+}
+
+int learning_diagnostic_run_counterfactual_policy_preference_fit(
+    GruModel* model,
+    const GruModel* anchor_model,
+    CounterfactualSample* const* train_samples,
+    size_t train_count,
+    CounterfactualSample* const* selection_samples,
+    size_t selection_count,
+    CounterfactualSample* const* holdout_samples,
+    size_t holdout_count,
+    size_t epochs,
+    size_t minibatch_pairs,
+    size_t early_stop_patience,
+    unsigned int shuffle_seed,
+    float learning_rate,
+    float preference_beta,
+    float anchor_kl_coefficient,
+    float max_mean_policy_kl,
+    float adam_beta1,
+    float adam_beta2,
+    float adam_epsilon,
+    float gradient_clip,
+    CounterfactualPolicyPreferenceResult* result
+) {
+    size_t* order = NULL;
+    float* best_parameters = NULL;
+    size_t parameter_count;
+    unsigned int shuffle_state = shuffle_seed;
+    double best_selection_loss;
+    double started_at = critic_wall_seconds();
+    size_t stale_epochs = 0;
+    size_t epoch;
+    size_t i;
+    if (!model || !anchor_model || !train_samples || train_count == 0 ||
+            !selection_samples || selection_count == 0 || !holdout_samples ||
+            holdout_count == 0 || train_count % 2u != 0 ||
+            selection_count % 2u != 0 || holdout_count % 2u != 0 ||
+            epochs == 0 || minibatch_pairs == 0 || early_stop_patience == 0 ||
+            !(learning_rate > 0.0f) || !(preference_beta > 0.0f) ||
+            anchor_kl_coefficient < 0.0f || !(max_mean_policy_kl > 0.0f) ||
+            !result) return 0;
+    memset(result, 0, sizeof(*result));
+    if (!evaluate_counterfactual_policy_preferences(
+            model, anchor_model, train_samples, train_count,
+            preference_beta, &result->before_train) ||
+            !evaluate_counterfactual_policy_preferences(
+                model, anchor_model, selection_samples, selection_count,
+                preference_beta, &result->before_selection) ||
+            !evaluate_counterfactual_policy_preferences(
+                model, anchor_model, holdout_samples, holdout_count,
+                preference_beta, &result->before_holdout)) return 0;
+    parameter_count = gru_model_parameter_count(model);
+    order = (size_t*)malloc((train_count / 2u) * sizeof(*order));
+    best_parameters = (float*)malloc(parameter_count * sizeof(*best_parameters));
+    if (!order || !best_parameters ||
+            !gru_model_export_parameters(model, best_parameters, parameter_count)) goto failure;
+    for (i = 0; i < train_count / 2u; ++i) order[i] = i;
+    best_selection_loss =
+        result->before_selection.confidence_weighted_reference_adjusted_preference_loss;
+    result->training_completed = 1;
+    for (epoch = 0; epoch < epochs; ++epoch) {
+        CounterfactualPolicyPreferenceMetrics selection_metrics;
+        critic_shuffle(order, train_count / 2u, &shuffle_state);
+        for (i = 0; i < train_count / 2u; i += minibatch_pairs) {
+            size_t batch_count = train_count / 2u - i;
+            size_t used_pairs = 0;
+            size_t j;
+            if (batch_count > minibatch_pairs) batch_count = minibatch_pairs;
+            gru_model_clear_accumulated_supervised_updates(model);
+            for (j = 0; j < batch_count; ++j) {
+                size_t pair_start = order[i + j] * 2u;
+                const CounterfactualSample* first = train_samples[pair_start];
+                const CounterfactualSample* second = train_samples[pair_start + 1u];
+                const CounterfactualSample* preferred;
+                const CounterfactualSample* rejected;
+                float current_preferred;
+                float current_rejected;
+                float anchor_preferred;
+                float anchor_rejected;
+                float confidence;
+                double adjusted_margin;
+                float preference_gradient;
+                if (!first || !second || strcmp(first->pair_id, second->pair_id) != 0) goto failure;
+                confidence = counterfactual_pair_preference_weight(first, second);
+                if (!(confidence > 0.0f)) continue;
+                preferred = first->target_value > second->target_value ? first : second;
+                rejected = preferred == first ? second : first;
+                if (!gru_model_factorized_choice_log_probability(
+                        model, preferred->hidden_state, preferred->legal_mask,
+                        &preferred->choice, &current_preferred) ||
+                        !gru_model_factorized_choice_log_probability(
+                            model, rejected->hidden_state, rejected->legal_mask,
+                            &rejected->choice, &current_rejected) ||
+                        !gru_model_factorized_choice_log_probability(
+                            anchor_model, preferred->hidden_state, preferred->legal_mask,
+                            &preferred->choice, &anchor_preferred) ||
+                        !gru_model_factorized_choice_log_probability(
+                            anchor_model, rejected->hidden_state, rejected->legal_mask,
+                            &rejected->choice, &anchor_rejected)) goto failure;
+                adjusted_margin = ((double)current_preferred - current_rejected) -
+                    ((double)anchor_preferred - anchor_rejected);
+                preference_gradient = confidence * preference_beta *
+                    (float)preference_gradient_factor(
+                        (double)preference_beta * adjusted_margin);
+                if (!gru_model_accumulate_factorized_preference_hidden(
+                        model, anchor_model, preferred->hidden_state,
+                        preferred->legal_mask, &preferred->choice,
+                        &rejected->choice, preference_gradient,
+                        anchor_kl_coefficient)) goto failure;
+                ++used_pairs;
+            }
+            if (used_pairs > 0 && !gru_model_apply_accumulated_policy_adam_updates(
+                    model, learning_rate, adam_beta1, adam_beta2,
+                    adam_epsilon, gradient_clip)) goto failure;
+        }
+        result->epochs_completed = epoch + 1u;
+        if (!evaluate_counterfactual_policy_preferences(
+                model, anchor_model, selection_samples, selection_count,
+                preference_beta, &selection_metrics)) goto failure;
+        if (selection_metrics.nonfinite_count == 0 &&
+                selection_metrics.mean_legal_policy_kl <= max_mean_policy_kl &&
+                selection_metrics.confidence_weighted_reference_adjusted_preference_loss <
+                    best_selection_loss - 1.0e-6) {
+            best_selection_loss =
+                selection_metrics.confidence_weighted_reference_adjusted_preference_loss;
+            result->best_epoch = epoch + 1u;
+            stale_epochs = 0;
+            if (!gru_model_export_parameters(
+                    model, best_parameters, parameter_count)) goto failure;
+        } else {
+            ++stale_epochs;
+        }
+        {
+            double elapsed = critic_wall_seconds() - started_at;
+            double eta = elapsed / (double)(epoch + 1u) *
+                (double)(epochs - epoch - 1u);
+            printf("[counterfactual-policy] epoch=%zu/%zu selection_loss=%.6f selection_direction=%.4f selection_kl=%.6f best_epoch=%zu elapsed=%.1fs eta=%.1fs\n",
+                epoch + 1u, epochs,
+                selection_metrics.confidence_weighted_reference_adjusted_preference_loss,
+                selection_metrics.confidence_weighted_update_direction_accuracy,
+                selection_metrics.mean_legal_policy_kl,
+                result->best_epoch, elapsed, eta);
+        }
+        if (stale_epochs >= early_stop_patience) {
+            result->stopped_early = epoch + 1u < epochs;
+            break;
+        }
+    }
+    result->last_attempted_epoch = result->epochs_completed;
+    if (!evaluate_counterfactual_policy_preferences(
+            model, anchor_model, train_samples, train_count,
+            preference_beta, &result->last_attempted_train) ||
+            !evaluate_counterfactual_policy_preferences(
+                model, anchor_model, selection_samples, selection_count,
+                preference_beta, &result->last_attempted_selection) ||
+            !gru_model_import_parameters(model, best_parameters, parameter_count) ||
+            !evaluate_counterfactual_policy_preferences(
+                model, anchor_model, train_samples, train_count,
+                preference_beta, &result->after_train) ||
+            !evaluate_counterfactual_policy_preferences(
+                model, anchor_model, selection_samples, selection_count,
+                preference_beta, &result->after_selection) ||
+            !evaluate_counterfactual_policy_preferences(
+                model, anchor_model, holdout_samples, holdout_count,
+                preference_beta, &result->after_holdout)) goto failure;
+    result->holdout_loss_improved =
+        result->after_holdout.discordant_pair_count >= 10u &&
+        result->after_holdout.confidence_weighted_reference_adjusted_preference_loss <=
+            result->before_holdout.confidence_weighted_reference_adjusted_preference_loss * 0.99;
+    result->holdout_direction_consistent =
+        result->after_holdout.confidence_weighted_update_direction_accuracy >= 0.55;
+    result->holdout_kl_acceptable =
+        result->after_holdout.mean_legal_policy_kl <= max_mean_policy_kl;
+    result->policy_signal_detected = result->training_completed &&
+        result->holdout_loss_improved && result->holdout_direction_consistent &&
+        result->holdout_kl_acceptable && result->after_holdout.nonfinite_count == 0;
+    free(best_parameters);
+    free(order);
+    return 1;
+
+failure:
+    result->training_completed = 0;
+    free(best_parameters);
+    free(order);
+    return 0;
+}
+
 static void write_json_string(FILE* out, const char* text) {
     const unsigned char* p = (const unsigned char*)(text ? text : "");
     fputc('"', out);
@@ -1434,7 +1755,7 @@ int learning_diagnostic_write_action_value_report(
     out = fopen(report_path, "w");
     if (!out) return 0;
     fputs("{\n  \"diagnostic\": \"action_conditioned_joint_q_fit\",\n", out);
-    fputs("  \"metrics_version\": 2,\n  \"training_source\": ", out);
+    fputs("  \"metrics_version\": 3,\n  \"training_source\": ", out);
     write_json_string(out, training_source_path);
     fputs(",\n  \"holdout_source\": ", out);
     write_json_string(out, holdout_source_path);
@@ -1449,6 +1770,7 @@ int learning_diagnostic_write_action_value_report(
         "  \"target_mode\": \"%s\",\n"
         "  \"target_value_source\": \"%s\",\n"
         "  \"advantage_centering\": \"exact expectation under the frozen legal policy\",\n"
+        "  \"head_mode\": \"%s\",\n"
         "  \"hidden_dim\": %zu,\n"
         "  \"latent_dim\": %zu,\n"
         "  \"parameter_count\": %zu,\n"
@@ -1469,6 +1791,7 @@ int learning_diagnostic_write_action_value_report(
         target_mode == ACTION_VALUE_TARGET_MONTE_CARLO
             ? "discounted_episode_rewards"
             : "frozen_state_value_and_episode_rewards",
+        action_value_head_mode_name(action_value_model_head_mode(action_value_model)),
         action_value_model_hidden_dim(action_value_model),
         action_value_model_latent_dim(action_value_model),
         action_value_model_parameter_count(action_value_model),
@@ -1513,6 +1836,8 @@ int learning_diagnostic_write_action_value_report(
 int learning_diagnostic_write_counterfactual_action_value_report(
     const char* report_path,
     const char* batch_path,
+    const CounterfactualDataset* training_dataset,
+    int training_source_is_manifest,
     const char* holdout_batch_path,
     int external_holdout,
     int final_confirmation,
@@ -1531,15 +1856,26 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     const ActionValueFitResult* result
 ) {
     FILE* out;
-    if (!report_path || !*report_path || !action_value_model || !result) return 0;
+    size_t source_index;
+    if (!report_path || !*report_path || !training_dataset ||
+            training_dataset->source_count == 0 || !action_value_model || !result) return 0;
     out = fopen(report_path, "w");
     if (!out) return 0;
     fprintf(out, "{\n  \"diagnostic\": \"%s\",\n",
         overfit_pair_count > 0
             ? "counterfactual_q_real_data_overfit"
-            : "paired_counterfactual_joint_q_fit");
-    fputs("  \"metrics_version\": 6,\n  \"counterfactual_batch\": ", out);
+            : "paired_counterfactual_q_fit");
+    fputs("  \"metrics_version\": 8,\n  \"counterfactual_batch\": ", out);
     write_json_string(out, batch_path);
+    fprintf(out, ",\n  \"training_source_kind\": \"%s\"",
+        training_source_is_manifest ? "manifest" : "batch");
+    fputs(",\n  \"counterfactual_sources\": [", out);
+    for (source_index = 0; source_index < training_dataset->source_count;
+            ++source_index) {
+        if (source_index > 0) fputs(", ", out);
+        write_json_string(out, training_dataset->source_paths[source_index]);
+    }
+    fputs("]", out);
     fputs(",\n  \"holdout_batch\": ", out);
     write_json_string(out, holdout_batch_path);
     fprintf(out, ",\n  \"holdout_source\": \"%s\"",
@@ -1566,6 +1902,8 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"pair_weight_definition\": \"normal confidence from the mean return gap and repeated-rollout standard error\",\n"
         "  \"tied_pairs_in_training\": false,\n"
         "  \"advantage_centering\": \"exact expectation under the frozen legal policy\",\n"
+        "  \"head_mode\": \"%s\",\n"
+        "  \"head_structure\": \"%s\",\n"
         "  \"hidden_dim\": %zu,\n"
         "  \"latent_dim\": %zu,\n"
         "  \"parameter_count\": %zu,\n"
@@ -1583,6 +1921,10 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         action_value_published ? "true" : "false",
         overfit_pair_count > 0 ? "false" : "true",
         (double)ACTION_VALUE_GAP_HUBER_DELTA,
+        action_value_head_mode_name(action_value_model_head_mode(action_value_model)),
+        action_value_model_head_mode(action_value_model) == ACTION_VALUE_HEAD_FACTORIZED
+            ? "slot-local state scores plus ordered joint interaction bias"
+            : "independent state-conditioned legal joint scores",
         action_value_model_hidden_dim(action_value_model),
         action_value_model_latent_dim(action_value_model),
         action_value_model_parameter_count(action_value_model),
@@ -1626,6 +1968,162 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         fputs("    \"pass_rule\": \"confidence-weighted pair-gap Huber loss improves at least 1% on holdout, at least 10 discordant holdout pairs achieve at least 55% confidence-weighted ranking accuracy, outputs remain finite, and advantages remain bounded\"\n", out);
     }
     fputs("  }\n}\n", out);
+    return fclose(out) == 0;
+}
+
+static void write_counterfactual_policy_preference_metrics(
+    FILE* out,
+    const CounterfactualPolicyPreferenceMetrics* metrics,
+    const char* indent
+) {
+    fprintf(out, "%s{\n", indent);
+    fprintf(out, "%s  \"pairs\": %zu,\n", indent, metrics->pair_count);
+    fprintf(out, "%s  \"discordant_pairs\": %zu,\n", indent,
+        metrics->discordant_pair_count);
+    fprintf(out, "%s  \"repeated_pairs\": %zu,\n", indent,
+        metrics->repeated_pair_count);
+    fprintf(out, "%s  \"nonfinite_values\": %zu,\n", indent,
+        metrics->nonfinite_count);
+    fprintf(out, "%s  \"pair_confidence_sum\": %.9g,\n", indent,
+        metrics->pair_confidence_sum);
+    fprintf(out, "%s  \"mean_pair_confidence\": %.9g,\n", indent,
+        metrics->mean_pair_confidence);
+    fprintf(out, "%s  \"pair_ranking_accuracy\": %.9g,\n", indent,
+        metrics->pair_ranking_accuracy);
+    fprintf(out, "%s  \"confidence_weighted_pair_ranking_accuracy\": %.9g,\n",
+        indent, metrics->confidence_weighted_pair_ranking_accuracy);
+    fprintf(out, "%s  \"update_direction_accuracy\": %.9g,\n", indent,
+        metrics->update_direction_accuracy);
+    fprintf(out, "%s  \"confidence_weighted_update_direction_accuracy\": %.9g,\n",
+        indent, metrics->confidence_weighted_update_direction_accuracy);
+    fprintf(out, "%s  \"reference_adjusted_preference_loss\": %.9g,\n",
+        indent, metrics->reference_adjusted_preference_loss);
+    fprintf(out, "%s  \"confidence_weighted_reference_adjusted_preference_loss\": %.9g,\n",
+        indent, metrics->confidence_weighted_reference_adjusted_preference_loss);
+    fprintf(out, "%s  \"mean_policy_margin\": %.9g,\n", indent,
+        metrics->mean_policy_margin);
+    fprintf(out, "%s  \"mean_reference_adjusted_margin\": %.9g,\n", indent,
+        metrics->mean_reference_adjusted_margin);
+    fprintf(out, "%s  \"mean_preferred_log_probability_delta\": %.9g,\n",
+        indent, metrics->mean_preferred_log_probability_delta);
+    fprintf(out, "%s  \"mean_rejected_log_probability_delta\": %.9g,\n",
+        indent, metrics->mean_rejected_log_probability_delta);
+    fprintf(out, "%s  \"mean_legal_policy_kl\": %.9g,\n", indent,
+        metrics->mean_legal_policy_kl);
+    fprintf(out, "%s  \"max_legal_policy_kl\": %.9g\n", indent,
+        metrics->max_legal_policy_kl);
+    fprintf(out, "%s}", indent);
+}
+
+int learning_diagnostic_write_counterfactual_policy_preference_report(
+    const char* report_path,
+    const char* batch_path,
+    const CounterfactualDataset* training_dataset,
+    int training_source_is_manifest,
+    const char* holdout_batch_path,
+    int external_holdout,
+    const char* checkpoint_path,
+    const char* output_checkpoint_path,
+    int checkpoint_published,
+    unsigned int validation_seed,
+    unsigned int shuffle_seed,
+    size_t epochs,
+    size_t minibatch_pairs,
+    size_t early_stop_patience,
+    float learning_rate,
+    float preference_beta,
+    float anchor_kl_coefficient,
+    float max_mean_policy_kl,
+    const CounterfactualPolicyPreferenceResult* result
+) {
+    FILE* out;
+    size_t source_index;
+    if (!report_path || !*report_path || !training_dataset ||
+            training_dataset->source_count == 0 || !result) return 0;
+    out = fopen(report_path, "w");
+    if (!out) return 0;
+    fputs("{\n  \"diagnostic\": \"counterfactual_policy_preference_fit\",\n", out);
+    fputs("  \"metrics_version\": 1,\n  \"counterfactual_batch\": ", out);
+    write_json_string(out, batch_path);
+    fprintf(out, ",\n  \"training_source_kind\": \"%s\"",
+        training_source_is_manifest ? "manifest" : "batch");
+    fputs(",\n  \"counterfactual_sources\": [", out);
+    for (source_index = 0; source_index < training_dataset->source_count;
+            ++source_index) {
+        if (source_index > 0) fputs(", ", out);
+        write_json_string(out, training_dataset->source_paths[source_index]);
+    }
+    fputs("],\n  \"holdout_batch\": ", out);
+    write_json_string(out, holdout_batch_path);
+    fprintf(out, ",\n  \"holdout_source\": \"%s\"",
+        external_holdout ? "external_batch" : "stable_pair_split");
+    fputs(",\n  \"parent_checkpoint\": ", out);
+    write_json_string(out, checkpoint_path);
+    fputs(",\n  \"output_checkpoint\": ", out);
+    write_json_string(out, output_checkpoint_path);
+    fprintf(out,
+        ",\n  \"checkpoint_published\": %s,\n"
+        "  \"encoder_frozen\": true,\n"
+        "  \"critic_frozen\": true,\n"
+        "  \"policy_heads_updated\": true,\n"
+        "  \"training_objective\": \"confidence-weighted reference-adjusted pairwise policy preference\",\n"
+        "  \"preference_beta\": %.9g,\n"
+        "  \"anchor_kl_coefficient\": %.9g,\n"
+        "  \"max_mean_policy_kl\": %.9g,\n"
+        "  \"validation_seed\": %u,\n"
+        "  \"shuffle_seed\": %u,\n"
+        "  \"epochs_requested\": %zu,\n"
+        "  \"epochs_completed\": %zu,\n"
+        "  \"best_epoch\": %zu,\n"
+        "  \"last_attempted_epoch\": %zu,\n"
+        "  \"stopped_early\": %s,\n"
+        "  \"early_stop_patience\": %zu,\n"
+        "  \"minibatch_pairs\": %zu,\n"
+        "  \"learning_rate\": %.9g,\n",
+        checkpoint_published ? "true" : "false",
+        preference_beta, anchor_kl_coefficient, max_mean_policy_kl,
+        validation_seed, shuffle_seed, epochs, result->epochs_completed,
+        result->best_epoch, result->last_attempted_epoch,
+        result->stopped_early ? "true" : "false",
+        early_stop_patience, minibatch_pairs, learning_rate);
+    fputs("  \"before\": {\n    \"train\": ", out);
+    write_counterfactual_policy_preference_metrics(
+        out, &result->before_train, "    ");
+    fputs(",\n    \"selection\": ", out);
+    write_counterfactual_policy_preference_metrics(
+        out, &result->before_selection, "    ");
+    fputs(",\n    \"holdout\": ", out);
+    write_counterfactual_policy_preference_metrics(
+        out, &result->before_holdout, "    ");
+    fputs("\n  },\n  \"after\": {\n    \"train\": ", out);
+    write_counterfactual_policy_preference_metrics(
+        out, &result->after_train, "    ");
+    fputs(",\n    \"selection\": ", out);
+    write_counterfactual_policy_preference_metrics(
+        out, &result->after_selection, "    ");
+    fputs(",\n    \"holdout\": ", out);
+    write_counterfactual_policy_preference_metrics(
+        out, &result->after_holdout, "    ");
+    fputs("\n  },\n  \"last_attempted\": {\n    \"train\": ", out);
+    write_counterfactual_policy_preference_metrics(
+        out, &result->last_attempted_train, "    ");
+    fputs(",\n    \"selection\": ", out);
+    write_counterfactual_policy_preference_metrics(
+        out, &result->last_attempted_selection, "    ");
+    fputs("\n  },\n  \"assessment\": {\n", out);
+    fprintf(out,
+        "    \"training_completed\": %s,\n"
+        "    \"holdout_loss_improved\": %s,\n"
+        "    \"holdout_direction_consistent\": %s,\n"
+        "    \"holdout_kl_acceptable\": %s,\n"
+        "    \"policy_signal_detected\": %s,\n"
+        "    \"pass_rule\": \"reference-adjusted preference loss improves at least 1%%, confidence-weighted holdout update direction reaches at least 55%%, mean legal-policy KL remains within the configured limit, at least 10 discordant pairs contribute, and outputs remain finite\"\n"
+        "  }\n}\n",
+        result->training_completed ? "true" : "false",
+        result->holdout_loss_improved ? "true" : "false",
+        result->holdout_direction_consistent ? "true" : "false",
+        result->holdout_kl_acceptable ? "true" : "false",
+        result->policy_signal_detected ? "true" : "false");
     return fclose(out) == 0;
 }
 

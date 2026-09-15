@@ -1020,6 +1020,127 @@ int gru_model_apply_accumulated_adam_updates(
     return 1;
 }
 
+typedef struct {
+    float* parameters;
+    float* first_moment;
+    float* second_moment;
+    float* gradients;
+    size_t count;
+} PolicyAdamArray;
+
+int gru_model_apply_accumulated_policy_adam_updates(
+    GruModel* model,
+    float learning_rate,
+    float beta1,
+    float beta2,
+    float epsilon,
+    float gradient_clip
+) {
+    GruGradientAccum* accum;
+    GruAdamState* state;
+    PolicyAdamArray arrays[22];
+    size_t array_count = 0;
+    size_t array_index;
+    double gradient_square_sum = 0.0;
+    float gradient_scale;
+    float bias_correction1;
+    float bias_correction2;
+    if (!model || !gru_gradient_accum_ensure(model) ||
+            !gru_adam_state_ensure(model)) return 0;
+    accum = &model->grad_accum;
+    state = &model->adam_state;
+    if (accum->count == 0) return 1;
+
+#define ADD_POLICY_ADAM_ARRAY(parameter_array, moment_prefix, gradient_array, element_count) \
+    do { \
+        arrays[array_count].parameters = (parameter_array); \
+        arrays[array_count].first_moment = state->moment_prefix##_m; \
+        arrays[array_count].second_moment = state->moment_prefix##_v; \
+        arrays[array_count].gradients = (gradient_array); \
+        arrays[array_count].count = (element_count); \
+        ++array_count; \
+    } while (0)
+
+    ADD_POLICY_ADAM_ARRAY(model->slot0_kind_head.data, slot0_kind_head,
+        accum->slot0_kind_head, model->slot0_kind_head.rows * model->slot0_kind_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot0_kind_bias, slot0_kind_bias,
+        accum->slot0_kind_bias, FACTORIZED_KIND_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->slot0_move_head.data, slot0_move_head,
+        accum->slot0_move_head, model->slot0_move_head.rows * model->slot0_move_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot0_move_bias, slot0_move_bias,
+        accum->slot0_move_bias, FACTORIZED_MOVE_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->slot0_switch_head.data, slot0_switch_head,
+        accum->slot0_switch_head, model->slot0_switch_head.rows * model->slot0_switch_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot0_switch_bias, slot0_switch_bias,
+        accum->slot0_switch_bias, FACTORIZED_SWITCH_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->slot0_tera_head.data, slot0_tera_head,
+        accum->slot0_tera_head, model->slot0_tera_head.rows * model->slot0_tera_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot0_tera_bias, slot0_tera_bias,
+        accum->slot0_tera_bias, FACTORIZED_TERA_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->slot0_target_head.data, slot0_target_head,
+        accum->slot0_target_head, model->slot0_target_head.rows * model->slot0_target_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot0_target_bias, slot0_target_bias,
+        accum->slot0_target_bias, FACTORIZED_TARGET_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_kind_head.data, slot1_kind_head,
+        accum->slot1_kind_head, model->slot1_kind_head.rows * model->slot1_kind_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_kind_bias, slot1_kind_bias,
+        accum->slot1_kind_bias, FACTORIZED_KIND_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_move_head.data, slot1_move_head,
+        accum->slot1_move_head, model->slot1_move_head.rows * model->slot1_move_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_move_bias, slot1_move_bias,
+        accum->slot1_move_bias, FACTORIZED_MOVE_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_switch_head.data, slot1_switch_head,
+        accum->slot1_switch_head, model->slot1_switch_head.rows * model->slot1_switch_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_switch_bias, slot1_switch_bias,
+        accum->slot1_switch_bias, FACTORIZED_SWITCH_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_tera_head.data, slot1_tera_head,
+        accum->slot1_tera_head, model->slot1_tera_head.rows * model->slot1_tera_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_tera_bias, slot1_tera_bias,
+        accum->slot1_tera_bias, FACTORIZED_TERA_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_target_head.data, slot1_target_head,
+        accum->slot1_target_head, model->slot1_target_head.rows * model->slot1_target_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->slot1_target_bias, slot1_target_bias,
+        accum->slot1_target_bias, FACTORIZED_TARGET_DIM);
+    ADD_POLICY_ADAM_ARRAY(model->joint_pair_head.data, joint_pair_head,
+        accum->joint_pair_head, model->joint_pair_head.rows * model->joint_pair_head.cols);
+    ADD_POLICY_ADAM_ARRAY(model->joint_pair_bias, joint_pair_bias,
+        accum->joint_pair_bias, FACTORIZED_PAIR_DIM);
+#undef ADD_POLICY_ADAM_ARRAY
+
+    gradient_scale = 1.0f / (float)accum->count;
+    for (array_index = 0; array_index < array_count; ++array_index) {
+        PolicyAdamArray* array = &arrays[array_index];
+        size_t i;
+        for (i = 0; i < array->count; ++i) {
+            double gradient = (double)array->gradients[i] * gradient_scale;
+            gradient_square_sum += gradient * gradient;
+        }
+    }
+    if (gradient_clip > 0.0f && gradient_square_sum > 0.0) {
+        double gradient_norm = sqrt(gradient_square_sum);
+        if (gradient_norm > gradient_clip) {
+            gradient_scale *= (float)(gradient_clip / gradient_norm);
+        }
+    }
+    ++state->step;
+    bias_correction1 = 1.0f - powf(beta1, (float)state->step);
+    bias_correction2 = 1.0f - powf(beta2, (float)state->step);
+    for (array_index = 0; array_index < array_count; ++array_index) {
+        PolicyAdamArray* array = &arrays[array_index];
+        size_t i;
+        for (i = 0; i < array->count; ++i) {
+            array->gradients[i] *= gradient_scale;
+        }
+        adam_apply_array(
+            array->parameters, array->first_moment, array->second_moment,
+            array->gradients, array->count, learning_rate, beta1, beta2,
+            epsilon, bias_correction1, bias_correction2);
+    }
+    sync_flat_heads_from_factorized(model);
+    gru_model_clear_accumulated_supervised_updates(model);
+    return 1;
+}
+
 static void matrix_vec_mul_accum(const Matrix* matrix, const float* vec, float* out) {
     size_t r;
 #ifdef _OPENMP
@@ -1610,7 +1731,6 @@ static int joint_policy_gradients(
     JointHeadGradients* grads
 ) {
     float joint_policy[FACTORIZED_JOINT_DIM];
-    float grad_joint[FACTORIZED_JOINT_DIM];
     float local0_grad[FACTORIZED_LOCAL_ACTION_DIM] = {0};
     float local1_grad[FACTORIZED_LOCAL_ACTION_DIM] = {0};
     float pair_grad[FACTORIZED_PAIR_DIM] = {0};
@@ -1641,7 +1761,6 @@ static int joint_policy_gradients(
         float p = joint_policy[i];
         float gradient;
         if (p <= 0.0f) {
-            grad_joint[i] = 0.0f;
             continue;
         }
         gradient = (p - (i == selected ? 1.0f : 0.0f)) * policy_scale;
@@ -1652,7 +1771,6 @@ static int joint_policy_gradients(
         if (anchor_policy && anchor_policy->has_joint_policy && anchor_kl_coef > 0.0f) {
             gradient += anchor_kl_coef * (p - anchor_policy->joint_policy[i]);
         }
-        grad_joint[i] = gradient;
         local0_grad[action0] += gradient;
         local1_grad[action1] += gradient;
         pair_grad[joint_pair_index(action0, action1)] += gradient;
@@ -1723,6 +1841,135 @@ static void factorized_target_policy_gradients(
         accumulate_linear_row_gradient(head, hidden_state, (size_t)i, grad_logits[i],
             grad_target_head, grad_target_bias, grad_h);
     }
+}
+
+int gru_model_accumulate_factorized_preference_hidden(
+    GruModel* model,
+    const GruModel* anchor_model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* preferred,
+    const FactorizedActionChoice* rejected,
+    float preference_gradient,
+    float anchor_kl_coef
+) {
+    GruGradientAccum* accum;
+    FactorizedPolicySnapshot anchor_snapshot;
+    JointHeadGradients gradients;
+    float* grad_h;
+    float ignored_loss = 0.0f;
+    float ignored_accuracy = 0.0f;
+    float half_anchor_kl;
+    int dual;
+    int slot;
+    int ok = 0;
+    if (!model || !hidden_state || !legal_mask || !preferred || !rejected ||
+            !isfinite(preference_gradient) || preference_gradient < 0.0f ||
+            !isfinite(anchor_kl_coef) || anchor_kl_coef < 0.0f ||
+            (anchor_kl_coef > 0.0f && !anchor_model) ||
+            !gru_gradient_accum_ensure(model)) return 0;
+    dual = preferred->slot0_has_action && preferred->slot1_has_action;
+    if (dual != (rejected->slot0_has_action && rejected->slot1_has_action) ||
+            preferred->slot0_has_action != rejected->slot0_has_action ||
+            preferred->slot1_has_action != rejected->slot1_has_action) return 0;
+    accum = &model->grad_accum;
+    grad_h = (float*)calloc(model->hidden_dim, sizeof(*grad_h));
+    if (!grad_h) return 0;
+    if (anchor_kl_coef > 0.0f && !gru_model_evaluate_policy_snapshot(
+            anchor_model, hidden_state, legal_mask, dual,
+            &anchor_snapshot, NULL)) goto cleanup;
+    memset(&gradients, 0, sizeof(gradients));
+    gradients.slot0_kind_head = accum->slot0_kind_head;
+    gradients.slot0_kind_bias = accum->slot0_kind_bias;
+    gradients.slot0_move_head = accum->slot0_move_head;
+    gradients.slot0_move_bias = accum->slot0_move_bias;
+    gradients.slot0_switch_head = accum->slot0_switch_head;
+    gradients.slot0_switch_bias = accum->slot0_switch_bias;
+    gradients.slot0_tera_head = accum->slot0_tera_head;
+    gradients.slot0_tera_bias = accum->slot0_tera_bias;
+    gradients.slot1_kind_head = accum->slot1_kind_head;
+    gradients.slot1_kind_bias = accum->slot1_kind_bias;
+    gradients.slot1_move_head = accum->slot1_move_head;
+    gradients.slot1_move_bias = accum->slot1_move_bias;
+    gradients.slot1_switch_head = accum->slot1_switch_head;
+    gradients.slot1_switch_bias = accum->slot1_switch_bias;
+    gradients.slot1_tera_head = accum->slot1_tera_head;
+    gradients.slot1_tera_bias = accum->slot1_tera_bias;
+    gradients.pair_head = accum->joint_pair_head;
+    gradients.pair_bias = accum->joint_pair_bias;
+    half_anchor_kl = anchor_kl_coef * 0.5f;
+    if (dual) {
+        if (!joint_policy_gradients(
+                model, hidden_state, legal_mask, preferred,
+                preference_gradient, 0.0f,
+                anchor_kl_coef > 0.0f ? &anchor_snapshot : NULL,
+                half_anchor_kl, &ignored_loss, &ignored_accuracy,
+                grad_h, &gradients) ||
+                !joint_policy_gradients(
+                    model, hidden_state, legal_mask, rejected,
+                    -preference_gradient, 0.0f,
+                    anchor_kl_coef > 0.0f ? &anchor_snapshot : NULL,
+                    half_anchor_kl, &ignored_loss, &ignored_accuracy,
+                    grad_h, &gradients)) goto cleanup;
+        for (slot = 0; slot < 2; ++slot) {
+            float* target_head = slot == 0
+                ? accum->slot0_target_head : accum->slot1_target_head;
+            float* target_bias = slot == 0
+                ? accum->slot0_target_bias : accum->slot1_target_bias;
+            factorized_target_policy_gradients(
+                model, hidden_state, slot, preferred,
+                preference_gradient, 0.0f,
+                anchor_kl_coef > 0.0f ? &anchor_snapshot : NULL,
+                half_anchor_kl, &ignored_loss, grad_h,
+                target_head, target_bias);
+            factorized_target_policy_gradients(
+                model, hidden_state, slot, rejected,
+                -preference_gradient, 0.0f,
+                anchor_kl_coef > 0.0f ? &anchor_snapshot : NULL,
+                half_anchor_kl, &ignored_loss, grad_h,
+                target_head, target_bias);
+        }
+    } else {
+        for (slot = 0; slot < 2; ++slot) {
+            if (!(slot == 0 ? preferred->slot0_has_action : preferred->slot1_has_action)) continue;
+            factorized_slot_policy_gradients(
+                model, hidden_state, legal_mask, slot, preferred,
+                preference_gradient, 0.0f,
+                anchor_kl_coef > 0.0f ? &anchor_snapshot : NULL,
+                half_anchor_kl, &ignored_loss, &ignored_accuracy, grad_h,
+                slot == 0 ? accum->slot0_kind_head : accum->slot1_kind_head,
+                slot == 0 ? accum->slot0_kind_bias : accum->slot1_kind_bias,
+                slot == 0 ? accum->slot0_move_head : accum->slot1_move_head,
+                slot == 0 ? accum->slot0_move_bias : accum->slot1_move_bias,
+                slot == 0 ? accum->slot0_switch_head : accum->slot1_switch_head,
+                slot == 0 ? accum->slot0_switch_bias : accum->slot1_switch_bias,
+                slot == 0 ? accum->slot0_tera_head : accum->slot1_tera_head,
+                slot == 0 ? accum->slot0_tera_bias : accum->slot1_tera_bias,
+                slot == 0 ? accum->slot0_target_head : accum->slot1_target_head,
+                slot == 0 ? accum->slot0_target_bias : accum->slot1_target_bias);
+            factorized_slot_policy_gradients(
+                model, hidden_state, legal_mask, slot, rejected,
+                -preference_gradient, 0.0f,
+                anchor_kl_coef > 0.0f ? &anchor_snapshot : NULL,
+                half_anchor_kl, &ignored_loss, &ignored_accuracy, grad_h,
+                slot == 0 ? accum->slot0_kind_head : accum->slot1_kind_head,
+                slot == 0 ? accum->slot0_kind_bias : accum->slot1_kind_bias,
+                slot == 0 ? accum->slot0_move_head : accum->slot1_move_head,
+                slot == 0 ? accum->slot0_move_bias : accum->slot1_move_bias,
+                slot == 0 ? accum->slot0_switch_head : accum->slot1_switch_head,
+                slot == 0 ? accum->slot0_switch_bias : accum->slot1_switch_bias,
+                slot == 0 ? accum->slot0_tera_head : accum->slot1_tera_head,
+                slot == 0 ? accum->slot0_tera_bias : accum->slot1_tera_bias,
+                slot == 0 ? accum->slot0_target_head : accum->slot1_target_head,
+                slot == 0 ? accum->slot0_target_bias : accum->slot1_target_bias);
+        }
+    }
+    accum->count += 1u;
+    ok = 1;
+
+cleanup:
+    free(grad_h);
+    return ok;
 }
 
 static void evaluate_hidden_internal(
@@ -2318,6 +2565,226 @@ int gru_model_evaluate_joint_hidden(
             *value_out += model->value_head[h] * hidden_state[h];
         }
     }
+    return 1;
+}
+
+static int masked_log_probability(
+    const float* policy,
+    const unsigned char* mask,
+    size_t count,
+    int selected,
+    float* log_probability
+) {
+    float total = 0.0f;
+    float probability;
+    size_t i;
+    if (!policy || !mask || !log_probability || selected < 0 ||
+            (size_t)selected >= count || !mask[selected]) return 0;
+    for (i = 0; i < count; ++i) {
+        if (mask[i]) total += policy[i];
+    }
+    if (!(total > 0.0f) || !isfinite(total)) return 0;
+    probability = policy[selected] / total;
+    if (!(probability > 0.0f) || !isfinite(probability)) return 0;
+    *log_probability += logf(probability > 1.0e-8f ? probability : 1.0e-8f);
+    return 1;
+}
+
+static float masked_anchor_kl(
+    const float* anchor,
+    const float* current,
+    const unsigned char* mask,
+    size_t count
+) {
+    float anchor_total = 0.0f;
+    float current_total = 0.0f;
+    float kl = 0.0f;
+    size_t i;
+    for (i = 0; i < count; ++i) {
+        if (!mask || mask[i]) {
+            anchor_total += anchor[i];
+            current_total += current[i];
+        }
+    }
+    if (!(anchor_total > 0.0f) || !(current_total > 0.0f)) return 0.0f;
+    for (i = 0; i < count; ++i) {
+        if (!mask || mask[i]) {
+            float q = anchor[i] / anchor_total;
+            float p = current[i] / current_total;
+            if (q > 0.0f) {
+                if (p < 1.0e-8f) p = 1.0e-8f;
+                kl += q * logf(q / p);
+            }
+        }
+    }
+    return kl > 0.0f ? kl : 0.0f;
+}
+
+static int factorized_choice_log_probability_from_snapshot(
+    const FactorizedPolicySnapshot* snapshot,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* choice,
+    float* log_probability_out
+) {
+    unsigned char kind_mask[FACTORIZED_KIND_DIM];
+    unsigned char move_mask[FACTORIZED_MOVE_DIM];
+    unsigned char switch_mask[FACTORIZED_SWITCH_DIM];
+    unsigned char tera_mask[FACTORIZED_TERA_DIM];
+    unsigned char target_mask[FACTORIZED_TARGET_DIM];
+    float log_probability = 0.0f;
+    int flat0 = -1;
+    int flat1 = -1;
+    int slot;
+    if (!snapshot || !legal_mask || !choice || !log_probability_out ||
+            !factorized_action_choice_to_flat_actions(choice, &flat0, &flat1)) return 0;
+    if (choice->slot0_has_action && choice->slot1_has_action) {
+        int selected;
+        if (!snapshot->has_joint_policy || flat0 < 0 || flat1 < FACTORIZED_LOCAL_ACTION_DIM) return 0;
+        selected = flat0 * FACTORIZED_LOCAL_ACTION_DIM +
+            (flat1 - FACTORIZED_LOCAL_ACTION_DIM);
+        if (selected < 0 || selected >= FACTORIZED_JOINT_DIM ||
+                !(snapshot->joint_policy[selected] > 0.0f)) return 0;
+        log_probability += logf(snapshot->joint_policy[selected] > 1.0e-8f
+            ? snapshot->joint_policy[selected] : 1.0e-8f);
+    }
+    for (slot = 0; slot < 2; ++slot) {
+        int has_action = slot == 0 ? choice->slot0_has_action : choice->slot1_has_action;
+        int kind = slot == 0 ? choice->slot0_kind : choice->slot1_kind;
+        int move = slot == 0 ? choice->slot0_move_index : choice->slot1_move_index;
+        int switch_index = slot == 0 ? choice->slot0_switch_index : choice->slot1_switch_index;
+        int tera = (slot == 0 ? choice->slot0_use_tera : choice->slot1_use_tera) ? 1 : 0;
+        int target = slot == 0 ? choice->slot0_target_index : choice->slot1_target_index;
+        unsigned char target_bits = slot == 0 ? choice->slot0_target_mask : choice->slot1_target_mask;
+        const float* kind_policy = slot == 0 ? snapshot->slot0_kind_policy : snapshot->slot1_kind_policy;
+        const float* move_policy = slot == 0 ? snapshot->slot0_move_policy : snapshot->slot1_move_policy;
+        const float* switch_policy = slot == 0 ? snapshot->slot0_switch_policy : snapshot->slot1_switch_policy;
+        const float* tera_policy = slot == 0 ? snapshot->slot0_tera_policy : snapshot->slot1_tera_policy;
+        const float* target_policy = slot == 0 ? snapshot->slot0_target_policy : snapshot->slot1_target_policy;
+        if (!has_action) continue;
+        if (!(choice->slot0_has_action && choice->slot1_has_action)) {
+            build_factorized_masks(
+                legal_mask, slot, kind_mask, move_mask, switch_mask, tera_mask);
+            if (!masked_log_probability(
+                    kind_policy, kind_mask, FACTORIZED_KIND_DIM,
+                    kind == FACTORIZED_ACTION_SWITCH ? 1 : 0,
+                    &log_probability)) return 0;
+            if (kind == FACTORIZED_ACTION_MOVE) {
+                int base = slot == 0 ? 0 : FACTORIZED_LOCAL_ACTION_DIM;
+                tera_mask[0] = legal_mask[base + move] ? 1u : 0u;
+                tera_mask[1] = legal_mask[base + FACTORIZED_MOVE_DIM + move] ? 1u : 0u;
+                if (!masked_log_probability(
+                        move_policy, move_mask, FACTORIZED_MOVE_DIM, move,
+                        &log_probability) ||
+                        !masked_log_probability(
+                            tera_policy, tera_mask, FACTORIZED_TERA_DIM, tera,
+                            &log_probability)) return 0;
+            } else if (kind == FACTORIZED_ACTION_SWITCH) {
+                if (!masked_log_probability(
+                        switch_policy, switch_mask, FACTORIZED_SWITCH_DIM,
+                        switch_index, &log_probability)) return 0;
+            } else {
+                return 0;
+            }
+        }
+        if (kind == FACTORIZED_ACTION_MOVE && target_bits != 0u) {
+            factorized_target_mask_to_array(target_bits, target_mask);
+            if (!masked_log_probability(
+                    target_policy, target_mask, FACTORIZED_TARGET_DIM,
+                    target, &log_probability)) return 0;
+        }
+    }
+    if (!isfinite(log_probability)) return 0;
+    *log_probability_out = log_probability;
+    return 1;
+}
+
+int gru_model_factorized_choice_log_probability(
+    const GruModel* model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* choice,
+    float* log_probability_out
+) {
+    FactorizedPolicySnapshot snapshot;
+    int include_joint;
+    if (!model || !hidden_state || !legal_mask || !choice || !log_probability_out) return 0;
+    include_joint = choice->slot0_has_action && choice->slot1_has_action;
+    return gru_model_evaluate_policy_snapshot(
+            model, hidden_state, legal_mask, include_joint, &snapshot, NULL) &&
+        factorized_choice_log_probability_from_snapshot(
+            &snapshot, legal_mask, choice, log_probability_out);
+}
+
+int gru_model_factorized_policy_kl(
+    const GruModel* model,
+    const GruModel* anchor_model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* choice,
+    float* kl_out
+) {
+    FactorizedPolicySnapshot current;
+    FactorizedPolicySnapshot anchor;
+    unsigned char kind_mask[FACTORIZED_KIND_DIM];
+    unsigned char move_mask[FACTORIZED_MOVE_DIM];
+    unsigned char switch_mask[FACTORIZED_SWITCH_DIM];
+    unsigned char tera_mask[FACTORIZED_TERA_DIM];
+    unsigned char target_mask[FACTORIZED_TARGET_DIM];
+    float kl = 0.0f;
+    int include_joint;
+    int slot;
+    if (!model || !anchor_model || !hidden_state || !legal_mask || !choice || !kl_out) return 0;
+    include_joint = choice->slot0_has_action && choice->slot1_has_action;
+    if (!gru_model_evaluate_policy_snapshot(
+            model, hidden_state, legal_mask, include_joint, &current, NULL) ||
+            !gru_model_evaluate_policy_snapshot(
+                anchor_model, hidden_state, legal_mask, include_joint, &anchor, NULL)) return 0;
+    if (include_joint) {
+        kl += masked_anchor_kl(
+            anchor.joint_policy, current.joint_policy, NULL, FACTORIZED_JOINT_DIM);
+    }
+    for (slot = 0; slot < 2; ++slot) {
+        int has_action = slot == 0 ? choice->slot0_has_action : choice->slot1_has_action;
+        int kind = slot == 0 ? choice->slot0_kind : choice->slot1_kind;
+        int move = slot == 0 ? choice->slot0_move_index : choice->slot1_move_index;
+        unsigned char target_bits = slot == 0 ? choice->slot0_target_mask : choice->slot1_target_mask;
+        const float* current_kind = slot == 0 ? current.slot0_kind_policy : current.slot1_kind_policy;
+        const float* anchor_kind = slot == 0 ? anchor.slot0_kind_policy : anchor.slot1_kind_policy;
+        const float* current_move = slot == 0 ? current.slot0_move_policy : current.slot1_move_policy;
+        const float* anchor_move = slot == 0 ? anchor.slot0_move_policy : anchor.slot1_move_policy;
+        const float* current_switch = slot == 0 ? current.slot0_switch_policy : current.slot1_switch_policy;
+        const float* anchor_switch = slot == 0 ? anchor.slot0_switch_policy : anchor.slot1_switch_policy;
+        const float* current_tera = slot == 0 ? current.slot0_tera_policy : current.slot1_tera_policy;
+        const float* anchor_tera = slot == 0 ? anchor.slot0_tera_policy : anchor.slot1_tera_policy;
+        const float* current_target = slot == 0 ? current.slot0_target_policy : current.slot1_target_policy;
+        const float* anchor_target = slot == 0 ? anchor.slot0_target_policy : anchor.slot1_target_policy;
+        if (!has_action) continue;
+        if (!include_joint) {
+            int base = slot == 0 ? 0 : FACTORIZED_LOCAL_ACTION_DIM;
+            build_factorized_masks(
+                legal_mask, slot, kind_mask, move_mask, switch_mask, tera_mask);
+            kl += masked_anchor_kl(
+                anchor_kind, current_kind, kind_mask, FACTORIZED_KIND_DIM);
+            if (kind == FACTORIZED_ACTION_MOVE) {
+                tera_mask[0] = legal_mask[base + move] ? 1u : 0u;
+                tera_mask[1] = legal_mask[base + FACTORIZED_MOVE_DIM + move] ? 1u : 0u;
+                kl += masked_anchor_kl(
+                    anchor_move, current_move, move_mask, FACTORIZED_MOVE_DIM);
+                kl += masked_anchor_kl(
+                    anchor_tera, current_tera, tera_mask, FACTORIZED_TERA_DIM);
+            } else if (kind == FACTORIZED_ACTION_SWITCH) {
+                kl += masked_anchor_kl(
+                    anchor_switch, current_switch, switch_mask, FACTORIZED_SWITCH_DIM);
+            }
+        }
+        if (kind == FACTORIZED_ACTION_MOVE && target_bits != 0u) {
+            factorized_target_mask_to_array(target_bits, target_mask);
+            kl += masked_anchor_kl(
+                anchor_target, current_target, target_mask, FACTORIZED_TARGET_DIM);
+        }
+    }
+    if (!isfinite(kl)) return 0;
+    *kl_out = kl;
     return 1;
 }
 

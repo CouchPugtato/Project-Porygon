@@ -163,6 +163,15 @@ split only into training and model-selection data, while every pair in `PATH`
 is reserved from optimization for holdout metrics. The JSON report records both paths
 and whether the holdout was external.
 
+For more than one training collection, put one batch path per line in a local
+manifest and use `--check-counterfactual-q-fit-manifest`. Blank lines and lines
+beginning with `#` are ignored. The command requires a separate holdout batch;
+that path must not also appear in the manifest. Duplicate manifest entries are
+rejected, and stable train/selection assignment includes the source path so
+pair IDs reused by independent collectors cannot become coupled. Reports list
+every training source as well as the manifest path. Manifests remain local run
+artifacts and are excluded from Git.
+
 The diagnostic trains the small action-Q sidecar over the frozen recurrent
 state. Counterfactual fitting regresses the predicted Q difference onto the
 measured return difference with a Huber loss and omits tied pairs. This gives
@@ -172,6 +181,15 @@ mean return gap and its standard error. Clear, repeatable preferences approach
 weight one; noisy small gaps approach zero. Older one-shot batches retain
 weight one for compatibility. The report keeps both raw and
 confidence-weighted metrics.
+
+The compatibility head remains `--counterfactual-q-head joint`: each legal
+joint action has its own state-conditioned score. The experimental
+`factorized` head reuses a slot-local action scorer across every partner action
+and adds a small ordered interaction bias for combinations that are not purely
+additive. This preserves doubles-specific combinations while avoiding a
+separate state-conditioned head for all 196 joint actions. Reports record the
+selected head and its parameter count so comparisons can hold the data split
+and optimizer fixed.
 
 Early stopping follows confidence-weighted selection loss. Publication
 requires at least a 1% weighted-loss improvement on the holdout, at least ten
@@ -187,6 +205,26 @@ and weighted ranking accuracy reaches 90% on at least ten discordant pairs.
 This is a trainer-capacity check, not evidence of generalization or playing
 strength. Counterfactual reports also retain metrics from the last attempted
 epoch before restoring the best selection checkpoint.
+
+When the action-Q sidecar fits its training pairs but does not generalize, use
+`--check-counterfactual-policy-preference` or its `-manifest` variant to test a
+more direct update. This path compares the log probabilities of the two
+matched actions and moves the policy toward the action with the better rollout
+return. The return-gap confidence controls the update weight. The recurrent
+encoder and value head remain frozen; only the existing factorized policy
+heads change.
+
+The objective measures each policy margin relative to the parent checkpoint,
+and `--preference-anchor-kl-coef` adds an explicit legal-policy KL penalty.
+Early stopping uses the fixed selection split and rejects epochs whose mean KL
+exceeds `--preference-max-mean-kl`. The report includes absolute pair ranking,
+the direction of the update relative to the parent, preferred and rejected
+log-probability changes, and mean and maximum legal-policy KL. A normal
+checkpoint is published through `--policy-output` only when the untouched
+holdout improves the confidence-weighted preference loss by at least 1%, the
+weighted update direction reaches 55%, outputs stay finite, and mean KL remains
+inside the configured limit. Passing this diagnostic warrants a balanced
+battle evaluation; it does not itself establish improved playing strength.
 
 An external batch can be used repeatedly for development with the default
 `--counterfactual-final-confirmation 0`. Such reports explicitly require a

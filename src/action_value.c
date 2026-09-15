@@ -13,17 +13,23 @@
 #define ACTION_VALUE_JOINT_ROWS FACTORIZED_JOINT_DIM
 #define ACTION_VALUE_SINGLE_ROWS OBS_NUM_ACTIONS
 #define ACTION_VALUE_TARGET_ROWS (2 * FACTORIZED_TARGET_DIM)
-#define ACTION_VALUE_HEAD_ROWS \
+#define ACTION_VALUE_JOINT_HEAD_ROWS \
     (ACTION_VALUE_JOINT_ROWS + ACTION_VALUE_SINGLE_ROWS + ACTION_VALUE_TARGET_ROWS)
+#define ACTION_VALUE_FACTORIZED_HEAD_ROWS \
+    (ACTION_VALUE_SINGLE_ROWS + ACTION_VALUE_TARGET_ROWS)
+#define ACTION_VALUE_MAX_HEAD_ROWS ACTION_VALUE_JOINT_HEAD_ROWS
 #define ACTION_VALUE_MAX_LATENT_DIM 64
 
 struct ActionValueModel {
     size_t hidden_dim;
     size_t latent_dim;
+    ActionValueHeadMode head_mode;
+    size_t head_row_count;
     size_t projection_offset;
     size_t projection_bias_offset;
     size_t head_offset;
     size_t head_bias_offset;
+    size_t interaction_bias_offset;
     size_t parameter_count;
     float* parameters;
     float* gradients;
@@ -35,7 +41,7 @@ struct ActionValueModel {
 
 typedef struct {
     float latent[ACTION_VALUE_MAX_LATENT_DIM];
-    float head_scores[ACTION_VALUE_HEAD_ROWS];
+    float head_scores[ACTION_VALUE_MAX_HEAD_ROWS];
     float probabilities[ACTION_VALUE_JOINT_ROWS];
     size_t probability_count;
     size_t selected_row;
@@ -70,6 +76,40 @@ static float head_score(const ActionValueModel* model, size_t row, const float* 
         value += model->parameters[head_index(model, row, i)] * latent[i];
     }
     return value;
+}
+
+static size_t local_head_row(
+    const ActionValueModel* model,
+    int slot,
+    int local_action
+) {
+    size_t base = model->head_mode == ACTION_VALUE_HEAD_JOINT
+        ? ACTION_VALUE_JOINT_ROWS
+        : 0u;
+    return base + (size_t)slot * FACTORIZED_LOCAL_ACTION_DIM +
+        (size_t)local_action;
+}
+
+static size_t target_head_base(const ActionValueModel* model, int slot) {
+    size_t base = model->head_mode == ACTION_VALUE_HEAD_JOINT
+        ? ACTION_VALUE_JOINT_ROWS + ACTION_VALUE_SINGLE_ROWS
+        : ACTION_VALUE_SINGLE_ROWS;
+    return base + (size_t)slot * FACTORIZED_TARGET_DIM;
+}
+
+static float joint_score(
+    const ActionValueModel* model,
+    const ActionValueWork* work,
+    size_t joint_index
+) {
+    if (model->head_mode == ACTION_VALUE_HEAD_JOINT) {
+        return work->head_scores[joint_index];
+    }
+    return work->head_scores[local_head_row(
+            model, 0, (int)(joint_index / FACTORIZED_LOCAL_ACTION_DIM))] +
+        work->head_scores[local_head_row(
+            model, 1, (int)(joint_index % FACTORIZED_LOCAL_ACTION_DIM))] +
+        model->parameters[model->interaction_bias_offset + joint_index];
 }
 
 static void build_latent(
@@ -127,6 +167,7 @@ static void build_local_policy(
 }
 
 static int add_target_component(
+    const ActionValueModel* model,
     ActionValueWork* work,
     const FactorizedActionChoice* choice,
     int slot,
@@ -154,8 +195,7 @@ static int add_target_component(
     if (target_bits == 0u) return 1;
     if (target_index < 0 || target_index >= FACTORIZED_TARGET_DIM ||
             !(target_bits & FACTORIZED_TARGET_BIT(target_index))) return 0;
-    row_base = ACTION_VALUE_JOINT_ROWS + ACTION_VALUE_SINGLE_ROWS +
-        (size_t)slot * FACTORIZED_TARGET_DIM;
+    row_base = target_head_base(model, slot);
     for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) {
         if (target_bits & FACTORIZED_TARGET_BIT(i)) probability_sum += target_policy[i];
     }
@@ -188,7 +228,7 @@ static int prepare_work(
 
     memset(work, 0, sizeof(*work));
     build_latent(model, hidden_state, work->latent);
-    for (row = 0; row < ACTION_VALUE_HEAD_ROWS; ++row) {
+    for (row = 0; row < model->head_row_count; ++row) {
         work->head_scores[row] = head_score(model, row, work->latent);
     }
     dual = choice->slot0_has_action && choice->slot1_has_action;
@@ -203,11 +243,13 @@ static int prepare_work(
         work->probability_count = ACTION_VALUE_JOINT_ROWS;
         for (index = 0; index < ACTION_VALUE_JOINT_ROWS; ++index) {
             float probability = work->policy.joint_policy[index];
+            float score;
             work->probabilities[index] = probability;
             if (probability <= 0.0f) continue;
-            work->expected_raw += probability * work->head_scores[index];
-            if (!have_score || work->head_scores[index] < minimum) minimum = work->head_scores[index];
-            if (!have_score || work->head_scores[index] > maximum) maximum = work->head_scores[index];
+            score = joint_score(model, work, index);
+            work->expected_raw += probability * score;
+            if (!have_score || score < minimum) minimum = score;
+            if (!have_score || score > maximum) maximum = score;
             have_score = 1;
             ++work->legal_count;
         }
@@ -223,7 +265,7 @@ static int prepare_work(
         work->selected_row = ACTION_VALUE_JOINT_ROWS + (size_t)base + (size_t)local_action;
         work->probability_count = FACTORIZED_LOCAL_ACTION_DIM;
         for (i = 0; i < FACTORIZED_LOCAL_ACTION_DIM; ++i) {
-            size_t single_row = ACTION_VALUE_JOINT_ROWS + (size_t)base + (size_t)i;
+            size_t single_row = local_head_row(model, slot, i);
             work->probabilities[i] = local_policy[i];
             if (local_policy[i] <= 0.0f) continue;
             work->expected_raw += local_policy[i] * work->head_scores[single_row];
@@ -233,18 +275,24 @@ static int prepare_work(
             ++work->legal_count;
         }
     }
-    if (!have_score || work->selected_row >= ACTION_VALUE_HEAD_ROWS) return 0;
+    if (!have_score) return 0;
     if (dual) {
-        if (work->probabilities[work->selected_row] <= 0.0f) return 0;
+        if (work->selected_row >= ACTION_VALUE_JOINT_ROWS ||
+                work->probabilities[work->selected_row] <= 0.0f) return 0;
+        work->selected_raw = joint_score(model, work, work->selected_row);
     } else {
+        int slot = choice->slot0_has_action ? 0 : 1;
         size_t selected_local = work->selected_row - ACTION_VALUE_JOINT_ROWS -
-            (size_t)(choice->slot0_has_action ? 0 : FACTORIZED_LOCAL_ACTION_DIM);
+            (size_t)slot * FACTORIZED_LOCAL_ACTION_DIM;
         if (selected_local >= work->probability_count ||
                 work->probabilities[selected_local] <= 0.0f) return 0;
+        work->selected_raw = work->head_scores[
+            local_head_row(model, slot, (int)selected_local)];
     }
-    work->selected_raw = work->head_scores[work->selected_row];
-    if (!add_target_component(work, choice, 0, &work->selected_raw, &work->expected_raw) ||
-            !add_target_component(work, choice, 1, &work->selected_raw, &work->expected_raw)) return 0;
+    if (!add_target_component(model, work, choice, 0,
+            &work->selected_raw, &work->expected_raw) ||
+            !add_target_component(model, work, choice, 1,
+                &work->selected_raw, &work->expected_raw)) return 0;
     work->spread = maximum - minimum;
     return 1;
 }
@@ -259,19 +307,38 @@ ActionValueModel* action_value_model_create(
     size_t latent_dim,
     unsigned int seed
 ) {
+    return action_value_model_create_with_head(
+        hidden_dim, latent_dim, seed, ACTION_VALUE_HEAD_JOINT);
+}
+
+ActionValueModel* action_value_model_create_with_head(
+    size_t hidden_dim,
+    size_t latent_dim,
+    unsigned int seed,
+    ActionValueHeadMode head_mode
+) {
     ActionValueModel* model;
     size_t i;
     float scale;
-    if (hidden_dim == 0 || latent_dim == 0 || latent_dim > ACTION_VALUE_MAX_LATENT_DIM) return NULL;
+    if (hidden_dim == 0 || latent_dim == 0 ||
+            latent_dim > ACTION_VALUE_MAX_LATENT_DIM ||
+            (head_mode != ACTION_VALUE_HEAD_JOINT &&
+             head_mode != ACTION_VALUE_HEAD_FACTORIZED)) return NULL;
     model = (ActionValueModel*)calloc(1, sizeof(*model));
     if (!model) return NULL;
     model->hidden_dim = hidden_dim;
     model->latent_dim = latent_dim;
+    model->head_mode = head_mode;
+    model->head_row_count = head_mode == ACTION_VALUE_HEAD_JOINT
+        ? ACTION_VALUE_JOINT_HEAD_ROWS
+        : ACTION_VALUE_FACTORIZED_HEAD_ROWS;
     model->projection_offset = 0;
     model->projection_bias_offset = latent_dim * hidden_dim;
     model->head_offset = model->projection_bias_offset + latent_dim;
-    model->head_bias_offset = model->head_offset + ACTION_VALUE_HEAD_ROWS * latent_dim;
-    model->parameter_count = model->head_bias_offset + ACTION_VALUE_HEAD_ROWS;
+    model->head_bias_offset = model->head_offset + model->head_row_count * latent_dim;
+    model->interaction_bias_offset = model->head_bias_offset + model->head_row_count;
+    model->parameter_count = model->interaction_bias_offset +
+        (head_mode == ACTION_VALUE_HEAD_FACTORIZED ? ACTION_VALUE_JOINT_ROWS : 0u);
     model->parameters = (float*)calloc(model->parameter_count, sizeof(float));
     model->gradients = (float*)calloc(model->parameter_count, sizeof(float));
     model->adam_mean = (float*)calloc(model->parameter_count, sizeof(float));
@@ -306,6 +373,31 @@ size_t action_value_model_latent_dim(const ActionValueModel* model) {
 
 size_t action_value_model_parameter_count(const ActionValueModel* model) {
     return model ? model->parameter_count : 0;
+}
+
+ActionValueHeadMode action_value_model_head_mode(const ActionValueModel* model) {
+    return model ? model->head_mode : ACTION_VALUE_HEAD_JOINT;
+}
+
+const char* action_value_head_mode_name(ActionValueHeadMode mode) {
+    switch (mode) {
+        case ACTION_VALUE_HEAD_JOINT: return "joint";
+        case ACTION_VALUE_HEAD_FACTORIZED: return "factorized";
+    }
+    return "unknown";
+}
+
+int action_value_parse_head_mode(const char* name, ActionValueHeadMode* mode) {
+    if (!name || !mode) return 0;
+    if (strcmp(name, "joint") == 0) {
+        *mode = ACTION_VALUE_HEAD_JOINT;
+        return 1;
+    }
+    if (strcmp(name, "factorized") == 0) {
+        *mode = ACTION_VALUE_HEAD_FACTORIZED;
+        return 1;
+    }
+    return 0;
 }
 
 int action_value_model_export_parameters(
@@ -407,8 +499,7 @@ static int accumulate_target_rows(
         if (bits & FACTORIZED_TARGET_BIT(i)) sum += policy[i];
     }
     if (sum <= 0.0f) return 0;
-    row_base = ACTION_VALUE_JOINT_ROWS + ACTION_VALUE_SINGLE_ROWS +
-        (size_t)slot * FACTORIZED_TARGET_DIM;
+    row_base = target_head_base(model, slot);
     for (i = 0; i < FACTORIZED_TARGET_DIM; ++i) {
         float coefficient;
         if (!(bits & FACTORIZED_TARGET_BIT(i))) continue;
@@ -429,13 +520,37 @@ static int accumulate_work_gradient(
     float latent_gradient[ACTION_VALUE_MAX_LATENT_DIM] = {0};
     size_t i;
     int dual = choice->slot0_has_action && choice->slot1_has_action;
-    for (i = 0; i < work->probability_count; ++i) {
-        size_t row = dual ? i : ACTION_VALUE_JOINT_ROWS +
-            (size_t)(choice->slot0_has_action ? 0 : FACTORIZED_LOCAL_ACTION_DIM) + i;
-        float row_coefficient = ((row == work->selected_row) ? 1.0f : 0.0f) -
-            work->probabilities[i];
-        accumulate_head_row(
-            model, work, row, coefficient * row_coefficient, latent_gradient);
+    if (dual) {
+        for (i = 0; i < work->probability_count; ++i) {
+            float row_coefficient = ((i == work->selected_row) ? 1.0f : 0.0f) -
+                work->probabilities[i];
+            float gradient = coefficient * row_coefficient;
+            if (model->head_mode == ACTION_VALUE_HEAD_JOINT) {
+                accumulate_head_row(
+                    model, work, i, gradient, latent_gradient);
+            } else if (gradient != 0.0f) {
+                accumulate_head_row(model, work,
+                    local_head_row(model, 0,
+                        (int)(i / FACTORIZED_LOCAL_ACTION_DIM)),
+                    gradient, latent_gradient);
+                accumulate_head_row(model, work,
+                    local_head_row(model, 1,
+                        (int)(i % FACTORIZED_LOCAL_ACTION_DIM)),
+                    gradient, latent_gradient);
+                model->gradients[model->interaction_bias_offset + i] += gradient;
+            }
+        }
+    } else {
+        int slot = choice->slot0_has_action ? 0 : 1;
+        size_t selected_local = work->selected_row - ACTION_VALUE_JOINT_ROWS -
+            (size_t)slot * FACTORIZED_LOCAL_ACTION_DIM;
+        for (i = 0; i < work->probability_count; ++i) {
+            float row_coefficient = ((i == selected_local) ? 1.0f : 0.0f) -
+                work->probabilities[i];
+            accumulate_head_row(model, work,
+                local_head_row(model, slot, (int)i),
+                coefficient * row_coefficient, latent_gradient);
+        }
     }
     if (!accumulate_target_rows(
             model, work, choice, 0, coefficient, latent_gradient) ||
@@ -709,7 +824,8 @@ int action_value_model_save(const char* path, const ActionValueModel* model) {
     if (!out) goto cleanup;
     memset(&header, 0, sizeof(header));
     memcpy(header.magic, "PORYQ01", 7u);
-    header.version = 1u;
+    header.version = model->head_mode == ACTION_VALUE_HEAD_JOINT ? 1u : 2u;
+    header.reserved = (uint32_t)model->head_mode;
     header.hidden_dim = (uint64_t)model->hidden_dim;
     header.latent_dim = (uint64_t)model->latent_dim;
     header.parameter_count = (uint64_t)model->parameter_count;
@@ -748,10 +864,14 @@ ActionValueModel* action_value_model_load(const char* path, size_t expected_hidd
     if (!in) return NULL;
     if (fread(&header, sizeof(header), 1u, in) != 1u ||
             memcmp(header.magic, "PORYQ01", 7u) != 0 ||
-            header.version != 1u || header.hidden_dim != expected_hidden_dim ||
+            (header.version != 1u && header.version != 2u) ||
+            header.hidden_dim != expected_hidden_dim ||
             header.latent_dim == 0 || header.latent_dim > 1024u) goto failure;
-    model = action_value_model_create(
-        (size_t)header.hidden_dim, (size_t)header.latent_dim, 0u);
+    if (header.version == 1u) header.reserved = ACTION_VALUE_HEAD_JOINT;
+    if (header.reserved > ACTION_VALUE_HEAD_FACTORIZED) goto failure;
+    model = action_value_model_create_with_head(
+        (size_t)header.hidden_dim, (size_t)header.latent_dim, 0u,
+        (ActionValueHeadMode)header.reserved);
     if (!model || header.parameter_count != model->parameter_count ||
             fread(model->parameters, sizeof(float), model->parameter_count, in) !=
                 model->parameter_count ||
