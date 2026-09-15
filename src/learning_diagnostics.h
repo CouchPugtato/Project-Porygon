@@ -391,6 +391,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     size_t early_stop_patience,
     float learning_rate,
     float l2_coefficient,
+    float minimum_pair_confidence,
     const ActionValueModel* action_value_model,
     const ActionValueFitResult* result
 );

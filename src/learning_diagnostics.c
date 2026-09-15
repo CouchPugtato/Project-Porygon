@@ -1930,6 +1930,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     size_t early_stop_patience,
     float learning_rate,
     float l2_coefficient,
+    float minimum_pair_confidence,
     const ActionValueModel* action_value_model,
     const ActionValueFitResult* result
 ) {
@@ -1943,7 +1944,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         overfit_pair_count > 0
             ? "counterfactual_q_real_data_overfit"
             : "paired_counterfactual_q_fit");
-    fputs("  \"metrics_version\": 8,\n  \"counterfactual_batch\": ", out);
+    fputs("  \"metrics_version\": 9,\n  \"counterfactual_batch\": ", out);
     write_json_string(out, batch_path);
     fprintf(out, ",\n  \"training_source_kind\": \"%s\"",
         training_source_is_manifest ? "manifest" : "batch");
@@ -1977,7 +1978,8 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"target_value_source\": \"matched_terminal_counterfactual_rollouts\",\n"
         "  \"training_objective\": \"rollout_confidence_weighted_pair_gap_huber_regression\",\n"
         "  \"pair_gap_huber_delta\": %.9g,\n"
-        "  \"pair_weight_definition\": \"normal confidence from the mean return gap and repeated-rollout standard error\",\n"
+        "  \"pair_weight_definition\": \"normal confidence from matched rollout differences with independent-variance fallback\",\n"
+        "  \"minimum_pair_confidence\": %.9g,\n"
         "  \"tied_pairs_in_training\": false,\n"
         "  \"advantage_centering\": \"exact expectation under the frozen legal policy\",\n"
         "  \"head_mode\": \"%s\",\n"
@@ -1999,6 +2001,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         action_value_published ? "true" : "false",
         overfit_pair_count > 0 ? "false" : "true",
         (double)ACTION_VALUE_GAP_HUBER_DELTA,
+        minimum_pair_confidence,
         action_value_head_mode_name(action_value_model_head_mode(action_value_model)),
         action_value_model_head_mode(action_value_model) == ACTION_VALUE_HEAD_FACTORIZED
             ? "slot-local state scores plus ordered joint interaction bias"

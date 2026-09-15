@@ -206,6 +206,11 @@ This is a trainer-capacity check, not evidence of generalization or playing
 strength. Counterfactual reports also retain metrics from the last attempted
 epoch before restoring the best selection checkpoint.
 
+Counterfactual Q fitting accepts `--counterfactual-min-confidence` to apply
+the same matched-rollout confidence filter to training, selection, and
+holdout pairs. Batches without matched return arrays use the older
+independent-variance confidence calculation.
+
 When the action-Q sidecar fits its training pairs but does not generalize, use
 `--check-counterfactual-policy-preference` or its `-manifest` variant to test a
 more direct update. This path compares the log probabilities of the two
