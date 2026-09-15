@@ -825,6 +825,10 @@ static void write_counterfactual_dataset_sample(
     float target,
     float second_hidden
 ) {
+    int positive_returns = (int)lroundf((target + 1.0f) * 6.0f);
+    float rollout_variance =
+        (12.0f - 12.0f * target * target) / 11.0f;
+    int repeat;
     fprintf(output,
         "{\"type\":\"counterfactual_sample\",\"pair_id\":\"pair-test\","
         "\"policy_tag\":\"F:/repo/models/parent.chk\",\"action_rank\":%d,"
@@ -838,8 +842,13 @@ static void write_counterfactual_dataset_sample(
         "\"baseline_value\":0.1,\"target_value\":%.1f,\"hidden_dim\":2,"
         "\"hidden_state\":[0.25,%.2f],"
         "\"legal_mask\":[1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"
-        "\"rollout_count\":12,\"rollout_variance\":0.75}\n",
-        rank, action, action, target, second_hidden);
+        "\"rollout_count\":12,\"rollout_variance\":%.9g,\"rollout_returns\":[",
+        rank, action, action, target, second_hidden, rollout_variance);
+    for (repeat = 0; repeat < 12; ++repeat) {
+        fprintf(output, "%s%d", repeat > 0 ? "," : "",
+            repeat < positive_returns ? 1 : -1);
+    }
+    fputs("]}\n", output);
 }
 
 static int test_counterfactual_dataset_preserves_whole_pairs(void) {
@@ -865,8 +874,9 @@ static int test_counterfactual_dataset_preserves_whole_pairs(void) {
             "counterfactual pair retains ranked branch order");
         ok &= assert_true(dataset.samples[0].has_rollout_statistics &&
             dataset.samples[0].rollout_count == 12u &&
-            fabsf(dataset.samples[0].rollout_variance - 0.75f) < 1.0e-6f,
-            "counterfactual loader retains repeated-rollout uncertainty");
+            dataset.samples[0].has_paired_preference_confidence &&
+            dataset.samples[0].paired_preference_confidence > 0.99f,
+            "counterfactual loader retains matched-rollout confidence");
     }
     counterfactual_dataset_free(&dataset);
 
@@ -1014,6 +1024,15 @@ static int test_counterfactual_preference_confidence_uses_repeat_uncertainty(voi
         "well-separated repeated outcomes receive high confidence");
     ok &= assert_true(weak_weight > 0.0f && weak_weight < strong_weight,
         "noisy small return gaps receive less confidence");
+    strong.has_paired_preference_confidence = 1;
+    baseline.has_paired_preference_confidence = 1;
+    strong.paired_preference_confidence = 0.8f;
+    baseline.paired_preference_confidence = 0.8f;
+    ok &= assert_true(fabsf(counterfactual_pair_preference_weight(
+            &strong, &baseline) - 0.8f) < 1.0e-6f,
+        "matched-rollout confidence takes precedence over independent variance");
+    strong.has_paired_preference_confidence = 0;
+    baseline.has_paired_preference_confidence = 0;
     baseline.has_rollout_statistics = 0;
     ok &= assert_true(fabsf(counterfactual_pair_preference_weight(
             &strong, &baseline) - 1.0f) < 1.0e-6f,
@@ -1022,6 +1041,43 @@ static int test_counterfactual_preference_confidence_uses_repeat_uncertainty(voi
     ok &= assert_true(counterfactual_pair_preference_weight(
             &strong, &baseline) == 0.0f,
         "tied counterfactual outcomes receive no preference weight");
+    return ok;
+}
+
+static int test_counterfactual_confidence_filter_keeps_whole_pairs(void) {
+    CounterfactualSample samples[4];
+    CounterfactualSample* train[4];
+    CounterfactualSample* selection[4];
+    CounterfactualSample* holdout[4];
+    CounterfactualDatasetSplit split;
+    int i;
+    int ok = 1;
+
+    memset(samples, 0, sizeof(samples));
+    memset(&split, 0, sizeof(split));
+    for (i = 0; i < 4; ++i) {
+        snprintf(samples[i].pair_id, sizeof(samples[i].pair_id),
+            "confidence-pair-%d", i / 2);
+        samples[i].target_value = i % 2 == 0 ? 1.0f : -1.0f;
+        samples[i].has_paired_preference_confidence = 1;
+        samples[i].paired_preference_confidence = i < 2 ? 0.95f : 0.5f;
+        train[i] = &samples[i];
+        selection[i] = &samples[i];
+        holdout[i] = &samples[i];
+    }
+    split.train = train;
+    split.train_count = 4u;
+    split.selection = selection;
+    split.selection_count = 4u;
+    split.holdout = holdout;
+    split.holdout_count = 4u;
+    ok &= assert_true(counterfactual_dataset_split_filter_confidence(
+            &split, 0.9f),
+        "filter counterfactual pairs by matched-rollout confidence");
+    ok &= assert_true(split.train_count == 2u &&
+            split.selection_count == 2u && split.holdout_count == 2u &&
+            split.train[0] == &samples[0] && split.train[1] == &samples[1],
+        "confidence filter preserves the complete qualifying pair");
     return ok;
 }
 
@@ -5301,7 +5357,7 @@ static int test_counterfactual_policy_preference_moves_policy_only(void) {
             sample_pointers, SAMPLE_COUNT,
             sample_pointers, SAMPLE_COUNT,
             20u, 4u, 5u, 313u,
-            0.01f, 1.0f, 0.1f, 10.0f,
+            0.01f, 1.0f, 1.0f, 0.1f, 10.0f,
             0.9f, 0.999f, 1.0e-8f, 1.0f, &result),
         "fit direct counterfactual policy preferences");
     ok &= assert_true(
@@ -5313,16 +5369,62 @@ static int test_counterfactual_policy_preference_moves_policy_only(void) {
             model, hidden, dual_legal, 1, &snapshot, &value_after),
         "evaluate policy after direct counterfactual preferences");
     ok &= assert_true(
-        preferred_after - rejected_after > preferred_before - rejected_before,
-        "direct counterfactual preferences favor the demonstrated winner");
+        preferred_after > preferred_before && rejected_after < rejected_before,
+        "conservative preference update raises the winner and lowers the rejected action");
     ok &= assert_true(
         result.policy_signal_detected &&
+        result.counterfactual_overfit_passed &&
         result.after_holdout.confidence_weighted_update_direction_accuracy >= 0.99 &&
+        result.after_holdout.confidence_weighted_preferred_probability_increase_rate >= 0.99 &&
+        result.after_holdout.confidence_weighted_mean_preferred_log_probability_delta > 0.0 &&
         result.after_holdout.confidence_weighted_reference_adjusted_preference_loss <
             result.before_holdout.confidence_weighted_reference_adjusted_preference_loss,
-        "direct counterfactual preference diagnostic detects held-out direction");
+        "direct counterfactual preference diagnostic learns its supplied pairs");
     ok &= assert_true(fabsf(value_after - value_before) < 1.0e-7f,
         "direct counterfactual preferences leave the critic unchanged");
+
+    gru_model_destroy(anchor);
+    gru_model_destroy(model);
+    return ok;
+}
+
+static int test_factorized_log_probability_survives_softmax_underflow(void) {
+    GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    GruModel* anchor = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    FactorizedActionChoice preferred;
+    FactorizedActionChoice rejected;
+    float hidden[8] = {0.25f, -0.4f, 0.1f, 0.35f, -0.2f, 0.15f, 0.3f, -0.1f};
+    unsigned char legal[OBS_NUM_ACTIONS] = {0};
+    float log_probability = 0.0f;
+    int step;
+    int ok = 1;
+
+    if (!assert_true(model && anchor &&
+            zero_model_parameters(model) && zero_model_parameters(anchor),
+            "initialize policy-underflow fixture")) {
+        gru_model_destroy(anchor);
+        gru_model_destroy(model);
+        return 0;
+    }
+    legal[0] = legal[1] = legal[14] = legal[15] = 1u;
+    factorized_action_choice_from_flat_actions(&preferred, 0, 14);
+    factorized_action_choice_from_flat_actions(&rejected, 1, 15);
+    for (step = 0; step < 200; ++step) {
+        gru_model_clear_accumulated_supervised_updates(model);
+        if (!gru_model_accumulate_factorized_preference_hidden(
+                model, anchor, hidden, legal, &preferred, &rejected,
+                1.0f, 0.0f, 0.0f) ||
+                !gru_model_apply_accumulated_policy_adam_updates(
+                    model, 1.0f, 0.9f, 0.999f, 1.0e-8f, 0.0f)) {
+            ok = assert_true(0, "drive a legal action below float softmax range");
+            break;
+        }
+    }
+    ok &= assert_true(
+        gru_model_factorized_choice_log_probability(
+            model, hidden, legal, &rejected, &log_probability) &&
+        isfinite(log_probability) && log_probability <= logf(1.0e-8f),
+        "legal choices remain measurable after softmax probability underflow");
 
     gru_model_destroy(anchor);
     gru_model_destroy(model);
@@ -5931,6 +6033,7 @@ int main(int argc, char** argv) {
     if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;
     if (!test_factorized_action_value_head_shares_credit_and_models_interactions()) return 1;
     if (!test_counterfactual_policy_preference_moves_policy_only()) return 1;
+    if (!test_factorized_log_probability_survives_softmax_underflow()) return 1;
     if (!test_action_value_target_modes()) return 1;
     if (!test_ppo_clipped_policy_still_updates_value()) return 1;
     if (!test_dual_action_turn_has_one_value_target()) return 1;
@@ -5953,6 +6056,7 @@ int main(int argc, char** argv) {
     if (!test_counterfactual_dataset_preserves_whole_pairs()) return 1;
     if (!test_counterfactual_manifest_combines_owned_sources()) return 1;
     if (!test_counterfactual_preference_confidence_uses_repeat_uncertainty()) return 1;
+    if (!test_counterfactual_confidence_filter_keeps_whole_pairs()) return 1;
     if (!test_counterfactual_external_holdout_stays_separate()) return 1;
     if (!test_runtime_dense_additive_rewards()) return 1;
     if (!test_single_turn_side_guards_reconstructed()) return 1;

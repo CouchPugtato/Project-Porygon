@@ -214,8 +214,17 @@ return. The return-gap confidence controls the update weight. The recurrent
 encoder and value head remain frozen; only the existing factorized policy
 heads change.
 
-The objective measures each policy margin relative to the parent checkpoint,
-and `--preference-anchor-kl-coef` adds an explicit legal-policy KL penalty.
+When matched `rollout_returns` are present, confidence uses the variance of
+the per-seed action differences. Older batches without those arrays retain the
+independent-variance estimate. `--preference-min-confidence` can exclude
+uncertain pairs from every split; the default of zero preserves earlier runs.
+Use a cutoff only when it was chosen before examining the final holdout.
+
+The objective measures each policy margin relative to the parent checkpoint.
+To prevent the model from satisfying a comparison by suppressing both sampled
+actions, `--preference-winner-nll-coef` adds a confidence-weighted likelihood
+term for the better rollout action. `--preference-anchor-kl-coef` adds an
+explicit legal-policy KL penalty.
 Early stopping uses the fixed selection split and rejects epochs whose mean KL
 exceeds `--preference-max-mean-kl`. The report includes absolute pair ranking,
 the direction of the update relative to the parent, preferred and rejected
@@ -223,8 +232,21 @@ log-probability changes, and mean and maximum legal-policy KL. A normal
 checkpoint is published through `--policy-output` only when the untouched
 holdout improves the confidence-weighted preference loss by at least 1%, the
 weighted update direction reaches 55%, outputs stay finite, and mean KL remains
-inside the configured limit. Passing this diagnostic warrants a balanced
+inside the configured limit. The preferred action must also become more likely
+on a majority of the weighted holdout pairs. Passing this diagnostic warrants a balanced
 battle evaluation; it does not itself establish improved playing strength.
+
+Before interpreting a failed holdout run, use
+`--check-counterfactual-policy-preference-overfit` on a small deterministic
+subset of the real counterfactual batch. It trains and evaluates on the same
+pairs, never publishes a checkpoint, and defaults to no anchor penalty with a
+generous KL ceiling so the diagnostic measures optimization rather than
+regularization. It passes only when at least ten discordant pairs contribute,
+confidence-weighted reference-adjusted loss falls by 50%, weighted update
+direction and preferred-probability increase rate reach 90%, and all outputs
+remain finite. Failure points to the
+direct preference objective or its gradients; passing while normal holdout
+fails points instead to representation or data coverage.
 
 An external batch can be used repeatedly for development with the default
 `--counterfactual-final-confirmation 0`. Such reports explicitly require a

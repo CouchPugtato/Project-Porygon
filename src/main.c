@@ -4164,13 +4164,16 @@ static int run_counterfactual_policy_preference_check(
     const char* checkpoint_path,
     const char* report_path,
     const char* output_checkpoint_path,
+    size_t overfit_pair_count,
     size_t epochs,
     size_t minibatch_pairs,
     size_t early_stop_patience,
     float learning_rate,
     float preference_beta,
+    float preferred_action_nll_coefficient,
     float anchor_kl_coefficient,
     float max_mean_policy_kl,
+    float minimum_pair_confidence,
     unsigned int validation_seed,
     unsigned int shuffle_seed,
     float adam_beta1,
@@ -4199,9 +4202,16 @@ static int run_counterfactual_policy_preference_check(
     if (!batch_path || !checkpoint_path || !report_path || epochs == 0 ||
             minibatch_pairs == 0 || early_stop_patience == 0 ||
             !(learning_rate > 0.0f) || !(preference_beta > 0.0f) ||
+            preferred_action_nll_coefficient < 0.0f ||
             anchor_kl_coefficient < 0.0f || !(max_mean_policy_kl > 0.0f) ||
+            !isfinite(minimum_pair_confidence) ||
+            minimum_pair_confidence < 0.0f || minimum_pair_confidence > 1.0f ||
             (training_source_is_manifest &&
-                (!holdout_batch_path || !*holdout_batch_path))) {
+                (!holdout_batch_path || !*holdout_batch_path)) ||
+            (training_source_is_manifest && overfit_pair_count > 0) ||
+            (overfit_pair_count > 0 &&
+                ((holdout_batch_path && *holdout_batch_path) ||
+                 (output_checkpoint_path && *output_checkpoint_path)))) {
         fprintf(stderr,
             "[counterfactual-policy] invalid diagnostic configuration\n");
         return 1;
@@ -4232,8 +4242,8 @@ static int run_counterfactual_policy_preference_check(
             training_source_is_manifest ? "manifest" : "batch", batch_path);
         goto cleanup;
     }
-    external_holdout = training_source_is_manifest ||
-        (holdout_batch_path && *holdout_batch_path);
+    external_holdout = overfit_pair_count == 0 && (training_source_is_manifest ||
+        (holdout_batch_path && *holdout_batch_path));
     if (external_holdout &&
             counterfactual_dataset_contains_source(&dataset, holdout_batch_path)) {
         fprintf(stderr,
@@ -4248,31 +4258,55 @@ static int run_counterfactual_policy_preference_check(
             holdout_batch_path);
         goto cleanup;
     }
-    if (!counterfactual_dataset_split(
+    if (overfit_pair_count > 0) {
+        if (!counterfactual_dataset_overfit_subset(
+                &dataset, overfit_pair_count, &split)) {
+            fprintf(stderr,
+                "[counterfactual-policy] could not build the real-data overfit subset\n");
+            goto cleanup;
+        }
+    } else if (!counterfactual_dataset_split(
             &dataset, external_holdout ? &holdout_dataset : NULL,
             validation_seed, &split)) {
         fprintf(stderr,
             "[counterfactual-policy] pair split was empty; collect more pairs or use another validation seed\n");
         goto cleanup;
     }
-    printf("[counterfactual-policy] sources=%zu train=%zu selection=%zu holdout=%zu pairs holdout_source=%s epochs=%zu minibatch_pairs=%zu learning_rate=%.9g beta=%.6g anchor_kl=%.6g max_mean_kl=%.6g\n",
+    if (!counterfactual_dataset_split_filter_confidence(
+            &split, minimum_pair_confidence)) {
+        fprintf(stderr,
+            "[counterfactual-policy] confidence filter left an empty or invalid split\n");
+        goto cleanup;
+    }
+    if (overfit_pair_count > 0) overfit_pair_count = split.train_count / 2u;
+    printf("[counterfactual-policy] mode=%s sources=%zu train=%zu selection=%zu holdout=%zu pairs holdout_source=%s epochs=%zu minibatch_pairs=%zu learning_rate=%.9g beta=%.6g preferred_nll_coef=%.6g anchor_kl=%.6g max_mean_kl=%.6g min_confidence=%.6g\n",
+        overfit_pair_count > 0 ? "real_data_overfit" : "generalization",
         dataset.source_count, split.train_count / 2u,
         split.selection_count / 2u, split.holdout_count / 2u,
-        split.external_holdout ? "external_batch" : "stable_split",
+        overfit_pair_count > 0 ? "reused_training_subset" :
+        (split.external_holdout ? "external_batch" : "stable_split"),
         epochs, minibatch_pairs, learning_rate, preference_beta,
-        anchor_kl_coefficient, max_mean_policy_kl);
+        preferred_action_nll_coefficient,
+        anchor_kl_coefficient, max_mean_policy_kl, minimum_pair_confidence);
     if (!learning_diagnostic_run_counterfactual_policy_preference_fit(
             model, anchor_model,
             split.train, split.train_count,
             split.selection, split.selection_count,
             split.holdout, split.holdout_count,
             epochs, minibatch_pairs, early_stop_patience, shuffle_seed,
-            learning_rate, preference_beta, anchor_kl_coefficient,
+            learning_rate, preference_beta, preferred_action_nll_coefficient,
+            anchor_kl_coefficient,
             max_mean_policy_kl, adam_beta1, adam_beta2, adam_epsilon,
             1.0f, &result)) {
         fprintf(stderr,
             "[counterfactual-policy] diagnostic execution failed\n");
         goto cleanup;
+    }
+    if (overfit_pair_count > 0) {
+        /* Reusing the training pairs can validate optimization, not generalization. */
+        result.policy_signal_detected = 0;
+    } else {
+        result.counterfactual_overfit_passed = 0;
     }
     publication_requested =
         output_checkpoint_path && *output_checkpoint_path;
@@ -4289,18 +4323,24 @@ static int run_counterfactual_policy_preference_check(
             split.external_holdout, checkpoint_path, output_checkpoint_path,
             checkpoint_published, validation_seed, shuffle_seed,
             epochs, minibatch_pairs, early_stop_patience, learning_rate,
-            preference_beta, anchor_kl_coefficient, max_mean_policy_kl,
+            preference_beta, preferred_action_nll_coefficient,
+            anchor_kl_coefficient, max_mean_policy_kl,
+            minimum_pair_confidence,
+            overfit_pair_count,
             &result)) {
         fprintf(stderr,
             "[counterfactual-policy] failed to write report '%s': %s\n",
             report_path, strerror(errno));
         goto cleanup;
     }
-    printf("[counterfactual-policy] signal=%d loss=%.6f before_loss=%.6f direction=%.4f ranking=%.4f mean_kl=%.6f max_kl=%.6f published=%d report=%s\n",
+    printf("[counterfactual-policy] signal=%d overfit_passed=%d loss=%.6f before_loss=%.6f direction=%.4f preferred_up=%.4f preferred_log_delta=%.6f ranking=%.4f mean_kl=%.6f max_kl=%.6f published=%d report=%s\n",
         result.policy_signal_detected,
+        result.counterfactual_overfit_passed,
         result.after_holdout.confidence_weighted_reference_adjusted_preference_loss,
         result.before_holdout.confidence_weighted_reference_adjusted_preference_loss,
         result.after_holdout.confidence_weighted_update_direction_accuracy,
+        result.after_holdout.confidence_weighted_preferred_probability_increase_rate,
+        result.after_holdout.confidence_weighted_mean_preferred_log_probability_delta,
         result.after_holdout.confidence_weighted_pair_ranking_accuracy,
         result.after_holdout.mean_legal_policy_kl,
         result.after_holdout.max_legal_policy_kl,
@@ -4531,9 +4571,12 @@ static int showdown_client_main(int argc, char** argv) {
          counterfactual_q_overfit_command);
     int counterfactual_policy_manifest_command = argc >= 2 &&
         strcmp(argv[1], "--check-counterfactual-policy-preference-manifest") == 0;
+    int counterfactual_policy_overfit_command = argc >= 2 &&
+        strcmp(argv[1], "--check-counterfactual-policy-preference-overfit") == 0;
     int counterfactual_policy_command = argc >= 2 &&
         (strcmp(argv[1], "--check-counterfactual-policy-preference") == 0 ||
-         counterfactual_policy_manifest_command);
+         counterfactual_policy_manifest_command ||
+         counterfactual_policy_overfit_command);
     int ppo_audit_command = argc >= 2 && strcmp(argv[1], "--audit-ppo-update") == 0;
     int overfit_epochs = parse_int_flag(argc, argv, "--epochs", 200);
     int overfit_seed = parse_int_flag(argc, argv, "--seed", 20260902);
@@ -4592,8 +4635,10 @@ static int showdown_client_main(int argc, char** argv) {
     int policy_preference_minibatch_pairs;
     int policy_preference_early_stop_patience;
     float policy_preference_beta;
+    float policy_preference_preferred_nll_coef;
     float policy_preference_anchor_kl;
     float policy_preference_max_mean_kl;
+    float policy_preference_min_confidence;
     ActionValueTargetMode action_q_target_mode;
     ActionValueHeadMode counterfactual_q_head_mode;
     float adam_beta1;
@@ -4662,7 +4707,9 @@ static int showdown_client_main(int argc, char** argv) {
         argc, argv, "--action-q-early-stop-patience", 3);
     action_q_l2_coefficient = parse_float_flag(
         argc, argv, "--action-q-l2", rl_defaults.action_q_l2_coefficient);
-    policy_preference_epochs = parse_int_flag(argc, argv, "--epochs", 100);
+    policy_preference_epochs = parse_int_flag(
+        argc, argv, "--epochs",
+        counterfactual_policy_overfit_command ? 200 : 100);
     policy_preference_seed = parse_int_flag(argc, argv, "--seed", 20260913);
     policy_preference_minibatch_pairs = parse_int_flag(
         argc, argv, "--preference-minibatch-pairs", 16);
@@ -4670,10 +4717,17 @@ static int showdown_client_main(int argc, char** argv) {
         argc, argv, "--preference-early-stop-patience", 30);
     policy_preference_beta = parse_float_flag(
         argc, argv, "--preference-beta", 1.0f);
+    policy_preference_preferred_nll_coef = parse_float_flag(
+        argc, argv, "--preference-winner-nll-coef",
+        counterfactual_policy_overfit_command ? 1.0f : 0.25f);
     policy_preference_anchor_kl = parse_float_flag(
-        argc, argv, "--preference-anchor-kl-coef", 0.01f);
+        argc, argv, "--preference-anchor-kl-coef",
+        counterfactual_policy_overfit_command ? 0.0f : 0.01f);
     policy_preference_max_mean_kl = parse_float_flag(
-        argc, argv, "--preference-max-mean-kl", 0.02f);
+        argc, argv, "--preference-max-mean-kl",
+        counterfactual_policy_overfit_command ? 10.0f : 0.02f);
+    policy_preference_min_confidence = parse_float_flag(
+        argc, argv, "--preference-min-confidence", 0.0f);
     if (!learning_diagnostic_parse_action_value_target(
             action_q_target_name, &action_q_target_mode)) {
         fprintf(stderr,
@@ -4716,9 +4770,19 @@ static int showdown_client_main(int argc, char** argv) {
             "action-Q diagnostics require positive epochs, minibatch size, latent dimension, and early-stop patience plus non-negative seed and L2 coefficient\n");
         return 1;
     }
-    if (counterfactual_q_overfit_command && counterfactual_overfit_pairs <= 0) {
+    if ((counterfactual_q_overfit_command ||
+            counterfactual_policy_overfit_command) &&
+            counterfactual_overfit_pairs <= 0) {
         fprintf(stderr,
-            "--check-counterfactual-q-overfit requires --counterfactual-overfit-pairs > 0\n");
+            "counterfactual overfit diagnostics require --counterfactual-overfit-pairs > 0\n");
+        return 1;
+    }
+    if (counterfactual_policy_overfit_command &&
+            ((policy_preference_output_path && *policy_preference_output_path) ||
+             (counterfactual_holdout_batch_path &&
+                *counterfactual_holdout_batch_path))) {
+        fprintf(stderr,
+            "policy-preference overfit cannot publish a checkpoint or use a holdout batch\n");
         return 1;
     }
     if (counterfactual_policy_command &&
@@ -4726,10 +4790,13 @@ static int showdown_client_main(int argc, char** argv) {
              policy_preference_minibatch_pairs <= 0 ||
              policy_preference_early_stop_patience <= 0 ||
              !(policy_preference_beta > 0.0f) ||
+             policy_preference_preferred_nll_coef < 0.0f ||
              policy_preference_anchor_kl < 0.0f ||
-             !(policy_preference_max_mean_kl > 0.0f))) {
+             !(policy_preference_max_mean_kl > 0.0f) ||
+             policy_preference_min_confidence < 0.0f ||
+             policy_preference_min_confidence > 1.0f)) {
         fprintf(stderr,
-            "counterfactual policy preferences require positive epochs, minibatch size, patience, beta, and max mean KL plus a non-negative seed and anchor coefficient\n");
+            "counterfactual policy preferences require positive epochs, minibatch size, patience, beta, and max mean KL; confidence must be between zero and one\n");
         return 1;
     }
     if (ppo_audit_command && (ppo_episode_limit < 0 || ppo_shuffle_seed < 0)) {
@@ -4790,6 +4857,7 @@ static int showdown_client_main(int argc, char** argv) {
             strcmp(argv[1], "--check-counterfactual-q-overfit") == 0 ||
             strcmp(argv[1], "--check-counterfactual-policy-preference") == 0 ||
             strcmp(argv[1], "--check-counterfactual-policy-preference-manifest") == 0 ||
+            strcmp(argv[1], "--check-counterfactual-policy-preference-overfit") == 0 ||
             strcmp(argv[1], "--audit-ppo-update") == 0 ||
             strcmp(argv[1], "--eval-supervised") == 0)) {
         training_or_eval_mode = 1;
@@ -4884,13 +4952,31 @@ static int showdown_client_main(int argc, char** argv) {
     if (argc >= 6 && counterfactual_policy_manifest_command) {
         return run_counterfactual_policy_preference_check(
             argv[2], argv[3], 1, argv[4], argv[5],
-            policy_preference_output_path,
+            policy_preference_output_path, 0u,
             (size_t)policy_preference_epochs,
             (size_t)policy_preference_minibatch_pairs,
             (size_t)policy_preference_early_stop_patience,
             learning_rate_override > 0.0f ? learning_rate_override : 0.00001f,
-            policy_preference_beta, policy_preference_anchor_kl,
+            policy_preference_beta, policy_preference_preferred_nll_coef,
+            policy_preference_anchor_kl,
             policy_preference_max_mean_kl,
+            policy_preference_min_confidence,
+            (unsigned int)validation_seed,
+            (unsigned int)policy_preference_seed,
+            adam_beta1, adam_beta2, adam_epsilon);
+    }
+    if (argc >= 5 && counterfactual_policy_overfit_command) {
+        return run_counterfactual_policy_preference_check(
+            argv[2], "", 0, argv[3], argv[4], "",
+            (size_t)counterfactual_overfit_pairs,
+            (size_t)policy_preference_epochs,
+            (size_t)policy_preference_minibatch_pairs,
+            (size_t)policy_preference_early_stop_patience,
+            learning_rate_override > 0.0f ? learning_rate_override : 0.001f,
+            policy_preference_beta, policy_preference_preferred_nll_coef,
+            policy_preference_anchor_kl,
+            policy_preference_max_mean_kl,
+            policy_preference_min_confidence,
             (unsigned int)validation_seed,
             (unsigned int)policy_preference_seed,
             adam_beta1, adam_beta2, adam_epsilon);
@@ -4898,13 +4984,15 @@ static int showdown_client_main(int argc, char** argv) {
     if (argc >= 5 && counterfactual_policy_command) {
         return run_counterfactual_policy_preference_check(
             argv[2], counterfactual_holdout_batch_path, 0,
-            argv[3], argv[4], policy_preference_output_path,
+            argv[3], argv[4], policy_preference_output_path, 0u,
             (size_t)policy_preference_epochs,
             (size_t)policy_preference_minibatch_pairs,
             (size_t)policy_preference_early_stop_patience,
             learning_rate_override > 0.0f ? learning_rate_override : 0.00001f,
-            policy_preference_beta, policy_preference_anchor_kl,
+            policy_preference_beta, policy_preference_preferred_nll_coef,
+            policy_preference_anchor_kl,
             policy_preference_max_mean_kl,
+            policy_preference_min_confidence,
             (unsigned int)validation_seed,
             (unsigned int)policy_preference_seed,
             adam_beta1, adam_beta2, adam_epsilon);
@@ -5242,8 +5330,9 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --check-counterfactual-q-fit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-holdout-batch PATH] [--counterfactual-final-confirmation 0|1] [--counterfactual-q-head joint|factorized] [--action-q-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F]\n"
         "  showdown_client --check-counterfactual-q-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-final-confirmation 0|1] [--counterfactual-q-head joint|factorized] [--action-q-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F]\n"
         "  showdown_client --check-counterfactual-q-overfit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-overfit-pairs N] [--counterfactual-q-head joint|factorized] [--epochs N] [--learning-rate F] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F]\n"
-        "  showdown_client --check-counterfactual-policy-preference <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-holdout-batch PATH] [--policy-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--preference-minibatch-pairs N] [--preference-early-stop-patience N] [--preference-beta F] [--preference-anchor-kl-coef F] [--preference-max-mean-kl F]\n"
-        "  showdown_client --check-counterfactual-policy-preference-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--policy-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--preference-minibatch-pairs N] [--preference-early-stop-patience N] [--preference-beta F] [--preference-anchor-kl-coef F] [--preference-max-mean-kl F]\n"
+        "  showdown_client --check-counterfactual-policy-preference <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-holdout-batch PATH] [--policy-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--preference-minibatch-pairs N] [--preference-early-stop-patience N] [--preference-beta F] [--preference-winner-nll-coef F] [--preference-anchor-kl-coef F] [--preference-max-mean-kl F] [--preference-min-confidence F]\n"
+        "  showdown_client --check-counterfactual-policy-preference-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--policy-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--preference-minibatch-pairs N] [--preference-early-stop-patience N] [--preference-beta F] [--preference-winner-nll-coef F] [--preference-anchor-kl-coef F] [--preference-max-mean-kl F] [--preference-min-confidence F]\n"
+        "  showdown_client --check-counterfactual-policy-preference-overfit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-overfit-pairs N] [--epochs N] [--learning-rate F] [--seed N] [--preference-minibatch-pairs N] [--preference-early-stop-patience N] [--preference-beta F] [--preference-winner-nll-coef F] [--preference-anchor-kl-coef F] [--preference-max-mean-kl F] [--preference-min-confidence F]\n"
         "  showdown_client --audit-ppo-update <episode_batch.jsonl> <before.bin> <after.bin> <report.json> [--episode-limit N] [--shuffle-seed N] [--gamma F] [--gae-lambda F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-rl <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --train-live-rl <episode_batch.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--gamma F] [--entropy-coef F] [--advantage-norm 0|1] [--reward-mode terminal|dense_additive] [--policy-tag-expected TAG]\n"

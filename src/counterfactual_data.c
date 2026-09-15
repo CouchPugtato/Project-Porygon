@@ -220,6 +220,7 @@ static int parse_sample(
     int rollout_count;
     int has_rollout_count;
     int has_rollout_variance;
+    int has_rollout_returns;
     memset(sample, 0, sizeof(*sample));
     sample->rollout_count = 1u;
     factorized_action_choice_init(&sample->choice);
@@ -239,7 +240,9 @@ static int parse_sample(
             !read_mask(line, "legal_mask", sample->legal_mask, OBS_NUM_ACTIONS)) return 0;
     has_rollout_count = find_value(line, "rollout_count") != NULL;
     has_rollout_variance = find_value(line, "rollout_variance") != NULL;
+    has_rollout_returns = find_value(line, "rollout_returns") != NULL;
     if (has_rollout_count != has_rollout_variance) return 0;
+    if (has_rollout_returns && !has_rollout_count) return 0;
     if (has_rollout_count) {
         if (!read_int(line, "rollout_count", &rollout_count) || rollout_count < 2 ||
                 !read_float(line, "rollout_variance", &sample->rollout_variance) ||
@@ -248,11 +251,24 @@ static int parse_sample(
         sample->rollout_count = (size_t)rollout_count;
         sample->has_rollout_statistics = 1;
     }
+    if (has_rollout_returns) {
+        sample->rollout_returns = (float*)malloc(
+            sample->rollout_count * sizeof(*sample->rollout_returns));
+        if (!sample->rollout_returns || !read_float_array(
+                line, "rollout_returns", sample->rollout_returns,
+                sample->rollout_count)) {
+            free(sample->rollout_returns);
+            sample->rollout_returns = NULL;
+            return 0;
+        }
+    }
     sample->hidden_state = (float*)malloc(hidden_dim * sizeof(*sample->hidden_state));
     if (!sample->hidden_state ||
             !read_float_array(line, "hidden_state", sample->hidden_state, hidden_dim)) {
         free(sample->hidden_state);
+        free(sample->rollout_returns);
         sample->hidden_state = NULL;
+        sample->rollout_returns = NULL;
         return 0;
     }
     return sample->pair_id[0] != '\0' && sample->policy_tag[0] != '\0' &&
@@ -312,12 +328,53 @@ static int samples_form_pair(
             first->has_rollout_statistics != second->has_rollout_statistics ||
             (first->has_rollout_statistics &&
                 first->rollout_count != second->rollout_count) ||
+            (first->rollout_returns != NULL) !=
+                (second->rollout_returns != NULL) ||
             memcmp(first->hidden_state, second->hidden_state,
                 hidden_dim * sizeof(*first->hidden_state)) != 0 ||
             memcmp(first->legal_mask, second->legal_mask, OBS_NUM_ACTIONS) != 0) return 0;
     return first->action != second->action || first->action2 != second->action2 ||
         first->choice.slot0_target_index != second->choice.slot0_target_index ||
         first->choice.slot1_target_index != second->choice.slot1_target_index;
+}
+
+static int set_paired_preference_confidence(
+    CounterfactualSample* first,
+    CounterfactualSample* second
+) {
+    double mean = 0.0;
+    double variance = 0.0;
+    double confidence;
+    size_t i;
+    if (!first || !second) return 0;
+    if (!first->rollout_returns || !second->rollout_returns) return 1;
+    if (first->rollout_count < 2u ||
+            first->rollout_count != second->rollout_count) return 0;
+    for (i = 0; i < first->rollout_count; ++i) {
+        mean += (double)first->rollout_returns[i] - second->rollout_returns[i];
+    }
+    mean /= (double)first->rollout_count;
+    for (i = 0; i < first->rollout_count; ++i) {
+        double difference =
+            (double)first->rollout_returns[i] - second->rollout_returns[i];
+        double residual = difference - mean;
+        variance += residual * residual;
+    }
+    variance /= (double)(first->rollout_count - 1u);
+    if (!isfinite(mean) || !isfinite(variance) || variance < 0.0) return 0;
+    if (fabs(mean) <= 1.0e-12) confidence = 0.0;
+    else if (variance <= 1.0e-12) confidence = 1.0;
+    else {
+        double z_score = fabs(mean) /
+            sqrt(variance / (double)first->rollout_count);
+        confidence = erf(z_score * 0.7071067811865475);
+    }
+    if (!isfinite(confidence) || confidence < 0.0 || confidence > 1.0) return 0;
+    first->paired_preference_confidence = (float)confidence;
+    second->paired_preference_confidence = (float)confidence;
+    first->has_paired_preference_confidence = 1;
+    second->has_paired_preference_confidence = 1;
+    return 1;
 }
 
 int counterfactual_dataset_load(
@@ -340,11 +397,13 @@ int counterfactual_dataset_load(
         if (!parse_sample(line, expected_hidden_dim, &sample) ||
                 (expected_policy_tag && *expected_policy_tag &&
                  !path_tags_match(sample.policy_tag, expected_policy_tag))) {
+            free(sample.rollout_returns);
             free(sample.hidden_state);
             status = -1;
             break;
         }
         if (dataset->count == dataset->capacity && !grow_dataset(dataset)) {
+            free(sample.rollout_returns);
             free(sample.hidden_state);
             status = -1;
             break;
@@ -362,7 +421,9 @@ int counterfactual_dataset_load(
         size_t index = dataset->pair_count * 2u;
         if (!samples_form_pair(
                 &dataset->samples[index], &dataset->samples[index + 1u],
-                expected_hidden_dim)) {
+                expected_hidden_dim) ||
+                !set_paired_preference_confidence(
+                    &dataset->samples[index], &dataset->samples[index + 1u])) {
             counterfactual_dataset_free(dataset);
             return 0;
         }
@@ -484,7 +545,10 @@ int counterfactual_dataset_load_manifest(
 void counterfactual_dataset_free(CounterfactualDataset* dataset) {
     size_t i;
     if (!dataset) return;
-    for (i = 0; i < dataset->count; ++i) free(dataset->samples[i].hidden_state);
+    for (i = 0; i < dataset->count; ++i) {
+        free(dataset->samples[i].rollout_returns);
+        free(dataset->samples[i].hidden_state);
+    }
     for (i = 0; i < dataset->source_count; ++i) free(dataset->source_paths[i]);
     free(dataset->source_paths);
     free(dataset->samples);
@@ -645,6 +709,44 @@ void counterfactual_dataset_split_free(CounterfactualDatasetSplit* split) {
     memset(split, 0, sizeof(*split));
 }
 
+static int filter_pair_array(
+    CounterfactualSample** samples,
+    size_t* sample_count,
+    float minimum_confidence
+) {
+    size_t read_index;
+    size_t write_count = 0;
+    if (!samples || !sample_count || *sample_count % 2u != 0) return 0;
+    for (read_index = 0; read_index < *sample_count; read_index += 2u) {
+        CounterfactualSample* first = samples[read_index];
+        CounterfactualSample* second = samples[read_index + 1u];
+        if (!first || !second || strcmp(first->pair_id, second->pair_id) != 0) {
+            return 0;
+        }
+        if (counterfactual_pair_preference_weight(first, second) + 1.0e-7f <
+                minimum_confidence) continue;
+        samples[write_count++] = first;
+        samples[write_count++] = second;
+    }
+    *sample_count = write_count;
+    return 1;
+}
+
+int counterfactual_dataset_split_filter_confidence(
+    CounterfactualDatasetSplit* split,
+    float minimum_confidence
+) {
+    if (!split || !isfinite(minimum_confidence) || minimum_confidence < 0.0f ||
+            minimum_confidence > 1.0f) return 0;
+    if (minimum_confidence <= 0.0f) return 1;
+    return filter_pair_array(split->train, &split->train_count, minimum_confidence) &&
+        filter_pair_array(
+            split->selection, &split->selection_count, minimum_confidence) &&
+        filter_pair_array(split->holdout, &split->holdout_count, minimum_confidence) &&
+        split->train_count > 0u && split->selection_count > 0u &&
+        split->holdout_count > 0u;
+}
+
 float counterfactual_pair_preference_weight(
     const CounterfactualSample* first,
     const CounterfactualSample* second
@@ -655,6 +757,10 @@ float counterfactual_pair_preference_weight(
     if (!first || !second) return 0.0f;
     target_gap = fabsf(first->target_value - second->target_value);
     if (!isfinite(target_gap) || target_gap <= 1.0e-6f) return 0.0f;
+    if (first->has_paired_preference_confidence &&
+            second->has_paired_preference_confidence) {
+        return first->paired_preference_confidence;
+    }
     if (!first->has_rollout_statistics || !second->has_rollout_statistics ||
             first->rollout_count < 2u || second->rollout_count < 2u) return 1.0f;
     variance = first->rollout_variance / (float)first->rollout_count +

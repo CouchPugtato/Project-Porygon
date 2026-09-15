@@ -1744,8 +1744,13 @@ static int joint_policy_gradients(
         return 0;
     }
     selected = flat0 * FACTORIZED_LOCAL_ACTION_DIM + (flat1 - 14);
-    if (!gru_model_evaluate_joint_hidden(model, hidden_state, legal_mask, joint_policy, NULL) ||
-            joint_policy[selected] <= 0.0f) {
+    if (selected < 0 || selected >= FACTORIZED_JOINT_DIM ||
+            !legal_mask[flat0] || !legal_mask[flat1] ||
+            !joint_local_pair_legal(flat0, flat1 - FACTORIZED_LOCAL_ACTION_DIM) ||
+            !gru_model_evaluate_joint_hidden(
+                model, hidden_state, legal_mask, joint_policy, NULL) ||
+            joint_policy[selected] < 0.0f ||
+            !isfinite(joint_policy[selected])) {
         return 0;
     }
     *action_loss_sum += -2.0f * logf(joint_policy[selected] > 1.0e-8f ? joint_policy[selected] : 1.0e-8f);
@@ -1758,11 +1763,15 @@ static int joint_policy_gradients(
     for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) {
         int action0 = i / FACTORIZED_LOCAL_ACTION_DIM;
         int action1 = i % FACTORIZED_LOCAL_ACTION_DIM;
+        int legal = legal_mask[action0] &&
+            legal_mask[FACTORIZED_LOCAL_ACTION_DIM + action1] &&
+            joint_local_pair_legal(action0, action1);
         float p = joint_policy[i];
         float gradient;
-        if (p <= 0.0f) {
+        if (!legal) {
             continue;
         }
+        if (p < 0.0f || !isfinite(p)) return 0;
         gradient = (p - (i == selected ? 1.0f : 0.0f)) * policy_scale;
         if (entropy_coef != 0.0f) {
             float safe_p = p > 1.0e-8f ? p : 1.0e-8f;
@@ -1851,6 +1860,7 @@ int gru_model_accumulate_factorized_preference_hidden(
     const FactorizedActionChoice* preferred,
     const FactorizedActionChoice* rejected,
     float preference_gradient,
+    float preferred_likelihood_gradient,
     float anchor_kl_coef
 ) {
     GruGradientAccum* accum;
@@ -1865,6 +1875,8 @@ int gru_model_accumulate_factorized_preference_hidden(
     int ok = 0;
     if (!model || !hidden_state || !legal_mask || !preferred || !rejected ||
             !isfinite(preference_gradient) || preference_gradient < 0.0f ||
+            !isfinite(preferred_likelihood_gradient) ||
+            preferred_likelihood_gradient < 0.0f ||
             !isfinite(anchor_kl_coef) || anchor_kl_coef < 0.0f ||
             (anchor_kl_coef > 0.0f && !anchor_model) ||
             !gru_gradient_accum_ensure(model)) return 0;
@@ -1901,7 +1913,7 @@ int gru_model_accumulate_factorized_preference_hidden(
     if (dual) {
         if (!joint_policy_gradients(
                 model, hidden_state, legal_mask, preferred,
-                preference_gradient, 0.0f,
+                preference_gradient + preferred_likelihood_gradient, 0.0f,
                 anchor_kl_coef > 0.0f ? &anchor_snapshot : NULL,
                 half_anchor_kl, &ignored_loss, &ignored_accuracy,
                 grad_h, &gradients) ||
@@ -1918,7 +1930,7 @@ int gru_model_accumulate_factorized_preference_hidden(
                 ? accum->slot0_target_bias : accum->slot1_target_bias;
             factorized_target_policy_gradients(
                 model, hidden_state, slot, preferred,
-                preference_gradient, 0.0f,
+                preference_gradient + preferred_likelihood_gradient, 0.0f,
                 anchor_kl_coef > 0.0f ? &anchor_snapshot : NULL,
                 half_anchor_kl, &ignored_loss, grad_h,
                 target_head, target_bias);
@@ -1934,7 +1946,7 @@ int gru_model_accumulate_factorized_preference_hidden(
             if (!(slot == 0 ? preferred->slot0_has_action : preferred->slot1_has_action)) continue;
             factorized_slot_policy_gradients(
                 model, hidden_state, legal_mask, slot, preferred,
-                preference_gradient, 0.0f,
+                preference_gradient + preferred_likelihood_gradient, 0.0f,
                 anchor_kl_coef > 0.0f ? &anchor_snapshot : NULL,
                 half_anchor_kl, &ignored_loss, &ignored_accuracy, grad_h,
                 slot == 0 ? accum->slot0_kind_head : accum->slot1_kind_head,
@@ -2585,7 +2597,7 @@ static int masked_log_probability(
     }
     if (!(total > 0.0f) || !isfinite(total)) return 0;
     probability = policy[selected] / total;
-    if (!(probability > 0.0f) || !isfinite(probability)) return 0;
+    if (probability < 0.0f || !isfinite(probability)) return 0;
     *log_probability += logf(probability > 1.0e-8f ? probability : 1.0e-8f);
     return 1;
 }
@@ -2643,7 +2655,10 @@ static int factorized_choice_log_probability_from_snapshot(
         selected = flat0 * FACTORIZED_LOCAL_ACTION_DIM +
             (flat1 - FACTORIZED_LOCAL_ACTION_DIM);
         if (selected < 0 || selected >= FACTORIZED_JOINT_DIM ||
-                !(snapshot->joint_policy[selected] > 0.0f)) return 0;
+                !legal_mask[flat0] || !legal_mask[flat1] ||
+                !joint_local_pair_legal(flat0, flat1 - FACTORIZED_LOCAL_ACTION_DIM) ||
+                snapshot->joint_policy[selected] < 0.0f ||
+                !isfinite(snapshot->joint_policy[selected])) return 0;
         log_probability += logf(snapshot->joint_policy[selected] > 1.0e-8f
             ? snapshot->joint_policy[selected] : 1.0e-8f);
     }

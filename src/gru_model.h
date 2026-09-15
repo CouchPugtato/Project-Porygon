@@ -399,6 +399,7 @@ int gru_model_accumulate_factorized_preference_hidden(
     const FactorizedActionChoice* preferred,
     const FactorizedActionChoice* rejected,
     float preference_gradient,
+    float preferred_likelihood_gradient,
     float anchor_kl_coef
 );
 int gru_model_critic_head_accumulate_hidden(

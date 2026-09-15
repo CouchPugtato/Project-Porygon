@@ -143,12 +143,22 @@ typedef struct {
     double confidence_weighted_pair_ranking_accuracy;
     double update_direction_accuracy;
     double confidence_weighted_update_direction_accuracy;
+    double preferred_probability_increase_rate;
+    double confidence_weighted_preferred_probability_increase_rate;
+    double rejected_probability_decrease_rate;
+    double confidence_weighted_rejected_probability_decrease_rate;
     double reference_adjusted_preference_loss;
     double confidence_weighted_reference_adjusted_preference_loss;
+    double preferred_action_nll;
+    double confidence_weighted_preferred_action_nll;
+    double conservative_preference_loss;
+    double confidence_weighted_conservative_preference_loss;
     double mean_policy_margin;
     double mean_reference_adjusted_margin;
     double mean_preferred_log_probability_delta;
     double mean_rejected_log_probability_delta;
+    double confidence_weighted_mean_preferred_log_probability_delta;
+    double confidence_weighted_mean_rejected_log_probability_delta;
     double mean_legal_policy_kl;
     double max_legal_policy_kl;
 } CounterfactualPolicyPreferenceMetrics;
@@ -169,8 +179,10 @@ typedef struct {
     int training_completed;
     int holdout_loss_improved;
     int holdout_direction_consistent;
+    int holdout_preferred_probability_increased;
     int holdout_kl_acceptable;
     int policy_signal_detected;
+    int counterfactual_overfit_passed;
 } CounterfactualPolicyPreferenceResult;
 
 typedef enum {
@@ -398,6 +410,7 @@ int learning_diagnostic_run_counterfactual_policy_preference_fit(
     unsigned int shuffle_seed,
     float learning_rate,
     float preference_beta,
+    float preferred_action_nll_coefficient,
     float anchor_kl_coefficient,
     float max_mean_policy_kl,
     float adam_beta1,
@@ -424,8 +437,11 @@ int learning_diagnostic_write_counterfactual_policy_preference_report(
     size_t early_stop_patience,
     float learning_rate,
     float preference_beta,
+    float preferred_action_nll_coefficient,
     float anchor_kl_coefficient,
     float max_mean_policy_kl,
+    float minimum_pair_confidence,
+    size_t overfit_pair_count,
     const CounterfactualPolicyPreferenceResult* result
 );
 

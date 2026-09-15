@@ -22,6 +22,9 @@ typedef struct {
     size_t rollout_count;
     float rollout_variance;
     int has_rollout_statistics;
+    float* rollout_returns;
+    float paired_preference_confidence;
+    int has_paired_preference_confidence;
     size_t source_index;
     float* hidden_state;
     unsigned char legal_mask[OBS_NUM_ACTIONS];
@@ -74,6 +77,10 @@ int counterfactual_dataset_overfit_subset(
     CounterfactualDataset* dataset,
     size_t requested_pair_count,
     CounterfactualDatasetSplit* split
+);
+int counterfactual_dataset_split_filter_confidence(
+    CounterfactualDatasetSplit* split,
+    float minimum_confidence
 );
 void counterfactual_dataset_split_free(CounterfactualDatasetSplit* split);
 float counterfactual_pair_preference_weight(
