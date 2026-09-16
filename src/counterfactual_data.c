@@ -271,6 +271,23 @@ static int parse_sample(
         sample->rollout_returns = NULL;
         return 0;
     }
+    if (find_value(line, "prior_hidden_state")) {
+        sample->transition_state = (float*)malloc(
+            hidden_dim * 2u * sizeof(*sample->transition_state));
+        if (!sample->transition_state || !read_float_array(
+                line, "prior_hidden_state", sample->transition_state,
+                hidden_dim)) {
+            free(sample->transition_state);
+            free(sample->hidden_state);
+            free(sample->rollout_returns);
+            sample->transition_state = NULL;
+            sample->hidden_state = NULL;
+            sample->rollout_returns = NULL;
+            return 0;
+        }
+        memcpy(sample->transition_state + hidden_dim, sample->hidden_state,
+            hidden_dim * sizeof(*sample->hidden_state));
+    }
     return sample->pair_id[0] != '\0' && sample->policy_tag[0] != '\0' &&
         sample->decision_index >= 0 && sample->action_rank >= 0 &&
         sample->action_rank <= 1 && sample->target_value >= -1.0f &&
@@ -330,6 +347,11 @@ static int samples_form_pair(
                 first->rollout_count != second->rollout_count) ||
             (first->rollout_returns != NULL) !=
                 (second->rollout_returns != NULL) ||
+            (first->transition_state != NULL) !=
+                (second->transition_state != NULL) ||
+            (first->transition_state &&
+                memcmp(first->transition_state, second->transition_state,
+                    hidden_dim * 2u * sizeof(*first->transition_state)) != 0) ||
             memcmp(first->hidden_state, second->hidden_state,
                 hidden_dim * sizeof(*first->hidden_state)) != 0 ||
             memcmp(first->legal_mask, second->legal_mask, OBS_NUM_ACTIONS) != 0) return 0;
@@ -399,12 +421,14 @@ int counterfactual_dataset_load(
                  !path_tags_match(sample.policy_tag, expected_policy_tag))) {
             free(sample.rollout_returns);
             free(sample.hidden_state);
+            free(sample.transition_state);
             status = -1;
             break;
         }
         if (dataset->count == dataset->capacity && !grow_dataset(dataset)) {
             free(sample.rollout_returns);
             free(sample.hidden_state);
+            free(sample.transition_state);
             status = -1;
             break;
         }
@@ -461,6 +485,17 @@ int counterfactual_dataset_contains_source(
         if (path_tags_equal(dataset->source_paths[index], path)) return 1;
     }
     return 0;
+}
+
+int counterfactual_dataset_has_transition_states(
+    const CounterfactualDataset* dataset
+) {
+    size_t index;
+    if (!dataset || dataset->count == 0) return 0;
+    for (index = 0; index < dataset->count; ++index) {
+        if (!dataset->samples[index].transition_state) return 0;
+    }
+    return 1;
 }
 
 static int append_dataset(
@@ -548,6 +583,7 @@ void counterfactual_dataset_free(CounterfactualDataset* dataset) {
     for (i = 0; i < dataset->count; ++i) {
         free(dataset->samples[i].rollout_returns);
         free(dataset->samples[i].hidden_state);
+        free(dataset->samples[i].transition_state);
     }
     for (i = 0; i < dataset->source_count; ++i) free(dataset->source_paths[i]);
     free(dataset->source_paths);

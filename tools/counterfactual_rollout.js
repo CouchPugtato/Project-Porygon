@@ -4,6 +4,7 @@
 
 const fs = require('fs');
 const fsp = fs.promises;
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const {spawn} = require('child_process');
@@ -75,6 +76,13 @@ function resolveOptions(argv) {
     );
     const decisionMin = integerOption(options, 'decision-min', 0, 0);
     const decisionMax = integerOption(options, 'decision-max', 7, decisionMin);
+    const branchConcurrency = integerOption(options, 'branch-concurrency', 3, 1);
+    const concurrency = integerOption(options, 'concurrency', 1, 1);
+    const maxAgentProcesses = integerOption(options, 'max-agent-processes', 8, 2);
+    const maxSystemMemoryPercent = integerOption(
+        options, 'max-system-memory-percent', 70, 1);
+    const maxSystemCpuPercent = integerOption(
+        options, 'max-system-cpu-percent', 75, 1);
     if (!runName) throw new Error('--run-name is required');
     if (!options.checkpoint) throw new Error('--checkpoint is required');
     if (!fs.existsSync(checkpoint)) throw new Error(`checkpoint not found: ${checkpoint}`);
@@ -84,6 +92,15 @@ function resolveOptions(argv) {
     if (!fs.existsSync(CLIENT_EXE)) throw new Error(`trainer executable not found: ${CLIENT_EXE}`);
     if (!fs.existsSync(path.join(SHOWDOWN_DIR, 'dist', 'sim', 'index.js'))) {
         throw new Error(`built Showdown simulator not found: ${SHOWDOWN_DIR}`);
+    }
+    if (concurrency * branchConcurrency * 2 > maxAgentProcesses) {
+        throw new Error(
+            `requested concurrency can launch ${concurrency * branchConcurrency * 2} ` +
+            `agent processes, above --max-agent-processes ${maxAgentProcesses}`
+        );
+    }
+    if (maxSystemMemoryPercent > 100 || maxSystemCpuPercent > 100) {
+        throw new Error('system resource percentage limits must be between 1 and 100');
     }
     const format = String(options.format || 'gen9randomdoublesbattle');
     if (!format.toLowerCase().includes('double') && !format.toLowerCase().includes('vgc')) {
@@ -96,8 +113,18 @@ function resolveOptions(argv) {
         format,
         pairs: integerOption(options, 'pairs', 500, 1),
         repeatsPerAction: integerOption(options, 'repeats-per-action', 3, 2),
-        branchConcurrency: integerOption(options, 'branch-concurrency', 6, 1),
-        concurrency: integerOption(options, 'concurrency', 4, 1),
+        branchConcurrency,
+        concurrency,
+        maxAgentProcesses,
+        agentOmpThreads: integerOption(options, 'agent-omp-threads', 1, 1),
+        maxSystemMemoryPercent,
+        maxSystemCpuPercent,
+        resourceCheckSeconds: integerOption(
+            options, 'resource-check-seconds', 2, 1),
+        launchStaggerMilliseconds: integerOption(
+            options, 'launch-stagger-ms', 500, 0),
+        failureMessageLimitBytes: integerOption(
+            options, 'failure-message-limit-bytes', 16384, 256),
         decisionMin,
         decisionMax,
         seed: integerOption(options, 'seed', 20260911, 0),
@@ -137,10 +164,11 @@ function continuationSeed(base, attempt, repeat) {
 }
 
 class AgentProcess {
-    constructor(checkpoint, inferenceSeedValue, intervention) {
+    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads) {
         this.checkpoint = checkpoint;
         this.inferenceSeed = inferenceSeedValue;
         this.intervention = intervention;
+        this.ompThreads = ompThreads;
         this.process = null;
         this.messages = [];
         this.waiters = [];
@@ -162,6 +190,7 @@ class AgentProcess {
         }
         this.process = spawn(CLIENT_EXE, args, {
             cwd: REPO_ROOT,
+            env: {...process.env, PORYGON_OMP_THREADS: String(this.ompThreads)},
             windowsHide: true,
             stdio: ['pipe', 'pipe', 'pipe'],
         });
@@ -330,7 +359,9 @@ async function drivePlayer(stream, agent, battleId, playerName, format, beforeCh
     return {episode, intervention, result, choiceRejections};
 }
 
-async function runBranch(sim, options, attempt, decisionIndex, actionRank, repeat) {
+async function runBranch(
+    sim, options, resourceGate, attempt, decisionIndex, actionRank, repeat
+) {
     const battleId = `counterfactual-${attempt}-${actionRank}-${repeat}`;
     const candidateName = 'CounterfactualCandidate';
     const opponentName = 'CounterfactualOpponent';
@@ -339,15 +370,18 @@ async function runBranch(sim, options, attempt, decisionIndex, actionRank, repea
     const candidate = new AgentProcess(
         options.checkpoint,
         inferenceSeed(options.seed, attempt, 0),
-        {decisionIndex, actionRank}
+        {decisionIndex, actionRank},
+        options.agentOmpThreads
     );
     const opponent = new AgentProcess(
         options.opponentCheckpoint,
         inferenceSeed(options.seed, attempt, 1),
-        null
+        null,
+        options.agentOmpThreads
     );
     let timeout;
     try {
+        await resourceGate.waitForLaunch();
         const work = (async () => {
             await Promise.all([candidate.start(), opponent.start()]);
             const candidateDrive = drivePlayer(
@@ -466,6 +500,9 @@ function buildCounterfactualSample(action, pairId, policyTag, returnValue, rollo
         hidden_state: action.hidden_state,
         legal_mask: action.legal_mask,
     };
+    if (Array.isArray(action.prior_hidden_state)) {
+        sample.prior_hidden_state = action.prior_hidden_state;
+    }
     if (rollout) {
         sample.rollout_returns = rollout.returns;
         sample.rollout_count = rollout.returns.length;
@@ -485,7 +522,9 @@ function sampleVariance(values, average = mean(values)) {
         (values.length - 1);
 }
 
-async function collectReplicatedBranches(sim, options, attempt, decisionIndex) {
+async function collectReplicatedBranches(
+    sim, options, resourceGate, attempt, decisionIndex
+) {
     const requests = [];
     for (let repeat = 0; repeat < options.repeatsPerAction; ++repeat) {
         for (let rank = 0; rank < 2; ++rank) {
@@ -499,7 +538,7 @@ async function collectReplicatedBranches(sim, options, attempt, decisionIndex) {
             const index = nextRequest++;
             const request = requests[index];
             completed[index] = await runBranch(
-                sim, options, attempt, decisionIndex,
+                sim, options, resourceGate, attempt, decisionIndex,
                 request.rank, request.repeat);
         }
     }
@@ -512,11 +551,11 @@ async function collectReplicatedBranches(sim, options, attempt, decisionIndex) {
     };
 }
 
-async function runPair(sim, options, attempt) {
+async function runPair(sim, options, resourceGate, attempt) {
     const decisionSpan = options.decisionMax - options.decisionMin + 1;
     const decisionIndex = options.decisionMin + (attempt % decisionSpan);
     const branches = await collectReplicatedBranches(
-        sim, options, attempt, decisionIndex);
+        sim, options, resourceGate, attempt, decisionIndex);
     const allBranches = [...branches.rank0, ...branches.rank1];
     const choiceRejections = allBranches.flatMap(branch => branch.choiceRejections);
     if (allBranches.some(branch => !branch.intervention)) {
@@ -676,10 +715,11 @@ async function summarizeFailureLog(filePath) {
         highest_attempt: -1,
     };
     if (!fs.existsSync(filePath)) return summary;
-    const lines = (await fsp.readFile(filePath, 'utf8')).split(/\r?\n/);
     const rejectionKeys = new Set();
     const failedAttempts = new Map();
-    for (const line of lines) {
+    const input = fs.createReadStream(filePath, {encoding: 'utf8'});
+    const lines = readline.createInterface({input, crlfDelay: Infinity});
+    for await (const line of lines) {
         if (!line.trim()) continue;
         let record;
         try {
@@ -721,7 +761,7 @@ async function summarizeFailureLog(filePath) {
 
 function emptyManifest(options) {
     return {
-        schema_version: 3,
+        schema_version: 4,
         status: 'running',
         run_name: options.runName,
         format: options.format,
@@ -733,6 +773,17 @@ function emptyManifest(options) {
         decision_min: options.decisionMin,
         decision_max: options.decisionMax,
         battle_timeout_seconds: options.battleTimeoutSeconds,
+        resource_limits: {
+            outer_concurrency: options.concurrency,
+            branch_concurrency: options.branchConcurrency,
+            max_agent_processes: options.maxAgentProcesses,
+            agent_omp_threads: options.agentOmpThreads,
+            max_system_memory_percent: options.maxSystemMemoryPercent,
+            max_system_cpu_percent: options.maxSystemCpuPercent,
+            resource_check_seconds: options.resourceCheckSeconds,
+            launch_stagger_ms: options.launchStaggerMilliseconds,
+            failure_message_limit_bytes: options.failureMessageLimitBytes,
+        },
         attempts: 0,
         completed_pairs: 0,
         invalid_attempts: 0,
@@ -751,7 +802,7 @@ function emptyManifest(options) {
 
 function assertResumeCompatible(manifest, options) {
     for (const [key, expected] of [
-        ['schema_version', 3],
+        ['schema_version', 4],
         ['run_name', options.runName], ['format', options.format],
         ['checkpoint', options.checkpoint], ['opponent_checkpoint', options.opponentCheckpoint],
         ['seed', options.seed], ['decision_min', options.decisionMin],
@@ -1097,6 +1148,87 @@ function formatDuration(seconds) {
     return `${(seconds / 3600).toFixed(1)}h`;
 }
 
+function cpuTimes() {
+    let idle = 0;
+    let total = 0;
+    for (const cpu of os.cpus()) {
+        idle += cpu.times.idle;
+        total += Object.values(cpu.times).reduce((sum, value) => sum + value, 0);
+    }
+    return {idle, total};
+}
+
+function cpuPercentBetween(previous, current) {
+    const total = current.total - previous.total;
+    const idle = current.idle - previous.idle;
+    if (!(total > 0) || idle < 0) return 0;
+    return Math.max(0, Math.min(100, (1 - idle / total) * 100));
+}
+
+function memoryUsedPercent() {
+    const total = os.totalmem();
+    return total > 0 ? (1 - os.freemem() / total) * 100 : 100;
+}
+
+function delay(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function createResourceGate(options) {
+    let queue = Promise.resolve();
+    let previousCpuTimes = cpuTimes();
+    let nextLaunchAt = 0;
+    let lastPauseLogAt = 0;
+
+    return {
+        async waitForLaunch() {
+            const previous = queue;
+            let release;
+            queue = new Promise(resolve => { release = resolve; });
+            await previous;
+            try {
+                while (true) {
+                    const currentCpuTimes = cpuTimes();
+                    const cpuPercent = cpuPercentBetween(
+                        previousCpuTimes, currentCpuTimes);
+                    const memoryPercent = memoryUsedPercent();
+                    previousCpuTimes = currentCpuTimes;
+                    if (memoryPercent <= options.maxSystemMemoryPercent &&
+                            cpuPercent <= options.maxSystemCpuPercent) break;
+                    const now = Date.now();
+                    if (now - lastPauseLogAt >= 10000) {
+                        console.log(
+                            `[counterfactual] resource pause memory=${memoryPercent.toFixed(1)}%/` +
+                            `${options.maxSystemMemoryPercent}% cpu=${cpuPercent.toFixed(1)}%/` +
+                            `${options.maxSystemCpuPercent}%`
+                        );
+                        lastPauseLogAt = now;
+                    }
+                    await delay(options.resourceCheckSeconds * 1000);
+                }
+                const stagger = nextLaunchAt - Date.now();
+                if (stagger > 0) await delay(stagger);
+                nextLaunchAt = Date.now() + options.launchStaggerMilliseconds;
+            } finally {
+                release();
+            }
+        },
+    };
+}
+
+function limitUtf8(text, maximumBytes) {
+    const value = String(text || '');
+    const encoded = Buffer.from(value, 'utf8');
+    if (encoded.length <= maximumBytes) {
+        return {text: value, originalBytes: encoded.length, truncated: false};
+    }
+    return {
+        text: `${encoded.subarray(0, maximumBytes).toString('utf8')}\n...[truncated]`,
+        originalBytes: encoded.length,
+        truncated: true,
+    };
+}
+
 async function combinePairFiles(runDir, manifest) {
     const temporary = path.join(runDir, 'counterfactual_action_batch.jsonl.tmp');
     const output = path.join(runDir, 'counterfactual_action_batch.jsonl');
@@ -1159,9 +1291,17 @@ async function collect(
     const initialElapsed = Number(manifest.elapsed_seconds) || 0;
     const startedAt = Date.now();
     const maximumAttempts = options.pairs * options.maxAttemptMultiplier;
+    const resourceGate = createResourceGate(options);
     let nextAttempt = manifest.attempts;
     let writeLock = Promise.resolve();
     let resultsSinceCheckpoint = 0;
+    console.log(
+        `[counterfactual] resource limits outer=${options.concurrency} ` +
+        `branches=${options.branchConcurrency} agents<=${options.maxAgentProcesses} ` +
+        `omp_threads=${options.agentOmpThreads} ` +
+        `memory<=${options.maxSystemMemoryPercent}% cpu<=${options.maxSystemCpuPercent}% ` +
+        `launch_stagger=${options.launchStaggerMilliseconds}ms`
+    );
 
     async function recordResult(attempt, result) {
         const previous = writeLock;
@@ -1183,11 +1323,17 @@ async function collect(
                     (manifest.choice_rejection_reasons[reason] || 0) + 1;
             }
             if (!result.valid) {
+                const failureMessage = limitUtf8(
+                    result.message || result.reason,
+                    options.failureMessageLimitBytes
+                );
                 await appendJsonLineDurably(failureLogPath, {
                     type: 'attempt_failure',
                     attempt,
                     reason: result.reason,
-                    message: result.message || result.reason,
+                    message: failureMessage.text,
+                    message_truncated: failureMessage.truncated,
+                    original_message_bytes: failureMessage.originalBytes,
                 });
                 ++manifest.invalid_attempts;
                 manifest.invalid_reasons[result.reason] =
@@ -1243,7 +1389,10 @@ async function collect(
             const attempt = nextAttempt++;
             if (attempt >= maximumAttempts) return;
             try {
-                await recordResult(attempt, await runPair(sim, options, attempt));
+                await recordResult(
+                    attempt,
+                    await runPair(sim, options, resourceGate, attempt)
+                );
             } catch (error) {
                 const reason = battleFailureReason(error);
                 await recordResult(attempt, {
@@ -1326,10 +1475,12 @@ module.exports = {
     choicesDiffer,
     choiceRejectionReason,
     continuationSeed,
+    cpuPercentBetween,
     drivePlayer,
     equalPrefix,
     acquireRunLock,
     inferenceSeed,
+    limitUtf8,
     mix32,
     pairEntryFromRecords,
     parseToml,

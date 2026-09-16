@@ -212,7 +212,7 @@ static void write_counterfactual_action(
         "\"slot1_has_action\":%u,\"slot1_kind\":%u,\"slot1_move_index\":%u,"
         "\"slot1_switch_index\":%u,\"slot1_use_tera\":%u,"
         "\"slot1_target_index\":%u,\"slot1_target_mask\":%u,"
-        "\"hidden_dim\":%zu,\"hidden_state\":[",
+        "\"hidden_dim\":%zu,\"prior_hidden_state\":[",
         session->battle_id, session->last_request_id, action, action2, command,
         session->decision_count, session->pending_counterfactual_rank,
         session->pending_old_value, session->pending_old_log_prob,
@@ -224,6 +224,11 @@ static void write_counterfactual_action(
         (unsigned int)choice->slot1_move_index, (unsigned int)choice->slot1_switch_index,
         (unsigned int)choice->slot1_use_tera, (unsigned int)choice->slot1_target_index,
         (unsigned int)choice->slot1_target_mask, hidden_dim);
+    for (i = 0; i < hidden_dim; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%.9g", session->decision_prior_hidden_state[i]);
+    }
+    fputs("],\"hidden_state\":[", out);
     for (i = 0; i < hidden_dim; ++i) {
         if (i > 0) fputc(',', out);
         fprintf(out, "%.9g", session->hidden_state[i]);
@@ -305,8 +310,11 @@ static EnvSession* ensure_session(EnvRuntime* runtime, const char* battle_id, in
     session->episode.dense_reward_clip = runtime->dense_reward_config.reward_clip;
     session->episode.reward_config_present = 1;
     session->hidden_state = (float*)calloc(gru_model_hidden_dim(runtime->model), sizeof(float));
+    session->decision_prior_hidden_state = (float*)calloc(
+        gru_model_hidden_dim(runtime->model), sizeof(float));
     session->flat_observation = (float*)calloc(runtime->obs_dim, sizeof(float));
-    if (!session->hidden_state || !session->flat_observation) {
+    if (!session->hidden_state || !session->decision_prior_hidden_state ||
+            !session->flat_observation) {
         return NULL;
     }
     return session;
@@ -318,6 +326,7 @@ static void free_session(EnvSession* session) {
     }
     episode_free(&session->episode);
     free(session->hidden_state);
+    free(session->decision_prior_hidden_state);
     free(session->flat_observation);
     memset(session, 0, sizeof(*session));
 }
@@ -550,7 +559,10 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     build_runtime_factor_masks(session->observation.legal_mask, 0, slot0_kind_mask, slot0_move_mask, slot0_switch_mask);
     build_runtime_factor_masks(session->observation.legal_mask, 1, slot1_kind_mask, slot1_move_mask, slot1_switch_mask);
     factorized_action_choice_init(&sampled_choice);
-    gru_model_forward_step(runtime->model, session->flat_observation, session->hidden_state, session->hidden_state, NULL, &value);
+    memcpy(session->decision_prior_hidden_state, session->hidden_state,
+        gru_model_hidden_dim(runtime->model) * sizeof(*session->hidden_state));
+    gru_model_forward_step(runtime->model, session->flat_observation,
+        session->hidden_state, session->hidden_state, NULL, &value);
     if (!gru_model_evaluate_policy_snapshot(
             runtime->model,
             session->hidden_state,

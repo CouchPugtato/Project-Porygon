@@ -15,8 +15,10 @@ const {
     choiceRejectionReason,
     choicesDiffer,
     continuationSeed,
+    cpuPercentBetween,
     drivePlayer,
     equalPrefix,
+    limitUtf8,
     recoverManifestFromPairFiles,
     seedTuple,
     summarizeCounterfactualSignal,
@@ -46,6 +48,7 @@ function sampleAction() {
         baseline_value: 0.2,
         behavior_log_prob: -2.3,
         hidden_dim: 3,
+        prior_hidden_state: [-0.1, -0.2, -0.3],
         hidden_state: [0.1, 0.2, 0.3],
         legal_mask: Array(28).fill(1),
     };
@@ -66,6 +69,7 @@ test('counterfactual records store the compact recurrent state and intervention'
     assert.equal(record.rollout_count, 3);
     assert.equal(record.continuation_seeds.length, 3);
     assert.deepEqual(record.hidden_state, [0.1, 0.2, 0.3]);
+    assert.deepEqual(record.prior_hidden_state, [-0.1, -0.2, -0.3]);
     assert.equal(record.legal_mask.length, 28);
 });
 
@@ -107,7 +111,7 @@ test('manifest recovery keeps complete pairs and skips crash-damaged files', asy
     };
     const manifest = await recoverManifestFromPairFiles(pairs, options);
     assert.equal(manifest.completed_pairs, 1);
-    assert.equal(manifest.schema_version, 3);
+    assert.equal(manifest.schema_version, 4);
     assert.equal(manifest.repeats_per_action, 3);
     assert.equal(manifest.attempts, 3);
     assert.equal(manifest.invalid_attempts, 2);
@@ -221,6 +225,20 @@ test('failure categories and durable JSONL retain exact messages', async t => {
     assert.deepEqual(summary.logged_failure_reasons, {battle_error: 1});
     assert.equal(summary.choice_rejections_recovered, 1);
     assert.deepEqual(summary.choice_rejection_reasons, {trapped_switch: 1});
+});
+
+test('resource measurements and failure logs stay bounded', () => {
+    assert.equal(cpuPercentBetween(
+        {idle: 500, total: 1000}, {idle: 750, total: 2000}), 75);
+    const short = limitUtf8('exact error', 256);
+    assert.deepEqual(short, {
+        text: 'exact error', originalBytes: 11, truncated: false,
+    });
+    const long = limitUtf8('x'.repeat(1024), 256);
+    assert.equal(long.truncated, true);
+    assert.equal(long.originalBytes, 1024);
+    assert.match(long.text, /\[truncated\]$/);
+    assert.ok(Buffer.byteLength(long.text, 'utf8') < 300);
 });
 
 test('Showdown seed tuples are deterministic and attempt-specific', () => {

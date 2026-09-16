@@ -32,6 +32,7 @@ typedef struct {
     int action1;
     float baseline_value;
     float target_value;
+    const float* features;
 } ActionValueExample;
 
 ActionValueModel* action_value_model_create(
@@ -67,6 +68,18 @@ int action_value_model_import_parameters(
 int action_value_model_predict(
     const ActionValueModel* model,
     const GruModel* policy_model,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* choice,
+    int action0,
+    int action1,
+    float baseline_value,
+    ActionValuePrediction* prediction
+);
+int action_value_model_predict_with_features(
+    const ActionValueModel* model,
+    const GruModel* policy_model,
+    const float* features,
     const float* hidden_state,
     const unsigned char* legal_mask,
     const FactorizedActionChoice* choice,

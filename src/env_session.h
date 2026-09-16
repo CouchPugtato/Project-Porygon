@@ -35,6 +35,7 @@ typedef struct {
     ParsedRequest parsed_request;
     Episode episode;
     float* hidden_state;
+    float* decision_prior_hidden_state;
     float* flat_observation;
     int last_request_id;
     int format_known;

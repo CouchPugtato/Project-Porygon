@@ -133,13 +133,25 @@ decision state fixed while exposing outcome variance after the action.
 number of repeats, so a larger noise audit does not multiply the collector's
 peak process count.
 
+Collection also has a hard agent-process ceiling and a shared launch gate.
+Before starting another branch, the gate checks total system RAM and CPU use;
+it pauses while either exceeds the configured percentage and staggers process
+starts to avoid short launch spikes. The conservative defaults use one outer
+pair, three concurrent branches, at most eight agents, 70% system memory, and
+75% CPU. Each spawned agent is also pinned to one OpenMP thread so several
+small inference processes cannot each create a machine-wide worker pool. These
+controls limit new work rather than terminating an active battle. Failed-agent
+messages are byte-limited, and failure summaries stream the log instead of
+loading the entire file into memory.
+
 The collector verifies that the frozen recurrent state and legal mask are
 identical at the intervention. It rejects pairs whose decision was not reached
 or whose actions are not distinct. Each accepted branch becomes one compact
-`counterfactual_sample` record containing the 128-value recurrent state, legal
-mask, joint action, individual rollout returns, their variance, and the mean
-terminal return used as the target. This avoids copying the very large raw
-observation prefix into every branch.
+`counterfactual_sample` record containing the 128-value recurrent state before
+and after the current observation, legal mask, joint action, individual rollout
+returns, their variance, and the mean terminal return used as the target. The
+two recurrent states separate remembered battle context from the latest state
+update without copying the very large raw observation into every branch.
 
 The default three repeats per action provide the control used to judge the
 labels. Rank-zero versus rank-one outcomes under a shared continuation seed
@@ -210,6 +222,17 @@ Counterfactual Q fitting accepts `--counterfactual-min-confidence` to apply
 the same matched-rollout confidence filter to training, selection, and
 holdout pairs. Batches without matched return arrays use the older
 independent-variance confidence calculation.
+
+The default `--counterfactual-q-representation hidden` keeps compatibility
+with existing collections and fits from the current recurrent state alone.
+New collections also support `--counterfactual-q-representation transition`,
+which concatenates the recurrent states immediately before and after the
+current observation. This is a representation diagnostic: it tests whether
+separating memory from the current update helps the Q head generalize. A
+transition sidecar cannot be published for live play; a positive result must
+first be incorporated into a supported model path and confirmed on a fresh
+collection. The added state changes the collector manifest to schema version
+4, so start a new run rather than resuming a schema-3 collection.
 
 When the action-Q sidecar fits its training pairs but does not generalize, use
 `--check-counterfactual-policy-preference` or its `-manifest` variant to test a

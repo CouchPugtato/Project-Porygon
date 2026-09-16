@@ -1,8 +1,15 @@
 format = "gen9randomdoublesbattle"
 pairs = 500
 repeats_per_action = 3
-branch_concurrency = 6
-concurrency = 2
+branch_concurrency = 3
+concurrency = 1
+max_agent_processes = 8
+agent_omp_threads = 1
+max_system_memory_percent = 70
+max_system_cpu_percent = 75
+resource_check_seconds = 2
+launch_stagger_ms = 500
+failure_message_limit_bytes = 16384
 decision_min = 0
 decision_max = 7
 seed = 20260911

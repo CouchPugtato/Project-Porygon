@@ -27,6 +27,7 @@ typedef struct {
     int has_paired_preference_confidence;
     size_t source_index;
     float* hidden_state;
+    float* transition_state;
     unsigned char legal_mask[OBS_NUM_ACTIONS];
 } CounterfactualSample;
 
@@ -65,6 +66,9 @@ int counterfactual_dataset_load_manifest(
 int counterfactual_dataset_contains_source(
     const CounterfactualDataset* dataset,
     const char* path
+);
+int counterfactual_dataset_has_transition_states(
+    const CounterfactualDataset* dataset
 );
 void counterfactual_dataset_free(CounterfactualDataset* dataset);
 int counterfactual_dataset_split(

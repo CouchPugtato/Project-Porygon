@@ -807,6 +807,9 @@ static int test_runtime_counterfactual_ranks_are_distinct_and_reported(void) {
         ok &= assert_true(strstr(rank0_json, "\"action_rank\":0") != NULL &&
             strstr(rank1_json, "\"action_rank\":1") != NULL,
             "counterfactual action metadata identifies each rank");
+        ok &= assert_true(strstr(rank0_json, "\"prior_hidden_state\":[") != NULL &&
+            strstr(rank1_json, "\"prior_hidden_state\":[") != NULL,
+            "counterfactual actions retain the state before the current observation");
     }
     if (rank0_output) fclose(rank0_output);
     if (rank1_output) fclose(rank1_output);
@@ -823,7 +826,8 @@ static void write_counterfactual_dataset_sample(
     int rank,
     int action,
     float target,
-    float second_hidden
+    float second_hidden,
+    int include_prior_hidden
 ) {
     int positive_returns = (int)lroundf((target + 1.0f) * 6.0f);
     float rollout_variance =
@@ -839,11 +843,16 @@ static void write_counterfactual_dataset_sample(
         "\"slot1_has_action\":0,\"slot1_kind\":0,\"slot1_move_index\":0,"
         "\"slot1_switch_index\":0,\"slot1_use_tera\":0,"
         "\"slot1_target_index\":0,\"slot1_target_mask\":0,"
-        "\"baseline_value\":0.1,\"target_value\":%.1f,\"hidden_dim\":2,"
+        "\"baseline_value\":0.1,\"target_value\":%.1f,\"hidden_dim\":2,",
+        rank, action, action, target);
+    if (include_prior_hidden) {
+        fputs("\"prior_hidden_state\":[-0.25,0.5],", output);
+    }
+    fprintf(output,
         "\"hidden_state\":[0.25,%.2f],"
         "\"legal_mask\":[1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"
         "\"rollout_count\":12,\"rollout_variance\":%.9g,\"rollout_returns\":[",
-        rank, action, action, target, second_hidden, rollout_variance);
+        second_hidden, rollout_variance);
     for (repeat = 0; repeat < 12; ++repeat) {
         fprintf(output, "%s%d", repeat > 0 ? "," : "",
             repeat < positive_returns ? 1 : -1);
@@ -860,8 +869,8 @@ static int test_counterfactual_dataset_preserves_whole_pairs(void) {
     remove(path);
     output = fopen(path, "w");
     if (!assert_true(output != NULL, "create counterfactual dataset fixture")) return 0;
-    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f);
-    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f);
+    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f, 1);
+    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f, 1);
     fclose(output);
     ok &= assert_true(counterfactual_dataset_load(
         &dataset, path, 2, ".\\models\\parent.chk"),
@@ -877,13 +886,17 @@ static int test_counterfactual_dataset_preserves_whole_pairs(void) {
             dataset.samples[0].has_paired_preference_confidence &&
             dataset.samples[0].paired_preference_confidence > 0.99f,
             "counterfactual loader retains matched-rollout confidence");
+        ok &= assert_true(counterfactual_dataset_has_transition_states(&dataset) &&
+            dataset.samples[0].transition_state[0] == -0.25f &&
+            dataset.samples[0].transition_state[2] == 0.25f,
+            "counterfactual loader retains prior and current recurrent states");
     }
     counterfactual_dataset_free(&dataset);
 
     output = fopen(path, "w");
     if (!assert_true(output != NULL, "rewrite counterfactual dataset fixture")) return 0;
-    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f);
-    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, 0.5f);
+    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f, 0);
+    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, 0.5f, 0);
     fclose(output);
     ok &= assert_true(!counterfactual_dataset_load(
         &dataset, path, 2, ".\\models\\parent.chk"),
@@ -914,16 +927,16 @@ static int test_counterfactual_manifest_combines_owned_sources(void) {
     if (!assert_true(output != NULL, "create first counterfactual manifest batch")) {
         return 0;
     }
-    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f);
-    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f);
+    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f, 0);
+    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f, 0);
     fclose(output);
     output = fopen(second_path, "w");
     if (!assert_true(output != NULL, "create second counterfactual manifest batch")) {
         remove(first_path);
         return 0;
     }
-    write_counterfactual_dataset_sample(output, 0, 1, 0.5f, 0.25f);
-    write_counterfactual_dataset_sample(output, 1, 0, -0.5f, 0.25f);
+    write_counterfactual_dataset_sample(output, 0, 1, 0.5f, 0.25f, 0);
+    write_counterfactual_dataset_sample(output, 1, 0, -0.5f, 0.25f, 0);
     fclose(output);
     output = fopen(manifest_path, "w");
     if (!assert_true(output != NULL, "create counterfactual manifest")) {
@@ -5094,6 +5107,7 @@ static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
     GruModel* policy_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     ActionValueModel* value_model = NULL;
     float hidden[8] = {0};
+    float transition_features[16] = {0};
     unsigned char legal[OBS_NUM_ACTIONS] = {0};
     FactorizedActionChoice better_choice;
     FactorizedActionChoice worse_choice;
@@ -5115,7 +5129,9 @@ static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
         gru_model_destroy(policy_model);
         return 0;
     }
-    value_model = action_value_model_create(8u, 4u, 93u);
+    transition_features[0] = -0.5f;
+    transition_features[8] = 0.5f;
+    value_model = action_value_model_create(16u, 4u, 93u);
     if (!assert_true(value_model != NULL,
             "initialize pairwise action-value sidecar")) {
         gru_model_destroy(policy_model);
@@ -5125,16 +5141,18 @@ static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
     factorized_action_choice_from_flat_actions(&better_choice, 0, 14);
     factorized_action_choice_from_flat_actions(&worse_choice, 1, 15);
     better = (ActionValueExample){
-        hidden, legal, &better_choice, 0, 14, 0.0f, 1.0f
+        hidden, legal, &better_choice, 0, 14, 0.0f, 1.0f,
+        transition_features
     };
     worse = (ActionValueExample){
-        hidden, legal, &worse_choice, 1, 15, 0.0f, -1.0f
+        hidden, legal, &worse_choice, 1, 15, 0.0f, -1.0f,
+        transition_features
     };
-    ok &= assert_true(action_value_model_predict(
-            value_model, policy_model, hidden, legal, &better_choice,
+    ok &= assert_true(action_value_model_predict_with_features(
+            value_model, policy_model, transition_features, hidden, legal, &better_choice,
             0, 14, 0.0f, &better_before) &&
-        action_value_model_predict(
-            value_model, policy_model, hidden, legal, &worse_choice,
+        action_value_model_predict_with_features(
+            value_model, policy_model, transition_features, hidden, legal, &worse_choice,
             1, 15, 0.0f, &worse_before),
         "evaluate pairwise values before fitting");
     action_value_model_clear_gradients(value_model);
@@ -5165,11 +5183,11 @@ static int test_action_value_pairwise_preference_moves_the_value_gap(void) {
                 1.0f, 0.0f),
             "fit pairwise action preference");
     }
-    ok &= assert_true(action_value_model_predict(
-            value_model, policy_model, hidden, legal, &better_choice,
+    ok &= assert_true(action_value_model_predict_with_features(
+            value_model, policy_model, transition_features, hidden, legal, &better_choice,
             0, 14, 0.0f, &better_after) &&
-        action_value_model_predict(
-            value_model, policy_model, hidden, legal, &worse_choice,
+        action_value_model_predict_with_features(
+            value_model, policy_model, transition_features, hidden, legal, &worse_choice,
             1, 15, 0.0f, &worse_after),
         "evaluate pairwise values after fitting");
     action_value_model_clear_gradients(value_model);

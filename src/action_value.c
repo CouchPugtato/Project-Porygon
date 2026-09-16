@@ -212,6 +212,7 @@ static int add_target_component(
 static int prepare_work(
     const ActionValueModel* model,
     const GruModel* policy_model,
+    const float* features,
     const float* hidden_state,
     const unsigned char* legal_mask,
     const FactorizedActionChoice* choice,
@@ -226,7 +227,7 @@ static int prepare_work(
     int have_score = 0;
 
     memset(work, 0, sizeof(*work));
-    build_latent(model, hidden_state, work->latent);
+    build_latent(model, features, work->latent);
     for (row = 0; row < model->head_row_count; ++row) {
         work->head_scores[row] = head_score(model, row, work->latent);
     }
@@ -430,9 +431,28 @@ int action_value_model_predict(
     float baseline_value,
     ActionValuePrediction* prediction
 ) {
+    return action_value_model_predict_with_features(
+        model, policy_model, hidden_state, hidden_state, legal_mask, choice,
+        action0, action1, baseline_value, prediction);
+}
+
+int action_value_model_predict_with_features(
+    const ActionValueModel* model,
+    const GruModel* policy_model,
+    const float* features,
+    const float* hidden_state,
+    const unsigned char* legal_mask,
+    const FactorizedActionChoice* choice,
+    int action0,
+    int action1,
+    float baseline_value,
+    ActionValuePrediction* prediction
+) {
     ActionValueWork work;
-    if (!model || !policy_model || !hidden_state || !legal_mask || !choice || !prediction) return 0;
-    if (!prepare_work(model, policy_model, hidden_state, legal_mask, choice, action0, action1, &work)) {
+    if (!model || !policy_model || !features || !hidden_state || !legal_mask ||
+            !choice || !prediction) return 0;
+    if (!prepare_work(model, policy_model, features, hidden_state, legal_mask,
+            choice, action0, action1, &work)) {
         free_work(&work);
         return 0;
     }
@@ -513,7 +533,7 @@ static int accumulate_work_gradient(
     ActionValueModel* model,
     const ActionValueWork* work,
     const FactorizedActionChoice* choice,
-    const float* hidden_state,
+    const float* features,
     float coefficient
 ) {
     float latent_gradient[ACTION_VALUE_MAX_LATENT_DIM] = {0};
@@ -562,7 +582,7 @@ static int accumulate_work_gradient(
         model->gradients[model->projection_bias_offset + i] += projection_gradient;
         for (h = 0; h < model->hidden_dim; ++h) {
             model->gradients[projection_index(model, i, h)] +=
-                projection_gradient * hidden_state[h];
+                projection_gradient * features[h];
         }
     }
     return 1;
@@ -585,7 +605,8 @@ int action_value_model_accumulate(
     float error;
     int ok = 0;
     if (!model || !policy_model || !hidden_state || !legal_mask || !choice) return 0;
-    if (!prepare_work(model, policy_model, hidden_state, legal_mask, choice, action0, action1, &work)) {
+    if (!prepare_work(model, policy_model, hidden_state, hidden_state, legal_mask,
+            choice, action0, action1, &work)) {
         free_work(&work);
         return 0;
     }
@@ -618,6 +639,8 @@ int action_value_model_accumulate_weighted_preference(
     float signed_margin;
     float direction;
     float gradient;
+    const float* first_features;
+    const float* second_features;
     int ok = 0;
     if (loss_out) *loss_out = 0.0f;
     if (preference_used) *preference_used = 0;
@@ -628,11 +651,15 @@ int action_value_model_accumulate_weighted_preference(
             !isfinite(preference_weight) || preference_weight < 0.0f) return 0;
     target_gap = first->target_value - second->target_value;
     if (fabsf(target_gap) <= 1.0e-6f || preference_weight <= 1.0e-6f) return 1;
+    first_features = first->features ? first->features : first->hidden_state;
+    second_features = second->features ? second->features : second->hidden_state;
     if (!prepare_work(
-            model, policy_model, first->hidden_state, first->legal_mask,
+            model, policy_model, first_features, first->hidden_state,
+            first->legal_mask,
             first->choice, first->action0, first->action1, &first_work) ||
             !prepare_work(
-                model, policy_model, second->hidden_state, second->legal_mask,
+                model, policy_model, second_features, second->hidden_state,
+                second->legal_mask,
                 second->choice, second->action0, second->action1,
                 &second_work)) goto cleanup;
     direction = target_gap > 0.0f ? 1.0f : -1.0f;
@@ -650,9 +677,9 @@ int action_value_model_accumulate_weighted_preference(
         : -direction / (1.0f + expf(signed_margin));
     gradient *= preference_weight;
     if (!accumulate_work_gradient(
-            model, &first_work, first->choice, first->hidden_state, gradient) ||
+            model, &first_work, first->choice, first_features, gradient) ||
             !accumulate_work_gradient(
-                model, &second_work, second->choice, second->hidden_state,
+                model, &second_work, second->choice, second_features,
                 -gradient)) goto cleanup;
     ++model->gradient_samples;
     if (preference_used) *preference_used = 1;
@@ -694,6 +721,8 @@ int action_value_model_accumulate_weighted_gap_regression(
     float error;
     float absolute_error;
     float gradient;
+    const float* first_features;
+    const float* second_features;
     int ok = 0;
     if (loss_out) *loss_out = 0.0f;
     if (pair_used) *pair_used = 0;
@@ -705,11 +734,15 @@ int action_value_model_accumulate_weighted_gap_regression(
             !isfinite(huber_delta) || huber_delta <= 0.0f) return 0;
     target_gap = first->target_value - second->target_value;
     if (fabsf(target_gap) <= 1.0e-6f || pair_weight <= 1.0e-6f) return 1;
+    first_features = first->features ? first->features : first->hidden_state;
+    second_features = second->features ? second->features : second->hidden_state;
     if (!prepare_work(
-            model, policy_model, first->hidden_state, first->legal_mask,
+            model, policy_model, first_features, first->hidden_state,
+            first->legal_mask,
             first->choice, first->action0, first->action1, &first_work) ||
             !prepare_work(
-                model, policy_model, second->hidden_state, second->legal_mask,
+                model, policy_model, second_features, second->hidden_state,
+                second->legal_mask,
                 second->choice, second->action0, second->action1,
                 &second_work)) goto cleanup;
     predicted_gap =
@@ -728,9 +761,9 @@ int action_value_model_accumulate_weighted_gap_regression(
         gradient = pair_weight * huber_delta * (error > 0.0f ? 1.0f : -1.0f);
     }
     if (!accumulate_work_gradient(
-            model, &first_work, first->choice, first->hidden_state, gradient) ||
+            model, &first_work, first->choice, first_features, gradient) ||
             !accumulate_work_gradient(
-                model, &second_work, second->choice, second->hidden_state,
+                model, &second_work, second->choice, second_features,
                 -gradient)) goto cleanup;
     ++model->gradient_samples;
     if (pair_used) *pair_used = 1;

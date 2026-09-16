@@ -473,6 +473,18 @@ static double action_value_gap_huber_loss(double error) {
         (absolute_error - 0.5 * ACTION_VALUE_GAP_HUBER_DELTA);
 }
 
+static const float* counterfactual_action_value_features(
+    const ActionValueModel* action_value_model,
+    const GruModel* policy_model,
+    const CounterfactualSample* sample
+) {
+    size_t feature_dim = action_value_model_hidden_dim(action_value_model);
+    size_t hidden_dim = gru_model_hidden_dim(policy_model);
+    if (feature_dim == hidden_dim) return sample->hidden_state;
+    if (feature_dim == hidden_dim * 2u) return sample->transition_state;
+    return NULL;
+}
+
 static int evaluate_counterfactual_action_value(
     const ActionValueModel* action_value_model,
     const GruModel* policy_model,
@@ -506,13 +518,21 @@ static int evaluate_counterfactual_action_value(
         double target_gap;
         double predicted_gap;
         double confidence;
+        const float* first_features;
+        const float* second_features;
         if (!first || !second || strcmp(first->pair_id, second->pair_id) != 0 ||
-                !action_value_model_predict(
-                    action_value_model, policy_model, first->hidden_state,
+                !(first_features = counterfactual_action_value_features(
+                    action_value_model, policy_model, first)) ||
+                !(second_features = counterfactual_action_value_features(
+                    action_value_model, policy_model, second)) ||
+                !action_value_model_predict_with_features(
+                    action_value_model, policy_model, first_features,
+                    first->hidden_state,
                     first->legal_mask, &first->choice, first->action,
                     first->action2, first->baseline_value, &first_prediction) ||
-                !action_value_model_predict(
-                    action_value_model, policy_model, second->hidden_state,
+                !action_value_model_predict_with_features(
+                    action_value_model, policy_model, second_features,
+                    second->hidden_state,
                     second->legal_mask, &second->choice, second->action,
                     second->action2, second->baseline_value, &second_prediction)) return 0;
         action_value_metric_add(&accumulator, first->target_value, &first_prediction);
@@ -1249,19 +1269,32 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
                 const CounterfactualSample* first = train_samples[pair_start];
                 const CounterfactualSample* second = train_samples[pair_start + 1u];
                 ActionValueExample first_example = {
-                    first->hidden_state, first->legal_mask, &first->choice,
-                    first->action, first->action2,
-                    first->baseline_value, first->target_value
+                    .hidden_state = first->hidden_state,
+                    .legal_mask = first->legal_mask,
+                    .choice = &first->choice,
+                    .action0 = first->action,
+                    .action1 = first->action2,
+                    .baseline_value = first->baseline_value,
+                    .target_value = first->target_value,
+                    .features = counterfactual_action_value_features(
+                        action_value_model, policy_model, first)
                 };
                 ActionValueExample second_example = {
-                    second->hidden_state, second->legal_mask, &second->choice,
-                    second->action, second->action2,
-                    second->baseline_value, second->target_value
+                    .hidden_state = second->hidden_state,
+                    .legal_mask = second->legal_mask,
+                    .choice = &second->choice,
+                    .action0 = second->action,
+                    .action1 = second->action2,
+                    .baseline_value = second->baseline_value,
+                    .target_value = second->target_value,
+                    .features = counterfactual_action_value_features(
+                        action_value_model, policy_model, second)
                 };
                 int pair_used = 0;
                 float pair_weight =
                     counterfactual_pair_preference_weight(first, second);
-                if (!action_value_model_accumulate_weighted_gap_regression(
+                if (!first_example.features || !second_example.features ||
+                        !action_value_model_accumulate_weighted_gap_regression(
                         action_value_model, policy_model,
                         &first_example, &second_example, pair_weight,
                         ACTION_VALUE_GAP_HUBER_DELTA, NULL,
@@ -1936,15 +1969,20 @@ int learning_diagnostic_write_counterfactual_action_value_report(
 ) {
     FILE* out;
     size_t source_index;
+    size_t feature_dim;
+    int transition_representation;
     if (!report_path || !*report_path || !training_dataset ||
             training_dataset->source_count == 0 || !action_value_model || !result) return 0;
     out = fopen(report_path, "w");
     if (!out) return 0;
+    feature_dim = action_value_model_hidden_dim(action_value_model);
+    transition_representation =
+        feature_dim == training_dataset->hidden_dim * 2u;
     fprintf(out, "{\n  \"diagnostic\": \"%s\",\n",
         overfit_pair_count > 0
             ? "counterfactual_q_real_data_overfit"
             : "paired_counterfactual_q_fit");
-    fputs("  \"metrics_version\": 9,\n  \"counterfactual_batch\": ", out);
+    fputs("  \"metrics_version\": 10,\n  \"counterfactual_batch\": ", out);
     write_json_string(out, batch_path);
     fprintf(out, ",\n  \"training_source_kind\": \"%s\"",
         training_source_is_manifest ? "manifest" : "batch");
@@ -1982,9 +2020,11 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"minimum_pair_confidence\": %.9g,\n"
         "  \"tied_pairs_in_training\": false,\n"
         "  \"advantage_centering\": \"exact expectation under the frozen legal policy\",\n"
+        "  \"representation\": \"%s\",\n"
         "  \"head_mode\": \"%s\",\n"
         "  \"head_structure\": \"%s\",\n"
         "  \"hidden_dim\": %zu,\n"
+        "  \"feature_dim\": %zu,\n"
         "  \"latent_dim\": %zu,\n"
         "  \"parameter_count\": %zu,\n"
         "  \"validation_seed\": %u,\n"
@@ -1999,14 +2039,16 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"learning_rate\": %.9g,\n"
         "  \"l2_coefficient\": %.9g,\n",
         action_value_published ? "true" : "false",
-        overfit_pair_count > 0 ? "false" : "true",
+        overfit_pair_count > 0 || transition_representation ? "false" : "true",
         (double)ACTION_VALUE_GAP_HUBER_DELTA,
         minimum_pair_confidence,
+        transition_representation ? "prior_and_current_hidden" : "current_hidden",
         action_value_head_mode_name(action_value_model_head_mode(action_value_model)),
         action_value_model_head_mode(action_value_model) == ACTION_VALUE_HEAD_FACTORIZED
             ? "slot-local state scores plus ordered joint interaction bias"
             : "independent state-conditioned legal joint scores",
-        action_value_model_hidden_dim(action_value_model),
+        training_dataset->hidden_dim,
+        feature_dim,
         action_value_model_latent_dim(action_value_model),
         action_value_model_parameter_count(action_value_model),
         validation_seed, shuffle_seed, epochs, result->epochs_completed,
