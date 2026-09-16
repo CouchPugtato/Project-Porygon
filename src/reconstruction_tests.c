@@ -5388,6 +5388,18 @@ static int test_counterfactual_policy_preference_moves_policy_only(void) {
     return ok;
 }
 
+static int test_action_value_latent_capacity_boundary(void) {
+    ActionValueModel* supported = action_value_model_create(
+        8u, ACTION_VALUE_MAX_LATENT_DIM, 17u);
+    ActionValueModel* oversized = action_value_model_create(
+        8u, ACTION_VALUE_MAX_LATENT_DIM + 1u, 17u);
+    int ok = assert_true(supported != NULL && oversized == NULL,
+        "action-value latent capacity accepts its documented boundary only");
+    action_value_model_destroy(oversized);
+    action_value_model_destroy(supported);
+    return ok;
+}
+
 static int test_factorized_log_probability_survives_softmax_underflow(void) {
     GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     GruModel* anchor = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
@@ -6032,6 +6044,7 @@ int main(int argc, char** argv) {
     if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
     if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;
     if (!test_factorized_action_value_head_shares_credit_and_models_interactions()) return 1;
+    if (!test_action_value_latent_capacity_boundary()) return 1;
     if (!test_counterfactual_policy_preference_moves_policy_only()) return 1;
     if (!test_factorized_log_probability_survives_softmax_underflow()) return 1;
     if (!test_action_value_target_modes()) return 1;

@@ -4123,6 +4123,9 @@ static int run_counterfactual_q_fit_check(
                 result.before_train.confidence_weighted_pair_gap_huber_loss * 0.5 &&
             result.after_train.confidence_weighted_pair_ranking_accuracy >= 0.90 &&
             result.after_train.nonfinite_count == 0u;
+        /* Reused training pairs measure capacity, never generalization. */
+        result.counterfactual_pair_signal_detected = 0;
+        result.action_signal_detected = 0;
     }
     publication_requested = output_path && *output_path;
     if (publication_requested && result.action_signal_detected) {
@@ -4778,12 +4781,14 @@ static int showdown_client_main(int argc, char** argv) {
     if ((action_q_command || counterfactual_q_command) &&
             (action_q_epochs <= 0 || action_q_seed < 0 ||
              action_q_minibatch_episodes <= 0 || action_q_latent_dim <= 0 ||
+             action_q_latent_dim > ACTION_VALUE_MAX_LATENT_DIM ||
              action_q_early_stop_patience <= 0 || action_q_l2_coefficient < 0.0f ||
              (counterfactual_q_command &&
                 (counterfactual_min_confidence < 0.0f ||
                  counterfactual_min_confidence > 1.0f)))) {
         fprintf(stderr,
-            "action-Q diagnostics require positive epochs, minibatch size, latent dimension, and early-stop patience plus non-negative seed and L2 coefficient\n");
+            "action-Q diagnostics require positive epochs, minibatch size, and early-stop patience; latent dimension must be between 1 and %u\n",
+            (unsigned int)ACTION_VALUE_MAX_LATENT_DIM);
         return 1;
     }
     if ((counterfactual_q_overfit_command ||

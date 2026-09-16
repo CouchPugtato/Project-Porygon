@@ -7,6 +7,7 @@
 #include "gru_model.h"
 
 #define ACTION_VALUE_GAP_HUBER_DELTA 1.0f
+#define ACTION_VALUE_MAX_LATENT_DIM 128u
 
 typedef struct ActionValueModel ActionValueModel;
 

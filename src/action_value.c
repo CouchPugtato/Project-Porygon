@@ -18,7 +18,6 @@
 #define ACTION_VALUE_FACTORIZED_HEAD_ROWS \
     (ACTION_VALUE_SINGLE_ROWS + ACTION_VALUE_TARGET_ROWS)
 #define ACTION_VALUE_MAX_HEAD_ROWS ACTION_VALUE_JOINT_HEAD_ROWS
-#define ACTION_VALUE_MAX_LATENT_DIM 64
 
 struct ActionValueModel {
     size_t hidden_dim;
@@ -866,7 +865,8 @@ ActionValueModel* action_value_model_load(const char* path, size_t expected_hidd
             memcmp(header.magic, "PORYQ01", 7u) != 0 ||
             (header.version != 1u && header.version != 2u) ||
             header.hidden_dim != expected_hidden_dim ||
-            header.latent_dim == 0 || header.latent_dim > 1024u) goto failure;
+            header.latent_dim == 0 ||
+            header.latent_dim > ACTION_VALUE_MAX_LATENT_DIM) goto failure;
     if (header.version == 1u) header.reserved = ACTION_VALUE_HEAD_JOINT;
     if (header.reserved > ACTION_VALUE_HEAD_FACTORIZED) goto failure;
     model = action_value_model_create_with_head(
