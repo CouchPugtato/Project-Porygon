@@ -807,9 +807,9 @@ static int test_runtime_counterfactual_ranks_are_distinct_and_reported(void) {
         ok &= assert_true(strstr(rank0_json, "\"action_rank\":0") != NULL &&
             strstr(rank1_json, "\"action_rank\":1") != NULL,
             "counterfactual action metadata identifies each rank");
-        ok &= assert_true(strstr(rank0_json, "\"prior_hidden_state\":[") != NULL &&
-            strstr(rank1_json, "\"prior_hidden_state\":[") != NULL,
-            "counterfactual actions retain the state before the current observation");
+        ok &= assert_true(strstr(rank0_json, "\"action_semantics\":[") != NULL &&
+            strstr(rank1_json, "\"action_semantics\":[") != NULL,
+            "counterfactual actions describe the selected moves and switches");
     }
     if (rank0_output) fclose(rank0_output);
     if (rank1_output) fclose(rank1_output);
@@ -826,13 +826,13 @@ static void write_counterfactual_dataset_sample(
     int rank,
     int action,
     float target,
-    float second_hidden,
-    int include_prior_hidden
+    float second_hidden
 ) {
     int positive_returns = (int)lroundf((target + 1.0f) * 6.0f);
     float rollout_variance =
         (12.0f - 12.0f * target * target) / 11.0f;
     int repeat;
+    size_t semantic_index;
     fprintf(output,
         "{\"type\":\"counterfactual_sample\",\"pair_id\":\"pair-test\","
         "\"policy_tag\":\"F:/repo/models/parent.chk\",\"action_rank\":%d,"
@@ -845,14 +845,19 @@ static void write_counterfactual_dataset_sample(
         "\"slot1_target_index\":0,\"slot1_target_mask\":0,"
         "\"baseline_value\":0.1,\"target_value\":%.1f,\"hidden_dim\":2,",
         rank, action, action, target);
-    if (include_prior_hidden) {
-        fputs("\"prior_hidden_state\":[-0.25,0.5],", output);
-    }
     fprintf(output,
         "\"hidden_state\":[0.25,%.2f],"
         "\"legal_mask\":[1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"
-        "\"rollout_count\":12,\"rollout_variance\":%.9g,\"rollout_returns\":[",
-        second_hidden, rollout_variance);
+        "\"action_semantics\":[",
+        second_hidden);
+    for (semantic_index = 0; semantic_index < ACTION_SEMANTIC_DIM;
+            ++semantic_index) {
+        fprintf(output, "%s%d", semantic_index > 0 ? "," : "",
+            semantic_index == (size_t)action ? 1 : 0);
+    }
+    fprintf(output,
+        "],\"rollout_count\":12,\"rollout_variance\":%.9g,\"rollout_returns\":[",
+        rollout_variance);
     for (repeat = 0; repeat < 12; ++repeat) {
         fprintf(output, "%s%d", repeat > 0 ? "," : "",
             repeat < positive_returns ? 1 : -1);
@@ -869,8 +874,8 @@ static int test_counterfactual_dataset_preserves_whole_pairs(void) {
     remove(path);
     output = fopen(path, "w");
     if (!assert_true(output != NULL, "create counterfactual dataset fixture")) return 0;
-    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f, 1);
-    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f, 1);
+    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f);
+    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f);
     fclose(output);
     ok &= assert_true(counterfactual_dataset_load(
         &dataset, path, 2, ".\\models\\parent.chk"),
@@ -886,17 +891,17 @@ static int test_counterfactual_dataset_preserves_whole_pairs(void) {
             dataset.samples[0].has_paired_preference_confidence &&
             dataset.samples[0].paired_preference_confidence > 0.99f,
             "counterfactual loader retains matched-rollout confidence");
-        ok &= assert_true(counterfactual_dataset_has_transition_states(&dataset) &&
-            dataset.samples[0].transition_state[0] == -0.25f &&
-            dataset.samples[0].transition_state[2] == 0.25f,
-            "counterfactual loader retains prior and current recurrent states");
+        ok &= assert_true(counterfactual_dataset_has_action_semantics(&dataset) &&
+            dataset.samples[0].semantic_state[2] == 1.0f &&
+            dataset.samples[1].semantic_state[3] == 1.0f,
+            "counterfactual loader appends selected-action semantics to the recurrent state");
     }
     counterfactual_dataset_free(&dataset);
 
     output = fopen(path, "w");
     if (!assert_true(output != NULL, "rewrite counterfactual dataset fixture")) return 0;
-    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f, 0);
-    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, 0.5f, 0);
+    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f);
+    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, 0.5f);
     fclose(output);
     ok &= assert_true(!counterfactual_dataset_load(
         &dataset, path, 2, ".\\models\\parent.chk"),
@@ -927,16 +932,16 @@ static int test_counterfactual_manifest_combines_owned_sources(void) {
     if (!assert_true(output != NULL, "create first counterfactual manifest batch")) {
         return 0;
     }
-    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f, 0);
-    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f, 0);
+    write_counterfactual_dataset_sample(output, 0, 0, 1.0f, -0.5f);
+    write_counterfactual_dataset_sample(output, 1, 1, -1.0f, -0.5f);
     fclose(output);
     output = fopen(second_path, "w");
     if (!assert_true(output != NULL, "create second counterfactual manifest batch")) {
         remove(first_path);
         return 0;
     }
-    write_counterfactual_dataset_sample(output, 0, 1, 0.5f, 0.25f, 0);
-    write_counterfactual_dataset_sample(output, 1, 0, -0.5f, 0.25f, 0);
+    write_counterfactual_dataset_sample(output, 0, 1, 0.5f, 0.25f);
+    write_counterfactual_dataset_sample(output, 1, 0, -0.5f, 0.25f);
     fclose(output);
     output = fopen(manifest_path, "w");
     if (!assert_true(output != NULL, "create counterfactual manifest")) {
@@ -5298,6 +5303,94 @@ cleanup:
     return ok;
 }
 
+static int test_selected_action_value_head_shares_one_semantic_scorer(void) {
+    GruModel* policy_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
+    ActionValueModel* selected_model = NULL;
+    ActionValueModel* joint_model = NULL;
+    float hidden[8] = {0};
+    float preferred_features[6] = {1.0f, 0.5f, 0, 0, 0, 0};
+    float rejected_features[6] = {-1.0f, -0.5f, 0, 0, 0, 0};
+    unsigned char legal[OBS_NUM_ACTIONS] = {0};
+    FactorizedActionChoice preferred_choice;
+    FactorizedActionChoice rejected_choice;
+    ActionValueExample preferred;
+    ActionValueExample rejected;
+    ActionValuePrediction preferred_before;
+    ActionValuePrediction rejected_before;
+    ActionValuePrediction preferred_after;
+    ActionValuePrediction rejected_after;
+    ActionValueHeadMode parsed_mode = ACTION_VALUE_HEAD_JOINT;
+    int pair_used = 0;
+    int update;
+    int ok = 1;
+
+    if (!assert_true(policy_model && zero_model_parameters(policy_model),
+            "initialize selected-action scorer policy fixture")) {
+        gru_model_destroy(policy_model);
+        return 0;
+    }
+    selected_model = action_value_model_create_with_head(
+        6u, 4u, 419u, ACTION_VALUE_HEAD_SELECTED);
+    joint_model = action_value_model_create_with_head(
+        6u, 4u, 419u, ACTION_VALUE_HEAD_JOINT);
+    if (!assert_true(selected_model && joint_model &&
+            action_value_model_parameter_count(selected_model) <
+                action_value_model_parameter_count(joint_model) &&
+            action_value_parse_head_mode("selected", &parsed_mode) &&
+            parsed_mode == ACTION_VALUE_HEAD_SELECTED,
+            "selected-action head uses one compact shared scorer")) goto cleanup;
+
+    legal[0] = legal[1] = legal[14] = legal[15] = 1u;
+    factorized_action_choice_from_flat_actions(&preferred_choice, 0, 14);
+    factorized_action_choice_from_flat_actions(&rejected_choice, 1, 15);
+    preferred_choice.slot0_target_mask =
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) |
+        FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_RIGHT);
+    preferred_choice.slot0_target_index = FACTORIZED_TARGET_FOE_LEFT;
+    rejected_choice.slot0_target_mask = preferred_choice.slot0_target_mask;
+    rejected_choice.slot0_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    preferred = (ActionValueExample){
+        hidden, legal, &preferred_choice, 0, 14, 0.0f, 1.0f,
+        preferred_features
+    };
+    rejected = (ActionValueExample){
+        hidden, legal, &rejected_choice, 1, 15, 0.0f, -1.0f,
+        rejected_features
+    };
+    ok &= assert_true(action_value_model_predict_with_features(
+            selected_model, policy_model, preferred_features, hidden, legal,
+            &preferred_choice, 0, 14, 0.0f, &preferred_before) &&
+        action_value_model_predict_with_features(
+            selected_model, policy_model, rejected_features, hidden, legal,
+            &rejected_choice, 1, 15, 0.0f, &rejected_before),
+        "evaluate shared selected-action scores before fitting");
+    for (update = 0; update < 80; ++update) {
+        action_value_model_clear_gradients(selected_model);
+        ok &= assert_true(action_value_model_accumulate_weighted_gap_regression(
+                selected_model, policy_model, &preferred, &rejected, 1.0f,
+                ACTION_VALUE_GAP_HUBER_DELTA, NULL, &pair_used) && pair_used &&
+            action_value_model_apply_adam(
+                selected_model, 0.01f, 0.9f, 0.999f, 1.0e-8f,
+                1.0f, 0.0f),
+            "fit shared selected-action semantic scores");
+    }
+    ok &= assert_true(action_value_model_predict_with_features(
+            selected_model, policy_model, preferred_features, hidden, legal,
+            &preferred_choice, 0, 14, 0.0f, &preferred_after) &&
+        action_value_model_predict_with_features(
+            selected_model, policy_model, rejected_features, hidden, legal,
+            &rejected_choice, 1, 15, 0.0f, &rejected_after) &&
+        preferred_after.q_value - rejected_after.q_value >
+            preferred_before.q_value - rejected_before.q_value,
+        "shared selected-action scorer learns the supplied semantic preference");
+
+cleanup:
+    action_value_model_destroy(joint_model);
+    action_value_model_destroy(selected_model);
+    gru_model_destroy(policy_model);
+    return ok;
+}
+
 static int test_counterfactual_policy_preference_moves_policy_only(void) {
     enum { PAIR_COUNT = 12, SAMPLE_COUNT = PAIR_COUNT * 2 };
     GruModel* model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
@@ -6062,6 +6155,7 @@ int main(int argc, char** argv) {
     if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
     if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;
     if (!test_factorized_action_value_head_shares_credit_and_models_interactions()) return 1;
+    if (!test_selected_action_value_head_shares_one_semantic_scorer()) return 1;
     if (!test_action_value_latent_capacity_boundary()) return 1;
     if (!test_counterfactual_policy_preference_moves_policy_only()) return 1;
     if (!test_factorized_log_probability_survives_softmax_underflow()) return 1;

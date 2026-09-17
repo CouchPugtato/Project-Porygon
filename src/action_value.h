@@ -13,7 +13,8 @@ typedef struct ActionValueModel ActionValueModel;
 
 typedef enum {
     ACTION_VALUE_HEAD_JOINT = 0,
-    ACTION_VALUE_HEAD_FACTORIZED = 1
+    ACTION_VALUE_HEAD_FACTORIZED = 1,
+    ACTION_VALUE_HEAD_SELECTED = 2
 } ActionValueHeadMode;
 
 typedef struct {

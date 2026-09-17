@@ -147,11 +147,12 @@ loading the entire file into memory.
 The collector verifies that the frozen recurrent state and legal mask are
 identical at the intervention. It rejects pairs whose decision was not reached
 or whose actions are not distinct. Each accepted branch becomes one compact
-`counterfactual_sample` record containing the 128-value recurrent state before
-and after the current observation, legal mask, joint action, individual rollout
-returns, their variance, and the mean terminal return used as the target. The
-two recurrent states separate remembered battle context from the latest state
-update without copying the very large raw observation into every branch.
+`counterfactual_sample` record containing the 128-value recurrent state after
+the current observation, legal mask, joint action, compact selected-action
+descriptors, individual rollout returns, their variance, and the mean terminal
+return used as the target. The descriptors cover move slot and type, targeting,
+remaining PP, Tera use, and the selected switch's slot, types, status, HP, and
+stats. They avoid copying the very large raw observation into every branch.
 
 The default three repeats per action provide the control used to judge the
 labels. Rank-zero versus rank-one outcomes under a shared continuation seed
@@ -225,14 +226,16 @@ independent-variance confidence calculation.
 
 The default `--counterfactual-q-representation hidden` keeps compatibility
 with existing collections and fits from the current recurrent state alone.
-New collections also support `--counterfactual-q-representation transition`,
-which concatenates the recurrent states immediately before and after the
-current observation. This is a representation diagnostic: it tests whether
-separating memory from the current update helps the Q head generalize. A
-transition sidecar cannot be published for live play; a positive result must
-first be incorporated into a supported model path and confirmed on a fresh
-collection. The added state changes the collector manifest to schema version
-4, so start a new run rather than resuming a schema-3 collection.
+Schema-5 collections also support `--counterfactual-q-representation semantic`,
+which appends the compact description of the selected actions. This is a
+diagnostic for whether the Q head needs explicit action meaning rather than
+only recurrent state and action-slot numbers. Use it with
+`--counterfactual-q-head selected`. That head produces one shared score from
+the state and selected-action description instead of routing sparse examples
+through hundreds of fixed joint-action rows. The semantic/selected path is
+diagnostic-only and cannot publish a live sidecar; a positive result must first
+be incorporated into a supported model path and confirmed on a fresh
+collection. Start a new run rather than resuming an older collector manifest.
 
 When the action-Q sidecar fits its training pairs but does not generalize, use
 `--check-counterfactual-policy-preference` or its `-manifest` variant to test a

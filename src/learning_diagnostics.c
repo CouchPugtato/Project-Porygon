@@ -481,7 +481,9 @@ static const float* counterfactual_action_value_features(
     size_t feature_dim = action_value_model_hidden_dim(action_value_model);
     size_t hidden_dim = gru_model_hidden_dim(policy_model);
     if (feature_dim == hidden_dim) return sample->hidden_state;
-    if (feature_dim == hidden_dim * 2u) return sample->transition_state;
+    if (feature_dim == hidden_dim + ACTION_SEMANTIC_DIM) {
+        return sample->semantic_state;
+    }
     return NULL;
 }
 
@@ -1970,19 +1972,23 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     FILE* out;
     size_t source_index;
     size_t feature_dim;
-    int transition_representation;
+    int semantic_representation;
+    const char* representation_name;
     if (!report_path || !*report_path || !training_dataset ||
             training_dataset->source_count == 0 || !action_value_model || !result) return 0;
     out = fopen(report_path, "w");
     if (!out) return 0;
     feature_dim = action_value_model_hidden_dim(action_value_model);
-    transition_representation =
-        feature_dim == training_dataset->hidden_dim * 2u;
+    semantic_representation =
+        feature_dim == training_dataset->hidden_dim + ACTION_SEMANTIC_DIM;
+    representation_name = semantic_representation
+        ? "current_hidden_and_selected_action_semantics"
+        : "current_hidden";
     fprintf(out, "{\n  \"diagnostic\": \"%s\",\n",
         overfit_pair_count > 0
             ? "counterfactual_q_real_data_overfit"
             : "paired_counterfactual_q_fit");
-    fputs("  \"metrics_version\": 10,\n  \"counterfactual_batch\": ", out);
+    fputs("  \"metrics_version\": 11,\n  \"counterfactual_batch\": ", out);
     write_json_string(out, batch_path);
     fprintf(out, ",\n  \"training_source_kind\": \"%s\"",
         training_source_is_manifest ? "manifest" : "batch");
@@ -2039,14 +2045,18 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"learning_rate\": %.9g,\n"
         "  \"l2_coefficient\": %.9g,\n",
         action_value_published ? "true" : "false",
-        overfit_pair_count > 0 || transition_representation ? "false" : "true",
+        overfit_pair_count > 0 || semantic_representation
+            ? "false" : "true",
         (double)ACTION_VALUE_GAP_HUBER_DELTA,
         minimum_pair_confidence,
-        transition_representation ? "prior_and_current_hidden" : "current_hidden",
+        representation_name,
         action_value_head_mode_name(action_value_model_head_mode(action_value_model)),
         action_value_model_head_mode(action_value_model) == ACTION_VALUE_HEAD_FACTORIZED
             ? "slot-local state scores plus ordered joint interaction bias"
-            : "independent state-conditioned legal joint scores",
+            : (action_value_model_head_mode(action_value_model) ==
+                    ACTION_VALUE_HEAD_SELECTED
+                ? "one shared score conditioned on the selected action semantics"
+                : "independent state-conditioned legal joint scores"),
         training_dataset->hidden_dim,
         feature_dim,
         action_value_model_latent_dim(action_value_model),

@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 
+#include "action_semantics.h"
 #include "episode.h"
 #include "observation.h"
 
@@ -27,7 +28,9 @@ typedef struct {
     int has_paired_preference_confidence;
     size_t source_index;
     float* hidden_state;
-    float* transition_state;
+    float* semantic_state;
+    float action_semantics[ACTION_SEMANTIC_DIM];
+    int has_action_semantics;
     unsigned char legal_mask[OBS_NUM_ACTIONS];
 } CounterfactualSample;
 
@@ -67,7 +70,7 @@ int counterfactual_dataset_contains_source(
     const CounterfactualDataset* dataset,
     const char* path
 );
-int counterfactual_dataset_has_transition_states(
+int counterfactual_dataset_has_action_semantics(
     const CounterfactualDataset* dataset
 );
 void counterfactual_dataset_free(CounterfactualDataset* dataset);

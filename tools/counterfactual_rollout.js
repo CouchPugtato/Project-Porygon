@@ -500,8 +500,8 @@ function buildCounterfactualSample(action, pairId, policyTag, returnValue, rollo
         hidden_state: action.hidden_state,
         legal_mask: action.legal_mask,
     };
-    if (Array.isArray(action.prior_hidden_state)) {
-        sample.prior_hidden_state = action.prior_hidden_state;
+    if (Array.isArray(action.action_semantics)) {
+        sample.action_semantics = action.action_semantics;
     }
     if (rollout) {
         sample.rollout_returns = rollout.returns;
@@ -761,7 +761,7 @@ async function summarizeFailureLog(filePath) {
 
 function emptyManifest(options) {
     return {
-        schema_version: 4,
+        schema_version: 5,
         status: 'running',
         run_name: options.runName,
         format: options.format,
@@ -802,7 +802,7 @@ function emptyManifest(options) {
 
 function assertResumeCompatible(manifest, options) {
     for (const [key, expected] of [
-        ['schema_version', 4],
+        ['schema_version', 5],
         ['run_name', options.runName], ['format', options.format],
         ['checkpoint', options.checkpoint], ['opponent_checkpoint', options.opponentCheckpoint],
         ['seed', options.seed], ['decision_min', options.decisionMin],

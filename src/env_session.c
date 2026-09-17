@@ -1,5 +1,6 @@
 #include "env_session.h"
 
+#include "action_semantics.h"
 #include "observation_builder.h"
 #include "request_parser.h"
 
@@ -201,6 +202,10 @@ static void write_counterfactual_action(
     size_t i;
     size_t hidden_dim = gru_model_hidden_dim(runtime->model);
     const FactorizedActionChoice* choice = &session->pending_factorized_choice;
+    float action_semantics[ACTION_SEMANTIC_DIM];
+    if (!action_semantics_build(
+            action_semantics, ACTION_SEMANTIC_DIM,
+            &session->observation, &session->parsed_request, choice)) return;
     fprintf(out,
         "{\"type\":\"action\",\"battle_id\":\"%s\",\"request_id\":%d,"
         "\"action\":%d,\"action2\":%d,\"command\":\"%s\","
@@ -212,7 +217,7 @@ static void write_counterfactual_action(
         "\"slot1_has_action\":%u,\"slot1_kind\":%u,\"slot1_move_index\":%u,"
         "\"slot1_switch_index\":%u,\"slot1_use_tera\":%u,"
         "\"slot1_target_index\":%u,\"slot1_target_mask\":%u,"
-        "\"hidden_dim\":%zu,\"prior_hidden_state\":[",
+        "\"hidden_dim\":%zu,\"hidden_state\":[",
         session->battle_id, session->last_request_id, action, action2, command,
         session->decision_count, session->pending_counterfactual_rank,
         session->pending_old_value, session->pending_old_log_prob,
@@ -226,17 +231,17 @@ static void write_counterfactual_action(
         (unsigned int)choice->slot1_target_mask, hidden_dim);
     for (i = 0; i < hidden_dim; ++i) {
         if (i > 0) fputc(',', out);
-        fprintf(out, "%.9g", session->decision_prior_hidden_state[i]);
-    }
-    fputs("],\"hidden_state\":[", out);
-    for (i = 0; i < hidden_dim; ++i) {
-        if (i > 0) fputc(',', out);
         fprintf(out, "%.9g", session->hidden_state[i]);
     }
     fputs("],\"legal_mask\":[", out);
     for (i = 0; i < OBS_NUM_ACTIONS; ++i) {
         if (i > 0) fputc(',', out);
         fprintf(out, "%u", (unsigned int)session->observation.legal_mask[i]);
+    }
+    fputs("],\"action_semantics\":[", out);
+    for (i = 0; i < ACTION_SEMANTIC_DIM; ++i) {
+        if (i > 0) fputc(',', out);
+        fprintf(out, "%.9g", action_semantics[i]);
     }
     fputs("]}\n", out);
     fflush(out);
@@ -310,11 +315,8 @@ static EnvSession* ensure_session(EnvRuntime* runtime, const char* battle_id, in
     session->episode.dense_reward_clip = runtime->dense_reward_config.reward_clip;
     session->episode.reward_config_present = 1;
     session->hidden_state = (float*)calloc(gru_model_hidden_dim(runtime->model), sizeof(float));
-    session->decision_prior_hidden_state = (float*)calloc(
-        gru_model_hidden_dim(runtime->model), sizeof(float));
     session->flat_observation = (float*)calloc(runtime->obs_dim, sizeof(float));
-    if (!session->hidden_state || !session->decision_prior_hidden_state ||
-            !session->flat_observation) {
+    if (!session->hidden_state || !session->flat_observation) {
         return NULL;
     }
     return session;
@@ -326,7 +328,6 @@ static void free_session(EnvSession* session) {
     }
     episode_free(&session->episode);
     free(session->hidden_state);
-    free(session->decision_prior_hidden_state);
     free(session->flat_observation);
     memset(session, 0, sizeof(*session));
 }
@@ -559,8 +560,6 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     build_runtime_factor_masks(session->observation.legal_mask, 0, slot0_kind_mask, slot0_move_mask, slot0_switch_mask);
     build_runtime_factor_masks(session->observation.legal_mask, 1, slot1_kind_mask, slot1_move_mask, slot1_switch_mask);
     factorized_action_choice_init(&sampled_choice);
-    memcpy(session->decision_prior_hidden_state, session->hidden_state,
-        gru_model_hidden_dim(runtime->model) * sizeof(*session->hidden_state));
     gru_model_forward_step(runtime->model, session->flat_observation,
         session->hidden_state, session->hidden_state, NULL, &value);
     if (!gru_model_evaluate_policy_snapshot(

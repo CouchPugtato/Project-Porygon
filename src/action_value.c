@@ -17,6 +17,7 @@
     (ACTION_VALUE_JOINT_ROWS + ACTION_VALUE_SINGLE_ROWS + ACTION_VALUE_TARGET_ROWS)
 #define ACTION_VALUE_FACTORIZED_HEAD_ROWS \
     (ACTION_VALUE_SINGLE_ROWS + ACTION_VALUE_TARGET_ROWS)
+#define ACTION_VALUE_SELECTED_HEAD_ROWS 1u
 #define ACTION_VALUE_MAX_HEAD_ROWS ACTION_VALUE_JOINT_HEAD_ROWS
 
 struct ActionValueModel {
@@ -231,6 +232,19 @@ static int prepare_work(
     for (row = 0; row < model->head_row_count; ++row) {
         work->head_scores[row] = head_score(model, row, work->latent);
     }
+    if (model->head_mode == ACTION_VALUE_HEAD_SELECTED) {
+        if ((!choice->slot0_has_action && !choice->slot1_has_action) ||
+                (action0 >= 0 && (action0 >= OBS_NUM_ACTIONS || !legal_mask[action0])) ||
+                (action1 >= 0 && (action1 >= OBS_NUM_ACTIONS || !legal_mask[action1])) ||
+                (choice->slot0_has_action && action0 < 0) ||
+                (choice->slot1_has_action && action1 < 0)) return 0;
+        work->selected_row = 0u;
+        work->selected_raw = work->head_scores[0];
+        for (row = 0; row < OBS_NUM_ACTIONS; ++row) {
+            if (legal_mask[row]) ++work->legal_count;
+        }
+        return work->legal_count > 0;
+    }
     dual = choice->slot0_has_action && choice->slot1_has_action;
     if (!gru_model_evaluate_policy_snapshot(
             policy_model, hidden_state, legal_mask, dual, &work->policy, NULL)) return 0;
@@ -323,7 +337,8 @@ ActionValueModel* action_value_model_create_with_head(
     if (hidden_dim == 0 || latent_dim == 0 ||
             latent_dim > ACTION_VALUE_MAX_LATENT_DIM ||
             (head_mode != ACTION_VALUE_HEAD_JOINT &&
-             head_mode != ACTION_VALUE_HEAD_FACTORIZED)) return NULL;
+             head_mode != ACTION_VALUE_HEAD_FACTORIZED &&
+             head_mode != ACTION_VALUE_HEAD_SELECTED)) return NULL;
     model = (ActionValueModel*)calloc(1, sizeof(*model));
     if (!model) return NULL;
     model->hidden_dim = hidden_dim;
@@ -331,7 +346,9 @@ ActionValueModel* action_value_model_create_with_head(
     model->head_mode = head_mode;
     model->head_row_count = head_mode == ACTION_VALUE_HEAD_JOINT
         ? ACTION_VALUE_JOINT_HEAD_ROWS
-        : ACTION_VALUE_FACTORIZED_HEAD_ROWS;
+        : (head_mode == ACTION_VALUE_HEAD_FACTORIZED
+            ? ACTION_VALUE_FACTORIZED_HEAD_ROWS
+            : ACTION_VALUE_SELECTED_HEAD_ROWS);
     model->projection_offset = 0;
     model->projection_bias_offset = latent_dim * hidden_dim;
     model->head_offset = model->projection_bias_offset + latent_dim;
@@ -383,6 +400,7 @@ const char* action_value_head_mode_name(ActionValueHeadMode mode) {
     switch (mode) {
         case ACTION_VALUE_HEAD_JOINT: return "joint";
         case ACTION_VALUE_HEAD_FACTORIZED: return "factorized";
+        case ACTION_VALUE_HEAD_SELECTED: return "selected";
     }
     return "unknown";
 }
@@ -395,6 +413,10 @@ int action_value_parse_head_mode(const char* name, ActionValueHeadMode* mode) {
     }
     if (strcmp(name, "factorized") == 0) {
         *mode = ACTION_VALUE_HEAD_FACTORIZED;
+        return 1;
+    }
+    if (strcmp(name, "selected") == 0) {
+        *mode = ACTION_VALUE_HEAD_SELECTED;
         return 1;
     }
     return 0;
@@ -539,7 +561,9 @@ static int accumulate_work_gradient(
     float latent_gradient[ACTION_VALUE_MAX_LATENT_DIM] = {0};
     size_t i;
     int dual = choice->slot0_has_action && choice->slot1_has_action;
-    if (dual) {
+    if (model->head_mode == ACTION_VALUE_HEAD_SELECTED) {
+        accumulate_head_row(model, work, 0u, coefficient, latent_gradient);
+    } else if (dual) {
         for (i = 0; i < work->probability_count; ++i) {
             float row_coefficient = ((i == work->selected_row) ? 1.0f : 0.0f) -
                 work->probabilities[i];
@@ -571,10 +595,11 @@ static int accumulate_work_gradient(
                 coefficient * row_coefficient, latent_gradient);
         }
     }
-    if (!accumulate_target_rows(
-            model, work, choice, 0, coefficient, latent_gradient) ||
-            !accumulate_target_rows(
-                model, work, choice, 1, coefficient, latent_gradient)) return 0;
+    if (model->head_mode != ACTION_VALUE_HEAD_SELECTED &&
+            (!accumulate_target_rows(
+                model, work, choice, 0, coefficient, latent_gradient) ||
+             !accumulate_target_rows(
+                model, work, choice, 1, coefficient, latent_gradient))) return 0;
     for (i = 0; i < model->latent_dim; ++i) {
         float projection_gradient = latent_gradient[i] *
             (1.0f - work->latent[i] * work->latent[i]);
@@ -856,7 +881,8 @@ int action_value_model_save(const char* path, const ActionValueModel* model) {
     if (!out) goto cleanup;
     memset(&header, 0, sizeof(header));
     memcpy(header.magic, "PORYQ01", 7u);
-    header.version = model->head_mode == ACTION_VALUE_HEAD_JOINT ? 1u : 2u;
+    header.version = model->head_mode == ACTION_VALUE_HEAD_JOINT ? 1u :
+        (model->head_mode == ACTION_VALUE_HEAD_FACTORIZED ? 2u : 3u);
     header.reserved = (uint32_t)model->head_mode;
     header.hidden_dim = (uint64_t)model->hidden_dim;
     header.latent_dim = (uint64_t)model->latent_dim;
@@ -896,12 +922,13 @@ ActionValueModel* action_value_model_load(const char* path, size_t expected_hidd
     if (!in) return NULL;
     if (fread(&header, sizeof(header), 1u, in) != 1u ||
             memcmp(header.magic, "PORYQ01", 7u) != 0 ||
-            (header.version != 1u && header.version != 2u) ||
+            (header.version != 1u && header.version != 2u &&
+             header.version != 3u) ||
             header.hidden_dim != expected_hidden_dim ||
             header.latent_dim == 0 ||
             header.latent_dim > ACTION_VALUE_MAX_LATENT_DIM) goto failure;
     if (header.version == 1u) header.reserved = ACTION_VALUE_HEAD_JOINT;
-    if (header.reserved > ACTION_VALUE_HEAD_FACTORIZED) goto failure;
+    if (header.reserved > ACTION_VALUE_HEAD_SELECTED) goto failure;
     model = action_value_model_create_with_head(
         (size_t)header.hidden_dim, (size_t)header.latent_dim, 0u,
         (ActionValueHeadMode)header.reserved);

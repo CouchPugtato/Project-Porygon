@@ -48,7 +48,7 @@ function sampleAction() {
         baseline_value: 0.2,
         behavior_log_prob: -2.3,
         hidden_dim: 3,
-        prior_hidden_state: [-0.1, -0.2, -0.3],
+        action_semantics: [1, 0, 1],
         hidden_state: [0.1, 0.2, 0.3],
         legal_mask: Array(28).fill(1),
     };
@@ -69,7 +69,7 @@ test('counterfactual records store the compact recurrent state and intervention'
     assert.equal(record.rollout_count, 3);
     assert.equal(record.continuation_seeds.length, 3);
     assert.deepEqual(record.hidden_state, [0.1, 0.2, 0.3]);
-    assert.deepEqual(record.prior_hidden_state, [-0.1, -0.2, -0.3]);
+    assert.deepEqual(record.action_semantics, [1, 0, 1]);
     assert.equal(record.legal_mask.length, 28);
 });
 
@@ -111,7 +111,7 @@ test('manifest recovery keeps complete pairs and skips crash-damaged files', asy
     };
     const manifest = await recoverManifestFromPairFiles(pairs, options);
     assert.equal(manifest.completed_pairs, 1);
-    assert.equal(manifest.schema_version, 4);
+    assert.equal(manifest.schema_version, 5);
     assert.equal(manifest.repeats_per_action, 3);
     assert.equal(manifest.attempts, 3);
     assert.equal(manifest.invalid_attempts, 2);
