@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+    adaptiveRolloutDecision,
     acquireRunLock,
     appendJsonLineDurably,
     battleFailureReason,
@@ -25,6 +26,7 @@ const {
     summarizeFailureLog,
     writeJsonAtomic,
 } = require('./counterfactual_rollout');
+const {moveRow} = require('./export_move_semantics');
 
 function sampleAction() {
     return {
@@ -58,7 +60,8 @@ test('counterfactual records store the compact recurrent state and intervention'
     const record = buildCounterfactualSample(
         sampleAction(), 'pair-7', 'parent.chk', -1 / 3,
         {returns: [-1, -1, 1], variance: 4 / 3,
-            continuationSeeds: ['1,2,3,4', '5,6,7,8', '9,10,11,12']});
+            continuationSeeds: ['1,2,3,4', '5,6,7,8', '9,10,11,12'],
+            stopReason: 'maximum_reached', preferenceConfidence: 0.5});
     assert.equal(record.type, 'counterfactual_sample');
     assert.equal(record.pair_id, 'pair-7');
     assert.equal(record.action_rank, 1);
@@ -68,6 +71,8 @@ test('counterfactual records store the compact recurrent state and intervention'
     assert.deepEqual(record.rollout_returns, [-1, -1, 1]);
     assert.equal(record.rollout_count, 3);
     assert.equal(record.continuation_seeds.length, 3);
+    assert.equal(record.rollout_stop_reason, 'maximum_reached');
+    assert.equal(record.paired_preference_confidence, 0.5);
     assert.deepEqual(record.hidden_state, [0.1, 0.2, 0.3]);
     assert.deepEqual(record.action_semantics, [1, 0, 1]);
     assert.equal(record.legal_mask.length, 28);
@@ -106,13 +111,20 @@ test('manifest recovery keeps complete pairs and skips crash-damaged files', asy
     const options = {
         runName: 'recovery-test', format: 'gen9randomdoublesbattle',
         checkpoint: 'parent.chk', opponentCheckpoint: 'opponent.chk', pairs: 5,
-        repeatsPerAction: 3, seed: 7, decisionMin: 0, decisionMax: 7,
+        minRepeatsPerAction: 3, maxRepeatsPerAction: 6,
+        adaptiveConfidence: 0.9, requiredActionSemanticDim: 3,
+        seed: 7, decisionMin: 0, decisionMax: 7,
         battleTimeoutSeconds: 180,
     };
     const manifest = await recoverManifestFromPairFiles(pairs, options);
     assert.equal(manifest.completed_pairs, 1);
-    assert.equal(manifest.schema_version, 5);
-    assert.equal(manifest.repeats_per_action, 3);
+    assert.equal(manifest.schema_version, 6);
+    assert.equal(manifest.min_repeats_per_action, 3);
+    assert.equal(manifest.max_repeats_per_action, 6);
+    assert.equal(manifest.action_semantic_dim, 3);
+    assert.equal(manifest.retained_branch_battles, 6);
+    assert.equal(manifest.action_semantic_dim, 3);
+    assert.equal(manifest.retained_branch_battles, 6);
     assert.equal(manifest.attempts, 3);
     assert.equal(manifest.invalid_attempts, 2);
     assert.equal(manifest.rank0_better, 1);
@@ -247,6 +259,36 @@ test('Showdown seed tuples are deterministic and attempt-specific', () => {
     assert.match(seedTuple(17, 4, 2), /^\d+,\d+,\d+,\d+$/);
     assert.equal(continuationSeed(17, 4, 0), continuationSeed(17, 4, 0));
     assert.notEqual(continuationSeed(17, 4, 0), continuationSeed(17, 4, 1));
+});
+
+test('adaptive rollout allocation stops decisive pairs and extends noisy pairs', () => {
+    const decisive = adaptiveRolloutDecision(
+        [1, 1, 1, 1], [-1, -1, -1, -1], 4, 12, 0.9);
+    assert.equal(decisive.stop, true);
+    assert.equal(decisive.reason, 'confidence_reached');
+    assert.equal(decisive.confidence, 1);
+
+    const uncertain = adaptiveRolloutDecision(
+        [1, -1, 1, -1], [-1, 1, -1, 1], 4, 12, 0.9);
+    assert.equal(uncertain.stop, false);
+    assert.equal(uncertain.reason, 'uncertain');
+
+    const exhausted = adaptiveRolloutDecision(
+        Array(12).fill(0), Array(12).fill(0), 4, 12, 0.9);
+    assert.equal(exhausted.stop, true);
+    assert.equal(exhausted.reason, 'maximum_reached');
+});
+
+test('generated move semantics retain doubles-relevant roles', () => {
+    const rockSlide = moveRow('rockslide');
+    const protect = moveRow('protect');
+    const helpingHand = moveRow('helpinghand');
+    assert.deepEqual(rockSlide.slice(1, 5), [75, 90, 2, 0]);
+    assert.equal(rockSlide[5], 1);
+    assert.equal(rockSlide[10], 1);
+    assert.equal(protect[7], 1);
+    assert.equal(helpingHand[4], 5);
+    assert.equal(helpingHand[19], 1);
 });
 
 test('signal audit separates action effects from same-action rollout noise', () => {

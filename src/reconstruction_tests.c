@@ -6123,6 +6123,44 @@ static int test_validation_split_is_stable_and_seeded(void) {
         "validation seed changes the split hash");
 }
 
+static int test_selected_action_semantics_include_move_roles(void) {
+    Observation observation;
+    ParsedRequest request;
+    FactorizedActionChoice choice;
+    MoveSemanticMetadata protect;
+    MoveSemanticMetadata helping_hand;
+    float semantics[ACTION_SEMANTIC_DIM];
+    int rock_slide = move_id_from_name("rockslide");
+    int ok = 1;
+    observation_init(&observation);
+    parsed_request_init(&request);
+    factorized_action_choice_init(&choice);
+    ok &= assert_true(move_semantics_from_id(
+        move_id_from_name("protect"), &protect) &&
+        protect.protection && protect.category == 1,
+        "move metadata identifies protection moves");
+    ok &= assert_true(move_semantics_from_id(
+        move_id_from_name("helpinghand"), &helping_hand) &&
+        helping_hand.ally_support && helping_hand.priority == 5,
+        "move metadata identifies prioritized ally support");
+    request.active[0].move_id[0] = rock_slide;
+    request.active[0].move_pp[0] = 9;
+    request.active[0].move_max_pp[0] = 10;
+    request.active[0].move_target[0] = REQUEST_TARGET_ALL_ADJACENT_FOES;
+    choice.slot0_has_action = 1;
+    choice.slot0_kind = FACTORIZED_ACTION_MOVE;
+    choice.slot0_move_index = 0;
+    ok &= assert_true(action_semantics_build(
+        semantics, ACTION_SEMANTIC_DIM, &observation, &request, &choice),
+        "build enriched selected-action semantics");
+    ok &= assert_true(nearly_equal(semantics[101], 75.0 / 250.0, 0.0001) &&
+        nearly_equal(semantics[102], 0.9, 0.0001) && semantics[104] == 1.0f,
+        "selected-action semantics include power accuracy and category");
+    ok &= assert_true(semantics[107] == 1.0f && semantics[112] == 1.0f,
+        "selected-action semantics identify spread damage");
+    return ok;
+}
+
 int main(int argc, char** argv) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
@@ -6178,6 +6216,7 @@ int main(int argc, char** argv) {
     if (!test_turn_number_not_overwritten_by_request()) return 1;
     if (!test_runtime_request_session_not_forced_doubles()) return 1;
     if (!test_runtime_counterfactual_ranks_are_distinct_and_reported()) return 1;
+    if (!test_selected_action_semantics_include_move_roles()) return 1;
     if (!test_counterfactual_dataset_preserves_whole_pairs()) return 1;
     if (!test_counterfactual_manifest_combines_owned_sources()) return 1;
     if (!test_counterfactual_preference_confidence_uses_repeat_uncertainty()) return 1;

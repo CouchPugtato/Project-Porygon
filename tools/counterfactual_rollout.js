@@ -59,6 +59,14 @@ function integerOption(options, name, fallback, minimum = Number.MIN_SAFE_INTEGE
     return value;
 }
 
+function numberOption(options, name, fallback, minimum, maximum) {
+    const value = options[name] === undefined ? fallback : Number(options[name]);
+    if (!Number.isFinite(value) || value < minimum || value > maximum) {
+        throw new Error(`--${name} must be between ${minimum} and ${maximum}`);
+    }
+    return value;
+}
+
 function booleanOption(options, name, fallback) {
     if (options[name] === undefined) return fallback;
     const value = String(options[name]).toLowerCase();
@@ -83,6 +91,12 @@ function resolveOptions(argv) {
         options, 'max-system-memory-percent', 70, 1);
     const maxSystemCpuPercent = integerOption(
         options, 'max-system-cpu-percent', 75, 1);
+    const legacyRepeats = options['repeats-per-action'] === undefined
+        ? null : integerOption(options, 'repeats-per-action', 4, 2);
+    const minRepeatsPerAction = legacyRepeats ?? integerOption(
+        options, 'min-repeats-per-action', 4, 2);
+    const maxRepeatsPerAction = legacyRepeats ?? integerOption(
+        options, 'max-repeats-per-action', 12, minRepeatsPerAction);
     if (!runName) throw new Error('--run-name is required');
     if (!options.checkpoint) throw new Error('--checkpoint is required');
     if (!fs.existsSync(checkpoint)) throw new Error(`checkpoint not found: ${checkpoint}`);
@@ -112,7 +126,12 @@ function resolveOptions(argv) {
         opponentCheckpoint,
         format,
         pairs: integerOption(options, 'pairs', 500, 1),
-        repeatsPerAction: integerOption(options, 'repeats-per-action', 3, 2),
+        minRepeatsPerAction,
+        maxRepeatsPerAction,
+        adaptiveConfidence: numberOption(
+            options, 'adaptive-confidence', 0.90, 0.5, 1.0),
+        requiredActionSemanticDim: integerOption(
+            options, 'required-action-semantic-dim', 244, 1),
         branchConcurrency,
         concurrency,
         maxAgentProcesses,
@@ -508,6 +527,8 @@ function buildCounterfactualSample(action, pairId, policyTag, returnValue, rollo
         sample.rollout_count = rollout.returns.length;
         sample.rollout_variance = rollout.variance;
         sample.continuation_seeds = rollout.continuationSeeds;
+        sample.rollout_stop_reason = rollout.stopReason;
+        sample.paired_preference_confidence = rollout.preferenceConfidence;
     }
     return sample;
 }
@@ -522,15 +543,64 @@ function sampleVariance(values, average = mean(values)) {
         (values.length - 1);
 }
 
-async function collectReplicatedBranches(
-    sim, options, resourceGate, attempt, decisionIndex
+function normalTwoSidedConfidence(zScore) {
+    if (!Number.isFinite(zScore) || zScore < 0) return 0;
+    const p = 0.3275911;
+    const a1 = 0.254829592;
+    const a2 = -0.284496736;
+    const a3 = 1.421413741;
+    const a4 = -1.453152027;
+    const a5 = 1.061405429;
+    const x = zScore / Math.sqrt(2);
+    const t = 1 / (1 + p * x);
+    const polynomial = (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t;
+    return Math.max(0, Math.min(1, 1 - polynomial * Math.exp(-x * x)));
+}
+
+function adaptiveRolloutDecision(
+    rank0Returns,
+    rank1Returns,
+    minRepeats,
+    maxRepeats,
+    requiredConfidence
 ) {
-    const requests = [];
-    for (let repeat = 0; repeat < options.repeatsPerAction; ++repeat) {
-        for (let rank = 0; rank < 2; ++rank) {
-            requests.push({rank, repeat});
-        }
+    const count = Math.min(rank0Returns.length, rank1Returns.length);
+    if (count < minRepeats) {
+        return {stop: false, confidence: 0, reason: 'minimum_not_reached'};
     }
+    const differences = [];
+    for (let i = 0; i < count; ++i) {
+        differences.push(rank0Returns[i] - rank1Returns[i]);
+    }
+    const average = mean(differences);
+    const variance = sampleVariance(differences, average);
+    const plannedLooks = maxRepeats - minRepeats + 1;
+    const perLookConfidence = 1 - (1 - requiredConfidence) / plannedLooks;
+    let confidence = 0;
+    if (Math.abs(average) > Number.EPSILON) {
+        confidence = variance <= Number.EPSILON
+            ? 1
+            : normalTwoSidedConfidence(
+                Math.abs(average) / Math.sqrt(variance / count));
+    }
+    if (confidence >= perLookConfidence) {
+        return {
+            stop: true, confidence, perLookConfidence,
+            reason: 'confidence_reached',
+        };
+    }
+    if (count >= maxRepeats) {
+        return {
+            stop: true, confidence, perLookConfidence,
+            reason: 'maximum_reached',
+        };
+    }
+    return {stop: false, confidence, perLookConfidence, reason: 'uncertain'};
+}
+
+async function runBranchRequests(
+    sim, options, resourceGate, attempt, decisionIndex, requests
+) {
     const completed = new Array(requests.length);
     let nextRequest = 0;
     async function worker() {
@@ -545,10 +615,39 @@ async function collectReplicatedBranches(
     await Promise.all(Array.from(
         {length: Math.min(options.branchConcurrency, requests.length)},
         () => worker()));
-    return {
-        rank0: completed.filter((_, index) => index % 2 === 0),
-        rank1: completed.filter((_, index) => index % 2 === 1),
-    };
+    return completed;
+}
+
+async function collectReplicatedBranches(
+    sim, options, resourceGate, attempt, decisionIndex
+) {
+    const initialRequests = [];
+    for (let repeat = 0; repeat < options.minRepeatsPerAction; ++repeat) {
+        for (let rank = 0; rank < 2; ++rank) {
+            initialRequests.push({rank, repeat});
+        }
+    }
+    const initial = await runBranchRequests(
+        sim, options, resourceGate, attempt, decisionIndex, initialRequests);
+    const rank0 = initial.filter((_, index) => index % 2 === 0);
+    const rank1 = initial.filter((_, index) => index % 2 === 1);
+    let decision;
+    while (true) {
+        decision = adaptiveRolloutDecision(
+            rank0.map(branch => branch.result.reward),
+            rank1.map(branch => branch.result.reward),
+            options.minRepeatsPerAction,
+            options.maxRepeatsPerAction,
+            options.adaptiveConfidence);
+        if (decision.stop) break;
+        const repeat = rank0.length;
+        const next = await runBranchRequests(
+            sim, options, resourceGate, attempt, decisionIndex,
+            [{rank: 0, repeat}, {rank: 1, repeat}]);
+        rank0.push(next[0]);
+        rank1.push(next[1]);
+    }
+    return {rank0, rank1, adaptive: decision};
 }
 
 async function runPair(sim, options, resourceGate, attempt) {
@@ -580,6 +679,17 @@ async function runPair(sim, options, resourceGate, attempt) {
             choiceRejections,
         };
     }
+    if (allBranches.some(branch =>
+            !Array.isArray(branch.intervention.action_semantics) ||
+            branch.intervention.action_semantics.length !==
+                options.requiredActionSemanticDim)) {
+        return {
+            valid: false,
+            reason: 'action_semantic_schema_mismatch',
+            message: `runtime did not emit ${options.requiredActionSemanticDim} action semantics`,
+            choiceRejections,
+        };
+    }
     const choice0 = interventionChoice(branches.rank0[0].intervention);
     const choice1 = interventionChoice(branches.rank1[0].intervention);
     if (branches.rank0.some(branch =>
@@ -607,17 +717,21 @@ async function runPair(sim, options, resourceGate, attempt) {
     const rank0Mean = mean(rank0Returns);
     const rank1Mean = mean(rank1Returns);
     const continuationSeeds = Array.from(
-        {length: options.repeatsPerAction},
+        {length: rank0Returns.length},
         (_, repeat) => continuationSeed(options.seed, attempt, repeat));
     const rank0Rollout = {
         returns: rank0Returns,
         variance: sampleVariance(rank0Returns, rank0Mean),
         continuationSeeds,
+        stopReason: branches.adaptive.reason,
+        preferenceConfidence: branches.adaptive.confidence,
     };
     const rank1Rollout = {
         returns: rank1Returns,
         variance: sampleVariance(rank1Returns, rank1Mean),
         continuationSeeds,
+        stopReason: branches.adaptive.reason,
+        preferenceConfidence: branches.adaptive.confidence,
     };
     return {
         valid: true,
@@ -630,6 +744,8 @@ async function runPair(sim, options, resourceGate, attempt) {
         rank1Returns,
         choice0,
         choice1,
+        adaptiveConfidence: branches.adaptive.confidence,
+        adaptiveStopReason: branches.adaptive.reason,
         choiceRejections,
         records: [
             buildCounterfactualSample(
@@ -761,14 +877,17 @@ async function summarizeFailureLog(filePath) {
 
 function emptyManifest(options) {
     return {
-        schema_version: 5,
+        schema_version: 6,
         status: 'running',
         run_name: options.runName,
         format: options.format,
         checkpoint: options.checkpoint,
         opponent_checkpoint: options.opponentCheckpoint,
         requested_pairs: options.pairs,
-        repeats_per_action: options.repeatsPerAction,
+        min_repeats_per_action: options.minRepeatsPerAction,
+        max_repeats_per_action: options.maxRepeatsPerAction,
+        adaptive_confidence: options.adaptiveConfidence,
+        action_semantic_dim: options.requiredActionSemanticDim,
         seed: options.seed,
         decision_min: options.decisionMin,
         decision_max: options.decisionMax,
@@ -795,6 +914,9 @@ function emptyManifest(options) {
         rank0_better: 0,
         rank1_better: 0,
         equal_returns: 0,
+        confidence_stops: 0,
+        maximum_repeat_stops: 0,
+        retained_branch_battles: 0,
         elapsed_seconds: 0,
         pairs: [],
     };
@@ -802,12 +924,15 @@ function emptyManifest(options) {
 
 function assertResumeCompatible(manifest, options) {
     for (const [key, expected] of [
-        ['schema_version', 5],
+        ['schema_version', 6],
         ['run_name', options.runName], ['format', options.format],
         ['checkpoint', options.checkpoint], ['opponent_checkpoint', options.opponentCheckpoint],
         ['seed', options.seed], ['decision_min', options.decisionMin],
         ['decision_max', options.decisionMax],
-        ['repeats_per_action', options.repeatsPerAction],
+        ['min_repeats_per_action', options.minRepeatsPerAction],
+        ['max_repeats_per_action', options.maxRepeatsPerAction],
+        ['adaptive_confidence', options.adaptiveConfidence],
+        ['action_semantic_dim', options.requiredActionSemanticDim],
         ['battle_timeout_seconds', options.battleTimeoutSeconds],
     ]) {
         if (manifest[key] !== expected) {
@@ -852,12 +977,18 @@ function pairEntryFromRecords(filename, attempt, records) {
         rank1_variance: Number(rank1.rollout_variance) || 0,
         continuation_seeds: Array.isArray(rank0.continuation_seeds)
             ? rank0.continuation_seeds : [],
+        action_semantic_dim: Array.isArray(rank0.action_semantics)
+            ? rank0.action_semantics.length : 0,
+        repeats_used: Array.isArray(rank0.rollout_returns)
+            ? rank0.rollout_returns.length : 1,
+        adaptive_confidence: Number(rank0.paired_preference_confidence) || 0,
+        adaptive_stop_reason: rank0.rollout_stop_reason || 'legacy_fixed_repeats',
         rank0_choice: choiceFromRecord(rank0),
         rank1_choice: choiceFromRecord(rank1),
     };
 }
 
-function summarizeCounterfactualSignal(pairs, repeatsPerAction) {
+function summarizeCounterfactualSignal(pairs, minimumRepeatsPerAction) {
     let usablePairs = 0;
     let treatmentComparisons = 0;
     let treatmentDisagreements = 0;
@@ -953,7 +1084,7 @@ function summarizeCounterfactualSignal(pairs, repeatsPerAction) {
         : 0;
     const pairedLiftLower95 = pairedLiftMean - 1.96 * pairedLiftStandardError;
     const pairedLiftUpper95 = pairedLiftMean + 1.96 * pairedLiftStandardError;
-    const enoughEvidence = usablePairs >= 30 && repeatsPerAction >= 2;
+    const enoughEvidence = usablePairs >= 30 && minimumRepeatsPerAction >= 2;
     const effectAboveNoise = zeroNoiseFloor
         ? effectRms > 0
         : signalToNoiseRatio >= 1.25;
@@ -961,7 +1092,7 @@ function summarizeCounterfactualSignal(pairs, repeatsPerAction) {
         pairedLiftLower95 > 0 && reliablePairRate >= 0.2;
 
     return {
-        requested_repeats_per_action: repeatsPerAction,
+        requested_min_repeats_per_action: minimumRepeatsPerAction,
         usable_decision_pairs: usablePairs,
         treatment_comparisons: treatmentComparisons,
         same_action_control_comparisons: controlComparisons,
@@ -1003,25 +1134,41 @@ function summarizeCounterfactualSignal(pairs, repeatsPerAction) {
 }
 
 function buildSignalAudit(options, manifest) {
+    const repeatHistogram = {};
+    for (const pair of manifest.pairs) {
+        const repeats = Number(pair.repeats_used) || 0;
+        repeatHistogram[repeats] = (repeatHistogram[repeats] || 0) + 1;
+    }
     return {
         diagnostic: 'counterfactual_rollout_signal_audit',
-        metrics_version: 2,
+        metrics_version: 3,
         run_name: options.runName,
         format: options.format,
         checkpoint: options.checkpoint,
         opponent_checkpoint: options.opponentCheckpoint,
         seed: options.seed,
         completed_decision_pairs: manifest.completed_pairs,
-        repeats_per_action: options.repeatsPerAction,
-        branch_battles_completed:
-            manifest.completed_pairs * options.repeatsPerAction * 2,
+        min_repeats_per_action: options.minRepeatsPerAction,
+        max_repeats_per_action: options.maxRepeatsPerAction,
+        adaptive_confidence: options.adaptiveConfidence,
+        action_semantic_dim: options.requiredActionSemanticDim,
+        retained_branch_battles: manifest.retained_branch_battles,
+        allocation: {
+            confidence_stops: manifest.confidence_stops,
+            maximum_repeat_stops: manifest.maximum_repeat_stops,
+            mean_repeats_per_action: manifest.completed_pairs > 0
+                ? manifest.retained_branch_battles / (2 * manifest.completed_pairs)
+                : 0,
+            repeat_histogram: repeatHistogram,
+            confidence_correction: 'Bonferroni across sequential looks',
+        },
         design: {
             prefix: 'identical battle, team, and agent seeds through the intervention',
             treatment: 'rank-zero versus rank-one under the same continuation seed',
             control: 'the same action under different continuation seeds',
         },
         metrics: summarizeCounterfactualSignal(
-            manifest.pairs, options.repeatsPerAction),
+            manifest.pairs, options.minRepeatsPerAction),
     };
 }
 
@@ -1096,8 +1243,11 @@ async function recoverManifestFromPairFiles(pairDir, options, priorManifest = nu
             const lines = text.split(/\r?\n/).filter(line => line.trim());
             const entry = pairEntryFromRecords(
                 filename, attempt, lines.map(line => JSON.parse(line)));
-            if (entry) manifest.pairs.push(entry);
-            else ++unreadablePairFiles;
+            if (entry && entry.action_semantic_dim === options.requiredActionSemanticDim) {
+                manifest.pairs.push(entry);
+            } else {
+                ++unreadablePairFiles;
+            }
         } catch (_) {
             ++unreadablePairFiles;
         }
@@ -1113,6 +1263,12 @@ async function recoverManifestFromPairFiles(pairDir, options, priorManifest = nu
         if (pair.rank0_return > pair.rank1_return) ++manifest.rank0_better;
         else if (pair.rank1_return > pair.rank0_return) ++manifest.rank1_better;
         else ++manifest.equal_returns;
+        manifest.retained_branch_battles += pair.repeats_used * 2;
+        if (pair.adaptive_stop_reason === 'confidence_reached') {
+            ++manifest.confidence_stops;
+        } else if (pair.adaptive_stop_reason === 'maximum_reached') {
+            ++manifest.maximum_repeat_stops;
+        }
     }
 
     manifest.invalid_attempts = Math.max(0, manifest.attempts - manifest.completed_pairs);
@@ -1357,10 +1513,19 @@ async function collect(
                     rank1_returns: result.rank1Returns,
                     rank0_variance: sampleVariance(result.rank0Returns, result.rank0Return),
                     rank1_variance: sampleVariance(result.rank1Returns, result.rank1Return),
+                    repeats_used: result.rank0Returns.length,
+                    adaptive_confidence: result.adaptiveConfidence,
+                    adaptive_stop_reason: result.adaptiveStopReason,
                     rank0_choice: result.choice0,
                     rank1_choice: result.choice1,
                 });
                 ++manifest.completed_pairs;
+                manifest.retained_branch_battles += result.rank0Returns.length * 2;
+                if (result.adaptiveStopReason === 'confidence_reached') {
+                    ++manifest.confidence_stops;
+                } else {
+                    ++manifest.maximum_repeat_stops;
+                }
                 if (result.rank0Return > result.rank1Return) ++manifest.rank0_better;
                 else if (result.rank1Return > result.rank0Return) ++manifest.rank1_better;
                 else ++manifest.equal_returns;
@@ -1377,6 +1542,9 @@ async function collect(
             console.log(
                 `[counterfactual] pairs=${manifest.completed_pairs}/${options.pairs} ` +
                 `attempts=${manifest.attempts}/${maximumAttempts} invalid=${manifest.invalid_attempts} ` +
+                `mean_repeats=${manifest.completed_pairs > 0
+                    ? (manifest.retained_branch_battles / (2 * manifest.completed_pairs)).toFixed(1)
+                    : '0.0'} ` +
                 `elapsed=${formatDuration(elapsed)} eta=${formatDuration(eta)}`
             );
         } finally {
@@ -1468,6 +1636,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+    adaptiveRolloutDecision,
     appendJsonLineDurably,
     battleFailureReason,
     buildSignalAudit,

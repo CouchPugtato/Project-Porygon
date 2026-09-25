@@ -18,7 +18,12 @@ enum {
     SEM_SWITCH_TYPE2 = 68,
     SEM_SWITCH_STATUS = 87,
     SEM_SWITCH_HP = 94,
-    SEM_SWITCH_STATS = 95
+    SEM_SWITCH_STATS = 95,
+    SEM_MOVE_BASE_POWER = 101,
+    SEM_MOVE_ACCURACY = 102,
+    SEM_MOVE_CATEGORY = 103,
+    SEM_MOVE_PRIORITY = 106,
+    SEM_MOVE_ROLES = 107
 };
 
 static void set_one_hot(float* values, size_t start, size_t count, int index) {
@@ -29,6 +34,41 @@ static float normalized_stat(int value) {
     if (value <= 0) return 0.0f;
     if (value >= 1000) return 1.0f;
     return (float)value / 1000.0f;
+}
+
+static float clamp_ratio(int value, int denominator) {
+    if (value <= -denominator) return -1.0f;
+    if (value >= denominator) return 1.0f;
+    return (float)value / (float)denominator;
+}
+
+static void write_move_metadata(float* values, int move_id) {
+    MoveSemanticMetadata metadata;
+    unsigned char roles[15];
+    size_t i;
+    if (!move_semantics_from_id(move_id, &metadata)) return;
+    roles[0] = metadata.spread;
+    roles[1] = metadata.healing;
+    roles[2] = metadata.protection;
+    roles[3] = metadata.setup;
+    roles[4] = metadata.redirection;
+    roles[5] = metadata.damaging;
+    roles[6] = metadata.recoil;
+    roles[7] = metadata.drain;
+    roles[8] = metadata.self_switch;
+    roles[9] = metadata.force_switch;
+    roles[10] = metadata.status_effect;
+    roles[11] = metadata.weather;
+    roles[12] = metadata.terrain;
+    roles[13] = metadata.field_effect;
+    roles[14] = metadata.ally_support;
+    values[SEM_MOVE_BASE_POWER] = clamp_ratio(metadata.base_power, 250);
+    values[SEM_MOVE_ACCURACY] = clamp_ratio(metadata.accuracy, 100);
+    set_one_hot(values, SEM_MOVE_CATEGORY, 3u, metadata.category - 1);
+    values[SEM_MOVE_PRIORITY] = clamp_ratio(metadata.priority, 7);
+    for (i = 0; i < sizeof(roles) / sizeof(roles[0]); ++i) {
+        values[SEM_MOVE_ROLES + i] = roles[i] ? 1.0f : 0.0f;
+    }
 }
 
 static void build_slot(
@@ -66,6 +106,7 @@ static void build_slot(
         }
         values[SEM_TERA] = use_tera ? 1.0f : 0.0f;
         set_one_hot(values, SEM_SELECTED_TARGET, FACTORIZED_TARGET_DIM, target_index);
+        write_move_metadata(values, move_id);
         return;
     }
     if (kind == FACTORIZED_ACTION_SWITCH && switch_index >= 0 &&

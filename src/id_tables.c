@@ -20,10 +20,13 @@ static IdTable g_type_table = {0};
 static int* g_species_type1 = NULL;
 static int* g_species_type2 = NULL;
 static int* g_move_type = NULL;
+static MoveSemanticMetadata* g_move_semantics = NULL;
 static int g_species_type_capacity = 0;
 static int g_species_type_entries = 0;
 static int g_move_type_capacity = 0;
 static int g_move_type_entries = 0;
+static int g_move_semantic_capacity = 0;
+static int g_move_semantic_entries = 0;
 
 static void normalize_token(const char* in, char* out, size_t out_len) {
     size_t i = 0;
@@ -247,6 +250,73 @@ static int ensure_move_type_capacity(int move_id) {
     return 1;
 }
 
+static int ensure_move_semantic_capacity(int move_id) {
+    int new_capacity;
+    MoveSemanticMetadata* resized;
+    if (move_id <= g_move_semantic_capacity) return 1;
+    new_capacity = g_move_semantic_capacity ? g_move_semantic_capacity : 32;
+    while (new_capacity < move_id) new_capacity *= 2;
+    resized = (MoveSemanticMetadata*)realloc(
+        g_move_semantics, (size_t)new_capacity * sizeof(*resized));
+    if (!resized) return 0;
+    memset(resized + g_move_semantic_capacity, 0,
+        (size_t)(new_capacity - g_move_semantic_capacity) * sizeof(*resized));
+    g_move_semantics = resized;
+    g_move_semantic_capacity = new_capacity;
+    return 1;
+}
+
+static int load_move_semantics_file(const char* path) {
+    FILE* f = fopen(path, "r");
+    char line[512];
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f)) {
+        char* fields[20];
+        char* token;
+        int count = 0;
+        int move_id;
+        MoveSemanticMetadata metadata;
+        if (line[0] == '#') continue;
+        token = strtok(line, ",\r\n");
+        while (token && count < 20) {
+            fields[count++] = token;
+            token = strtok(NULL, ",\r\n");
+        }
+        if (count != 20) continue;
+        move_id = move_id_from_name(fields[0]);
+        if (move_id <= 0 || !ensure_move_semantic_capacity(move_id)) {
+            fclose(f);
+            return 0;
+        }
+        memset(&metadata, 0, sizeof(metadata));
+        metadata.base_power = atoi(fields[1]);
+        metadata.accuracy = atoi(fields[2]);
+        metadata.category = atoi(fields[3]);
+        metadata.priority = atoi(fields[4]);
+#define READ_ROLE(field, index) metadata.field = (unsigned char)(atoi(fields[index]) != 0)
+        READ_ROLE(spread, 5);
+        READ_ROLE(healing, 6);
+        READ_ROLE(protection, 7);
+        READ_ROLE(setup, 8);
+        READ_ROLE(redirection, 9);
+        READ_ROLE(damaging, 10);
+        READ_ROLE(recoil, 11);
+        READ_ROLE(drain, 12);
+        READ_ROLE(self_switch, 13);
+        READ_ROLE(force_switch, 14);
+        READ_ROLE(status_effect, 15);
+        READ_ROLE(weather, 16);
+        READ_ROLE(terrain, 17);
+        READ_ROLE(field_effect, 18);
+        READ_ROLE(ally_support, 19);
+#undef READ_ROLE
+        g_move_semantics[move_id - 1] = metadata;
+        ++g_move_semantic_entries;
+    }
+    fclose(f);
+    return g_move_semantic_entries > 0;
+}
+
 static int load_move_types_file(const char* path) {
     FILE* f;
     char line[256];
@@ -349,6 +419,7 @@ int id_tables_init(void) {
     /* Optional while the repository is being upgraded to exact type reconstruction. */
     load_species_types_file("data/species_types.txt");
     load_move_types_file("data/move_types.txt");
+    load_move_semantics_file("data/move_semantics.txt");
     if (g_species_type_entries > 0 && g_species_type_entries < 100) {
         fprintf(stderr,
             "[id_tables] warning: data/species_types.txt only loaded %d entries; rerun py/tools/showdown_vocab_export.py\n",
@@ -358,6 +429,11 @@ int id_tables_init(void) {
         fprintf(stderr,
             "[id_tables] warning: data/move_types.txt only loaded %d entries; rerun py/tools/showdown_vocab_export.py\n",
             g_move_type_entries);
+    }
+    if (g_move_semantic_entries < 100) {
+        fprintf(stderr,
+            "[id_tables] warning: data/move_semantics.txt only loaded %d entries; rerun node tools/export_move_semantics.js\n",
+            g_move_semantic_entries);
     }
     return 1;
 }
@@ -429,4 +505,12 @@ int move_type_from_id(int id) {
         return 0;
     }
     return g_move_type[id - 1];
+}
+
+int move_semantics_from_id(int id, MoveSemanticMetadata* output) {
+    if (!output) return 0;
+    memset(output, 0, sizeof(*output));
+    if (id <= 0 || id > g_move_semantic_capacity || !g_move_semantics) return 0;
+    *output = g_move_semantics[id - 1];
+    return 1;
 }

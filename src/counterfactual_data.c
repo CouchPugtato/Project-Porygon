@@ -275,11 +275,22 @@ static int parse_sample(
         if (!read_float_array(
                 line, "action_semantics", sample->action_semantics,
                 ACTION_SEMANTIC_DIM)) {
-            free(sample->hidden_state);
-            free(sample->rollout_returns);
-            sample->hidden_state = NULL;
-            sample->rollout_returns = NULL;
-            return 0;
+            float legacy[ACTION_SEMANTIC_LEGACY_DIM];
+            memset(sample->action_semantics, 0, sizeof(sample->action_semantics));
+            if (!read_float_array(
+                    line, "action_semantics", legacy,
+                    ACTION_SEMANTIC_LEGACY_DIM)) {
+                free(sample->hidden_state);
+                free(sample->rollout_returns);
+                sample->hidden_state = NULL;
+                sample->rollout_returns = NULL;
+                return 0;
+            }
+            memcpy(sample->action_semantics, legacy,
+                ACTION_SEMANTIC_LEGACY_SLOT_DIM * sizeof(*legacy));
+            memcpy(sample->action_semantics + ACTION_SEMANTIC_SLOT_DIM,
+                legacy + ACTION_SEMANTIC_LEGACY_SLOT_DIM,
+                ACTION_SEMANTIC_LEGACY_SLOT_DIM * sizeof(*legacy));
         }
         sample->semantic_state = (float*)malloc(
             (hidden_dim + ACTION_SEMANTIC_DIM) *
