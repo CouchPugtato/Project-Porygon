@@ -2,6 +2,7 @@ format = "gen9randomdoublesbattle"
 pairs = 500
 min_repeats_per_action = 4
 max_repeats_per_action = 12
+adaptive_repeat_step = 4
 adaptive_confidence = 0.90
 required_action_semantic_dim = 244
 branch_concurrency = 3

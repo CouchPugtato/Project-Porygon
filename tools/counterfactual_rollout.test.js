@@ -111,16 +111,17 @@ test('manifest recovery keeps complete pairs and skips crash-damaged files', asy
     const options = {
         runName: 'recovery-test', format: 'gen9randomdoublesbattle',
         checkpoint: 'parent.chk', opponentCheckpoint: 'opponent.chk', pairs: 5,
-        minRepeatsPerAction: 3, maxRepeatsPerAction: 6,
+        minRepeatsPerAction: 3, maxRepeatsPerAction: 6, adaptiveRepeatStep: 3,
         adaptiveConfidence: 0.9, requiredActionSemanticDim: 3,
         seed: 7, decisionMin: 0, decisionMax: 7,
         battleTimeoutSeconds: 180,
     };
     const manifest = await recoverManifestFromPairFiles(pairs, options);
     assert.equal(manifest.completed_pairs, 1);
-    assert.equal(manifest.schema_version, 6);
+    assert.equal(manifest.schema_version, 7);
     assert.equal(manifest.min_repeats_per_action, 3);
     assert.equal(manifest.max_repeats_per_action, 6);
+    assert.equal(manifest.adaptive_repeat_step, 3);
     assert.equal(manifest.action_semantic_dim, 3);
     assert.equal(manifest.retained_branch_battles, 6);
     assert.equal(manifest.action_semantic_dim, 3);
@@ -263,18 +264,18 @@ test('Showdown seed tuples are deterministic and attempt-specific', () => {
 
 test('adaptive rollout allocation stops decisive pairs and extends noisy pairs', () => {
     const decisive = adaptiveRolloutDecision(
-        [1, 1, 1, 1], [-1, -1, -1, -1], 4, 12, 0.9);
+        [1, 1, 1, 1], [-1, -1, -1, -1], 4, 12, 0.9, 4);
     assert.equal(decisive.stop, true);
     assert.equal(decisive.reason, 'confidence_reached');
     assert.equal(decisive.confidence, 1);
 
     const uncertain = adaptiveRolloutDecision(
-        [1, -1, 1, -1], [-1, 1, -1, 1], 4, 12, 0.9);
+        [1, -1, 1, -1], [-1, 1, -1, 1], 4, 12, 0.9, 4);
     assert.equal(uncertain.stop, false);
     assert.equal(uncertain.reason, 'uncertain');
 
     const exhausted = adaptiveRolloutDecision(
-        Array(12).fill(0), Array(12).fill(0), 4, 12, 0.9);
+        Array(12).fill(0), Array(12).fill(0), 4, 12, 0.9, 4);
     assert.equal(exhausted.stop, true);
     assert.equal(exhausted.reason, 'maximum_reached');
 });

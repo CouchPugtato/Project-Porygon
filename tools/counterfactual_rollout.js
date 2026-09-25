@@ -97,6 +97,8 @@ function resolveOptions(argv) {
         options, 'min-repeats-per-action', 4, 2);
     const maxRepeatsPerAction = legacyRepeats ?? integerOption(
         options, 'max-repeats-per-action', 12, minRepeatsPerAction);
+    const adaptiveRepeatStep = integerOption(
+        options, 'adaptive-repeat-step', 4, 1);
     if (!runName) throw new Error('--run-name is required');
     if (!options.checkpoint) throw new Error('--checkpoint is required');
     if (!fs.existsSync(checkpoint)) throw new Error(`checkpoint not found: ${checkpoint}`);
@@ -128,6 +130,7 @@ function resolveOptions(argv) {
         pairs: integerOption(options, 'pairs', 500, 1),
         minRepeatsPerAction,
         maxRepeatsPerAction,
+        adaptiveRepeatStep,
         adaptiveConfidence: numberOption(
             options, 'adaptive-confidence', 0.90, 0.5, 1.0),
         requiredActionSemanticDim: integerOption(
@@ -562,7 +565,8 @@ function adaptiveRolloutDecision(
     rank1Returns,
     minRepeats,
     maxRepeats,
-    requiredConfidence
+    requiredConfidence,
+    repeatStep = 1
 ) {
     const count = Math.min(rank0Returns.length, rank1Returns.length);
     if (count < minRepeats) {
@@ -574,7 +578,7 @@ function adaptiveRolloutDecision(
     }
     const average = mean(differences);
     const variance = sampleVariance(differences, average);
-    const plannedLooks = maxRepeats - minRepeats + 1;
+    const plannedLooks = Math.ceil((maxRepeats - minRepeats) / repeatStep) + 1;
     const perLookConfidence = 1 - (1 - requiredConfidence) / plannedLooks;
     let confidence = 0;
     if (Math.abs(average) > Number.EPSILON) {
@@ -638,14 +642,23 @@ async function collectReplicatedBranches(
             rank1.map(branch => branch.result.reward),
             options.minRepeatsPerAction,
             options.maxRepeatsPerAction,
-            options.adaptiveConfidence);
+            options.adaptiveConfidence,
+            options.adaptiveRepeatStep);
         if (decision.stop) break;
-        const repeat = rank0.length;
+        const nextRepeatCount = Math.min(
+            options.maxRepeatsPerAction,
+            rank0.length + options.adaptiveRepeatStep);
+        const requests = [];
+        for (let repeat = rank0.length; repeat < nextRepeatCount; ++repeat) {
+            requests.push({rank: 0, repeat}, {rank: 1, repeat});
+        }
         const next = await runBranchRequests(
             sim, options, resourceGate, attempt, decisionIndex,
-            [{rank: 0, repeat}, {rank: 1, repeat}]);
-        rank0.push(next[0]);
-        rank1.push(next[1]);
+            requests);
+        for (let index = 0; index < next.length; index += 2) {
+            rank0.push(next[index]);
+            rank1.push(next[index + 1]);
+        }
     }
     return {rank0, rank1, adaptive: decision};
 }
@@ -877,7 +890,7 @@ async function summarizeFailureLog(filePath) {
 
 function emptyManifest(options) {
     return {
-        schema_version: 6,
+        schema_version: 7,
         status: 'running',
         run_name: options.runName,
         format: options.format,
@@ -886,6 +899,7 @@ function emptyManifest(options) {
         requested_pairs: options.pairs,
         min_repeats_per_action: options.minRepeatsPerAction,
         max_repeats_per_action: options.maxRepeatsPerAction,
+        adaptive_repeat_step: options.adaptiveRepeatStep,
         adaptive_confidence: options.adaptiveConfidence,
         action_semantic_dim: options.requiredActionSemanticDim,
         seed: options.seed,
@@ -924,13 +938,14 @@ function emptyManifest(options) {
 
 function assertResumeCompatible(manifest, options) {
     for (const [key, expected] of [
-        ['schema_version', 6],
+        ['schema_version', 7],
         ['run_name', options.runName], ['format', options.format],
         ['checkpoint', options.checkpoint], ['opponent_checkpoint', options.opponentCheckpoint],
         ['seed', options.seed], ['decision_min', options.decisionMin],
         ['decision_max', options.decisionMax],
         ['min_repeats_per_action', options.minRepeatsPerAction],
         ['max_repeats_per_action', options.maxRepeatsPerAction],
+        ['adaptive_repeat_step', options.adaptiveRepeatStep],
         ['adaptive_confidence', options.adaptiveConfidence],
         ['action_semantic_dim', options.requiredActionSemanticDim],
         ['battle_timeout_seconds', options.battleTimeoutSeconds],
@@ -1150,6 +1165,7 @@ function buildSignalAudit(options, manifest) {
         completed_decision_pairs: manifest.completed_pairs,
         min_repeats_per_action: options.minRepeatsPerAction,
         max_repeats_per_action: options.maxRepeatsPerAction,
+        adaptive_repeat_step: options.adaptiveRepeatStep,
         adaptive_confidence: options.adaptiveConfidence,
         action_semantic_dim: options.requiredActionSemanticDim,
         retained_branch_battles: manifest.retained_branch_battles,
