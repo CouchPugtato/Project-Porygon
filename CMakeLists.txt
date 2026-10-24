@@ -95,6 +95,8 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/gru_trainer.c
 	src/action_value.c
 	src/action_semantics.c
+	src/tactical_scoring.c
+	src/tactical_policy.c
 	src/counterfactual_data.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c

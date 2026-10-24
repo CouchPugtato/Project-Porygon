@@ -2328,7 +2328,8 @@ static int run_runtime_mode(
     const EnvDenseRewardConfig* dense_reward_config,
     int inference_seed,
     int counterfactual_decision_index,
-    int counterfactual_action_rank
+    int counterfactual_action_rank,
+    int tactical_teacher
 ) {
     GruModel* model = NULL;
     TrainerCheckpointState state;
@@ -2340,6 +2341,12 @@ static int run_runtime_mode(
     FILE* replay_file = NULL;
     const char* replay_path = getenv("PORYGON_REPLAY_PATH");
     EnvRewardMode reward_mode;
+
+    if (tactical_teacher && (!checkpoint_path || !*checkpoint_path ||
+            counterfactual_decision_index >= 0)) {
+        fprintf(stderr, "[runtime] tactical teacher requires a fallback checkpoint and cannot use counterfactual interventions\n");
+        return 1;
+    }
 
     if (!parse_reward_mode(reward_mode_name, &reward_mode)) {
         fprintf(stderr, "[runtime] unsupported reward mode '%s'\n", reward_mode_name ? reward_mode_name : "");
@@ -2377,7 +2384,7 @@ static int run_runtime_mode(
     if (!env_runtime_init(&runtime, model, replay_file, 0, reward_mode, dense_reward_config,
             resolved_checkpoint_path ? resolved_checkpoint_path : checkpoint_path)) {
         fprintf(stderr, "Failed to initialize runtime\n");
-        fclose(replay_file);
+        if (replay_file) fclose(replay_file);
         gru_model_destroy(model);
         return 1;
     }
@@ -2391,7 +2398,16 @@ static int run_runtime_mode(
         free(resolved_checkpoint_path);
         return 1;
     }
-    runtime_emit_ready_json(json, sizeof(json));
+    if (tactical_teacher && !env_runtime_enable_tactical_teacher(&runtime)) {
+        env_runtime_free(&runtime);
+        if (replay_file) fclose(replay_file);
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
+        return 1;
+    }
+    if (tactical_teacher) snprintf(json, sizeof(json),
+        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"tactical_teacher\":true}}");
+    else runtime_emit_ready_json(json, sizeof(json));
     puts(json);
     fflush(stdout);
 
@@ -4708,6 +4724,7 @@ static int showdown_client_main(int argc, char** argv) {
     int validation_seed = parse_int_flag(argc, argv, "--validation-seed", 1337);
     int aux_checkpoints = parse_bool01_flag(argc, argv, "--aux-checkpoints", 1);
     int inference_seed = parse_int_flag(argc, argv, "--inference-seed", -1);
+    int tactical_teacher = parse_bool01_flag(argc, argv, "--tactical-teacher", 0);
     int counterfactual_decision_index = parse_int_flag(
         argc, argv, "--counterfactual-decision", -1);
     int counterfactual_action_rank = parse_int_flag(
@@ -4979,7 +4996,8 @@ static int showdown_client_main(int argc, char** argv) {
             &reward_config.dense_additive,
             inference_seed,
             counterfactual_decision_index,
-            counterfactual_action_rank);
+            counterfactual_action_rank,
+            tactical_teacher);
     }
     if (argc >= 4 && overfit_command) {
         return run_supervised_overfit_check(
@@ -5412,7 +5430,7 @@ static int showdown_client_main(int argc, char** argv) {
 #else
         fprintf(stderr,
         "Usage:\n"
-        "  showdown_client --battle-agent [checkpoint] [--inference-seed N] [--counterfactual-decision N --counterfactual-rank N] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
+        "  showdown_client --battle-agent [checkpoint] [--tactical-teacher 0|1] [--inference-seed N] [--counterfactual-decision N --counterfactual-rank N] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"

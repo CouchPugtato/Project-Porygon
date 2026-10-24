@@ -1,5 +1,11 @@
 Default entrypoint config files.
 
+`experimental/tactical_teacher_smoke.json` configures
+`node tools/tactical_teacher_smoke.js --run-name <name>`. It runs six serial
+battles with the tactical override alternating sides against its parent,
+one OpenMP thread per agent, and 65% launch gates for system CPU and memory.
+It records coverage and choice failures rather than publishing training data.
+
 `experimental/counterfactual_preference_comparison.json` supplies the fixed
 four-split comparison in `tools/run_counterfactual_preference_comparison.ps1`.
 This PowerShell runner reads JSON rather than the TOML entrypoint format below.

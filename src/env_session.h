@@ -50,6 +50,10 @@ typedef struct {
     int pending_action;
     int pending_action2;
     size_t decision_count;
+    size_t tactical_attempts;
+    size_t tactical_applied;
+    size_t tactical_forced_switches;
+    size_t tactical_fallbacks;
     int pending_counterfactual;
     int pending_counterfactual_rank;
     float pending_old_log_prob;
@@ -71,6 +75,7 @@ typedef struct {
     char policy_tag[ENV_POLICY_TAG_LEN];
     int counterfactual_decision_index;
     int counterfactual_action_rank;
+    int tactical_teacher;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;
@@ -90,6 +95,7 @@ int env_runtime_set_counterfactual_intervention(
     int decision_index,
     int action_rank
 );
+int env_runtime_enable_tactical_teacher(EnvRuntime* runtime);
 void env_runtime_free(EnvRuntime* runtime);
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);
 

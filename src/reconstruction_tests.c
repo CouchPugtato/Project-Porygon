@@ -821,6 +821,76 @@ static int test_runtime_counterfactual_ranks_are_distinct_and_reported(void) {
     return ok;
 }
 
+static int test_tactical_runtime_reports_coverage_without_training_episodes(void) {
+    GruModel* model = gru_model_create(observation_flat_size(), 8u, OBS_NUM_ACTIONS);
+    EnvRuntime runtime;
+    RuntimeMessage message;
+    FILE* output = tmpfile();
+    char line[2048];
+    Episode parsed = {0};
+    size_t i;
+    int ok = 1;
+    memset(&runtime, 0, sizeof(runtime));
+    if (!assert_true(model && output, "initialize tactical runtime fixture")) {
+        if (output) fclose(output);
+        gru_model_destroy(model);
+        return 0;
+    }
+    ok &= assert_true(env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "parent.chk") &&
+        !runtime.tactical_teacher && env_runtime_enable_tactical_teacher(&runtime) &&
+        strcmp(runtime.policy_tag, "tactical-eval-v1") == 0 &&
+        !env_runtime_set_counterfactual_intervention(&runtime, 0, 0),
+        "Tactical runtime is opt-in, separately tagged, and excludes interventions");
+    ok &= assert_true(send_counterfactual_test_state(&runtime, output),
+        "Tactical runtime produces an action from visible battle information");
+    rewind(output);
+    ok &= assert_true(fgets(line, sizeof(line), output) &&
+        strstr(line, "\"tactical\":") && strstr(line, "\"applied\":true") &&
+        strstr(line, "\"reason\":\"power\"") && strstr(line, "\"training_eligible\":false"),
+        "Tactical action identifies its power-scoring provenance");
+    if (runtime.count > 0) {
+        for (i = 0; i < RAW_TEAM_SIZE; ++i)
+            runtime.sessions[0].raw_state.opp_team[i].effective_type1_id.knowledge = KNOW_UNKNOWN;
+        runtime_message_init(&message);
+        message.type = RUNTIME_MSG_REQUEST;
+        strcpy(message.battle_id, "battle-counterfactual-test");
+        message.is_doubles = 1;
+        message.request_id = 18;
+        snprintf(message.payload, sizeof(message.payload), "%s", runtime.sessions[0].parsed_request.raw_json);
+        fseek(output, 0, SEEK_END);
+        ok &= assert_true(env_runtime_handle_message(&runtime, &message, output) &&
+            runtime.sessions[0].tactical_attempts == 2 && runtime.sessions[0].tactical_applied == 1 &&
+            runtime.sessions[0].tactical_fallbacks == 1,
+            "Unknown foe types use the parent fallback and retain attempt coverage");
+        runtime_message_init(&message);
+        message.type = RUNTIME_MSG_TERMINAL;
+        strcpy(message.battle_id, "battle-counterfactual-test");
+        message.reward = 1.0f;
+        ok &= assert_true(env_runtime_handle_message(&runtime, &message, output),
+            "Complete tactical evaluation battle");
+        rewind(output);
+        ok &= assert_true(fgets(line, sizeof(line), output) && fgets(line, sizeof(line), output) &&
+            strstr(line, "\"applied\":false") && strstr(line, "\"reason\":\"no_supported_choice\""),
+            "Fallback actions identify the unsupported-choice path");
+        ok &= assert_true(fgets(line, sizeof(line), output) &&
+            strstr(line, "\"type\":\"episode_complete\"") &&
+            strstr(line, "\"training_eligible\":false") && !strstr(line, "\"observations\"") &&
+            !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0),
+            "Teacher evaluation summary cannot be parsed as a PPO episode");
+    } else {
+        ok = assert_true(0, "Tactical session was created");
+    }
+    env_runtime_free(&runtime);
+    ok &= assert_true(env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "parent.chk") &&
+        env_runtime_set_counterfactual_intervention(&runtime, 0, 0) &&
+        !env_runtime_enable_tactical_teacher(&runtime),
+        "Existing interventions also block enabling the tactical runtime");
+    env_runtime_free(&runtime);
+    fclose(output);
+    gru_model_destroy(model);
+    return ok;
+}
+
 static void write_counterfactual_dataset_sample(
     FILE* output,
     int rank,
@@ -6240,6 +6310,7 @@ int main(int argc, char** argv) {
     if (!test_turn_number_not_overwritten_by_request()) return 1;
     if (!test_runtime_request_session_not_forced_doubles()) return 1;
     if (!test_runtime_counterfactual_ranks_are_distinct_and_reported()) return 1;
+    if (!test_tactical_runtime_reports_coverage_without_training_episodes()) return 1;
     if (!test_selected_action_semantics_include_move_roles()) return 1;
     if (!test_counterfactual_dataset_preserves_whole_pairs()) return 1;
     if (!test_counterfactual_manifest_combines_owned_sources()) return 1;

@@ -1,0 +1,185 @@
+'use strict';
+
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const {
+    AgentProcess, acquireRunLock, createResourceGate, drivePlayer,
+    limitUtf8, seedTuple, writeJsonAtomic,
+} = require('./counterfactual_rollout');
+
+const REPO_ROOT = path.resolve(__dirname, '..');
+
+async function hashFile(filename) {
+    const hash = crypto.createHash('sha256');
+    for await (const chunk of require('node:fs').createReadStream(filename)) hash.update(chunk);
+    return hash.digest('hex');
+}
+
+function aggregateGames(games) {
+    const totals = {completed: 0, failed: 0, attempts: 0, applied: 0, forced_switches: 0, fallbacks: 0};
+    for (const game of games) {
+        if (game.status !== 'completed') { ++totals.failed; continue; }
+        ++totals.completed;
+        const report = game.coverage;
+        for (const key of ['attempts', 'applied', 'forced_switches', 'fallbacks']) {
+            const value = report[`tactical_${key}`];
+            if (!Number.isSafeInteger(value) || value < 0) throw new Error(`invalid coverage: ${key}`);
+            totals[key] += value;
+        }
+        if (report.training_eligible !== false || report.policy_tag !== 'tactical-eval-v1' ||
+                report.tactical_attempts !== report.tactical_applied + report.tactical_fallbacks ||
+                report.tactical_forced_switches > report.tactical_applied) {
+            throw new Error('missing or inconsistent evaluation-only teacher coverage');
+        }
+    }
+    totals.coverage_rate = totals.attempts ? totals.applied / totals.attempts : 0;
+    totals.power_decisions = totals.applied - totals.forced_switches;
+    return totals;
+}
+
+async function closeGame(streams, agents) {
+    agents.forEach(agent => agent.terminate());
+    // Showdown's writeEnd checks atEOF; destroy() resolves the read stream a
+    // second time after a completed battle and throws before results are saved.
+    const cleanup = await Promise.allSettled([
+        Promise.resolve().then(() => streams.omniscient.writeEnd()),
+        ...agents.map(agent => Promise.resolve().then(() => agent.close())),
+    ]);
+    const failures = cleanup.filter(result => result.status === 'rejected');
+    if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'battle cleanup failed');
+}
+
+async function playGame(sim, config, index) {
+    const battleId = `tactical-smoke-${config.seed}-${index}`;
+    const teacherSide = index % 2 === 0 ? 0 : 1;
+    const names = teacherSide === 0 ? ['TacticalTeacher', 'ParentPolicy'] : ['ParentPolicy', 'TacticalTeacher'];
+    const battle = new sim.BattleStream();
+    const streams = sim.getPlayerStreams(battle);
+    const agents = [0, 1].map(side => new AgentProcess(
+        path.resolve(REPO_ROOT, config.checkpoint), config.seed + index * 2 + side,
+        null, config.agent_omp_threads, side === teacherSide));
+    let timeout;
+    let game;
+    try {
+        const work = (async () => {
+            await Promise.all(agents.map(agent => agent.start()));
+            const players = [streams.p1, streams.p2].map((stream, side) =>
+                drivePlayer(stream, agents[side], battleId, names[side], config.format));
+            const drain = (async () => { for await (const chunk of streams.omniscient) { void chunk; } })();
+            const results = Promise.all([...players, drain]);
+            // Attach rejection handling before the first simulator write can
+            // trigger a player error. The awaited result still reports it below.
+            results.catch(() => {});
+            await streams.omniscient.write(
+                `>start ${JSON.stringify({formatid: config.format, seed: seedTuple(config.seed, index, 0)})}\n` +
+                `>player p1 ${JSON.stringify({name: names[0], seed: seedTuple(config.seed, index, 1)})}\n` +
+                `>player p2 ${JSON.stringify({name: names[1], seed: seedTuple(config.seed, index, 2)})}`);
+            const [first, second] = await results;
+            const teacher = teacherSide === 0 ? first : second;
+            const game = {
+                index, status: 'completed', teacher_side: teacherSide === 0 ? 'a' : 'b',
+                result: teacher.result, coverage: teacher.episode,
+                choice_rejections: [...first.choiceRejections, ...second.choiceRejections],
+            };
+            aggregateGames([game]);
+            return game;
+        })();
+        game = await Promise.race([work, new Promise((_, reject) => {
+            timeout = setTimeout(() => reject(new Error('battle timeout')), config.battle_timeout_seconds * 1000);
+        })]);
+    } catch (error) {
+        game = {index, status: 'failed', teacher_side: teacherSide === 0 ? 'a' : 'b',
+            error: limitUtf8(error.stack || error.message, 16384).text};
+    } finally {
+        clearTimeout(timeout);
+        try { await closeGame(streams, agents); }
+        catch (error) {
+            game = {...game, index, status: 'failed',
+                cleanup_error: limitUtf8(error.stack || error.message, 16384).text};
+        }
+    }
+    return game;
+}
+
+async function main(argv = process.argv.slice(2)) {
+    const args = {};
+    for (let i = 0; i < argv.length; i += 2) {
+        if (!['--run-name', '--config'].includes(argv[i]) || !argv[i + 1])
+            throw new Error('usage: node tools/tactical_teacher_smoke.js --run-name NAME [--config PATH]');
+        args[argv[i]] = argv[i + 1];
+    }
+    const name = args['--run-name'];
+    if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) throw new Error('a simple --run-name is required');
+    const config = JSON.parse(await fs.readFile(path.resolve(REPO_ROOT,
+        args['--config'] || 'config/experimental/tactical_teacher_smoke.json'), 'utf8'));
+    if (config.format !== 'gen9randomdoublesbattle' ||
+            !Number.isSafeInteger(config.games) || config.games < 2 || config.games > 20 || config.games % 2 ||
+            config.agent_omp_threads !== 1 || !Number.isSafeInteger(config.seed) || config.seed < 0 ||
+            !(config.battle_timeout_seconds > 0 && config.battle_timeout_seconds <= 300) ||
+            !(config.max_system_memory_percent > 0 && config.max_system_memory_percent <= 65) ||
+            !(config.max_system_cpu_percent > 0 && config.max_system_cpu_percent <= 65) ||
+            !(config.resource_check_seconds > 0) || !(config.launch_stagger_ms >= 0)) {
+        throw new Error('smoke config requires 2-20 even games, one thread per agent, and resource limits at most 65%');
+    }
+    const identity = {
+        config, checkpoint_sha256: await hashFile(path.resolve(REPO_ROOT, config.checkpoint)),
+        executable_sha256: await hashFile(path.join(REPO_ROOT, 'build-fresh/showdown_client.exe')),
+    };
+    const directory = path.join(REPO_ROOT, 'matches/runs', name);
+    await fs.mkdir(directory, {recursive: true});
+    const lock = await acquireRunLock(directory);
+    try {
+        const summaryPath = path.join(directory, `${name}_summary.json`);
+        let prior;
+        try { prior = JSON.parse(await fs.readFile(summaryPath, 'utf8')); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        if (prior && JSON.stringify(prior.identity) !== JSON.stringify(identity))
+            throw new Error('config, checkpoint, or executable changed; choose a new run name');
+        const games = prior?.games || [];
+        if (!Array.isArray(games) || games.length > config.games ||
+                games.some((game, index) => game.index !== index ||
+                    !['completed', 'failed'].includes(game.status))) {
+            throw new Error('saved smoke game records are inconsistent');
+        }
+        const gate = createResourceGate({
+            maxSystemMemoryPercent: config.max_system_memory_percent,
+            maxSystemCpuPercent: config.max_system_cpu_percent,
+            resourceCheckSeconds: config.resource_check_seconds,
+            launchStaggerMilliseconds: config.launch_stagger_ms,
+        });
+        const sim = require(path.join(REPO_ROOT, 'external/pokemon-showdown/dist/sim'));
+        async function publish() {
+            const coverage = aggregateGames(games);
+            const summary = {
+                diagnostic: 'tactical_teacher_runtime_smoke', run_name: name, identity,
+                status: games.length < config.games ? 'in_progress' : coverage.failed ? 'failed' : 'completed',
+                direction_step: 'project_direction.txt: step 2, runtime legality and coverage',
+                strength_claim: false, training_eligible: false, coverage, games,
+            };
+            await writeJsonAtomic(summaryPath, summary);
+            return summary;
+        }
+        await publish();
+        for (let index = games.length; index < config.games; ++index) {
+            await gate.waitForLaunch();
+            games.push(await playGame(sim, config, index));
+            const summary = await publish();
+            console.log(`[tactical-smoke] games=${games.length}/${config.games} ` +
+                `failed=${summary.coverage.failed} coverage=${(100 * summary.coverage.coverage_rate).toFixed(1)}%`);
+            const game = games[index];
+            if (game.status === 'failed') console.error(`[tactical-smoke] game=${index + 1} ` +
+                [game.error, game.cleanup_error].filter(Boolean).join('\n'));
+        }
+        const summary = await publish();
+        console.log(`[tactical-smoke] status=${summary.status} summary=${summaryPath}`);
+        if (summary.status !== 'completed') process.exitCode = 1;
+    } finally { await lock.release(); }
+}
+
+if (require.main === module) main().catch(error => {
+    console.error(`[tactical-smoke] ${error.stack || error.message}`);
+    process.exitCode = 1;
+});
+
+module.exports = {aggregateGames, closeGame};

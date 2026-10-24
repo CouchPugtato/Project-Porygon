@@ -38,3 +38,16 @@ C to Python:
 {"type":"log","message":"runtime initialized"}
 {"type":"error","battle_id":"battle-gen9randombattle-123","message":"failed to map action"}
 ```
+
+## Tactical evaluation mode
+
+`--battle-agent <checkpoint> --tactical-teacher 1` enables a tactical override
+with the named checkpoint as its fallback. The ready record advertises
+`capabilities.tactical_teacher: true` and `capabilities.training: false`.
+Action records retain their usual fields and add a `tactical` object containing
+the applied flag, reason, supported-choice count, and available power scores.
+
+Terminal `episode_complete` records in this mode contain coverage counts and
+`training_eligible: false` instead of episode arrays. Their policy tag is
+`tactical-eval-v1`; they are evaluation summaries and cannot be parsed as normal
+training episodes. Counters measure emitted decision attempts, including retries.

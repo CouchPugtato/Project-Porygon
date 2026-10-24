@@ -3,6 +3,7 @@
 #include "action_semantics.h"
 #include "observation_builder.h"
 #include "request_parser.h"
+#include "tactical_policy.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -476,9 +477,17 @@ int env_runtime_set_counterfactual_intervention(
     int decision_index,
     int action_rank
 ) {
-    if (!runtime || decision_index < 0 || action_rank < 0) return 0;
+    if (!runtime || runtime->tactical_teacher || decision_index < 0 || action_rank < 0) return 0;
     runtime->counterfactual_decision_index = decision_index;
     runtime->counterfactual_action_rank = action_rank;
+    return 1;
+}
+
+int env_runtime_enable_tactical_teacher(EnvRuntime* runtime) {
+    if (!runtime || runtime->replay_only || runtime->count > 0 ||
+            runtime->counterfactual_decision_index >= 0) return 0;
+    runtime->tactical_teacher = 1;
+    snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "tactical-eval-v1");
     return 1;
 }
 
@@ -492,6 +501,15 @@ void env_runtime_free(EnvRuntime* runtime) {
     }
     free(runtime->sessions);
     memset(runtime, 0, sizeof(*runtime));
+}
+
+static int evaluate_supported_tactical_choice(
+    const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, TacticalChoiceEvaluation* evaluation, void* context
+) {
+    return tactical_evaluate_power(observation, request, choice, evaluation, context) &&
+        evaluation->unscored_moves == 0 &&
+        (request->forced_switch_any || evaluation->score > 0.0f);
 }
 
 static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
@@ -529,6 +547,9 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     int i;
     ValidatedRequestChoice validated;
     FactorizedActionChoice sampled_choice;
+    TacticalDecision tactical_decision = {0};
+    int tactical_applied = 0;
+    const char* tactical_reason = "no_supported_choice";
     if (!runtime || !session || !out || runtime->replay_only) {
         return 1;
     }
@@ -658,6 +679,13 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             sampled_choice.slot1_switch_index = (unsigned char)sw;
         }
     }
+    if (runtime->tactical_teacher && tactical_select_choice(
+            &session->observation, &session->parsed_request,
+            evaluate_supported_tactical_choice, NULL, &tactical_decision)) {
+        sampled_choice = tactical_decision.choice;
+        tactical_applied = 1;
+        tactical_reason = session->parsed_request.forced_switch_any ? "forced_switch" : "power";
+    }
     session->pending_counterfactual = 0;
     session->pending_counterfactual_rank = -1;
     if (runtime->counterfactual_decision_index >= 0 &&
@@ -700,6 +728,14 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     }
     action = validated.slot0_has_action ? (int)validated.action0 : -1;
     action2 = validated.slot1_has_action ? (int)validated.action1 : -1;
+    if (tactical_applied) {
+        int selected0, selected1;
+        factorized_action_choice_to_flat_actions(&tactical_decision.choice, &selected0, &selected1);
+        if (selected0 != action || selected1 != action2) {
+            tactical_applied = 0;
+            tactical_reason = "validated_fallback";
+        }
+    }
     {
         int sampled_action0 = -1;
         int sampled_action1 = -1;
@@ -813,7 +849,26 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         runtime_emit_action_json(
             json, sizeof(json), session->battle_id, session->last_request_id,
             action, action2, command);
-        fputs(json, out);
+        if (runtime->tactical_teacher) {
+            ++session->tactical_attempts;
+            if (tactical_applied) {
+                ++session->tactical_applied;
+                if (session->parsed_request.forced_switch_any) ++session->tactical_forced_switches;
+            } else {
+                ++session->tactical_fallbacks;
+            }
+            fprintf(out, "%.*s,\"tactical\":{\"version\":1,\"applied\":%s,\"reason\":\"%s\","
+                "\"supported_choices\":%zu,\"training_eligible\":false",
+                (int)strlen(json) - 1, json, tactical_applied ? "true" : "false",
+                tactical_reason, tactical_decision.evaluated_choices);
+            if (tactical_applied) fprintf(out,
+                ",\"score\":%.9g,\"opponent_power\":%.9g,\"friendly_power\":%.9g",
+                tactical_decision.evaluation.score, tactical_decision.evaluation.opponent_power,
+                tactical_decision.evaluation.friendly_power);
+            fputs("}}", out);
+        } else {
+            fputs(json, out);
+        }
         fputc('\n', out);
         fflush(out);
     }
@@ -956,7 +1011,18 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
             clear_request_reward_snapshot(session);
             session->terminal = 1;
             if (out && !runtime->replay_only && session->episode.count > 0) {
-                episode_write_json_record(out, &session->episode, session->battle_id, runtime->policy_tag);
+                if (runtime->tactical_teacher) {
+                    /* Evaluation choices do not have the parent's behavior
+                     * probabilities. Never export them as on-policy episodes. */
+                    fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
+                        "\"policy_tag\":\"tactical-eval-v1\",\"training_eligible\":false,"
+                        "\"tactical_attempts\":%zu,\"tactical_applied\":%zu,"
+                        "\"tactical_forced_switches\":%zu,\"tactical_fallbacks\":%zu}\n",
+                        session->battle_id, session->tactical_attempts, session->tactical_applied,
+                        session->tactical_forced_switches, session->tactical_fallbacks);
+                } else {
+                    episode_write_json_record(out, &session->episode, session->battle_id, runtime->policy_tag);
+                }
                 fflush(out);
             }
             return 1;

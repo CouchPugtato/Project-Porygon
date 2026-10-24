@@ -186,11 +186,12 @@ function continuationSeed(base, attempt, repeat) {
 }
 
 class AgentProcess {
-    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads) {
+    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false) {
         this.checkpoint = checkpoint;
         this.inferenceSeed = inferenceSeedValue;
         this.intervention = intervention;
         this.ompThreads = ompThreads;
+        this.tacticalTeacher = tacticalTeacher;
         this.process = null;
         this.messages = [];
         this.waiters = [];
@@ -204,6 +205,7 @@ class AgentProcess {
             '--inference-seed', String(this.inferenceSeed),
             '--reward-mode', 'terminal',
         ];
+        if (this.tacticalTeacher) args.push('--tactical-teacher', '1');
         if (this.intervention) {
             args.push(
                 '--counterfactual-decision', String(this.intervention.decisionIndex),
@@ -237,7 +239,11 @@ class AgentProcess {
                 for (const waiter of this.waiters.splice(0)) waiter.reject(this.exitError);
             }
         });
-        await this.nextMessage('ready');
+        const ready = await this.nextMessage('ready');
+        if (this.tacticalTeacher && (ready.capabilities?.tactical_teacher !== true ||
+                ready.capabilities?.training !== false)) {
+            throw new Error('runtime does not advertise evaluation-only tactical teacher support; rebuild the client');
+        }
     }
 
     pushMessage(message) {
@@ -1652,6 +1658,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+    AgentProcess,
     adaptiveRolloutDecision,
     appendJsonLineDurably,
     battleFailureReason,
@@ -1661,6 +1668,7 @@ module.exports = {
     choiceRejectionReason,
     continuationSeed,
     cpuPercentBetween,
+    createResourceGate,
     drivePlayer,
     equalPrefix,
     acquireRunLock,

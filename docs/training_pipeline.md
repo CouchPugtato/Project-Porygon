@@ -272,9 +272,53 @@ semantic encoder retains the previous UNKNOWN input for this target class,
 preserving existing neural feature values and checkpoint layout.
 
 Build and run `showdown_tactical_tests` for its focused fixtures, and re-run
-reconstruction and legality tests when changing request parsing. The broader
-teacher still needs live integration and a strength evaluation against the
-parent, random play, and simple baselines before generating labels.
+reconstruction and legality tests when changing request parsing. The opt-in
+runtime integration below is ready for coverage checks. The broader teacher
+still needs a strength evaluation against the parent, random play, and simple
+baselines before generating labels.
+
+### Tactical runtime coverage smoke
+
+Pass `--tactical-teacher 1` after the fallback checkpoint in `--battle-agent`
+mode to enable the evaluation policy. It uses the tactical selector only when
+the power heuristic reports no unscored moves and a positive score, or when
+handling forced switches. Other decisions retain the checkpoint policy. This
+is a hybrid of the tactical heuristic and its parent, rather than an independent
+teacher whose strength has already been established.
+
+Each action includes `tactical.applied`, `reason`, `supported_choices`, and,
+when applied, the scored opponent and friendly power. These fields describe
+coverage of the current approximation; they do not assert that omitted game
+mechanics are modeled. Counts describe emitted attempts, including rejected
+choices, rather than only accepted turns.
+
+The runtime advertises `training: false`. At the end of a battle it emits an
+evaluation summary under `episode_complete`, with `training_eligible: false`,
+the distinct `tactical-eval-v1` policy tag, and attempt/applied/forced-switch/
+fallback counts. It omits episode training arrays. The normal episode parser
+rejects this record, preventing teacher choices from being mistaken for
+on-policy PPO data. Counterfactual interventions and tactical mode cannot be
+enabled together.
+
+After rebuilding and copying the client, run:
+
+```powershell
+node .\tools\tactical_teacher_smoke.js --run-name run_0265_tactical_runtime_smoke
+```
+
+`config/experimental/tactical_teacher_smoke.json` defaults to six serial battles
+against the same checkpoint without the tactical override, alternating sides.
+Each process uses one OpenMP thread. Launches wait when observed system memory
+or CPU usage exceeds 65%. The script reuses the collector's process bridge,
+choice-rejection handling, resource gate, and atomic writes.
+
+The summary is saved after every battle under `matches/runs/<run>/<run>_summary.json`.
+It retains coverage, results, rejected commands, and bounded failure messages;
+it does not export training episodes. Rerunning the same command resumes
+unattempted games only if the configuration, checkpoint hash, and executable
+hash match. Failed attempts remain recorded. Use a new run name after rebuilding
+or changing inputs. This smoke is a legality/coverage check and makes no strength
+or promotion claim.
 
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental
