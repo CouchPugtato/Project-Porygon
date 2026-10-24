@@ -250,9 +250,31 @@ handle legality, move-specific exceptions, abilities, Tera STAB, field effects,
 and spread damage before using the score in a reference player. Live action
 selection and student training do not consume this component yet.
 
-Build and run `showdown_tactical_tests` for its focused fixtures. The broader
-teacher still needs legal joint action selection and a strength evaluation
-against the parent, random play, and simple baselines before generating labels.
+`src/tactical_policy.c` now enumerates legal actions and explicit targets for
+both active slots. It reuses the request mapper's shared pair constraints for
+double Tera and duplicate switches. Explicit foe targets are restricted to
+living active opponents. Forced-switch requests fill the maximum possible
+number of slots, including a pass when only one bench Pokemon remains.
+
+The selector accepts a joint-choice evaluator, keeping legal enumeration
+separate from scoring. Its initial `tactical_evaluate_power` heuristic sums
+power against foes and subtracts power against the partner. Spread attacks use
+the 0.75 multiplier when multiple targets are present. A switching partner is
+evaluated using the incoming Pokemon's visible typing. This is a static board
+approximation: speed order, protection, abilities, field effects, and unusual
+move mechanics are still omitted. Switches have no strategic value term;
+status moves and Tera attacks contribute zero and are counted as unscored.
+The selector enforces Tera legality independently of whether its evaluator can
+estimate Tera value.
+
+The parser now distinguishes `allAdjacent` from unknown targeting. The action
+semantic encoder retains the previous UNKNOWN input for this target class,
+preserving existing neural feature values and checkpoint layout.
+
+Build and run `showdown_tactical_tests` for its focused fixtures, and re-run
+reconstruction and legality tests when changing request parsing. The broader
+teacher still needs live integration and a strength evaluation against the
+parent, random play, and simple baselines before generating labels.
 
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental

@@ -99,7 +99,11 @@ static void build_slot(
         values[SEM_KIND] = 1.0f;
         set_one_hot(values, SEM_MOVE_SLOT, PARSED_REQUEST_MOVE_SLOTS, move_index);
         set_one_hot(values, SEM_MOVE_TYPE, OBS_NUM_TYPES, move_type);
-        set_one_hot(values, SEM_MOVE_TARGET, 11u, active->move_target[move_index]);
+        /* allAdjacent was previously parsed as UNKNOWN. Keep its existing
+         * neural input encoding while exposing the distinction to the teacher. */
+        set_one_hot(values, SEM_MOVE_TARGET, 11u,
+            active->move_target[move_index] == REQUEST_TARGET_ALL_ADJACENT
+                ? REQUEST_TARGET_UNKNOWN : active->move_target[move_index]);
         if (active->move_max_pp[move_index] > 0) {
             values[SEM_MOVE_PP] =
                 (float)active->move_pp[move_index] / (float)active->move_max_pp[move_index];

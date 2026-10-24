@@ -54,6 +54,12 @@ typedef struct {
 void action_mask_init(ActionMask* mask);
 int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req);
 int request_has_legal_joint_action_pair(const ParsedRequest* req, const ActionMask* mask);
+/* Checks shared constraints for actions already admitted by the slot masks. */
+int request_choice_pair_is_valid(
+    const ParsedRequest* req,
+    int slot0_has_action, enum ObsAction action0,
+    int slot1_has_action, enum ObsAction action1
+);
 int obs_action_slot(enum ObsAction action);
 void factorized_action_choice_init(FactorizedActionChoice* choice);
 void factorized_action_choice_from_flat_actions(FactorizedActionChoice* choice, int action0, int action1);

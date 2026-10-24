@@ -261,6 +261,7 @@ unsigned char build_move_target_mask(const ParsedRequest* req, int active_slot, 
             break;
         case REQUEST_TARGET_SELF:
         case REQUEST_TARGET_ALL_ADJACENT_FOES:
+        case REQUEST_TARGET_ALL_ADJACENT:
         case REQUEST_TARGET_ALL:
         case REQUEST_TARGET_ALLY_SIDE:
         case REQUEST_TARGET_FOE_SIDE:
@@ -349,7 +350,7 @@ static int move_target_suffix(
     return 1;
 }
 
-static int request_choice_pair_is_valid(
+int request_choice_pair_is_valid(
     const ParsedRequest* req,
     int slot0_has_action,
     enum ObsAction action0,

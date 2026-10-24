@@ -312,6 +312,7 @@ static ParsedMoveTarget parse_move_target_value(const char* obj) {
     if (strcmp(token, "adjacentAllyOrSelf") == 0) return REQUEST_TARGET_ADJACENT_ALLY_OR_SELF;
     if (strcmp(token, "self") == 0) return REQUEST_TARGET_SELF;
     if (strcmp(token, "allAdjacentFoes") == 0) return REQUEST_TARGET_ALL_ADJACENT_FOES;
+    if (strcmp(token, "allAdjacent") == 0) return REQUEST_TARGET_ALL_ADJACENT;
     if (strcmp(token, "all") == 0) return REQUEST_TARGET_ALL;
     if (strcmp(token, "allySide") == 0) return REQUEST_TARGET_ALLY_SIDE;
     if (strcmp(token, "foeSide") == 0) return REQUEST_TARGET_FOE_SIDE;
