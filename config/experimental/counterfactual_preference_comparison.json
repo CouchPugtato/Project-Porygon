@@ -1,0 +1,37 @@
+{
+  "batch": "matches/runs/run_0256_counterfactual_semantic_v2_adaptive_1000/counterfactual_action_batch.jsonl",
+  "checkpoint": "models/runs/run_0093_current_arch_full/current_arch_full.chk",
+  "report_directory": "models/diagnostics",
+  "summary_name": "run_0261_0264_preference_comparison.json",
+  "epochs": 1000,
+  "learning_rate": 0.0001,
+  "shuffle_seed": 24701,
+  "minibatch_pairs": 8,
+  "latent_dim": 16,
+  "early_stop_patience": 120,
+  "l2_coefficient": 0.0001,
+  "minimum_pair_confidence": 0.60,
+  "omp_threads": 4,
+  "trials": [
+    {
+      "validation_seed": 20260922,
+      "report_name": "run_0261_selected_semantic_preference_split_20260922.json",
+      "gap_report": "models/diagnostics/run_0257_selected_semantic_v2_generalization.json"
+    },
+    {
+      "validation_seed": 20260923,
+      "report_name": "run_0262_selected_semantic_preference_split_20260923.json",
+      "gap_report": "models/diagnostics/run_0258_selected_semantic_v2_split_20260923.json"
+    },
+    {
+      "validation_seed": 20260924,
+      "report_name": "run_0263_selected_semantic_preference_split_20260924.json",
+      "gap_report": "models/diagnostics/run_0259_selected_semantic_v2_split_20260924.json"
+    },
+    {
+      "validation_seed": 20260925,
+      "report_name": "run_0264_selected_semantic_preference_split_20260925.json",
+      "gap_report": "models/diagnostics/run_0260_selected_semantic_v2_split_20260925.json"
+    }
+  ]
+}

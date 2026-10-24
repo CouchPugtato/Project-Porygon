@@ -204,6 +204,30 @@ preference-loss improvement rather than gap-loss improvement. The default is
 models are not publishable as live sidecars because their score margins are not
 calibrated Q differences.
 
+The current direction is recorded locally in `docs/project_direction.txt`.
+Its first step compares the two objectives on the existing four development
+splits before starting the tactical teacher work. Run the fixed comparison
+from the repository root after building and copying the current trainer:
+
+```powershell
+& .\tools\run_counterfactual_preference_comparison.ps1
+```
+
+The settings live in
+`config/experimental/counterfactual_preference_comparison.json`. The runner uses
+`build-fresh/showdown_client.exe`, runs one split at a time with four OpenMP
+threads, and reuses completed reports only when their recorded settings match.
+It checks the original gap reports before starting training. Missing or
+mismatched evidence stops the comparison. `-SummaryOnly` requires all reports
+to exist and never invokes the trainer.
+
+The JSON summary retains both objectives' preference-loss ratios and ranking
+accuracies, plus the new fits' gap loss and advantage magnitudes. A lower
+preference loss does not establish stronger play. These splits share one
+collection; the summary explicitly requires fresh confirmation and makes no
+promotion decision. Reports identify source paths, not content hashes, so
+preserve the original batch and checkpoint when resuming.
+
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental
 `factorized` head reuses a slot-local action scorer across every partner action

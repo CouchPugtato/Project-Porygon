@@ -1,5 +1,12 @@
 Default entrypoint config files.
 
+`experimental/counterfactual_preference_comparison.json` supplies the fixed
+four-split comparison in `tools/run_counterfactual_preference_comparison.ps1`.
+This PowerShell runner reads JSON rather than the TOML entrypoint format below.
+It uses `build-fresh/showdown_client.exe`, four OpenMP threads, and sequential
+fits. Completed reports must match the recorded settings before they can be
+reused. See `docs/training_pipeline.md` for running and summarizing the comparison.
+
 Format:
 - TOML
 - Each entrypoint config uses top-level key/value defaults
