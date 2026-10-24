@@ -47,6 +47,7 @@ set(SHOWDOWN_CLIENT_SOURCES
 	src/gru_trainer.c
 	src/action_value.c
 	src/action_semantics.c
+	src/tactical_scoring.c
 	src/counterfactual_data.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c
@@ -73,6 +74,12 @@ set(SHOWDOWN_LEGALITY_TEST_SOURCES
 )
 
 add_executable(showdown_legality_tests ${SHOWDOWN_LEGALITY_TEST_SOURCES})
+
+add_executable(showdown_tactical_tests
+    src/tactical_scoring_tests.c
+    src/tactical_scoring.c
+    src/id_tables.c
+)
 
 set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/reconstruction_tests.c
@@ -119,5 +126,6 @@ endif()
 if(UNIX)
     target_link_libraries(showdown_client PRIVATE m)
     target_link_libraries(showdown_legality_tests PRIVATE m)
+    target_link_libraries(showdown_tactical_tests PRIVATE m)
     target_link_libraries(showdown_reconstruction_tests PRIVATE m)
 endif()

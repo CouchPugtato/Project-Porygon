@@ -228,6 +228,32 @@ collection; the summary explicitly requires fresh confirmation and makes no
 promotion decision. Reports identify source paths, not content hashes, so
 preserve the original batch and checkpoint when resuming.
 
+The completed comparison is recorded locally in
+`models/diagnostics/run_0261_0264_preference_comparison.json`. Preference fitting
+improved holdout preference loss on two splits and worsened it on two, without
+a consistent ranking gain over gap regression. This closes the fixed comparison;
+the next direction step is the tactical reference player.
+
+### Tactical reference player: scoring foundation
+
+`src/tactical_scoring.c` provides the first component, `tactical_score_attack`.
+It scores an ordinary attack as base power times nominal hit probability,
+ordinary STAB, and type effectiveness against a supplied visible target. The
+result exposes each multiplier and uses effective base-power units. It does
+not estimate HP damage or knockout probability. It abstains when required type
+information or ordinary power metadata is missing. A known absent secondary
+type is represented by ID zero with a nonzero knowledge mode.
+
+The scorer uses effective visible typing rather than reconstructing defensive
+types from species. It reads no hidden opponent stats or moves. Callers must
+handle legality, move-specific exceptions, abilities, Tera STAB, field effects,
+and spread damage before using the score in a reference player. Live action
+selection and student training do not consume this component yet.
+
+Build and run `showdown_tactical_tests` for its focused fixtures. The broader
+teacher still needs legal joint action selection and a strength evaluation
+against the parent, random play, and simple baselines before generating labels.
+
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental
 `factorized` head reuses a slot-local action scorer across every partner action
