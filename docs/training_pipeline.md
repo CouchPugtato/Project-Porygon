@@ -195,6 +195,15 @@ weight one; noisy small gaps approach zero. Older one-shot batches retain
 weight one for compatibility. The report keeps both raw and
 confidence-weighted metrics.
 
+`--counterfactual-q-objective preference` is a diagnostic alternative for
+datasets where action order is more repeatable than the measured size of the
+return gap. It applies confidence-weighted logistic ranking updates and selects
+the best epoch by pairwise preference loss. Its holdout gate therefore requires
+preference-loss improvement rather than gap-loss improvement. The default is
+`gap`, preserving calibrated sidecar training and existing commands. Preference
+models are not publishable as live sidecars because their score margins are not
+calibrated Q differences.
+
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental
 `factorized` head reuses a slot-local action scorer across every partner action
@@ -204,7 +213,8 @@ separate state-conditioned head for all 196 joint actions. Reports record the
 selected head and its parameter count so comparisons can hold the data split
 and optimizer fixed.
 
-Early stopping follows confidence-weighted selection loss. Publication
+Early stopping follows the confidence-weighted selection loss for the chosen
+objective. Publication
 requires at least a 1% weighted-loss improvement on the holdout, at least ten
 holdout pairs with different outcomes, and at least 55% confidence-weighted
 within-pair ranking accuracy. A `.qv` sidecar is written only when every gate
@@ -213,7 +223,7 @@ passes.
 If a generalization run selects epoch zero, use
 `--check-counterfactual-q-overfit` before collecting more data. It reuses a
 deterministic prefix of real pairs for training and evaluation, cannot publish
-a sidecar, and passes only when weighted pair-gap loss falls by at least 50%
+a sidecar, and passes only when the selected objective loss falls by at least 50%
 and weighted ranking accuracy reaches 90% on at least ten discordant pairs.
 This is a trainer-capacity check, not evidence of generalization or playing
 strength. Counterfactual reports also retain metrics from the last attempted

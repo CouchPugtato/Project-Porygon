@@ -3998,6 +3998,7 @@ static int run_counterfactual_q_fit_check(
     size_t latent_dim,
     ActionValueHeadMode head_mode,
     CounterfactualQRepresentation representation,
+    CounterfactualQObjective objective,
     size_t early_stop_patience,
     float learning_rate,
     float l2_coefficient,
@@ -4025,9 +4026,11 @@ static int run_counterfactual_q_fit_check(
     memset(&dataset, 0, sizeof(dataset));
     memset(&holdout_dataset, 0, sizeof(holdout_dataset));
     memset(&split, 0, sizeof(split));
-    if (representation != COUNTERFACTUAL_Q_HIDDEN && output_path && *output_path) {
+    if ((representation != COUNTERFACTUAL_Q_HIDDEN ||
+            objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE) &&
+            output_path && *output_path) {
         fprintf(stderr,
-            "[counterfactual-q] semantic representation is diagnostic-only and cannot publish a sidecar\n");
+            "[counterfactual-q] semantic and preference-objective diagnostics cannot publish a sidecar\n");
         return 1;
     }
     if (!batch_path || !checkpoint_path || !report_path || epochs == 0 ||
@@ -4119,10 +4122,11 @@ static int run_counterfactual_q_fit_check(
         goto cleanup;
     }
     if (overfit_pair_count > 0) overfit_pair_count = split.train_count / 2u;
-    printf("[counterfactual-q] mode=%s representation=%s head=%s sources=%zu train=%zu selection=%zu holdout=%zu pairs holdout_source=%s epochs=%zu minibatch_pairs=%zu latent_dim=%zu learning_rate=%.9g l2=%.6g min_confidence=%.6g\n",
+    printf("[counterfactual-q] mode=%s representation=%s head=%s objective=%s sources=%zu train=%zu selection=%zu holdout=%zu pairs holdout_source=%s epochs=%zu minibatch_pairs=%zu latent_dim=%zu learning_rate=%.9g l2=%.6g min_confidence=%.6g\n",
         overfit_pair_count > 0 ? "real_data_overfit" : "generalization",
         representation == COUNTERFACTUAL_Q_SEMANTIC ? "semantic" : "hidden",
         action_value_head_mode_name(head_mode),
+        learning_diagnostic_counterfactual_q_objective_name(objective),
         dataset.source_count,
         split.train_count / 2u, split.selection_count / 2u,
         split.holdout_count / 2u,
@@ -4137,15 +4141,18 @@ static int run_counterfactual_q_fit_check(
             split.holdout, split.holdout_count,
             epochs, minibatch_pairs, early_stop_patience, shuffle_seed,
             learning_rate, adam_beta1, adam_beta2, adam_epsilon,
-            1.0f, l2_coefficient, &result)) {
+            1.0f, l2_coefficient, objective, &result)) {
         fprintf(stderr, "[counterfactual-q] diagnostic execution failed\n");
         goto cleanup;
     }
     if (overfit_pair_count > 0) {
         result.counterfactual_overfit_passed =
             result.after_train.discordant_pair_count >= 10u &&
-            result.after_train.confidence_weighted_pair_gap_huber_loss <=
-                result.before_train.confidence_weighted_pair_gap_huber_loss * 0.5 &&
+            (objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+                ? result.after_train.confidence_weighted_pairwise_preference_loss <=
+                    result.before_train.confidence_weighted_pairwise_preference_loss * 0.5
+                : result.after_train.confidence_weighted_pair_gap_huber_loss <=
+                    result.before_train.confidence_weighted_pair_gap_huber_loss * 0.5) &&
             result.after_train.confidence_weighted_pair_ranking_accuracy >= 0.90 &&
             result.after_train.nonfinite_count == 0u;
         /* Reused training pairs measure capacity, never generalization. */
@@ -4166,18 +4173,23 @@ static int run_counterfactual_q_fit_check(
             checkpoint_path, output_path,
             action_value_published, validation_seed, shuffle_seed,
             epochs, minibatch_pairs, early_stop_patience,
-            learning_rate, l2_coefficient, minimum_pair_confidence,
+            learning_rate, l2_coefficient, minimum_pair_confidence, objective,
             action_value_model, &result)) {
         fprintf(stderr, "[counterfactual-q] failed to write report '%s': %s\n",
             report_path, strerror(errno));
         goto cleanup;
     }
-    printf("[counterfactual-q] signal=%d overfit_passed=%d q_loss=%.6f baseline_q_loss=%.6f weighted_gap_loss=%.6f before_weighted_gap_loss=%.6f weighted_ranking=%.4f effective_pair_weight=%.1f discordant_pairs=%zu published=%d report=%s\n",
+    printf("[counterfactual-q] signal=%d overfit_passed=%d objective=%s objective_loss=%.6f before_objective_loss=%.6f weighted_gap_loss=%.6f weighted_preference_loss=%.6f weighted_ranking=%.4f effective_pair_weight=%.1f discordant_pairs=%zu published=%d report=%s\n",
         result.action_signal_detected, result.counterfactual_overfit_passed,
-        result.after_holdout.q_loss,
-        result.after_holdout.baseline_loss,
+        learning_diagnostic_counterfactual_q_objective_name(objective),
+        objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+            ? result.after_holdout.confidence_weighted_pairwise_preference_loss
+            : result.after_holdout.confidence_weighted_pair_gap_huber_loss,
+        objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+            ? result.before_holdout.confidence_weighted_pairwise_preference_loss
+            : result.before_holdout.confidence_weighted_pair_gap_huber_loss,
         result.after_holdout.confidence_weighted_pair_gap_huber_loss,
-        result.before_holdout.confidence_weighted_pair_gap_huber_loss,
+        result.after_holdout.confidence_weighted_pairwise_preference_loss,
         result.after_holdout.confidence_weighted_pair_ranking_accuracy,
         result.after_holdout.pair_confidence_sum,
         result.after_holdout.discordant_pair_count,
@@ -4645,7 +4657,10 @@ static int showdown_client_main(int argc, char** argv) {
         argc, argv, "--counterfactual-q-head", "joint");
     const char* counterfactual_q_representation_name = parse_string_flag(
         argc, argv, "--counterfactual-q-representation", "hidden");
+    const char* counterfactual_q_objective_name = parse_string_flag(
+        argc, argv, "--counterfactual-q-objective", "gap");
     CounterfactualQRepresentation counterfactual_q_representation;
+    CounterfactualQObjective counterfactual_q_objective;
     float learning_rate_override;
     const char* expected_policy_tag = parse_string_flag(argc, argv, "--policy-tag-expected", "");
     const char* training_summary_path = parse_string_flag(argc, argv, "--training-summary-path", "");
@@ -4801,6 +4816,16 @@ static int showdown_client_main(int argc, char** argv) {
             (counterfactual_q_head_mode == ACTION_VALUE_HEAD_SELECTED)) {
         fprintf(stderr,
             "The semantic counterfactual representation and selected head must be used together.\n");
+        return 1;
+    }
+    if (strcmp(counterfactual_q_objective_name, "gap") == 0) {
+        counterfactual_q_objective = COUNTERFACTUAL_Q_OBJECTIVE_GAP;
+    } else if (strcmp(counterfactual_q_objective_name, "preference") == 0) {
+        counterfactual_q_objective = COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE;
+    } else {
+        fprintf(stderr,
+            "Unsupported --counterfactual-q-objective '%s'. Supported objectives: gap, preference.\n",
+            counterfactual_q_objective_name);
         return 1;
     }
     adam_beta1 = parse_float_flag(argc, argv, "--adam-beta1", rl_defaults.adam_beta1);
@@ -5069,7 +5094,7 @@ static int showdown_client_main(int argc, char** argv) {
             argv[4], argv[5], action_q_output_path, 0u,
             (size_t)action_q_epochs, (size_t)action_q_minibatch_episodes,
             (size_t)action_q_latent_dim, counterfactual_q_head_mode,
-            counterfactual_q_representation,
+            counterfactual_q_representation, counterfactual_q_objective,
             (size_t)action_q_early_stop_patience,
             learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
             action_q_l2_coefficient, counterfactual_min_confidence,
@@ -5085,7 +5110,7 @@ static int showdown_client_main(int argc, char** argv) {
                 ? (size_t)counterfactual_overfit_pairs : 0u,
             (size_t)action_q_epochs, (size_t)action_q_minibatch_episodes,
             (size_t)action_q_latent_dim, counterfactual_q_head_mode,
-            counterfactual_q_representation,
+            counterfactual_q_representation, counterfactual_q_objective,
             (size_t)action_q_early_stop_patience,
             learning_rate_override > 0.0f ? learning_rate_override : 0.0001f,
             action_q_l2_coefficient, counterfactual_min_confidence,
@@ -5395,9 +5420,9 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --check-critic-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--critic-output-checkpoint PATH] [--epochs N] [--learning-rate F] [--gamma F] [--validation-seed N] [--seed N] [--critic-minibatch-episodes N] [--critic-policy-kl-coef F] [--critic-early-stop-patience N] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --check-action-q-fit <episode_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--action-q-target td0|td_lambda|monte_carlo] [--epochs N] [--learning-rate F] [--gamma F] [--gae-lambda F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
         "  showdown_client --check-action-q-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--action-q-output PATH] [--action-q-target td0|td_lambda|monte_carlo] [--epochs N] [--learning-rate F] [--gamma F] [--gae-lambda F] [--validation-seed N] [--seed N] [--action-q-minibatch-episodes N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--reward-mode terminal|dense_additive]\n"
-        "  showdown_client --check-counterfactual-q-fit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-holdout-batch PATH] [--counterfactual-final-confirmation 0|1] [--counterfactual-q-head joint|factorized|selected] [--counterfactual-q-representation hidden|semantic] [--action-q-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--counterfactual-min-confidence F]\n"
-        "  showdown_client --check-counterfactual-q-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-final-confirmation 0|1] [--counterfactual-q-head joint|factorized|selected] [--counterfactual-q-representation hidden|semantic] [--action-q-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--counterfactual-min-confidence F]\n"
-        "  showdown_client --check-counterfactual-q-overfit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-overfit-pairs N] [--counterfactual-q-head joint|factorized|selected] [--counterfactual-q-representation hidden|semantic] [--epochs N] [--learning-rate F] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--counterfactual-min-confidence F]\n"
+        "  showdown_client --check-counterfactual-q-fit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-holdout-batch PATH] [--counterfactual-final-confirmation 0|1] [--counterfactual-q-head joint|factorized|selected] [--counterfactual-q-representation hidden|semantic] [--counterfactual-q-objective gap|preference] [--action-q-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--counterfactual-min-confidence F]\n"
+        "  showdown_client --check-counterfactual-q-fit-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-final-confirmation 0|1] [--counterfactual-q-head joint|factorized|selected] [--counterfactual-q-representation hidden|semantic] [--counterfactual-q-objective gap|preference] [--action-q-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--counterfactual-min-confidence F]\n"
+        "  showdown_client --check-counterfactual-q-overfit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-overfit-pairs N] [--counterfactual-q-head joint|factorized|selected] [--counterfactual-q-representation hidden|semantic] [--counterfactual-q-objective gap|preference] [--epochs N] [--learning-rate F] [--seed N] [--action-q-minibatch-pairs N] [--action-q-latent-dim N] [--action-q-early-stop-patience N] [--action-q-l2 F] [--counterfactual-min-confidence F]\n"
         "  showdown_client --check-counterfactual-policy-preference <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-holdout-batch PATH] [--policy-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--preference-minibatch-pairs N] [--preference-early-stop-patience N] [--preference-beta F] [--preference-winner-nll-coef F] [--preference-anchor-kl-coef F] [--preference-max-mean-kl F] [--preference-min-confidence F]\n"
         "  showdown_client --check-counterfactual-policy-preference-manifest <training_paths.manifest> <holdout_batch.jsonl> <checkpoint.bin> <report.json> [--policy-output PATH] [--epochs N] [--learning-rate F] [--validation-seed N] [--seed N] [--preference-minibatch-pairs N] [--preference-early-stop-patience N] [--preference-beta F] [--preference-winner-nll-coef F] [--preference-anchor-kl-coef F] [--preference-max-mean-kl F] [--preference-min-confidence F]\n"
         "  showdown_client --check-counterfactual-policy-preference-overfit <counterfactual_action_batch.jsonl> <checkpoint.bin> <report.json> [--counterfactual-overfit-pairs N] [--epochs N] [--learning-rate F] [--seed N] [--preference-minibatch-pairs N] [--preference-early-stop-patience N] [--preference-beta F] [--preference-winner-nll-coef F] [--preference-anchor-kl-coef F] [--preference-max-mean-kl F] [--preference-min-confidence F]\n"

@@ -132,6 +132,15 @@ typedef struct {
     int counterfactual_overfit_passed;
 } ActionValueFitResult;
 
+typedef enum {
+    COUNTERFACTUAL_Q_OBJECTIVE_GAP = 0,
+    COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE = 1
+} CounterfactualQObjective;
+
+const char* learning_diagnostic_counterfactual_q_objective_name(
+    CounterfactualQObjective objective
+);
+
 typedef struct {
     size_t pair_count;
     size_t discordant_pair_count;
@@ -348,6 +357,7 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
     float adam_epsilon,
     float gradient_clip,
     float l2_coefficient,
+    CounterfactualQObjective objective,
     ActionValueFitResult* result
 );
 
@@ -392,6 +402,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     float learning_rate,
     float l2_coefficient,
     float minimum_pair_confidence,
+    CounterfactualQObjective objective,
     const ActionValueModel* action_value_model,
     const ActionValueFitResult* result
 );

@@ -5558,6 +5558,7 @@ static int test_counterfactual_q_overfits_repeated_real_shape_pairs(void) {
     enum { PAIR_COUNT = 12 };
     GruModel* policy_model = gru_model_create(4u, 8u, OBS_NUM_ACTIONS);
     ActionValueModel* value_model = NULL;
+    ActionValueModel* preference_model = NULL;
     CounterfactualSample samples[PAIR_COUNT * 2];
     CounterfactualSample* sample_pointers[PAIR_COUNT * 2];
     ActionValueFitResult result;
@@ -5572,8 +5573,11 @@ static int test_counterfactual_q_overfits_repeated_real_shape_pairs(void) {
         return 0;
     }
     value_model = action_value_model_create(8u, 8u, 197u);
-    if (!assert_true(value_model != NULL,
+    preference_model = action_value_model_create(8u, 8u, 198u);
+    if (!assert_true(value_model != NULL && preference_model != NULL,
             "initialize counterfactual overfit sidecar")) {
+        action_value_model_destroy(preference_model);
+        action_value_model_destroy(value_model);
         gru_model_destroy(policy_model);
         return 0;
     }
@@ -5607,7 +5611,8 @@ static int test_counterfactual_q_overfits_repeated_real_shape_pairs(void) {
             sample_pointers, PAIR_COUNT * 2u,
             sample_pointers, PAIR_COUNT * 2u,
             40u, 4u, 5u, 197u,
-            0.03f, 0.9f, 0.999f, 1.0e-8f, 1.0f, 0.0f, &result),
+            0.03f, 0.9f, 0.999f, 1.0e-8f, 1.0f, 0.0f,
+            COUNTERFACTUAL_Q_OBJECTIVE_GAP, &result),
         "run counterfactual real-shape overfit fixture");
     ok &= assert_true(result.best_epoch > 0u &&
             result.last_attempted_epoch == result.epochs_completed &&
@@ -5617,6 +5622,25 @@ static int test_counterfactual_q_overfits_repeated_real_shape_pairs(void) {
             result.after_train.confidence_weighted_pair_ranking_accuracy > 0.9,
         "counterfactual sidecar can memorize calibrated pair gaps");
 
+    ok &= assert_true(learning_diagnostic_run_counterfactual_action_value_fit(
+            preference_model, policy_model,
+            sample_pointers, PAIR_COUNT * 2u,
+            sample_pointers, PAIR_COUNT * 2u,
+            sample_pointers, PAIR_COUNT * 2u,
+            40u, 4u, 5u, 198u,
+            0.03f, 0.9f, 0.999f, 1.0e-8f, 1.0f, 0.0f,
+            COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE, &result),
+        "run counterfactual preference overfit fixture");
+    ok &= assert_true(result.best_epoch > 0u &&
+            result.after_train.confidence_weighted_pairwise_preference_loss <
+                result.before_train.confidence_weighted_pairwise_preference_loss * 0.5 &&
+            result.after_train.confidence_weighted_pair_ranking_accuracy > 0.9 &&
+            result.after_selection.confidence_weighted_pairwise_preference_loss <=
+                result.last_attempted_selection.confidence_weighted_pairwise_preference_loss +
+                    1.1e-6,
+        "counterfactual preference objective learns and restores its best epoch");
+
+    action_value_model_destroy(preference_model);
     action_value_model_destroy(value_model);
     gru_model_destroy(policy_model);
     return ok;

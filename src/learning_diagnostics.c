@@ -12,6 +12,14 @@
 #include <windows.h>
 #endif
 
+const char* learning_diagnostic_counterfactual_q_objective_name(
+    CounterfactualQObjective objective
+) {
+    return objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+        ? "rollout_confidence_weighted_pairwise_preference"
+        : "rollout_confidence_weighted_pair_gap_huber_regression";
+}
+
 static int evaluate_episodes(
     const GruTrainer* trainer,
     const GruModel* model,
@@ -605,7 +613,8 @@ static int evaluate_counterfactual_action_value(
 
 static void assess_action_value_fit(
     ActionValueFitResult* result,
-    int require_counterfactual_pair_signal
+    int require_counterfactual_pair_signal,
+    CounterfactualQObjective objective
 ) {
     result->holdout_loss_improved = result->after_holdout.sample_count > 0 &&
         result->after_holdout.nonfinite_count == 0 &&
@@ -633,7 +642,9 @@ static void assess_action_value_fit(
         result->explained_variance_generalization_gap <= 0.25;
     if (require_counterfactual_pair_signal) {
         result->action_signal_detected = result->training_completed &&
-            result->pair_gap_holdout_loss_improved &&
+            (objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+                ? result->pairwise_holdout_loss_improved
+                : result->pair_gap_holdout_loss_improved) &&
             result->counterfactual_pair_signal_detected &&
             result->after_holdout.nonfinite_count == 0 &&
             result->after_holdout.mean_absolute_advantage > 1.0e-4 &&
@@ -1191,7 +1202,7 @@ int learning_diagnostic_run_action_value_fit(
                 action_value_model, policy_model, holdout_episodes, holdout_count,
                 gamma, gae_lambda, target_mode, &result->after_holdout)) goto failure;
 
-    assess_action_value_fit(result, 0);
+    assess_action_value_fit(result, 0, COUNTERFACTUAL_Q_OBJECTIVE_GAP);
     free(best_parameters);
     free(order);
     return 1;
@@ -1221,6 +1232,7 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
     float adam_epsilon,
     float gradient_clip,
     float l2_coefficient,
+    CounterfactualQObjective objective,
     ActionValueFitResult* result
 ) {
     size_t* order = NULL;
@@ -1237,6 +1249,8 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
             holdout_count == 0 || epochs == 0 || minibatch_pairs == 0 ||
             train_count % 2u != 0 || selection_count % 2u != 0 ||
             holdout_count % 2u != 0 ||
+            (objective != COUNTERFACTUAL_Q_OBJECTIVE_GAP &&
+             objective != COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE) ||
             early_stop_patience == 0 || !result) return 0;
     memset(result, 0, sizeof(*result));
     if (!evaluate_counterfactual_action_value(
@@ -1254,8 +1268,9 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
     if (!order || !best_parameters || !action_value_model_export_parameters(
             action_value_model, best_parameters, parameter_count)) goto failure;
     for (i = 0; i < train_count / 2u; ++i) order[i] = i;
-    best_selection_loss =
-        result->before_selection.confidence_weighted_pair_gap_huber_loss;
+    best_selection_loss = objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+        ? result->before_selection.confidence_weighted_pairwise_preference_loss
+        : result->before_selection.confidence_weighted_pair_gap_huber_loss;
     result->training_completed = 1;
     for (epoch = 0; epoch < epochs; ++epoch) {
         ActionValueFitMetrics selection_metrics;
@@ -1295,8 +1310,13 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
                 int pair_used = 0;
                 float pair_weight =
                     counterfactual_pair_preference_weight(first, second);
-                if (!first_example.features || !second_example.features ||
-                        !action_value_model_accumulate_weighted_gap_regression(
+                if (!first_example.features || !second_example.features) goto failure;
+                if (objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE) {
+                    if (!action_value_model_accumulate_weighted_preference(
+                            action_value_model, policy_model,
+                            &first_example, &second_example, pair_weight,
+                            NULL, &pair_used)) goto failure;
+                } else if (!action_value_model_accumulate_weighted_gap_regression(
                         action_value_model, policy_model,
                         &first_example, &second_example, pair_weight,
                         ACTION_VALUE_GAP_HUBER_DELTA, NULL,
@@ -1311,23 +1331,32 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
         if (!evaluate_counterfactual_action_value(
                 action_value_model, policy_model, selection_samples, selection_count,
                 &selection_metrics)) goto failure;
-        if (selection_metrics.confidence_weighted_pair_gap_huber_loss <
-                best_selection_loss - 1.0e-6) {
-            best_selection_loss =
-                selection_metrics.confidence_weighted_pair_gap_huber_loss;
-            result->best_epoch = epoch + 1u;
-            stale_epochs = 0;
-            if (!action_value_model_export_parameters(
-                    action_value_model, best_parameters, parameter_count)) goto failure;
-        } else {
-            ++stale_epochs;
+        {
+            double selection_loss =
+                objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+                    ? selection_metrics.confidence_weighted_pairwise_preference_loss
+                    : selection_metrics.confidence_weighted_pair_gap_huber_loss;
+            if (selection_loss < best_selection_loss - 1.0e-6) {
+                best_selection_loss = selection_loss;
+                result->best_epoch = epoch + 1u;
+                stale_epochs = 0;
+                if (!action_value_model_export_parameters(
+                        action_value_model, best_parameters, parameter_count)) goto failure;
+            } else {
+                ++stale_epochs;
+            }
         }
         {
             double elapsed = critic_wall_seconds() - started_at;
             double eta = elapsed / (double)(epoch + 1u) * (double)(epochs - epoch - 1u);
-            printf("[counterfactual-q] epoch=%zu/%zu selection_weighted_gap_loss=%.6f selection_weighted_ranking=%.4f best_epoch=%zu elapsed=%.1fs eta=%.1fs\n",
+            double selection_loss =
+                objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+                    ? selection_metrics.confidence_weighted_pairwise_preference_loss
+                    : selection_metrics.confidence_weighted_pair_gap_huber_loss;
+            printf("[counterfactual-q] epoch=%zu/%zu selection_objective=%s selection_loss=%.6f selection_weighted_ranking=%.4f best_epoch=%zu elapsed=%.1fs eta=%.1fs\n",
                 epoch + 1u, epochs,
-                selection_metrics.confidence_weighted_pair_gap_huber_loss,
+                learning_diagnostic_counterfactual_q_objective_name(objective),
+                selection_loss,
                 selection_metrics.confidence_weighted_pair_ranking_accuracy,
                 result->best_epoch, elapsed, eta);
         }
@@ -1355,7 +1384,7 @@ int learning_diagnostic_run_counterfactual_action_value_fit(
             !evaluate_counterfactual_action_value(
                 action_value_model, policy_model, holdout_samples, holdout_count,
                 &result->after_holdout)) goto failure;
-    assess_action_value_fit(result, 1);
+    assess_action_value_fit(result, 1, objective);
     free(best_parameters);
     free(order);
     return 1;
@@ -1966,6 +1995,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
     float learning_rate,
     float l2_coefficient,
     float minimum_pair_confidence,
+    CounterfactualQObjective objective,
     const ActionValueModel* action_value_model,
     const ActionValueFitResult* result
 ) {
@@ -1988,7 +2018,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         overfit_pair_count > 0
             ? "counterfactual_q_real_data_overfit"
             : "paired_counterfactual_q_fit");
-    fputs("  \"metrics_version\": 11,\n  \"counterfactual_batch\": ", out);
+    fputs("  \"metrics_version\": 12,\n  \"counterfactual_batch\": ", out);
     write_json_string(out, batch_path);
     fprintf(out, ",\n  \"training_source_kind\": \"%s\"",
         training_source_is_manifest ? "manifest" : "batch");
@@ -2020,7 +2050,7 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"encoder_frozen\": true,\n"
         "  \"policy_frozen\": true,\n"
         "  \"target_value_source\": \"matched_terminal_counterfactual_rollouts\",\n"
-        "  \"training_objective\": \"rollout_confidence_weighted_pair_gap_huber_regression\",\n"
+        "  \"training_objective\": \"%s\",\n"
         "  \"pair_gap_huber_delta\": %.9g,\n"
         "  \"pair_weight_definition\": \"normal confidence from matched rollout differences with independent-variance fallback\",\n"
         "  \"minimum_pair_confidence\": %.9g,\n"
@@ -2045,8 +2075,10 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         "  \"learning_rate\": %.9g,\n"
         "  \"l2_coefficient\": %.9g,\n",
         action_value_published ? "true" : "false",
-        overfit_pair_count > 0 || semantic_representation
+        overfit_pair_count > 0 || semantic_representation ||
+            objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
             ? "false" : "true",
+        learning_diagnostic_counterfactual_q_objective_name(objective),
         (double)ACTION_VALUE_GAP_HUBER_DELTA,
         minimum_pair_confidence,
         representation_name,
@@ -2096,9 +2128,15 @@ int learning_diagnostic_write_counterfactual_action_value_report(
         result->action_signal_detected ? "true" : "false",
         result->counterfactual_overfit_passed ? "true" : "false");
     if (overfit_pair_count > 0) {
-        fputs("    \"pass_rule\": \"on the reused real-data subset, confidence-weighted pair-gap Huber loss falls at least 50%, weighted ranking accuracy reaches at least 90%, at least 10 discordant pairs contribute, and outputs remain finite\"\n", out);
+        fprintf(out,
+            "    \"pass_rule\": \"on the reused real-data subset, confidence-weighted %s loss falls at least 50%%, weighted ranking accuracy reaches at least 90%%, at least 10 discordant pairs contribute, and outputs remain finite\"\n",
+            objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+                ? "pairwise preference" : "pair-gap Huber");
     } else {
-        fputs("    \"pass_rule\": \"confidence-weighted pair-gap Huber loss improves at least 1% on holdout, at least 10 discordant holdout pairs achieve at least 55% confidence-weighted ranking accuracy, outputs remain finite, and advantages remain bounded\"\n", out);
+        fprintf(out,
+            "    \"pass_rule\": \"confidence-weighted %s loss improves at least 1%% on holdout, at least 10 discordant holdout pairs achieve at least 55%% confidence-weighted ranking accuracy, outputs remain finite, and advantages remain bounded\"\n",
+            objective == COUNTERFACTUAL_Q_OBJECTIVE_PREFERENCE
+                ? "pairwise preference" : "pair-gap Huber");
     }
     fputs("  }\n}\n", out);
     return fclose(out) == 0;
