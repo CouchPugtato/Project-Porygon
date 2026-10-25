@@ -77,7 +77,7 @@ function battleSeeds(seed, index, matchedTeams) {
             (matchedTeams ? (side === teacherSide ? 0 : 1) : side))};
 }
 
-async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false} = {}) {
+async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
     const battleId = `tactical-${opponent}-${config.seed}-${index}`;
     const teacherSide = index % 2 === 0 ? 0 : 1;
     const opponentName = opponent === 'random' ? 'RandomPolicy' : 'ParentPolicy';
@@ -87,7 +87,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
     const seeds = battleSeeds(config.seed, index, matchedTeams);
     const agents = [0, 1].map(side => opponent === 'random' && side !== teacherSide ? null : new AgentProcess(
         path.resolve(REPO_ROOT, config.checkpoint), seeds.inference[side],
-        null, config.agent_omp_threads, side === teacherSide));
+        null, config.agent_omp_threads, side === teacherSide, side === teacherSide ? recordTeacher : null));
     let timeout;
     let game;
     try {

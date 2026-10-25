@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const {aggregateGames, hashFile, playGame} = require('./tactical_teacher_smoke');
 const {acquireRunLock, createResourceGate, writeJsonAtomic} = require('./counterfactual_rollout');
+const {publishReplay, verifyReplays} = require('./tactical_demonstrations');
 const ROOT = path.resolve(__dirname, '..');
 const OPPONENTS = ['parent', 'random'];
 
@@ -94,7 +95,8 @@ async function loadSaved(filename) {
 }
 
 function validateConfig(config) {
-    if (config.format !== 'gen9randomdoublesbattle' || config.agent_omp_threads !== 1 ||
+    if ((config.collect_demonstrations !== undefined && typeof config.collect_demonstrations !== 'boolean') ||
+            config.format !== 'gen9randomdoublesbattle' || config.agent_omp_threads !== 1 ||
             !Number.isSafeInteger(config.games_per_side) || config.games_per_side < 1 || config.games_per_side > 1000 ||
             !Number.isSafeInteger(config.max_attempts_per_side) ||
             config.max_attempts_per_side < config.games_per_side || config.max_attempts_per_side > 5 * config.games_per_side ||
@@ -119,7 +121,7 @@ async function main(argv = process.argv.slice(2)) {
         args['--config'] || 'config/experimental/tactical_teacher_benchmark.json'), 'utf8'));
     validateConfig(config);
     const sources = ['tools/tactical_teacher_benchmark.js', 'tools/tactical_teacher_smoke.js',
-        'tools/counterfactual_rollout.js', 'external/pokemon-showdown/dist/sim/battle.js',
+        'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'external/pokemon-showdown/dist/sim/battle.js',
         'external/pokemon-showdown/dist/sim/battle-stream.js',
         'external/pokemon-showdown/dist/sim/tools/random-player-ai.js'];
     const identity = {config, checkpoint_sha256: await hashFile(path.resolve(ROOT, config.checkpoint)),
@@ -133,6 +135,7 @@ async function main(argv = process.argv.slice(2)) {
         const filename = path.join(directory, `${name}_summary.json`);
         const prior = await loadSaved(filename);
         const games = prior ? validateResume(prior, identity, config) : [];
+        if (config.collect_demonstrations) await verifyReplays(directory, games, isValid);
         const gate = createResourceGate({maxSystemMemoryPercent: config.max_system_memory_percent,
             maxSystemCpuPercent: config.max_system_cpu_percent, resourceCheckSeconds: config.resource_check_seconds,
             launchStaggerMilliseconds: config.launch_stagger_ms});
@@ -141,11 +144,17 @@ async function main(argv = process.argv.slice(2)) {
             const results = summarize(games);
             const valid = Object.values(results).reduce((sum, result) => sum + result.valid_games, 0);
             const elapsed = games.reduce((sum, game) => sum + game.duration_seconds, 0);
-            await writeJsonAtomic(filename, {diagnostic: 'tactical_teacher_strength_benchmark', run_name: name,
+            await writeJsonAtomic(filename, {diagnostic: config.collect_demonstrations ?
+                'tactical_teacher_demonstration_collection' : 'tactical_teacher_strength_benchmark', run_name: name,
                 identity, status, error, training_eligible: false, target_valid_games: 4 * config.games_per_side,
+                demonstration_purpose: config.collect_demonstrations ? 'supervised_imitation' : null,
+                ppo_eligible: false,
                 valid_games: valid, elapsed_seconds: elapsed,
                 estimated_remaining_seconds: valid ? elapsed / valid * (4 * config.games_per_side - valid) : null,
-                interval_method: '95% Wilson score; draws count half; paired games are not independent',
+                demonstration_count: games.filter(game => game.demonstration).length,
+                demonstration_turns: games.reduce((sum, game) => sum + (game.demonstration?.decision_turns || 0), 0),
+                interval_method: config.collect_demonstrations ? '95% Wilson score; draws count half' :
+                    '95% Wilson score; draws count half; paired games are not independent',
                 results, games});
         }
         try {
@@ -155,7 +164,14 @@ async function main(argv = process.argv.slice(2)) {
                 console.log(`[tactical-benchmark] ${next.opponent} side=${next.teacher_side} ` +
                     `attempt=${Math.floor(next.index / 2) + 1}/${config.max_attempts_per_side}`);
                 await gate.waitForLaunch();
-                const game = await playGame(sim, config, next.index, {opponent: next.opponent, matchedTeams: true});
+                const replay = [];
+                const battleConfig = config.collect_demonstrations && next.opponent === 'random' ?
+                    {...config, seed: config.seed + 10000000} : config;
+                const game = await playGame(sim, battleConfig, next.index, {opponent: next.opponent,
+                    matchedTeams: !config.collect_demonstrations,
+                    recordTeacher: config.collect_demonstrations ? line => replay.push(line) : null});
+                if (config.collect_demonstrations && isValid(game))
+                    game.demonstration = await publishReplay(directory, next.opponent, next.index, replay, game);
                 games.push({...game, ...next, duration_seconds: (Date.now() - start) / 1000});
                 await publish('in_progress');
                 const results = summarize(games);

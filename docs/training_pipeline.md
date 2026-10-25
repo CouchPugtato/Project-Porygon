@@ -377,6 +377,48 @@ screening run. Review each opponent and side separately rather than pooling
 both runs to conceal a weaker confirmation. A successful result supports the
 next teacher-imitation experiment; it does not demonstrate neural learning.
 
+### Teacher demonstration pilot
+
+After reviewing the fresh-seed confirmation, collect a small supervised pilot:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0268_tactical_demonstrations_200 --config .\config\experimental\tactical_teacher_collection.json
+```
+
+This opt-in collection mode uses the same battle bridge, scheduling, atomic
+summary, and resource gates as the benchmark. It requests 50 valid games per
+side against each opponent (200 total), with at most 65 attempts per side.
+The collection seed is 26801; the random-opponent seed range adds 10,000,000.
+Unlike the paired benchmark, collection uses a separate team/battle seed for
+each attempt. Both teacher wins and losses are retained; there is no wins-only
+selection.
+
+Each valid game's `teacher_<opponent>_<index>_raw.jsonl` contains exactly the
+messages sent to the teacher runtime: battle start, player-visible events and
+requests, accepted action pairs and target-bearing commands, terminal result,
+and battle end. The parent/random player's stream and the omniscient stream
+are not recorded. Parent-policy fallback decisions remain in the hybrid
+teacher's demonstrations. The existing replay reader can reconstruct these
+sessions for supervised learning; native ingestion must still be checked on
+the collected files before training.
+
+Completed, rejection-free games are validated and written atomically before
+their replay path, hash, battle ID, decision count, outcome, and policy tag are
+added to the run summary. Resume verifies referenced hashes and refuses missing
+or modified files. A crash between replay publication and summary publication
+may leave an unreferenced replay; the deterministic retry replaces it rather
+than counting it twice. Use only files referenced by a completed collection
+summary as training inputs. The summary reports `demonstration_count` and
+`demonstration_turns`, and each replay entry specifies
+`purpose: supervised_imitation` and `ppo_eligible: false`.
+
+No model is trained or checkpoint published by this command. Runtime
+`training_eligible: false` remains the safeguard against treating heuristic
+behavior as on-policy PPO data; it does not prohibit explicitly labelled
+supervised imitation. The next reviewable step is native replay-ingestion
+validation, followed by a controlled student fit with battle-level holdout
+and a fresh playing-strength evaluation with tactical overrides disabled.
+
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental
 `factorized` head reuses a slot-local action scorer across every partner action

@@ -186,12 +186,13 @@ function continuationSeed(base, attempt, repeat) {
 }
 
 class AgentProcess {
-    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false) {
+    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null) {
         this.checkpoint = checkpoint;
         this.inferenceSeed = inferenceSeedValue;
         this.intervention = intervention;
         this.ompThreads = ompThreads;
         this.tacticalTeacher = tacticalTeacher;
+        this.onSend = onSend;
         this.process = null;
         this.messages = [];
         this.waiters = [];
@@ -273,7 +274,9 @@ class AgentProcess {
         if (!this.process || !this.process.stdin.writable) {
             throw new Error('attempted to write to a closed showdown_client');
         }
-        this.process.stdin.write(`${JSON.stringify(payload)}\n`);
+        const line = `${JSON.stringify(payload)}\n`;
+        if (this.onSend) this.onSend(line);
+        this.process.stdin.write(line);
     }
 
     async close() {
@@ -1683,4 +1686,5 @@ module.exports = {
     summarizeCounterfactualSignal,
     summarizeFailureLog,
     writeJsonAtomic,
+    writeTextAtomic,
 };
