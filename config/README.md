@@ -13,6 +13,11 @@ running one battle at a time with the same resource gates. Each side permits
 125 attempts. Results, confidence intervals, coverage, and failed attempts are
 saved after every game. Reuse the command to resume unchanged inputs.
 
+`experimental/tactical_teacher_confirmation.json` repeats that benchmark with
+only the seed changed. Pass it using `--config` and use a new run name. Keep
+the checkpoint, executable, and tactical rules frozen between screening and
+confirmation.
+
 `experimental/counterfactual_preference_comparison.json` supplies the fixed
 four-split comparison in `tools/run_counterfactual_preference_comparison.ps1`.
 This PowerShell runner reads JSON rather than the TOML entrypoint format below.

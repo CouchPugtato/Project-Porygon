@@ -364,6 +364,19 @@ and memory launch gates at 65%. These gates pause new battles; they do not impos
 an operating-system-wide hard limit on other applications or a running battle.
 Neither benchmark opponent produces training data or publishes a checkpoint.
 
+For fresh-seed confirmation without changing the teacher or game counts, run:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0267_tactical_confirmation_100ps --config .\config\experimental\tactical_teacher_confirmation.json
+```
+
+The confirmation config changes only seed 26601 to 26701. Its battle, team,
+and random-player seed tuples do not overlap the screening schedule, including
+replacement attempts. Keep the executable and checkpoint identical to the
+screening run. Review each opponent and side separately rather than pooling
+both runs to conceal a weaker confirmation. A successful result supports the
+next teacher-imitation experiment; it does not demonstrate neural learning.
+
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental
 `factorized` head reuses a slot-local action scorer across every partner action

@@ -101,3 +101,17 @@ test('benchmark resource settings remain conservative', () => {
         {max_system_memory_percent: 90}, {max_attempts_per_side: 0}])
         assert.throws(() => validateConfig({...config, ...changes}), /bounded/);
 });
+
+test('confirmation changes only the seed and does not reuse screening battle or team seeds', () => {
+    const screening = require('../config/experimental/tactical_teacher_benchmark.json');
+    const confirmation = require('../config/experimental/tactical_teacher_confirmation.json');
+    validateConfig(confirmation);
+    assert.notEqual(confirmation.seed, screening.seed);
+    assert.deepEqual({...confirmation, seed: screening.seed}, screening);
+    const tuples = settings => Array.from({length: settings.max_attempts_per_side}, (_, pair) => {
+        const seeds = battleSeeds(settings.seed, pair * 2, true);
+        return [seeds.battle, seeds.random, ...seeds.players];
+    }).flat();
+    const seen = new Set(tuples(screening));
+    assert.equal(tuples(confirmation).some(seed => seen.has(seed)), false);
+});
