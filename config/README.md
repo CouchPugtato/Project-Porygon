@@ -6,6 +6,13 @@ battles with the tactical override alternating sides against its parent,
 one OpenMP thread per agent, and 65% launch gates for system CPU and memory.
 It records coverage and choice failures rather than publishing training data.
 
+`experimental/tactical_teacher_benchmark.json` configures
+`node tools/tactical_teacher_benchmark.js --run-name <name>`. It targets 100
+valid games per side against the parent and seeded Showdown random play,
+running one battle at a time with the same resource gates. Each side permits
+125 attempts. Results, confidence intervals, coverage, and failed attempts are
+saved after every game. Reuse the command to resume unchanged inputs.
+
 `experimental/counterfactual_preference_comparison.json` supplies the fixed
 four-split comparison in `tools/run_counterfactual_preference_comparison.ps1`.
 This PowerShell runner reads JSON rather than the TOML entrypoint format below.

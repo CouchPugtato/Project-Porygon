@@ -50,35 +50,72 @@ async function closeGame(streams, agents) {
     if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'battle cleanup failed');
 }
 
-async function playGame(sim, config, index) {
-    const battleId = `tactical-smoke-${config.seed}-${index}`;
+async function driveRandom(stream, seed) {
+    const {RandomPlayerAI} = require('../external/pokemon-showdown/dist/sim/tools/random-player-ai');
+    const choiceRejections = [];
+    class RecordedRandomPlayer extends RandomPlayerAI {
+        receiveError(error) {
+            choiceRejections.push({player: 'RandomPolicy', message: error.message});
+            return super.receiveError(error);
+        }
+    }
+    const player = new RecordedRandomPlayer(stream, {seed});
+    await player.start();
+    const terminal = player.log.find(line => line.startsWith('|win|') || line === '|tie|');
+    if (!terminal) throw new Error('random player ended without a result');
+    return {result: {result: terminal === '|tie|' ? 'draw' :
+        terminal === '|win|RandomPolicy' ? 'win' : 'loss'}, choiceRejections};
+}
+
+function battleSeeds(seed, index, matchedTeams) {
+    const teacherSide = index % 2;
+    const position = matchedTeams ? Math.floor(index / 2) : index;
+    return {battle: seedTuple(seed, position, 0), random: seedTuple(seed, position, 3),
+        players: [0, 1].map(side => seedTuple(seed, position,
+            matchedTeams ? (side === teacherSide ? 1 : 2) : side + 1)),
+        inference: [0, 1].map(side => seed + position * 2 +
+            (matchedTeams ? (side === teacherSide ? 0 : 1) : side))};
+}
+
+async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false} = {}) {
+    const battleId = `tactical-${opponent}-${config.seed}-${index}`;
     const teacherSide = index % 2 === 0 ? 0 : 1;
-    const names = teacherSide === 0 ? ['TacticalTeacher', 'ParentPolicy'] : ['ParentPolicy', 'TacticalTeacher'];
+    const opponentName = opponent === 'random' ? 'RandomPolicy' : 'ParentPolicy';
+    const names = teacherSide === 0 ? ['TacticalTeacher', opponentName] : [opponentName, 'TacticalTeacher'];
     const battle = new sim.BattleStream();
     const streams = sim.getPlayerStreams(battle);
-    const agents = [0, 1].map(side => new AgentProcess(
-        path.resolve(REPO_ROOT, config.checkpoint), config.seed + index * 2 + side,
+    const seeds = battleSeeds(config.seed, index, matchedTeams);
+    const agents = [0, 1].map(side => opponent === 'random' && side !== teacherSide ? null : new AgentProcess(
+        path.resolve(REPO_ROOT, config.checkpoint), seeds.inference[side],
         null, config.agent_omp_threads, side === teacherSide));
     let timeout;
     let game;
     try {
         const work = (async () => {
-            await Promise.all(agents.map(agent => agent.start()));
+            await Promise.all(agents.filter(Boolean).map(agent => agent.start()));
             const players = [streams.p1, streams.p2].map((stream, side) =>
-                drivePlayer(stream, agents[side], battleId, names[side], config.format));
+                agents[side] ? drivePlayer(stream, agents[side], battleId, names[side], config.format) :
+                    driveRandom(stream, seeds.random));
             const drain = (async () => { for await (const chunk of streams.omniscient) { void chunk; } })();
             const results = Promise.all([...players, drain]);
             // Attach rejection handling before the first simulator write can
             // trigger a player error. The awaited result still reports it below.
             results.catch(() => {});
             await streams.omniscient.write(
-                `>start ${JSON.stringify({formatid: config.format, seed: seedTuple(config.seed, index, 0)})}\n` +
-                `>player p1 ${JSON.stringify({name: names[0], seed: seedTuple(config.seed, index, 1)})}\n` +
-                `>player p2 ${JSON.stringify({name: names[1], seed: seedTuple(config.seed, index, 2)})}`);
+                `>start ${JSON.stringify({formatid: config.format, seed: seeds.battle})}\n` +
+                [0, 1].map(side => `>player p${side + 1} ${JSON.stringify({name: names[side],
+                    seed: seeds.players[side]})}`)
+                    .join('\n'));
             const [first, second] = await results;
             const teacher = teacherSide === 0 ? first : second;
+            const other = teacherSide === 0 ? second : first;
+            if (!['win', 'loss', 'draw'].includes(teacher.result.result) ||
+                    (teacher.result.result === 'draw' ? other.result.result !== 'draw' :
+                        other.result.result !== (teacher.result.result === 'win' ? 'loss' : 'win'))) {
+                throw new Error('players reported inconsistent terminal results');
+            }
             const game = {
-                index, status: 'completed', teacher_side: teacherSide === 0 ? 'a' : 'b',
+                index, status: 'completed', teacher_side: teacherSide === 0 ? 'a' : 'b', seeds,
                 result: teacher.result, coverage: teacher.episode,
                 choice_rejections: [...first.choiceRejections, ...second.choiceRejections],
             };
@@ -93,7 +130,7 @@ async function playGame(sim, config, index) {
             error: limitUtf8(error.stack || error.message, 16384).text};
     } finally {
         clearTimeout(timeout);
-        try { await closeGame(streams, agents); }
+        try { await closeGame(streams, agents.filter(Boolean)); }
         catch (error) {
             game = {...game, index, status: 'failed',
                 cleanup_error: limitUtf8(error.stack || error.message, 16384).text};
@@ -182,4 +219,4 @@ if (require.main === module) main().catch(error => {
     process.exitCode = 1;
 });
 
-module.exports = {aggregateGames, closeGame};
+module.exports = {aggregateGames, battleSeeds, closeGame, driveRandom, hashFile, playGame};

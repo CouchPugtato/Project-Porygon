@@ -320,6 +320,50 @@ hash match. Failed attempts remain recorded. Use a new run name after rebuilding
 or changing inputs. This smoke is a legality/coverage check and makes no strength
 or promotion claim.
 
+### Frozen tactical strength benchmark
+
+The six-game runtime smoke is not a strength test. Once it passes, keep the
+rules and checkpoint unchanged and run:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0266_tactical_strength_100ps
+```
+
+`config/experimental/tactical_teacher_benchmark.json` requests 100 valid games
+per side against each of two opponents: the same checkpoint without tactical
+overrides, then Showdown's seeded `RandomPlayerAI`. Random play uses only its
+player stream, not the simulator's hidden battle state. The runner shares the
+smoke's single-battle path rather than maintaining a second protocol adapter.
+Adjacent side-A/side-B attempts share battle and team seeds, swapping teams
+and preserving policy-role inference seeds. Opponent matchups reuse the same
+seed schedule. Replacement attempts can leave a seed pair incomplete; every
+completed game records its seeds.
+
+Only completed games with consistent terminal results, valid teacher coverage,
+and no rejected choices count. Failed games and choice rejections stay in the
+summary; each side stops after 125 attempts if it cannot reach its target.
+Results include wins/losses/draws, score rate (draws count half), side splits,
+invalid counts, tactical coverage, and approximate 95% Wilson score intervals.
+These intervals treat games as independent, although seed-paired games can be
+correlated. They are descriptive screening metrics, not an automatic promotion
+or student-training gate. Review both opponents, side effects, and errors before
+claiming a stronger teacher; use fresh seeds for confirmation.
+
+The atomic `<run>_summary.json` is saved after every attempt. Resume checks the
+config, checkpoint, executable, runner/bridge source hashes, and core simulator
+source hashes. A truncated primary summary can recover its last atomic backup;
+an interrupted game is replayed. Changed inputs require a new run name. The
+summary retains a failed status and error if the attempt budget is exhausted.
+Console progress reports attempts, valid games, invalid games, elapsed minutes,
+and an estimated total remaining time in minutes, calibrated from observed
+valid-game throughput. Early estimates and estimates across opponent changes
+can move substantially.
+
+Battles remain serial, with one OpenMP thread per native agent and system CPU
+and memory launch gates at 65%. These gates pause new battles; they do not impose
+an operating-system-wide hard limit on other applications or a running battle.
+Neither benchmark opponent produces training data or publishes a checkpoint.
+
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental
 `factorized` head reuses a slot-local action scorer across every partner action
