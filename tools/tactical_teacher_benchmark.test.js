@@ -145,3 +145,43 @@ test('neural results resume without fabricated tactical coverage and reject a po
     assert.throws(() => validateResume({identity, games: [game]}, identity, config), /policy mode/);
     assert.throws(() => validateResume({identity, games: [{...game, coverage: {}}]}, identity, neural), /must not contain/);
 });
+
+test('larger student confirmation freezes the policy and uses fresh battle and team seeds', () => {
+    const screening = require('../config/experimental/tactical_student_benchmark.json');
+    const confirmation = require('../config/experimental/tactical_student_confirmation.json');
+    validateConfig(confirmation);
+    assert.equal(confirmation.games_per_side, 500);
+    assert.equal(confirmation.max_attempts_per_side, 625);
+    assert.deepEqual({...confirmation, seed: screening.seed, games_per_side: screening.games_per_side,
+        max_attempts_per_side: screening.max_attempts_per_side}, screening);
+    const screeningSeeds = new Set();
+    for (let pair = 0; pair < screening.max_attempts_per_side; ++pair) {
+        const seeds = battleSeeds(screening.seed, pair * 2, true);
+        for (const tuple of [seeds.battle, seeds.random, ...seeds.players]) screeningSeeds.add(tuple);
+    }
+    for (let pair = 0; pair < confirmation.max_attempts_per_side; ++pair) {
+        const seeds = battleSeeds(confirmation.seed, pair * 2, true);
+        for (const tuple of [seeds.battle, seeds.random, ...seeds.players])
+            assert.equal(screeningSeeds.has(tuple), false);
+    }
+});
+
+test('parent control reuses the student random-matchup settings and skips the parent matchup', () => {
+    const control = require('../config/experimental/tactical_parent_control.json');
+    const student = require('../config/experimental/tactical_student_confirmation.json');
+    validateConfig(control);
+    const {opponents, ...settings} = control;
+    assert.deepEqual(opponents, ['random']);
+    assert.deepEqual({...settings, candidate_checkpoint: student.candidate_checkpoint}, student);
+    assert.equal(control.candidate_checkpoint, control.checkpoint);
+    const tiny = {...control, games_per_side: 1, max_attempts_per_side: 2};
+    const games = [];
+    assert.equal(nextGame(tiny, games).opponent, 'random');
+    games.push(record(nextGame(tiny, games), {policy_mode: 'neural', coverage: null}));
+    games.push(record(nextGame(tiny, games), {policy_mode: 'neural', coverage: null}));
+    assert.equal(nextGame(tiny, games), null);
+    assert.equal(summarize(games).parent.attempts, 0);
+    assert.equal(summarize(games).random.valid_games, 2);
+    for (const opponents of [[], ['unknown'], ['random', 'random'], 'random'])
+        assert.throws(() => validateConfig({...control, opponents}), /bounded/);
+});

@@ -1,0 +1,16 @@
+{
+  "checkpoint": "models/runs/run_0093_current_arch_full/current_arch_full.chk",
+  "candidate_checkpoint": "models/runs/run_0093_current_arch_full/current_arch_full.chk",
+  "tactical_teacher": false,
+  "opponents": ["random"],
+  "games_per_side": 500,
+  "max_attempts_per_side": 625,
+  "format": "gen9randomdoublesbattle",
+  "seed": 27101,
+  "agent_omp_threads": 1,
+  "battle_timeout_seconds": 180,
+  "max_system_memory_percent": 65,
+  "max_system_cpu_percent": 65,
+  "resource_check_seconds": 2,
+  "launch_stagger_ms": 750
+}

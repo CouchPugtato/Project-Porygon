@@ -444,6 +444,38 @@ claiming tactical coverage. Resume rejects a changed policy mode, checkpoint,
 config, or recorded runner source. Imitation improvement alone is not grounds
 to promote the student; first compare this run's actual playing results.
 
+If screening is promising but inconclusive, keep that same loss-selected
+checkpoint frozen for a larger fresh-seed evaluation:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0271_tactical_student_confirmation_500ps --config .\config\experimental\tactical_student_confirmation.json
+```
+
+This profile requests 500 valid games per side against each opponent: 1,000
+against the parent and 1,000 against random, with at most 625 attempts per
+side. Only the seed and sample/replacement counts change. Review this run
+separately from screening; do not pick another epoch using these results or
+train further while confirmation is in progress. Matched side pairs can be
+correlated, so the displayed per-game Wilson intervals remain descriptive.
+Review the paired records and invalid games as well as point estimates before
+claiming a verified gain.
+
+If the student beats its parent but not random, measure the parent against
+that same random policy rather than assuming the parent scored 50%:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0272_parent_random_control_500ps --config .\config\experimental\tactical_parent_control.json
+```
+
+This control changes the candidate back to the original parent and selects
+only `opponents: ["random"]`. It retains run_0271's seed 27101, 500 valid games
+per side, native inference seed roles, team seeds, random AI, and resource
+limits. The target and ETA adjust to the selected opponents (1,000 valid
+games total). Preserve the native executable between runs. Compare the two
+candidates' outcomes on shared valid seeds and side pairs; replacement games
+outside that intersection are not matched observations. This control is not
+an independent confirmation or a new student fit.
+
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental
 `factorized` head reuses a slot-local action scorer across every partner action

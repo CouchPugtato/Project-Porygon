@@ -32,6 +32,18 @@ and `tactical_teacher: false` disables the heuristic. It requests 100 valid
 games per side against the parent and random, with serial one-thread agents.
 Both checkpoint hashes and the candidate's neural policy mode are recorded.
 
+`experimental/tactical_student_confirmation.json` repeats the student test
+with fresh seed 27101 and 500 valid games per side per opponent (2,000 total).
+Only the seed, game target, and replacement budget differ from screening.
+Keep the checkpoint and executable frozen; rerun the same command to resume.
+
+`experimental/tactical_parent_control.json` runs only the `random` opponent,
+using the original parent as a plain-neural candidate on the student
+confirmation's exact seed schedule. It requests 1,000 valid games total.
+This matched control is needed before calling the student's random-matchup
+result an improvement or regression relative to its parent. `opponents` may
+select either or both supported opponents; omitting it retains both.
+
 `experimental/counterfactual_preference_comparison.json` supplies the fixed
 four-split comparison in `tools/run_counterfactual_preference_comparison.ps1`.
 This PowerShell runner reads JSON rather than the TOML entrypoint format below.

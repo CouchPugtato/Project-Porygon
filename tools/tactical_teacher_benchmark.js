@@ -45,7 +45,7 @@ function summarize(games) {
 
 function nextGame(config, games) {
     const results = summarize(games);
-    for (const opponent of OPPONENTS) {
+    for (const opponent of config.opponents || OPPONENTS) {
         const sides = results[opponent].sides;
         const pending = ['a', 'b'].filter(side => sides[side].valid_games < config.games_per_side);
         if (!pending.length) continue;
@@ -99,6 +99,9 @@ async function loadSaved(filename) {
 
 function validateConfig(config) {
     if ((config.collect_demonstrations !== undefined && typeof config.collect_demonstrations !== 'boolean') ||
+            (config.opponents !== undefined && (!Array.isArray(config.opponents) || !config.opponents.length ||
+                config.opponents.some(opponent => !OPPONENTS.includes(opponent)) ||
+                new Set(config.opponents).size !== config.opponents.length)) ||
             (config.tactical_teacher !== undefined && typeof config.tactical_teacher !== 'boolean') ||
             (config.candidate_checkpoint !== undefined &&
                 (typeof config.candidate_checkpoint !== 'string' || !config.candidate_checkpoint.trim())) ||
@@ -127,6 +130,7 @@ async function main(argv = process.argv.slice(2)) {
     const config = JSON.parse(await fs.readFile(path.resolve(ROOT,
         args['--config'] || 'config/experimental/tactical_teacher_benchmark.json'), 'utf8'));
     validateConfig(config);
+    const targetGames = 2 * config.games_per_side * (config.opponents || OPPONENTS).length;
     const sources = ['tools/tactical_teacher_benchmark.js', 'tools/tactical_teacher_smoke.js',
         'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'external/pokemon-showdown/dist/sim/battle.js',
         'external/pokemon-showdown/dist/sim/battle-stream.js',
@@ -155,12 +159,12 @@ async function main(argv = process.argv.slice(2)) {
             await writeJsonAtomic(filename, {diagnostic: config.collect_demonstrations ?
                 'tactical_teacher_demonstration_collection' : config.tactical_teacher === false ?
                     'neural_candidate_strength_benchmark' : 'tactical_teacher_strength_benchmark', run_name: name,
-                identity, status, error, training_eligible: false, target_valid_games: 4 * config.games_per_side,
+                identity, status, error, training_eligible: false, target_valid_games: targetGames,
                 candidate_policy_mode: config.tactical_teacher === false ? 'neural' : 'tactical',
                 demonstration_purpose: config.collect_demonstrations ? 'supervised_imitation' : null,
                 ppo_eligible: false,
                 valid_games: valid, elapsed_seconds: elapsed,
-                estimated_remaining_seconds: valid ? elapsed / valid * (4 * config.games_per_side - valid) : null,
+                estimated_remaining_seconds: valid ? elapsed / valid * (targetGames - valid) : null,
                 demonstration_count: games.filter(game => game.demonstration).length,
                 demonstration_turns: games.reduce((sum, game) => sum + (game.demonstration?.decision_turns || 0), 0),
                 interval_method: config.collect_demonstrations ? '95% Wilson score; draws count half' :
@@ -187,8 +191,8 @@ async function main(argv = process.argv.slice(2)) {
                 const results = summarize(games);
                 const valid = Object.values(results).reduce((sum, result) => sum + result.valid_games, 0);
                 const elapsed = games.reduce((sum, record) => sum + record.duration_seconds, 0);
-                const eta = valid ? `${Math.ceil(elapsed / valid * (4 * config.games_per_side - valid) / 60)} min` : 'unknown';
-                console.log(`[tactical-benchmark] valid=${valid}/${4 * config.games_per_side} ` +
+                const eta = valid ? `${Math.ceil(elapsed / valid * (targetGames - valid) / 60)} min` : 'unknown';
+                console.log(`[tactical-benchmark] valid=${valid}/${targetGames} ` +
                     `invalid=${games.length - valid} elapsed=${Math.ceil(elapsed / 60)} min total_eta=${eta}`);
                 if (!isValid(game)) console.error(`[tactical-benchmark] invalid: ` +
                     JSON.stringify({error: game.error, cleanup_error: game.cleanup_error, rejections: game.choice_rejections}));
