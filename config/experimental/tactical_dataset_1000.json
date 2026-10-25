@@ -1,0 +1,11 @@
+{
+  "collections": [
+    "matches/runs/run_0268_tactical_demonstrations_200/run_0268_tactical_demonstrations_200_summary.json",
+    "matches/runs/run_0273_tactical_demonstrations_add800/run_0273_tactical_demonstrations_add800_summary.json"
+  ],
+  "expected_battles": 1000,
+  "expected_decision_turns": 13282,
+  "battles_per_shard": 50,
+  "max_shard_bytes": 8388608,
+  "validation_seed": 20261024
+}

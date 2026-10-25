@@ -78,8 +78,9 @@ function battleSeeds(seed, index, matchedTeams) {
 }
 
 function createBattleAgents(config, seeds, candidateSide, opponent, recordTeacher) {
+    const opponentCheckpoint = opponent === 'pilot' ? config.pilot_checkpoint : config.checkpoint;
     return [0, 1].map(side => opponent === 'random' && side !== candidateSide ? null : new AgentProcess(
-        path.resolve(REPO_ROOT, side === candidateSide ? (config.candidate_checkpoint || config.checkpoint) : config.checkpoint),
+        path.resolve(REPO_ROOT, side === candidateSide ? (config.candidate_checkpoint || config.checkpoint) : opponentCheckpoint),
         seeds.inference[side], null, config.agent_omp_threads,
         side === candidateSide && config.tactical_teacher !== false, side === candidateSide ? recordTeacher : null));
 }
@@ -87,7 +88,7 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
     const battleId = `tactical-${opponent}-${config.seed}-${index}`;
     const teacherSide = index % 2 === 0 ? 0 : 1;
-    const opponentName = opponent === 'random' ? 'RandomPolicy' : 'ParentPolicy';
+    const opponentName = opponent === 'random' ? 'RandomPolicy' : opponent === 'pilot' ? 'PilotPolicy' : 'ParentPolicy';
     const candidateName = config.tactical_teacher === false ? 'NeuralCandidate' : 'TacticalTeacher';
     const names = teacherSide === 0 ? [candidateName, opponentName] : [opponentName, candidateName];
     const battle = new sim.BattleStream();

@@ -185,3 +185,36 @@ test('parent control reuses the student random-matchup settings and skips the pa
     for (const opponents of [[], ['unknown'], ['random', 'random'], 'random'])
         assert.throws(() => validateConfig({...control, opponents}), /bounded/);
 });
+
+test('larger-data screen routes the frozen epoch and pilot correctly without tactical overrides', () => {
+    const screen = require('../config/experimental/tactical_student_1000_screen.json');
+    validateConfig(screen);
+    assert.deepEqual(screen.opponents, ['parent', 'random', 'pilot']);
+    assert.equal(2 * screen.games_per_side * screen.opponents.length, 600);
+    for (const side of [0, 1]) {
+        const agents = createBattleAgents(screen, battleSeeds(screen.seed, side, true), side, 'pilot', null);
+        assert.ok(agents[side].checkpoint.endsWith('tactical_student_dataset_epoch003.chk'));
+        assert.ok(agents[1 - side].checkpoint.endsWith('run_0269_tactical_student_pilot' + path.sep + 'tactical_student_best.chk'));
+        assert.ok(agents.every(agent => agent.tacticalTeacher === false));
+    }
+    assert.throws(() => validateConfig({...screen, pilot_checkpoint: ''}), /bounded/);
+    assert.throws(() => validateConfig({...screen, pilot_checkpoint: undefined}), /bounded/);
+});
+
+test('three-opponent screening keeps separate results and resumes into the pilot matchup', () => {
+    const screen = {...config, tactical_teacher: false, opponents: ['parent', 'random', 'pilot'], pilot_checkpoint: 'pilot.chk'};
+    const games = [];
+    for (let i = 0; i < 4; ++i)
+        games.push(record(nextGame(screen, games), {policy_mode: 'neural', coverage: null}));
+    assert.deepEqual(nextGame(screen, games), {opponent: 'pilot', index: 0, teacher_side: 'a'});
+    const identity = {config: screen, pilot_checkpoint_sha256: 'fixture'};
+    assert.deepEqual(validateResume({identity, games}, identity, screen), games);
+    for (let i = 0; i < 2; ++i)
+        games.push(record(nextGame(screen, games), {policy_mode: 'neural', coverage: null}));
+    assert.equal(nextGame(screen, games), null);
+    const results = summarize(games, screen.opponents);
+    assert.deepEqual(Object.keys(results), ['parent', 'random', 'pilot']);
+    assert.equal(results.pilot.valid_games, 2);
+    assert.equal(results.parent.valid_games, 2);
+    assert.throws(() => validateResume({identity, games}, {...identity, pilot_checkpoint_sha256: 'changed'}, screen), /inputs changed/);
+});

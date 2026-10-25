@@ -25,12 +25,40 @@ losses. Only teacher-visible messages and accepted decisions are published,
 one atomic `teacher_*_raw.jsonl` file per valid game. Replay hashes are checked
 on resume. This mode does not create PPO episodes or train a model.
 
+`experimental/tactical_teacher_collection_scale_800.json` adds 800 fresh
+demonstration battles with the same teacher, opponent mix, and resource
+settings. Combined with the 200-battle pilot, this gives a nested 1,000-battle
+dataset. It changes only the collection seed and game/replacement budgets;
+it does not continue student training or alter the original pilot files.
+
+`experimental/tactical_dataset_1000.json` combines checksummed references from
+the completed 200- and 800-battle collections. Run
+`node tools/prepare_tactical_dataset.js --run-name run_0274_tactical_dataset_1000`.
+It preserves whole battles in shards of at most 50 battles/8 MiB and writes
+separate files containing the same stable-hash holdout used during training.
+
+`experimental/tactical_student_train_1000.toml` selects the sharded supervised
+fit through `python py/tools/train_batch_selfplay.py --config <path>`. It uses
+all prepared shards, the original parent, three epochs, Adam at 0.0001, the
+same validation seed, and one OpenMP thread. The selected config supplies both
+arguments and environment settings; the default profile is not also loaded.
+`shuffle_seed` fixes outer shard order, not the C trainer's within-shard RNG.
+Use `--evaluate-only 1 --evaluation-summary <path>` with an existing checkpoint
+and `--pattern "holdout_*_raw.jsonl"` for a weighted common-holdout baseline.
+
 `experimental/tactical_student_benchmark.json` evaluates the pilot's
 loss-selected student checkpoint using that same battle harness. Here
 `checkpoint` is the parent opponent, `candidate_checkpoint` is the student,
 and `tactical_teacher: false` disables the heuristic. It requests 100 valid
 games per side against the parent and random, with serial one-thread agents.
 Both checkpoint hashes and the candidate's neural policy mode are recorded.
+
+`experimental/tactical_student_1000_screen.json` freezes run_0275's
+lowest-loss dataset epoch (epoch 3) and screens it against the original parent,
+random, and run_0269's smaller-data student. The `pilot` opponent uses
+`pilot_checkpoint`, which is separately hashed for resume. All three native
+policies run without tactical overrides. At 100 valid games per side per
+opponent, this profile requests 600 games total on fresh seed 27601.
 
 `experimental/tactical_student_confirmation.json` repeats the student test
 with fresh seed 27101 and 500 valid games per side per opponent (2,000 total).

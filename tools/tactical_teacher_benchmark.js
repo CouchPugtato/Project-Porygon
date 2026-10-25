@@ -7,6 +7,7 @@ const {acquireRunLock, createResourceGate, writeJsonAtomic} = require('./counter
 const {publishReplay, verifyReplays} = require('./tactical_demonstrations');
 const ROOT = path.resolve(__dirname, '..');
 const OPPONENTS = ['parent', 'random'];
+const SUPPORTED_OPPONENTS = [...OPPONENTS, 'pilot'];
 
 function wilson(score, count) {
     if (!count) return null;
@@ -22,9 +23,9 @@ function isValid(game) {
         game.choice_rejections.length === 0 && ['win', 'loss', 'draw'].includes(game.result?.result);
 }
 
-function summarize(games) {
+function summarize(games, opponents = OPPONENTS) {
     const results = {};
-    for (const opponent of OPPONENTS) {
+    for (const opponent of new Set([...opponents, ...games.map(game => game.opponent)])) {
         const records = games.filter(game => game.opponent === opponent);
         const tally = subset => {
             const valid = subset.filter(isValid);
@@ -44,7 +45,7 @@ function summarize(games) {
 }
 
 function nextGame(config, games) {
-    const results = summarize(games);
+    const results = summarize(games, config.opponents);
     for (const opponent of config.opponents || OPPONENTS) {
         const sides = results[opponent].sides;
         const pending = ['a', 'b'].filter(side => sides[side].valid_games < config.games_per_side);
@@ -100,8 +101,10 @@ async function loadSaved(filename) {
 function validateConfig(config) {
     if ((config.collect_demonstrations !== undefined && typeof config.collect_demonstrations !== 'boolean') ||
             (config.opponents !== undefined && (!Array.isArray(config.opponents) || !config.opponents.length ||
-                config.opponents.some(opponent => !OPPONENTS.includes(opponent)) ||
+                config.opponents.some(opponent => !SUPPORTED_OPPONENTS.includes(opponent)) ||
                 new Set(config.opponents).size !== config.opponents.length)) ||
+            (config.opponents?.includes('pilot') &&
+                (typeof config.pilot_checkpoint !== 'string' || !config.pilot_checkpoint.trim())) ||
             (config.tactical_teacher !== undefined && typeof config.tactical_teacher !== 'boolean') ||
             (config.candidate_checkpoint !== undefined &&
                 (typeof config.candidate_checkpoint !== 'string' || !config.candidate_checkpoint.trim())) ||
@@ -140,6 +143,8 @@ async function main(argv = process.argv.slice(2)) {
         executable_sha256: await hashFile(path.join(ROOT, 'build-fresh/showdown_client.exe')),
         source_sha256: Object.fromEntries(await Promise.all(sources.map(async source =>
             [source, await hashFile(path.join(ROOT, source))])))};
+    if (config.opponents?.includes('pilot'))
+        identity.pilot_checkpoint_sha256 = await hashFile(path.resolve(ROOT, config.pilot_checkpoint));
     const directory = path.join(ROOT, 'matches/runs', name);
     await fs.mkdir(directory, {recursive: true});
     const lock = await acquireRunLock(directory);
@@ -153,7 +158,7 @@ async function main(argv = process.argv.slice(2)) {
             launchStaggerMilliseconds: config.launch_stagger_ms});
         const sim = require('../external/pokemon-showdown/dist/sim');
         async function publish(status, error = null) {
-            const results = summarize(games);
+            const results = summarize(games, config.opponents);
             const valid = Object.values(results).reduce((sum, result) => sum + result.valid_games, 0);
             const elapsed = games.reduce((sum, game) => sum + game.duration_seconds, 0);
             await writeJsonAtomic(filename, {diagnostic: config.collect_demonstrations ?
@@ -188,7 +193,7 @@ async function main(argv = process.argv.slice(2)) {
                     game.demonstration = await publishReplay(directory, next.opponent, next.index, replay, game);
                 games.push({...game, ...next, duration_seconds: (Date.now() - start) / 1000});
                 await publish('in_progress');
-                const results = summarize(games);
+                const results = summarize(games, config.opponents);
                 const valid = Object.values(results).reduce((sum, result) => sum + result.valid_games, 0);
                 const elapsed = games.reduce((sum, record) => sum + record.duration_seconds, 0);
                 const eta = valid ? `${Math.ceil(elapsed / valid * (targetGames - valid) / 60)} min` : 'unknown';

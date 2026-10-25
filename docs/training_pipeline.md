@@ -419,6 +419,103 @@ supervised imitation. The next reviewable step is native replay-ingestion
 validation, followed by a controlled student fit with battle-level holdout
 and a fresh playing-strength evaluation with tactical overrides disabled.
 
+For the next dataset-size experiment, add 800 fresh teacher battles:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0273_tactical_demonstrations_add800 --config .\config\experimental\tactical_teacher_collection_scale_800.json
+```
+
+This requests 200 valid games per side against each opponent, with at most
+250 attempts per side. The teacher, parent/random opponent mix, unpaired
+collection, one-thread agents, and 65% launch gates match the pilot. Seed
+27301 supplies fresh positions; tests check battle/team/random seed-tuple
+separation from the pilot, including replacement budgets and both opponent
+seed ranges. No checkpoint changes or student fitting occur in this step.
+
+Keep the original 200 demonstrations and their collection summary intact.
+The later 1,000-battle dataset must reference those 200 plus these 800, using
+only checksummed references from completed summaries. Before fitting, plan
+memory-bounded ingestion and re-evaluate the parent and pilot student on the
+same expanded holdout as the larger-data student. Continue to exclude holdout
+battle IDs using the fixed validation seed; do not compare validation scores
+computed over different holdout sets as if they were the same test. Start the
+larger-data student from the original parent, not the already-trained pilot.
+With the same epoch count, this experiment increases both distinct training
+battles and update count; it is not an equal-compute isolation of data diversity.
+Use the existing strength results for development, reserving fresh evaluation
+seeds for a later selected-model confirmation.
+
+### Prepare and fit the 1,000-battle dataset
+
+Prepare the derived dataset without changing either source collection:
+
+```powershell
+node .\tools\prepare_tactical_dataset.js --run-name run_0274_tactical_dataset_1000
+```
+
+`config/experimental/tactical_dataset_1000.json` fixes the two source summaries,
+1,000 battles, 13,282 decision turns, split seed 20261024, and shard limits.
+Preparation checks completed collections, matching teacher checkpoint/runtime
+hashes, referenced replay hashes, complete accepted decisions, unique battle
+IDs, and the expected totals. Only referenced valid games are included. Each
+`shard_*_raw.jsonl` holds at most 50 whole battles and 8 MiB of replay text;
+an individually oversized battle is rejected, not truncated. The native
+trainer loads one such shard at a time. These bounds constrain replay input,
+not an exact RAM percentage for the process or the whole computer.
+
+The dataset manifest records source summary hashes, per-battle provenance,
+split counts, and shard hashes. Its separate `holdout_*_raw.jsonl` files
+contain exactly the validation battles from those same shards, using the C
+trainer's seeded battle-ID hash. The JS implementation is tested against the
+native/Python hash fixture. Rerunning preparation verifies completed output;
+an interrupted preparation can be rebuilt with the same identity. Changed
+inputs or damaged completed shards stop with an error rather than silently
+replacing a different dataset.
+
+Evaluate the parent and pilot student on this expanded holdout before fitting:
+
+```powershell
+python .\py\tools\train_batch_selfplay.py --config .\config\experimental\tactical_student_train_1000.toml --evaluate-only 1 --pattern "holdout_*_raw.jsonl" --checkpoint .\models\runs\run_0093_current_arch_full\current_arch_full.chk --evaluation-summary .\models\diagnostics\run_0274_parent_common_holdout.json
+python .\py\tools\train_batch_selfplay.py --config .\config\experimental\tactical_student_train_1000.toml --evaluate-only 1 --pattern "holdout_*_raw.jsonl" --checkpoint .\models\runs\run_0269_tactical_student_pilot\tactical_student_best.chk --evaluation-summary .\models\diagnostics\run_0274_pilot_common_holdout.json
+```
+
+Evaluation-only reuses the weighted metric aggregator and does not initialize,
+train, or publish a model. It rejects dropped ingestion messages/labels,
+missing or changed prepared shards, a changed validation seed, an unexpected
+holdout turn count, empty evaluation, skipped turns, illegal predictions, or
+non-finite output. The baseline JSON files and subsequent epoch summaries
+therefore refer to the same holdout, not the original 22-battle subset alone.
+
+Start the new fit only after those commands succeed:
+
+```powershell
+python .\py\tools\train_batch_selfplay.py --config .\config\experimental\tactical_student_train_1000.toml
+```
+
+The profile writes to run_0275, initializing from the original parent rather
+than the pilot student. It uses all shards, three outer epochs, one pass per
+file, Adam at 0.0001, split seed 20261024, and one OpenMP thread. Optional
+`shuffle_seed` fixes the outer shard order; the native within-shard RNG remains
+unchanged. CLI flags override only the selected profile's defaults. Explicit
+zero values for `sample_files` and `limit_files` now correctly mean all files.
+The profile does not run a parameter search or change model architecture.
+
+Adam state is retained across shards within an epoch, but the current wrapper
+starts a new optimizer process for each outer epoch. This differs from the
+single-process pilot. The larger-data experiment also has more updates, so it
+does not isolate data diversity from optimizer scheduling or compute. Record
+those limits when comparing results; use a matched-pipeline small-data control
+if a later causal claim requires separating them.
+
+The wrapper saves atomic `_dataset_epochNNN.chk` snapshots and weighted
+`_dataset_epochNNN_validation.json` summaries. Per-shard auxiliary checkpoints
+stay disabled. Resume is at completed outer-epoch boundaries: a crash within
+an unfinished epoch reruns that epoch from its starting checkpoint. It does
+not restore the in-memory Adam state midway through an epoch. After fitting,
+review all epoch summaries and select by the predeclared lowest full-turn
+holdout NLL before any new playing-strength test. Do not pick an epoch by its
+later battle win rate. Root README and existing checkpoints remain unchanged.
+
 ### Student-only strength evaluation
 
 The pilot's best checkpoint is selected by full-turn holdout loss, not by
@@ -443,6 +540,32 @@ means the candidate's side. Neural results have `coverage: null` rather than
 claiming tactical coverage. Resume rejects a changed policy mode, checkpoint,
 config, or recorded runner source. Imitation improvement alone is not grounds
 to promote the student; first compare this run's actual playing results.
+
+After the larger-data fit, screen its preselected lowest-loss epoch against
+all three reference opponents in one resumable run:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0276_tactical_student_1000_screen_100ps --config .\config\experimental\tactical_student_1000_screen.json
+```
+
+The candidate is run_0275's immutable `tactical_student_dataset_epoch003.chk`.
+`checkpoint` still points to the original parent; `pilot_checkpoint` points to
+run_0269's loss-selected 200-battle student. Selecting
+`opponents: ["parent", "random", "pilot"]` requests 100 valid games per side
+against each, or 600 valid games total. The new seed is 27601, matched team
+seeds alternate candidate sides, and resource limits remain serial battles
+with one native thread per agent and 65% launch gates. No training occurs.
+
+Results retain a separate `pilot` matchup rather than labelling the smaller
+student as the original parent. The pilot checkpoint hash joins the candidate,
+parent, executable, config, and runner hashes in resume identity. Neither
+native player receives a tactical override flag. Review strength against all
+three opponents, side splits, invalid games, and seed-pair outcomes; imitation
+metrics alone are not the success criterion. Screen before spending another
+long fit. Only promising screen results advance to 500-valid-games-per-side
+confirmation on fresh seeds with this same candidate frozen. Do not switch to
+another epoch after seeing screening win rates without treating that choice
+as new development selection.
 
 If screening is promising but inconclusive, keep that same loss-selected
 checkpoint frozen for a larger fresh-seed evaluation:

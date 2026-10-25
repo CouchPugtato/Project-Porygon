@@ -5,6 +5,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const {AgentProcess, drivePlayer} = require('./counterfactual_rollout');
+const {battleSeeds} = require('./tactical_teacher_smoke');
 const {inspectReplay, publishReplay, verifyReplays} = require('./tactical_demonstrations');
 const {isValid, validateConfig} = require('./tactical_teacher_benchmark');
 
@@ -86,4 +87,25 @@ test('collection pilot stays small, serial, fresh-seeded, and explicitly opt-in'
     assert.equal(config.agent_omp_threads, 1);
     assert.notEqual(config.seed, require('../config/experimental/tactical_teacher_confirmation.json').seed);
     assert.throws(() => validateConfig({...config, collect_demonstrations: 'true'}), /bounded/);
+});
+
+test('scaled collection adds 800 fresh battles without changing the teacher or resource settings', () => {
+    const pilot = require('../config/experimental/tactical_teacher_collection.json');
+    const scale = require('../config/experimental/tactical_teacher_collection_scale_800.json');
+    validateConfig(scale);
+    assert.equal(4 * scale.games_per_side, 800);
+    assert.deepEqual({...scale, seed: pilot.seed, games_per_side: pilot.games_per_side,
+        max_attempts_per_side: pilot.max_attempts_per_side}, pilot);
+    const tuples = config => {
+        const values = [];
+        for (const offset of [0, 10000000]) {
+            for (let index = 0; index < 2 * config.max_attempts_per_side; ++index) {
+                const seeds = battleSeeds(config.seed + offset, index, false);
+                values.push(seeds.battle, seeds.random, ...seeds.players);
+            }
+        }
+        return values;
+    };
+    const pilotSeeds = new Set(tuples(pilot));
+    assert.equal(tuples(scale).some(seed => pilotSeeds.has(seed)), false);
 });

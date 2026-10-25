@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 from dataclasses import dataclass, field
 import json
 import os
@@ -53,6 +54,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
     return parsed
 
 
@@ -802,13 +810,24 @@ def evaluate_fixed_holdout(
                 f"fixed holdout evaluation failed shard={index}/{len(replay_paths)} "
                 f"path={replay_path} exit_code={return_code}"
             )
-        shard_stats.append(collect_training_stats(lines))
+        parsed = collect_training_stats(lines)
+        if int(parsed.get("ingest", {}).get("invalid", 0)) or any(
+            int(record.get("failed", 0)) for record in parsed.get("accepted_labels", [])
+        ):
+            raise RuntimeError(f"fixed holdout ingestion dropped messages or labels: {replay_path}")
+        shard_stats.append(parsed)
     state.current_file = None
-    return aggregate_validation_metrics(
+    summary = aggregate_validation_metrics(
         shard_stats,
         source_shard_count=len(replay_paths),
         validation_seed=args.validation_seed,
     )
+    dataset = load_json_if_exists(repo_root / DEFAULT_RUNS_ROOT / args.run / f"{args.run}_manifest.json")
+    if dataset and dataset.get("dataset_kind") == "supervised_tactical_demonstrations":
+        expected_turns = dataset["counts"]["holdout_decision_turns"]
+        if summary["counts"]["turns"] != expected_turns:
+            raise RuntimeError(f"fixed holdout count changed: expected {expected_turns}, got {summary['counts']['turns']}")
+    return summary
 
 
 def write_batch_training_stats(
@@ -963,6 +982,7 @@ def validate_resume_manifest(
     epochs_per_file: int,
     sample_files: int,
     shuffle: bool,
+    shuffle_seed: int | None = None,
 ) -> None:
     expected_sources = [str(path.resolve()) for path in source_files]
     checks = {
@@ -975,6 +995,7 @@ def validate_resume_manifest(
         "epochs_per_file": epochs_per_file,
         "sample_files": sample_files,
         "shuffle": shuffle,
+        "shuffle_seed": shuffle_seed,
     }
     for key, expected in checks.items():
         if manifest.get(key) != expected:
@@ -1063,6 +1084,9 @@ def batch_label_counts(parsed_stats: dict[str, object], expected_files: int) -> 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=str(DEFAULT_ARGS_PATH))
+    parser.add_argument("--evaluate-only", type=parse_bool01, default=False)
+    parser.add_argument("--evaluation-summary", default="")
     parser.add_argument("--run", required=True, help="Run name under matches/runs/")
     parser.add_argument("--checkpoint", required=True, help="Checkpoint path/name to train into")
     parser.add_argument("--init-checkpoint", default="", help="Optional checkpoint path/name to use for warm-start initialization")
@@ -1073,6 +1097,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pattern", default="worker_*_raw.jsonl", help="Glob for training shards")
     parser.add_argument("--trainer-exe", default=str(DEFAULT_TRAINER_EXE))
     parser.add_argument("--shuffle", type=parse_bool01, default=True, help="Shuffle shard order each epoch")
+    parser.add_argument("--shuffle-seed", type=int, default=None, help="Optional reproducible outer-epoch shard order")
     parser.add_argument("--supervised-profile", type=parse_bool01, default=True, help="Enable per-episode supervised profiling output")
     parser.add_argument("--supervised-optimizer", choices=["sgd", "adam"], default="sgd")
     parser.add_argument("--validation-seed", type=int, default=1337)
@@ -1084,8 +1109,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dashboard-show-shard-window", type=parse_bool01, default=True, help="Show the dashboard shard window")
     parser.add_argument("--dashboard-write-raw-logs", type=parse_bool01, default=True, help="Write raw per-shard trainer logs")
     parser.add_argument("--start-index", type=int, default=0, help="Skip the first N matched files")
-    parser.add_argument("--limit-files", type=positive_int, default=0, help="Optional cap on matched files")
-    parser.add_argument("--sample-files", type=positive_int, default=0, help="Train on a random subset of up to N shards per epoch")
+    parser.add_argument("--limit-files", type=nonnegative_int, default=0, help="Optional cap on matched files")
+    parser.add_argument("--sample-files", type=nonnegative_int, default=0, help="Train on a random subset of up to N shards per epoch; 0 uses all files")
     parser.add_argument("--epochs-per-file", type=positive_int, default=1, help="Epochs to pass to showdown_client for each shard")
     parser.add_argument("--learning-rate", type=float, default=-1.0)
     parser.add_argument("--gamma", type=float, default=float_default("policy_gradient_gamma"))
@@ -1093,6 +1118,64 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--advantage-norm", choices=["0", "1"], default="1")
     parser.add_argument("--reward-mode", default="terminal")
     return parser
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=str(DEFAULT_ARGS_PATH))
+    configured, _ = config_parser.parse_known_args(argv)
+    config_path = Path(configured.config)
+    if not config_path.exists():
+        raise SystemExit(f"config not found: {config_path}")
+    args = build_parser().parse_args(load_default_args(config_path) + argv)
+    args.config = str(config_path.resolve())
+    return args
+
+
+def verify_prepared_dataset(run_dir: Path, files: list[Path], validation_seed: int) -> None:
+    manifest = load_json_if_exists(run_dir / f"{run_dir.name}_manifest.json")
+    if not manifest or manifest.get("dataset_kind") != "supervised_tactical_demonstrations":
+        return
+    if manifest.get("status") != "completed" or manifest.get("validation_seed") != validation_seed:
+        raise SystemExit("prepared dataset is incomplete or uses a different validation seed")
+    records = {str((run_dir / record["file"]).resolve()): record for record in
+               manifest["shards"] + manifest["holdout_shards"]}
+    for path in files:
+        record = records.get(str(path.resolve()))
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if record is None or digest.hexdigest() != record.get("sha256"):
+            raise SystemExit(f"prepared dataset shard is unreferenced or changed: {path}")
+
+
+def evaluate_checkpoint_only(
+    args: argparse.Namespace, replay_paths: list[Path], repo_root: Path,
+    env: dict[str, str], configured_env: dict[str, str],
+) -> None:
+    if args.mode != "supervised" or not args.evaluation_summary or not args.resolved_checkpoint.exists():
+        raise SystemExit("evaluation-only requires an existing checkpoint, supervised mode, and --evaluation-summary")
+    summary_path = Path(args.evaluation_summary)
+    protected_paths = {args.resolved_checkpoint.resolve(), *(path.resolve() for path in replay_paths)}
+    if summary_path.resolve() in protected_paths:
+        raise SystemExit("evaluation summary must not overwrite a checkpoint or replay")
+    state = RunDisplayState(run=args.run, mode=args.mode, checkpoint=str(args.resolved_checkpoint),
+                            epochs=1, configured_env=configured_env)
+    reporter = select_reporter(args, state)
+    reporter.run_started()
+    try:
+        summary = evaluate_fixed_holdout(args, replay_paths, args.resolved_checkpoint, repo_root, env, reporter, state)
+        counts = summary["counts"]
+        if not counts["turns"] or any(counts.get(key, 0) for key in ("illegal_predictions", "nonfinite_values", "skipped_turns")):
+            raise SystemExit("holdout evaluation returned no turns, skipped turns, illegal predictions, or nonfinite outputs")
+        summary.update({"checkpoint": str(args.resolved_checkpoint.resolve()), "run": args.run,
+                        "source_shards": [str(path.resolve()) for path in replay_paths]})
+        write_json_atomically(summary_path, summary)
+        state.last_notice = f"evaluation complete: {summary_path}"
+        reporter.run_finished()
+    finally:
+        reporter.close()
 
 
 def trainer_command_for_file(args: argparse.Namespace, replay_path: Path) -> list[str]:
@@ -1282,10 +1365,8 @@ def train_supervised_epoch_batch(
 
 
 def main() -> None:
-    parser = build_parser()
-    argv = load_default_args(DEFAULT_ARGS_PATH) + sys.argv[1:]
-    configured_env = load_default_env(DEFAULT_ARGS_PATH)
-    args = parser.parse_args(argv)
+    args = parse_args(sys.argv[1:])
+    configured_env = load_default_env(Path(args.config))
     if args.validation_seed < 0:
         raise SystemExit("--validation-seed must be >= 0")
     repo_root = Path.cwd()
@@ -1307,8 +1388,6 @@ def main() -> None:
         raise SystemExit(f"run dir not found: {run_dir}")
     if not trainer_exe.exists():
         raise SystemExit(f"trainer executable not found: {trainer_exe}")
-    args.resolved_checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    initialized_from_init, initialized_checkpoint_path = ensure_initialized_checkpoint(args)
     subprocess_env = os.environ.copy()
     subprocess_env.update(configured_env)
 
@@ -1319,6 +1398,14 @@ def main() -> None:
         all_files = all_files[: args.limit_files]
     if not all_files:
         raise SystemExit(f"no input files matched {args.pattern!r} in {run_dir}")
+    verify_prepared_dataset(run_dir, all_files, args.validation_seed)
+
+    if args.evaluate_only:
+        evaluate_checkpoint_only(args, all_files, repo_root, subprocess_env, configured_env)
+        return
+
+    args.resolved_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    initialized_from_init, initialized_checkpoint_path = ensure_initialized_checkpoint(args)
 
     planned_total_shards = args.epochs * (min(len(all_files), args.sample_files) if args.sample_files > 0 else len(all_files))
     source_replay_summary = replay_run_summary_path(args.run).resolve()
@@ -1339,6 +1426,7 @@ def main() -> None:
             epochs_per_file=args.epochs_per_file,
             sample_files=args.sample_files,
             shuffle=bool(args.shuffle),
+            shuffle_seed=args.shuffle_seed,
         )
         if existing_manifest.get("status") == "completed":
             print(
@@ -1389,6 +1477,8 @@ def main() -> None:
             "epochs": args.epochs,
             "epochs_per_file": args.epochs_per_file,
             "shuffle": bool(args.shuffle),
+            "shuffle_seed": args.shuffle_seed,
+            "config": args.config,
             "trainer_exe": str(trainer_exe.resolve()),
             "configured_env": configured_env,
             "status": "running",
@@ -1438,8 +1528,9 @@ def main() -> None:
                     raise SystemExit(f"cannot resume: epoch {epoch} plan contains unknown shard {unexpected[0]}")
             else:
                 epoch_files = list(all_files)
+                epoch_random = random.Random(args.shuffle_seed + epoch) if args.shuffle_seed is not None else random
                 if args.shuffle:
-                    random.shuffle(epoch_files)
+                    epoch_random.shuffle(epoch_files)
                 if args.sample_files > 0 and len(epoch_files) > args.sample_files:
                     epoch_files = epoch_files[: args.sample_files]
                 epoch_plans[plan_key] = [str(path.resolve()) for path in epoch_files]

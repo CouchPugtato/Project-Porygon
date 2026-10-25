@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import sys
+import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch, Mock
 
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -20,18 +23,102 @@ from train_batch_selfplay import (
     copy_file_atomically,
     dataset_epoch_snapshot_path,
     dataset_epoch_validation_path,
+    evaluate_fixed_holdout,
     epoch_work_checkpoint_path,
     is_validation_battle,
+    load_default_env,
+    main,
+    parse_args,
     replay_path_manifest_path,
     trainer_command_for_file,
     trainer_command_for_manifest,
     validate_resume_manifest,
     validation_hash,
     write_replay_path_manifest,
+    verify_prepared_dataset,
 )
 
 
 class TrainingStatsTests(unittest.TestCase):
+    def test_selected_config_controls_arguments_and_environment_without_default_leakage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "training.toml"
+            config.write_text('run = "dataset"\ncheckpoint = "models/student.chk"\n'
+                              'sample_files = 0\nepochs = 3\nsupervised_optimizer = "adam"\n'
+                              'env_porygon_omp_threads = 1\nshuffle_seed = 27501\n', encoding="utf-8")
+            args = parse_args(["--config", str(config), "--epochs", "2"])
+            self.assertEqual(args.epochs, 2)
+            self.assertEqual(args.sample_files, 0)
+            self.assertEqual(args.supervised_optimizer, "adam")
+            self.assertEqual(args.shuffle_seed, 27501)
+            self.assertEqual(load_default_env(Path(args.config)), {"PORYGON_OMP_THREADS": "1"})
+
+    def test_large_data_profile_uses_all_shards_and_one_thread(self) -> None:
+        config = TOOLS_DIR.parents[1] / "config/experimental/tactical_student_train_1000.toml"
+        args = parse_args(["--config", str(config)])
+        self.assertEqual(args.sample_files, 0)
+        self.assertEqual(args.epochs, 3)
+        self.assertEqual(args.validation_seed, 20261024)
+        self.assertEqual(args.learning_rate, 0.0001)
+        self.assertEqual(args.shuffle_seed, 27501)
+        self.assertEqual(load_default_env(Path(args.config))["PORYGON_OMP_THREADS"], "1")
+
+    def test_prepared_dataset_checks_hash_and_split_before_training(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "dataset"
+            directory.mkdir()
+            replay = directory / "shard_000_raw.jsonl"
+            replay.write_bytes(b"replay fixture\n")
+            manifest = {"dataset_kind": "supervised_tactical_demonstrations", "status": "completed",
+                        "validation_seed": 1337, "shards": [{"file": replay.name,
+                        "sha256": hashlib.sha256(replay.read_bytes()).hexdigest()}], "holdout_shards": []}
+            (directory / "dataset_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            verify_prepared_dataset(directory, [replay], 1337)
+            with self.assertRaises(SystemExit):
+                verify_prepared_dataset(directory, [replay], 1338)
+            replay.write_bytes(b"changed")
+            with self.assertRaises(SystemExit):
+                verify_prepared_dataset(directory, [replay], 1337)
+
+    def test_evaluation_only_does_not_initialize_or_publish_a_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = root / "matches/runs/dataset"
+            run.mkdir(parents=True)
+            (run / "holdout_000_raw.jsonl").write_text("fixture", encoding="utf-8")
+            executable = root / "client.exe"
+            executable.touch()
+            checkpoint = root / "parent.chk"
+            checkpoint.write_bytes(b"unchanged model")
+            output = root / "baseline.json"
+            config = root / "config.toml"
+            config.write_text(f'run = "dataset"\ncheckpoint = "{checkpoint.as_posix()}"\n'
+                              f'trainer_exe = "{executable.as_posix()}"\npattern = "holdout_*_raw.jsonl"\n', encoding="utf-8")
+            argv = ["trainer", "--config", str(config), "--evaluate-only", "1", "--evaluation-summary", str(output)]
+            metrics = {"counts": {"turns": 1, "illegal_predictions": 0, "nonfinite_values": 0}, "metrics": {}}
+            with patch("sys.argv", argv), patch("train_batch_selfplay.Path.cwd", return_value=root), \
+                    patch("train_batch_selfplay.ensure_initialized_checkpoint") as initialize, \
+                    patch("train_batch_selfplay.evaluate_fixed_holdout", return_value=metrics), \
+                    patch("train_batch_selfplay.select_reporter", return_value=Mock()):
+                main()
+            initialize.assert_not_called()
+            self.assertEqual(checkpoint.read_bytes(), b"unchanged model")
+            self.assertEqual(json.loads(output.read_text())["counts"]["turns"], 1)
+            self.assertFalse((root / "models").exists())
+
+    def test_common_holdout_rejects_dropped_labels_or_changed_turn_counts(self) -> None:
+        args = SimpleNamespace(trainer_exe="unused", validation_seed=1337, run="dataset")
+        metrics = "[eval] validation metrics_version=2 turns=2 full_turn_nll=1 illegal_predictions=0 nonfinite_values=0"
+        cases = [(["[train] ingest complete invalid=1", metrics], None),
+                 (["[train] accepted_labels direct=1 reconstructed=0 failed=1", metrics], None),
+                 ([metrics], {"dataset_kind": "supervised_tactical_demonstrations",
+                              "counts": {"holdout_decision_turns": 3}})]
+        for lines, dataset in cases:
+            with self.subTest(lines=lines), patch("train_batch_selfplay.run_trainer_and_capture", return_value=(0, lines)), \
+                    patch("train_batch_selfplay.load_json_if_exists", return_value=dataset):
+                with self.assertRaises(RuntimeError):
+                    evaluate_fixed_holdout(args, [Path("holdout.jsonl")], Path("model.chk"), Path.cwd(), {}, Mock(), SimpleNamespace())
+
     def test_collects_versioned_policy_metrics(self) -> None:
         stats = collect_training_stats(
             [
