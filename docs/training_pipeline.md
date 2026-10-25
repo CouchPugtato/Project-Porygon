@@ -567,6 +567,24 @@ confirmation on fresh seeds with this same candidate frozen. Do not switch to
 another epoch after seeing screening win rates without treating that choice
 as new development selection.
 
+For a promising but mixed screen, confirm the same model on fresh seeds:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0277_tactical_student_1000_confirmation_500ps --config .\config\experimental\tactical_student_1000_confirmation.json
+```
+
+The confirmation profile changes only seed 27701 and the sample/replacement
+budgets: 500 valid games per side against each of parent, random, and pilot,
+or 3,000 valid games total, with at most 625 attempts per side. Do not train
+further, change epochs, or rebuild the native executable during this run.
+The three native checkpoints are unchanged and tactical overrides remain off.
+Inspect confirmation separately from the screen. A parent-matchup gain alone
+does not establish that the larger dataset beat the pilot; that question
+requires the direct pilot matchup as well as checking for losses elsewhere.
+Use side-pair outcomes and invalid-game records alongside the descriptive
+per-game Wilson intervals. A near-50% pilot result is inconclusive, not proof
+of equivalence and not an automatic reason for another larger training run.
+
 If screening is promising but inconclusive, keep that same loss-selected
 checkpoint frozen for a larger fresh-seed evaluation:
 

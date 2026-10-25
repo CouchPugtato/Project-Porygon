@@ -8,6 +8,13 @@ const {battleSeeds, createBattleAgents, driveRandom} = require('./tactical_teach
 const {isValid, loadSaved, nextGame, summarize, validateConfig, validateResume, wilson} = require('./tactical_teacher_benchmark');
 const config = {...require('../config/experimental/tactical_teacher_benchmark.json'), games_per_side: 1, max_attempts_per_side: 2};
 
+function seedTuples(settings) {
+    return Array.from({length: settings.max_attempts_per_side}, (_, pair) => {
+        const seeds = battleSeeds(settings.seed, pair * 2, true);
+        return [seeds.battle, seeds.random, ...seeds.players];
+    }).flat();
+}
+
 function record(next, overrides = {}) {
     return {...next, status: 'completed', duration_seconds: 1, result: {result: 'win'}, choice_rejections: [],
         coverage: {policy_tag: 'tactical-eval-v1', training_eligible: false, tactical_attempts: 2,
@@ -108,12 +115,8 @@ test('confirmation changes only the seed and does not reuse screening battle or 
     validateConfig(confirmation);
     assert.notEqual(confirmation.seed, screening.seed);
     assert.deepEqual({...confirmation, seed: screening.seed}, screening);
-    const tuples = settings => Array.from({length: settings.max_attempts_per_side}, (_, pair) => {
-        const seeds = battleSeeds(settings.seed, pair * 2, true);
-        return [seeds.battle, seeds.random, ...seeds.players];
-    }).flat();
-    const seen = new Set(tuples(screening));
-    assert.equal(tuples(confirmation).some(seed => seen.has(seed)), false);
+    const seen = new Set(seedTuples(screening));
+    assert.equal(seedTuples(confirmation).some(seed => seen.has(seed)), false);
 });
 
 test('student evaluation loads the candidate on either side without enabling tactical overrides', () => {
@@ -154,16 +157,8 @@ test('larger student confirmation freezes the policy and uses fresh battle and t
     assert.equal(confirmation.max_attempts_per_side, 625);
     assert.deepEqual({...confirmation, seed: screening.seed, games_per_side: screening.games_per_side,
         max_attempts_per_side: screening.max_attempts_per_side}, screening);
-    const screeningSeeds = new Set();
-    for (let pair = 0; pair < screening.max_attempts_per_side; ++pair) {
-        const seeds = battleSeeds(screening.seed, pair * 2, true);
-        for (const tuple of [seeds.battle, seeds.random, ...seeds.players]) screeningSeeds.add(tuple);
-    }
-    for (let pair = 0; pair < confirmation.max_attempts_per_side; ++pair) {
-        const seeds = battleSeeds(confirmation.seed, pair * 2, true);
-        for (const tuple of [seeds.battle, seeds.random, ...seeds.players])
-            assert.equal(screeningSeeds.has(tuple), false);
-    }
+    const seen = new Set(seedTuples(screening));
+    assert.equal(seedTuples(confirmation).some(seed => seen.has(seed)), false);
 });
 
 test('parent control reuses the student random-matchup settings and skips the parent matchup', () => {
@@ -217,4 +212,17 @@ test('three-opponent screening keeps separate results and resumes into the pilot
     assert.equal(results.pilot.valid_games, 2);
     assert.equal(results.parent.valid_games, 2);
     assert.throws(() => validateResume({identity, games}, {...identity, pilot_checkpoint_sha256: 'changed'}, screen), /inputs changed/);
+});
+
+test('three-opponent confirmation freezes all models and mode while increasing the fresh-seed sample', () => {
+    const screen = require('../config/experimental/tactical_student_1000_screen.json');
+    const confirmation = require('../config/experimental/tactical_student_1000_confirmation.json');
+    validateConfig(confirmation);
+    assert.equal(confirmation.games_per_side, 500);
+    assert.equal(confirmation.max_attempts_per_side, 625);
+    assert.equal(2 * confirmation.games_per_side * confirmation.opponents.length, 3000);
+    assert.deepEqual({...confirmation, seed: screen.seed, games_per_side: screen.games_per_side,
+        max_attempts_per_side: screen.max_attempts_per_side}, screen);
+    const seen = new Set(seedTuples(screen));
+    assert.equal(seedTuples(confirmation).some(seed => seen.has(seed)), false);
 });

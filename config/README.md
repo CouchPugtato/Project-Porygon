@@ -60,6 +60,12 @@ random, and run_0269's smaller-data student. The `pilot` opponent uses
 policies run without tactical overrides. At 100 valid games per side per
 opponent, this profile requests 600 games total on fresh seed 27601.
 
+`experimental/tactical_student_1000_confirmation.json` keeps all three models
+and neural-only mode frozen, changes the seed to 27701, and requests 500 valid
+games per side per opponent (3,000 total). Only seed and sample/replacement
+budgets differ from the screen. Use a new run name; reuse that command for
+resume without rebuilding or editing checkpoints during the evaluation.
+
 `experimental/tactical_student_confirmation.json` repeats the student test
 with fresh seed 27101 and 500 valid games per side per opponent (2,000 total).
 Only the seed, game target, and replacement budget differ from screening.
