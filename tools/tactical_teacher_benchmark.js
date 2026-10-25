@@ -37,7 +37,7 @@ function summarize(games) {
         };
         results[opponent] = {...tally(records), sides: Object.fromEntries(['a', 'b'].map(side =>
             [side, tally(records.filter(game => game.teacher_side === side))])),
-        coverage: aggregateGames(records.filter(isValid)),
+        coverage: records.some(game => game.policy_mode === 'neural') ? null : aggregateGames(records.filter(isValid)),
         choice_rejections: records.reduce((sum, game) => sum + (game.choice_rejections?.length || 0), 0)};
     }
     return results;
@@ -72,7 +72,10 @@ function validateResume(saved, identity, config) {
         if (game.status === 'completed') {
             if (!Array.isArray(game.choice_rejections) || !['win', 'loss', 'draw'].includes(game.result?.result))
                 throw new Error('saved completed game has no terminal result or rejection record');
-            aggregateGames([game]);
+            if ((game.policy_mode === 'neural') !== (config.tactical_teacher === false))
+                throw new Error('saved candidate policy mode differs from the configured mode');
+            if (config.tactical_teacher !== false) aggregateGames([game]);
+            else if (game.coverage !== null) throw new Error('neural evaluation must not contain tactical coverage');
         }
         checked.push(game);
     }
@@ -96,6 +99,10 @@ async function loadSaved(filename) {
 
 function validateConfig(config) {
     if ((config.collect_demonstrations !== undefined && typeof config.collect_demonstrations !== 'boolean') ||
+            (config.tactical_teacher !== undefined && typeof config.tactical_teacher !== 'boolean') ||
+            (config.candidate_checkpoint !== undefined &&
+                (typeof config.candidate_checkpoint !== 'string' || !config.candidate_checkpoint.trim())) ||
+            (config.collect_demonstrations && config.tactical_teacher === false) ||
             config.format !== 'gen9randomdoublesbattle' || config.agent_omp_threads !== 1 ||
             !Number.isSafeInteger(config.games_per_side) || config.games_per_side < 1 || config.games_per_side > 1000 ||
             !Number.isSafeInteger(config.max_attempts_per_side) ||
@@ -125,6 +132,7 @@ async function main(argv = process.argv.slice(2)) {
         'external/pokemon-showdown/dist/sim/battle-stream.js',
         'external/pokemon-showdown/dist/sim/tools/random-player-ai.js'];
     const identity = {config, checkpoint_sha256: await hashFile(path.resolve(ROOT, config.checkpoint)),
+        candidate_checkpoint_sha256: await hashFile(path.resolve(ROOT, config.candidate_checkpoint || config.checkpoint)),
         executable_sha256: await hashFile(path.join(ROOT, 'build-fresh/showdown_client.exe')),
         source_sha256: Object.fromEntries(await Promise.all(sources.map(async source =>
             [source, await hashFile(path.join(ROOT, source))])))};
@@ -145,8 +153,10 @@ async function main(argv = process.argv.slice(2)) {
             const valid = Object.values(results).reduce((sum, result) => sum + result.valid_games, 0);
             const elapsed = games.reduce((sum, game) => sum + game.duration_seconds, 0);
             await writeJsonAtomic(filename, {diagnostic: config.collect_demonstrations ?
-                'tactical_teacher_demonstration_collection' : 'tactical_teacher_strength_benchmark', run_name: name,
+                'tactical_teacher_demonstration_collection' : config.tactical_teacher === false ?
+                    'neural_candidate_strength_benchmark' : 'tactical_teacher_strength_benchmark', run_name: name,
                 identity, status, error, training_eligible: false, target_valid_games: 4 * config.games_per_side,
+                candidate_policy_mode: config.tactical_teacher === false ? 'neural' : 'tactical',
                 demonstration_purpose: config.collect_demonstrations ? 'supervised_imitation' : null,
                 ppo_eligible: false,
                 valid_games: valid, elapsed_seconds: elapsed,

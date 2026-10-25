@@ -419,6 +419,31 @@ supervised imitation. The next reviewable step is native replay-ingestion
 validation, followed by a controlled student fit with battle-level holdout
 and a fresh playing-strength evaluation with tactical overrides disabled.
 
+### Student-only strength evaluation
+
+The pilot's best checkpoint is selected by full-turn holdout loss, not by
+whichever epoch later wins the most battles. Evaluate that fixed selection:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0270_tactical_student_strength_100ps --config .\config\experimental\tactical_student_benchmark.json
+```
+
+The config sets `candidate_checkpoint` to run_0269's
+`tactical_student_best.chk`, keeps `checkpoint` as the original parent, and
+sets `tactical_teacher` to false. Neither native player receives the tactical
+override flag. The random opponent remains Showdown's seeded `RandomPlayerAI`,
+as in the teacher benchmark. New seed 27001 is used for both matchups with
+matched team seeds across sides, 100 valid games per side, and unchanged
+serial resource gates. No demonstrations or PPO episodes are published.
+
+The summary reports `candidate_policy_mode: neural`, hashes both checkpoints,
+and retains wins, losses, draws, approximate intervals, side splits, and
+invalid games. Per-game `teacher_side` is the existing scheduling key and now
+means the candidate's side. Neural results have `coverage: null` rather than
+claiming tactical coverage. Resume rejects a changed policy mode, checkpoint,
+config, or recorded runner source. Imitation improvement alone is not grounds
+to promote the student; first compare this run's actual playing results.
+
 The compatibility head remains `--counterfactual-q-head joint`: each legal
 joint action has its own state-conditioned score. The experimental
 `factorized` head reuses a slot-local action scorer across every partner action

@@ -77,17 +77,23 @@ function battleSeeds(seed, index, matchedTeams) {
             (matchedTeams ? (side === teacherSide ? 0 : 1) : side))};
 }
 
+function createBattleAgents(config, seeds, candidateSide, opponent, recordTeacher) {
+    return [0, 1].map(side => opponent === 'random' && side !== candidateSide ? null : new AgentProcess(
+        path.resolve(REPO_ROOT, side === candidateSide ? (config.candidate_checkpoint || config.checkpoint) : config.checkpoint),
+        seeds.inference[side], null, config.agent_omp_threads,
+        side === candidateSide && config.tactical_teacher !== false, side === candidateSide ? recordTeacher : null));
+}
+
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
     const battleId = `tactical-${opponent}-${config.seed}-${index}`;
     const teacherSide = index % 2 === 0 ? 0 : 1;
     const opponentName = opponent === 'random' ? 'RandomPolicy' : 'ParentPolicy';
-    const names = teacherSide === 0 ? ['TacticalTeacher', opponentName] : [opponentName, 'TacticalTeacher'];
+    const candidateName = config.tactical_teacher === false ? 'NeuralCandidate' : 'TacticalTeacher';
+    const names = teacherSide === 0 ? [candidateName, opponentName] : [opponentName, candidateName];
     const battle = new sim.BattleStream();
     const streams = sim.getPlayerStreams(battle);
     const seeds = battleSeeds(config.seed, index, matchedTeams);
-    const agents = [0, 1].map(side => opponent === 'random' && side !== teacherSide ? null : new AgentProcess(
-        path.resolve(REPO_ROOT, config.checkpoint), seeds.inference[side],
-        null, config.agent_omp_threads, side === teacherSide, side === teacherSide ? recordTeacher : null));
+    const agents = createBattleAgents(config, seeds, teacherSide, opponent, recordTeacher);
     let timeout;
     let game;
     try {
@@ -116,10 +122,12 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
             }
             const game = {
                 index, status: 'completed', teacher_side: teacherSide === 0 ? 'a' : 'b', seeds,
-                result: teacher.result, coverage: teacher.episode,
+                result: teacher.result, policy_mode: config.tactical_teacher === false ? 'neural' : 'tactical',
+                policy_tag: teacher.episode.policy_tag,
+                coverage: config.tactical_teacher === false ? null : teacher.episode,
                 choice_rejections: [...first.choiceRejections, ...second.choiceRejections],
             };
-            aggregateGames([game]);
+            if (config.tactical_teacher !== false) aggregateGames([game]);
             return game;
         })();
         game = await Promise.race([work, new Promise((_, reject) => {
@@ -219,4 +227,4 @@ if (require.main === module) main().catch(error => {
     process.exitCode = 1;
 });
 
-module.exports = {aggregateGames, battleSeeds, closeGame, driveRandom, hashFile, playGame};
+module.exports = {aggregateGames, battleSeeds, closeGame, createBattleAgents, driveRandom, hashFile, playGame};

@@ -4,7 +4,7 @@ const test = require('node:test');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const {battleSeeds, driveRandom} = require('./tactical_teacher_smoke');
+const {battleSeeds, createBattleAgents, driveRandom} = require('./tactical_teacher_smoke');
 const {isValid, loadSaved, nextGame, summarize, validateConfig, validateResume, wilson} = require('./tactical_teacher_benchmark');
 const config = {...require('../config/experimental/tactical_teacher_benchmark.json'), games_per_side: 1, max_attempts_per_side: 2};
 
@@ -114,4 +114,34 @@ test('confirmation changes only the seed and does not reuse screening battle or 
     }).flat();
     const seen = new Set(tuples(screening));
     assert.equal(tuples(confirmation).some(seed => seen.has(seed)), false);
+});
+
+test('student evaluation loads the candidate on either side without enabling tactical overrides', () => {
+    const student = require('../config/experimental/tactical_student_benchmark.json');
+    validateConfig(student);
+    for (const side of [0, 1]) {
+        const agents = createBattleAgents(student, battleSeeds(student.seed, side, true), side, 'parent', null);
+        assert.ok(agents[side].checkpoint.endsWith('tactical_student_best.chk'));
+        assert.ok(agents[1 - side].checkpoint.endsWith('current_arch_full.chk'));
+        assert.equal(agents[side].tacticalTeacher, false);
+        assert.equal(agents[1 - side].tacticalTeacher, false);
+        const againstRandom = createBattleAgents(student, battleSeeds(student.seed, side, true), side, 'random', null);
+        assert.equal(againstRandom[1 - side], null);
+        assert.equal(againstRandom[side].tacticalTeacher, false);
+    }
+    const teacher = createBattleAgents(config, battleSeeds(config.seed, 0, true), 0, 'parent', null);
+    assert.equal(teacher[0].tacticalTeacher, true);
+    assert.equal(teacher[1].tacticalTeacher, false);
+    assert.throws(() => validateConfig({...student, collect_demonstrations: true}), /bounded/);
+});
+
+test('neural results resume without fabricated tactical coverage and reject a policy-mode mismatch', () => {
+    const neural = {...config, tactical_teacher: false};
+    const game = record(nextGame(neural, []), {policy_mode: 'neural', coverage: null});
+    const identity = {config: neural};
+    assert.deepEqual(validateResume({identity, games: [game]}, identity, neural), [game]);
+    assert.equal(summarize([game]).parent.coverage, null);
+    assert.equal(summarize([game]).parent.wins, 1);
+    assert.throws(() => validateResume({identity, games: [game]}, identity, config), /policy mode/);
+    assert.throws(() => validateResume({identity, games: [{...game, coverage: {}}]}, identity, neural), /must not contain/);
 });

@@ -25,6 +25,13 @@ losses. Only teacher-visible messages and accepted decisions are published,
 one atomic `teacher_*_raw.jsonl` file per valid game. Replay hashes are checked
 on resume. This mode does not create PPO episodes or train a model.
 
+`experimental/tactical_student_benchmark.json` evaluates the pilot's
+loss-selected student checkpoint using that same battle harness. Here
+`checkpoint` is the parent opponent, `candidate_checkpoint` is the student,
+and `tactical_teacher: false` disables the heuristic. It requests 100 valid
+games per side against the parent and random, with serial one-thread agents.
+Both checkpoint hashes and the candidate's neural policy mode are recorded.
+
 `experimental/counterfactual_preference_comparison.json` supplies the fixed
 four-split comparison in `tools/run_counterfactual_preference_comparison.ps1`.
 This PowerShell runner reads JSON rather than the TOML entrypoint format below.
