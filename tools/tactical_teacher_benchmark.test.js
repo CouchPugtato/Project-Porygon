@@ -9,6 +9,23 @@ const {AgentProcess} = require('./counterfactual_rollout');
 const {isValid, loadSaved, nextGame, summarize, validateConfig, validateResume, wilson} = require('./tactical_teacher_benchmark');
 const config = {...require('../config/experimental/tactical_teacher_benchmark.json'), games_per_side: 1, max_attempts_per_side: 2};
 
+test('passive audit routes only to the student and cannot collect training demonstrations', () => {
+    const settings = require('../config/experimental/tactical_student_decision_audit.json');
+    validateConfig(settings);
+    for (const side of [0, 1]) {
+        const agents = createBattleAgents(settings, battleSeeds(settings.seed, side, true), side, 'parent', null);
+        assert.equal(agents[side].tacticalAudit, true);
+        assert.equal(agents[1 - side].tacticalAudit, false);
+        assert.equal(agents[side].inferencePolicy, 'sample');
+        assert.equal(agents[side].tacticalTeacher, false);
+    }
+    assert.throws(() => validateConfig({...settings, collect_demonstrations: true}), /bounded/);
+    assert.throws(() => validateConfig({...settings, tactical_teacher: true}), /bounded/);
+    const identity = {config: settings};
+    const game = record(nextGame(settings, []), {policy_mode: 'neural', coverage: null});
+    assert.throws(() => validateResume({identity, games: [game]}, identity, settings), /no accepted decisions/);
+});
+
 function seedTuples(settings) {
     return Array.from({length: settings.max_attempts_per_side}, (_, pair) => {
         const seeds = battleSeeds(settings.seed, pair * 2, true);

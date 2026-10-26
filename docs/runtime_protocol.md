@@ -73,3 +73,23 @@ includes joint action mass and each move's legally normalized target mass;
 single-action turns use their slot's conditional factors. Ties keep the first
 enumerated legal turn. A legality validator changing its selected actions is
 an evaluation error, not a silent random fallback.
+
+## Passive tactical audit
+
+`--battle-agent <checkpoint> --tactical-audit 1` adds a `decision_audit` object
+to action records without changing neural choices, RNG, or recurrent state.
+It works with sampled or greedy decoding and excludes teacher overrides and
+counterfactual interventions. Ready capabilities advertise `tactical_audit: true`
+and `training: false`. Actions are marked `training_eligible: false`.
+
+The object records selected effective power, unscored moves, the teacher's
+supported best choice, and the best targets with the selected moves/switches/
+Tera held fixed. Slot records identify move IDs, damaging/status classification,
+Protect, Tera, and target-choice counts. These are visible-type heuristic scores,
+not HP damage, action values, or loss explanations. Unsupported choices are
+explicit; their zero contribution must not be called a tactical mistake.
+
+Terminal records use `policy_tag: "tactical-audit-v1"`, `audit_decisions`
+(accepted choices), decoding mode, and `training_eligible: false`. They omit
+PPO arrays. The benchmark matches proposals to acceptance/rejection messages,
+retains only accepted decisions, and verifies the terminal count.

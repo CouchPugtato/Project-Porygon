@@ -2330,7 +2330,8 @@ static int run_runtime_mode(
     int counterfactual_decision_index,
     int counterfactual_action_rank,
     int tactical_teacher,
-    const char* inference_policy
+    const char* inference_policy,
+    int tactical_audit
 ) {
     GruModel* model = NULL;
     TrainerCheckpointState state;
@@ -2343,6 +2344,11 @@ static int run_runtime_mode(
     const char* replay_path = getenv("PORYGON_REPLAY_PATH");
     EnvRewardMode reward_mode;
     int greedy_inference = inference_policy && strcmp(inference_policy, "greedy") == 0;
+
+    if (tactical_audit && (tactical_teacher || counterfactual_decision_index >= 0)) {
+        fprintf(stderr, "[runtime] tactical audit excludes teacher/interventions\n");
+        return 1;
+    }
 
     if (!inference_policy || (strcmp(inference_policy, "sample") != 0 && !greedy_inference) ||
             (greedy_inference && (tactical_teacher || counterfactual_decision_index >= 0))) {
@@ -2420,7 +2426,17 @@ static int run_runtime_mode(
         free(resolved_checkpoint_path);
         return 1;
     }
-    if (greedy_inference) snprintf(json, sizeof(json),
+    if (tactical_audit && !env_runtime_enable_tactical_audit(&runtime)) {
+        env_runtime_free(&runtime);
+        if (replay_file) fclose(replay_file);
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
+        return 1;
+    }
+    if (tactical_audit) snprintf(json, sizeof(json),
+        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"tactical_audit\":true,\"inference_policy\":\"%s\"}}",
+        inference_policy);
+    else if (greedy_inference) snprintf(json, sizeof(json),
         "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"inference_policy\":\"greedy\"}}");
     else if (tactical_teacher) snprintf(json, sizeof(json),
         "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"tactical_teacher\":true}}");
@@ -4743,6 +4759,7 @@ static int showdown_client_main(int argc, char** argv) {
     int inference_seed = parse_int_flag(argc, argv, "--inference-seed", -1);
     int tactical_teacher = parse_bool01_flag(argc, argv, "--tactical-teacher", 0);
     const char* inference_policy_name = parse_string_flag(argc, argv, "--inference-policy", "sample");
+    int tactical_audit = parse_bool01_flag(argc, argv, "--tactical-audit", 0);
     int counterfactual_decision_index = parse_int_flag(
         argc, argv, "--counterfactual-decision", -1);
     int counterfactual_action_rank = parse_int_flag(
@@ -4756,9 +4773,9 @@ static int showdown_client_main(int argc, char** argv) {
     int ppo_command = argc >= 2 && strcmp(argv[1], "--train-live-ppo") == 0;
     int awr_command = argc >= 2 && strcmp(argv[1], "--train-live-awr") == 0;
     int training_or_eval_mode = 0;
-    if (strcmp(inference_policy_name, "sample") != 0 &&
+    if ((tactical_audit || strcmp(inference_policy_name, "sample") != 0) &&
             !(argc >= 2 && (strcmp(argv[1], "--battle-agent") == 0 || strcmp(argv[1], "--runtime") == 0))) {
-        fprintf(stderr, "[runtime] non-sampling inference is only available in --battle-agent/--runtime mode\n");
+        fprintf(stderr, "[runtime] non-sampling inference and tactical auditing require --battle-agent/--runtime mode\n");
         return 1;
     }
     srand((unsigned int)time(NULL));
@@ -5021,7 +5038,8 @@ static int showdown_client_main(int argc, char** argv) {
             counterfactual_decision_index,
             counterfactual_action_rank,
             tactical_teacher,
-            inference_policy_name);
+            inference_policy_name,
+            tactical_audit);
     }
     if (argc >= 4 && overfit_command) {
         return run_supervised_overfit_check(
@@ -5455,6 +5473,7 @@ static int showdown_client_main(int argc, char** argv) {
         fprintf(stderr,
         "Usage:\n"
         "  Runtime decoding: --inference-policy sample|greedy (default sample; greedy is evaluation-only)\n"
+        "  Passive decision audit: --tactical-audit 1 (evaluation-only; does not change choices)\n"
         "  showdown_client --battle-agent [checkpoint] [--tactical-teacher 0|1] [--inference-seed N] [--counterfactual-decision N --counterfactual-rank N] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"

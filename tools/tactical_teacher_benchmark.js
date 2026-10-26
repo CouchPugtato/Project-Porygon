@@ -5,6 +5,7 @@ const path = require('node:path');
 const {aggregateGames, hashFile, playGame} = require('./tactical_teacher_smoke');
 const {acquireRunLock, createResourceGate, writeJsonAtomic} = require('./counterfactual_rollout');
 const {publishReplay, verifyReplays} = require('./tactical_demonstrations');
+const {summarizeDecisions} = require('./tactical_decision_audit');
 const ROOT = path.resolve(__dirname, '..');
 const OPPONENTS = ['parent', 'random'];
 const SUPPORTED_OPPONENTS = [...OPPONENTS, 'pilot', 'sampled'];
@@ -71,6 +72,7 @@ function validateResume(saved, identity, config) {
                 !Number.isFinite(game.duration_seconds) || game.duration_seconds < 0)
             throw new Error('saved benchmark records do not match the deterministic schedule');
         if (game.status === 'completed') {
+            if (config.decision_audit) summarizeDecisions([game]);
             if ((game.inference_policy || 'sample') !== (config.candidate_inference_policy || 'sample'))
                 throw new Error('saved candidate inference policy differs from the configured decoder');
             if (!Array.isArray(game.choice_rejections) || !['win', 'loss', 'draw'].includes(game.result?.result))
@@ -102,6 +104,8 @@ async function loadSaved(filename) {
 
 function validateConfig(config) {
     if ((config.collect_demonstrations !== undefined && typeof config.collect_demonstrations !== 'boolean') ||
+            (config.decision_audit !== undefined && typeof config.decision_audit !== 'boolean') ||
+            (config.decision_audit && (config.tactical_teacher !== false || config.collect_demonstrations)) ||
             (config.candidate_inference_policy !== undefined && !['sample', 'greedy'].includes(config.candidate_inference_policy)) ||
             (config.candidate_inference_policy === 'greedy' && (config.tactical_teacher !== false || config.collect_demonstrations)) ||
             (config.opponents !== undefined && (!Array.isArray(config.opponents) || !config.opponents.length ||
@@ -139,7 +143,8 @@ async function main(argv = process.argv.slice(2)) {
     validateConfig(config);
     const targetGames = 2 * config.games_per_side * (config.opponents || OPPONENTS).length;
     const sources = ['tools/tactical_teacher_benchmark.js', 'tools/tactical_teacher_smoke.js',
-        'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'external/pokemon-showdown/dist/sim/battle.js',
+        'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'tools/tactical_decision_audit.js',
+        'external/pokemon-showdown/dist/sim/battle.js',
         'external/pokemon-showdown/dist/sim/battle-stream.js',
         'external/pokemon-showdown/dist/sim/tools/random-player-ai.js'];
     const identity = {config, checkpoint_sha256: await hashFile(path.resolve(ROOT, config.checkpoint)),
@@ -171,6 +176,8 @@ async function main(argv = process.argv.slice(2)) {
                 identity, status, error, training_eligible: false, target_valid_games: targetGames,
                 candidate_policy_mode: config.tactical_teacher === false ? 'neural' : 'tactical',
                 candidate_inference_policy: config.candidate_inference_policy || 'sample',
+                decision_audit: config.decision_audit ? Object.fromEntries(Object.keys(results).map(opponent =>
+                    [opponent, summarizeDecisions(games.filter(game => game.opponent === opponent && isValid(game)))])) : null,
                 demonstration_purpose: config.collect_demonstrations ? 'supervised_imitation' : null,
                 ppo_eligible: false,
                 valid_games: valid, elapsed_seconds: elapsed,

@@ -587,6 +587,12 @@ of equivalence and not an automatic reason for another larger training run.
 
 ### Sampled versus greedy inference
 
+Completed runs 0278/0279 favored sampling. Over 200 valid games per matchup,
+sampling scored 55% against the parent and 48.5% against random; greedy scored
+37.5% and 24.5%. In their direct matchup greedy scored 22.5%. Checkpoint,
+executable, and base seed matched. Keep sampling; this full-turn MAP decoder
+does not justify a larger confirmation.
+
 An imitation gain need not survive stochastic action selection. Before
 another fit, compare inference policies on the frozen larger student. Rebuild
 the client and run reconstruction, legality, and tactical tests first; copy
@@ -1114,6 +1120,9 @@ A candidate that clears the point estimate but not the confidence bound is retai
 
 ## Recommended first RL ladder
 
+The ladder below is historical. The current recovery work follows
+`docs/project_direction.txt`; it does not call for another RL sweep yet.
+
 The current recommended first RL sweep is:
 
 1. start from the trusted baseline checkpoint
@@ -1132,3 +1141,38 @@ The current recommended first RL sweep is:
    - `0.003`
 
 Do not scale model size or broaden collection policy until this ladder stops collapsing.
+
+## Student decision audit
+
+After rebuilding/copying the native client, run:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0280_student_decision_audit --config .\config\experimental\tactical_student_decision_audit.json
+```
+
+This runs 200 valid games (50 per side against parent and random) on fresh
+seed 28001, using the frozen run_0275 epoch-3 student with sampling. The teacher
+scores the student's visited boards without controlling play. Nothing is
+trained or published. Reuse the command to resume with unchanged inputs.
+
+The normal summary retains accepted per-game `decision_audit` records and
+opponent-level totals. Fully scored choices have three effective-power gaps:
+teacher minus selected; best targets with the selected actions held fixed
+minus selected; and teacher minus that retargeted choice. Target averages
+include only choices with multiple targets. The teacher and target averages
+have separate denominators; do not add them as if they covered the same rows.
+All totals weight decisions rather than averaging battle percentages.
+
+Protect/status, Tera, voluntary switches, friendly effective power, and move-ID
+counts help locate behavior patterns. `consecutive_protect` means consecutive
+accepted ordinary requests in the same slot, not verified consecutive battle
+turns. Forced replacements reset that counter. The ten largest fully scored
+gaps retain game/request indices and both commands for follow-up inspection.
+Invalid games remain in the summary but are excluded from aggregate audits
+and win rates, including all their accepted choices.
+
+Unscored choices (including Protect and Tera) are counted separately and
+excluded from gap averages. An effective-power gap is not an HP-damage loss or
+proof of a worse battle decision: status, switching, abilities, speed, and
+protection can make the simple attack heuristic wrong. Use this audit to pick
+a concrete transfer problem, not to select another checkpoint on these games.

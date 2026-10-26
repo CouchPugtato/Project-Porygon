@@ -930,6 +930,55 @@ static int test_greedy_runtime_is_evaluation_only(void) {
     return ok;
 }
 
+static int test_tactical_audit_preserves_sampled_runtime(void) {
+    GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    EnvRuntime runtime = {0};
+    FactorizedActionChoice baseline;
+    float hidden[8];
+    int next_rng = 0, mode, ok = assert_true(model != NULL, "create passive runtime audit fixture");
+    if (!ok) return 0;
+    for (mode = 0; mode < 2; ++mode) {
+        FILE* output = tmpfile();
+        RuntimeMessage terminal;
+        char line[4096];
+        Episode parsed = {0};
+        if (!output) { ok = 0; break; }
+        ok &= env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "parent.chk");
+        if (mode) ok &= assert_true(env_runtime_enable_tactical_audit(&runtime) &&
+            !env_runtime_enable_tactical_teacher(&runtime) && !env_runtime_set_counterfactual_intervention(&runtime, 0, 0),
+            "Audit blocks behavior overrides");
+        srand(28001);
+        ok &= assert_true(send_counterfactual_test_state(&runtime, output), "emit sampled action with passive audit");
+        if (runtime.count) {
+            if (!mode) {
+                baseline = runtime.sessions[0].pending_factorized_choice;
+                memcpy(hidden, runtime.sessions[0].hidden_state, sizeof(hidden));
+                next_rng = rand();
+            } else {
+                ok &= assert_true(memcmp(&baseline, &runtime.sessions[0].pending_factorized_choice, sizeof(baseline)) == 0 &&
+                    memcmp(hidden, runtime.sessions[0].hidden_state, sizeof(hidden)) == 0 && rand() == next_rng,
+                    "Audit leaves sampled choices, recurrent state, and RNG unchanged");
+            }
+        }
+        if (mode) {
+            runtime_message_init(&terminal);
+            terminal.type = RUNTIME_MSG_TERMINAL;
+            strcpy(terminal.battle_id, "battle-counterfactual-test");
+            terminal.reward = 1.0f;
+            ok &= env_runtime_handle_message(&runtime, &terminal, output);
+            rewind(output);
+            ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "\"decision_audit\":{") &&
+                strstr(line, "\"training_eligible\":false"), "Audit action carries passive telemetry");
+            ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "tactical-audit-v1") &&
+                !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0), "Audit terminal cannot become PPO data");
+        }
+        env_runtime_free(&runtime);
+        fclose(output);
+    }
+    gru_model_destroy(model);
+    return ok;
+}
+
 static void write_counterfactual_dataset_sample(
     FILE* output,
     int rank,
@@ -6438,6 +6487,7 @@ int main(int argc, char** argv) {
     if (!test_action_value_pairwise_preference_moves_the_value_gap()) return 1;
     if (!test_counterfactual_q_overfits_repeated_real_shape_pairs()) return 1;
     if (!test_greedy_runtime_is_evaluation_only()) return 1;
+    if (!test_tactical_audit_preserves_sampled_runtime()) return 1;
     printf("reconstruction tests passed\n");
     return 0;
 }

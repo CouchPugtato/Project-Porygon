@@ -186,9 +186,11 @@ function continuationSeed(base, attempt, repeat) {
 }
 
 class AgentProcess {
-    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null, inferencePolicy = 'sample') {
+    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null, inferencePolicy = 'sample', tacticalAudit = false) {
         if (!['sample', 'greedy'].includes(inferencePolicy) || (inferencePolicy === 'greedy' && (tacticalTeacher || intervention)))
             throw new Error('greedy inference is evaluation-only and excludes tactical/counterfactual overrides');
+        if (tacticalAudit && (tacticalTeacher || intervention))
+            throw new Error('passive tactical audit excludes teacher/counterfactual overrides');
         this.checkpoint = checkpoint;
         this.inferenceSeed = inferenceSeedValue;
         this.intervention = intervention;
@@ -196,6 +198,7 @@ class AgentProcess {
         this.tacticalTeacher = tacticalTeacher;
         this.onSend = onSend;
         this.inferencePolicy = inferencePolicy;
+        this.tacticalAudit = tacticalAudit;
         this.process = null;
         this.messages = [];
         this.waiters = [];
@@ -211,6 +214,7 @@ class AgentProcess {
         ];
         if (this.tacticalTeacher) args.push('--tactical-teacher', '1');
         if (this.inferencePolicy === 'greedy') args.push('--inference-policy', 'greedy');
+        if (this.tacticalAudit) args.push('--tactical-audit', '1');
         if (this.intervention) {
             args.push(
                 '--counterfactual-decision', String(this.intervention.decisionIndex),
@@ -245,6 +249,8 @@ class AgentProcess {
             }
         });
         const ready = await this.nextMessage('ready');
+        if (this.tacticalAudit && (ready.capabilities?.tactical_audit !== true || ready.capabilities?.training !== false))
+            throw new Error('runtime does not advertise passive tactical auditing; rebuild the client');
         if (this.inferencePolicy === 'greedy' && (ready.capabilities?.inference_policy !== 'greedy' ||
                 ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise evaluation-only greedy decoding; rebuild the client');

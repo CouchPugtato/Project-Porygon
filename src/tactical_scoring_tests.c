@@ -1,6 +1,7 @@
 #include "tactical_scoring.h"
 #include "tactical_policy.h"
 #include "policy_decoding.h"
+#include "tactical_audit.h"
 #include "action_semantics.h"
 
 #include <math.h>
@@ -431,6 +432,41 @@ static int test_greedy_single_slot_and_forced_switches(void) {
     return ok;
 }
 
+static int test_passive_decision_audit(void) {
+    Observation observation, before;
+    ParsedRequest request, original;
+    FactorizedActionChoice choice;
+    TacticalAudit audit;
+    int expected_rng, ok = decision_fixture(&observation, &request);
+    if (!ok) return 0;
+    before = observation;
+    original = request;
+    factorized_action_choice_from_flat_actions(&choice, 0, 14);
+    choice.slot0_target_mask = build_move_target_mask(&request, 0, 0);
+    choice.slot1_target_mask = build_move_target_mask(&request, 1, 0);
+    choice.slot0_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    choice.slot1_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    srand(28001); expected_rng = rand(); srand(28001);
+    ok &= check(tactical_audit_choice(&observation, &request, &choice, &audit) &&
+        audit.teacher_available && audit.retargeted_available &&
+        audit.retargeted.evaluation.score > audit.selected.score &&
+        fabsf(audit.teacher.evaluation.score - audit.retargeted.evaluation.score) < 1e-5f &&
+        audit.retargeted.choice.slot0_move_index == choice.slot0_move_index,
+        "Audit isolates target quality while holding both moves fixed");
+    ok &= check(rand() == expected_rng && memcmp(&observation, &before, sizeof(before)) == 0 &&
+        memcmp(&request, &original, sizeof(original)) == 0 && choice.slot0_target_index == FACTORIZED_TARGET_FOE_RIGHT,
+        "Passive audit preserves requests, observations, choices, and RNG");
+    factorized_action_choice_from_flat_actions(&choice, 1, 14);
+    choice.slot0_target_mask = build_move_target_mask(&request, 0, 1);
+    choice.slot0_target_index = FACTORIZED_TARGET_SELF;
+    choice.slot1_target_mask = build_move_target_mask(&request, 1, 0);
+    choice.slot1_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    ok &= check(tactical_audit_choice(&observation, &request, &choice, &audit) &&
+        audit.selected.unscored_moves == 1 && audit.teacher_available,
+        "Protect is marked unscored, not treated as a demonstrated mistake");
+    return ok;
+}
+
 int main(void) {
     if (!check(id_tables_init(), "load vocabulary and move metadata")) return 1;
     if (!test_target_matchups() || !test_accuracy_and_stab() ||
@@ -442,7 +478,8 @@ int main(void) {
             !test_forced_switches_and_passes() ||
             !test_selector_respects_traps_wait_and_finite_scores() ||
             !test_all_adjacent_parser_and_legacy_encoding() ||
-            !test_greedy_full_turn_probability() || !test_greedy_single_slot_and_forced_switches()) return 1;
+            !test_greedy_full_turn_probability() || !test_greedy_single_slot_and_forced_switches() ||
+            !test_passive_decision_audit()) return 1;
     puts("tactical scoring tests passed");
     return 0;
 }

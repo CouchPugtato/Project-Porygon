@@ -4,6 +4,7 @@
 #include "observation_builder.h"
 #include "request_parser.h"
 #include "tactical_policy.h"
+#include "tactical_audit.h"
 #include "policy_decoding.h"
 
 #include <math.h>
@@ -478,14 +479,14 @@ int env_runtime_set_counterfactual_intervention(
     int decision_index,
     int action_rank
 ) {
-    if (!runtime || runtime->tactical_teacher || runtime->greedy_inference || decision_index < 0 || action_rank < 0) return 0;
+    if (!runtime || runtime->tactical_teacher || runtime->greedy_inference || runtime->tactical_audit || decision_index < 0 || action_rank < 0) return 0;
     runtime->counterfactual_decision_index = decision_index;
     runtime->counterfactual_action_rank = action_rank;
     return 1;
 }
 
 int env_runtime_enable_tactical_teacher(EnvRuntime* runtime) {
-    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->greedy_inference ||
+    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->greedy_inference || runtime->tactical_audit ||
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->tactical_teacher = 1;
     snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "tactical-eval-v1");
@@ -497,6 +498,13 @@ int env_runtime_enable_greedy_inference(EnvRuntime* runtime) {
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->greedy_inference = 1;
     snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "greedy-eval-v1");
+    return 1;
+}
+
+int env_runtime_enable_tactical_audit(EnvRuntime* runtime) {
+    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher ||
+            runtime->counterfactual_decision_index >= 0) return 0;
+    runtime->tactical_audit = 1;
     return 1;
 }
 
@@ -894,6 +902,12 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
                 tactical_decision.evaluation.score, tactical_decision.evaluation.opponent_power,
                 tactical_decision.evaluation.friendly_power);
             fputs("}}", out);
+        } else if (runtime->tactical_audit) {
+            fprintf(out, "%.*s,\"inference_policy\":\"%s\",\"training_eligible\":false,\"decision_audit\":",
+                (int)strlen(json) - 1, json, runtime->greedy_inference ? "greedy" : "sample");
+            tactical_audit_write_json(out, &session->observation, &session->parsed_request,
+                &session->pending_factorized_choice);
+            fputc('}', out);
         } else if (runtime->greedy_inference) {
             fprintf(out, "%.*s,\"inference_policy\":\"greedy\",\"training_eligible\":false}",
                 (int)strlen(json) - 1, json);
@@ -1051,6 +1065,11 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                         "\"tactical_forced_switches\":%zu,\"tactical_fallbacks\":%zu}\n",
                         session->battle_id, session->tactical_attempts, session->tactical_applied,
                         session->tactical_forced_switches, session->tactical_fallbacks);
+                } else if (runtime->tactical_audit) {
+                    fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
+                        "\"policy_tag\":\"tactical-audit-v1\",\"training_eligible\":false,"
+                        "\"inference_policy\":\"%s\",\"audit_decisions\":%zu}\n",
+                        session->battle_id, runtime->greedy_inference ? "greedy" : "sample", session->decision_count);
                 } else if (runtime->greedy_inference) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
                         "\"policy_tag\":\"greedy-eval-v1\",\"training_eligible\":false,"

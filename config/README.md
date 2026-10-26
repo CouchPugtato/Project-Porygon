@@ -75,6 +75,14 @@ profiles request 400 and 600 valid games, respectively. The opt-in
 `candidate_inference_policy` is recorded and checked on resume. Opponents
 always sample; greedy mode cannot be used for teacher collection or PPO data.
 
+`experimental/tactical_student_decision_audit.json` requests 200 valid games
+on fresh seed 28001, with sampling and the same frozen epoch-3 student.
+`decision_audit: true` passively compares accepted choices with the tactical
+teacher on student-visited boards. It does not alter choices or create training
+data. The usual summary gains `decision_audit` totals per opponent; each game
+retains its accepted decision records. Serial battles, one thread per agent,
+65% launch gates, and identity-checked resume remain in effect.
+
 `experimental/tactical_student_confirmation.json` repeats the student test
 with fresh seed 27101 and 500 valid games per side per opponent (2,000 total).
 Only the seed, game target, and replacement budget differ from screening.

@@ -9,6 +9,7 @@ const {
 } = require('./counterfactual_rollout');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
+const {createDecisionAudit} = require('./tactical_decision_audit');
 
 async function hashFile(filename) {
     const hash = crypto.createHash('sha256');
@@ -84,7 +85,8 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
         path.resolve(REPO_ROOT, side === candidateSide ? (config.candidate_checkpoint || config.checkpoint) : opponentCheckpoint),
         seeds.inference[side], null, config.agent_omp_threads,
         side === candidateSide && config.tactical_teacher !== false, side === candidateSide ? recordTeacher : null,
-        side === candidateSide ? (config.candidate_inference_policy || 'sample') : 'sample'));
+        side === candidateSide ? (config.candidate_inference_policy || 'sample') : 'sample',
+        side === candidateSide && config.decision_audit === true));
 }
 
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
@@ -97,14 +99,17 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
     const battle = new sim.BattleStream();
     const streams = sim.getPlayerStreams(battle);
     const seeds = battleSeeds(config.seed, index, matchedTeams);
-    const agents = createBattleAgents(config, seeds, teacherSide, opponent, recordTeacher);
+    const audit = config.decision_audit ? createDecisionAudit() : null;
+    const observe = audit ? line => { audit.observe(line); if (recordTeacher) recordTeacher(line); } : recordTeacher;
+    const agents = createBattleAgents(config, seeds, teacherSide, opponent, observe);
     let timeout;
     let game;
     try {
         const work = (async () => {
             await Promise.all(agents.filter(Boolean).map(agent => agent.start()));
             const players = [streams.p1, streams.p2].map((stream, side) =>
-                agents[side] ? drivePlayer(stream, agents[side], battleId, names[side], config.format) :
+                agents[side] ? drivePlayer(stream, agents[side], battleId, names[side], config.format,
+                    side === teacherSide && audit ? action => audit.propose(action) : null) :
                     driveRandom(stream, seeds.random));
             const drain = (async () => { for await (const chunk of streams.omniscient) { void chunk; } })();
             const results = Promise.all([...players, drain]);
@@ -136,6 +141,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
                 choice_rejections: [...first.choiceRejections, ...second.choiceRejections],
             };
             if (config.tactical_teacher !== false) aggregateGames([game]);
+            if (audit) game.decision_audit = audit.finish(teacher.episode);
             return game;
         })();
         game = await Promise.race([work, new Promise((_, reject) => {
