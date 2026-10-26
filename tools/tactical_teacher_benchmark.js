@@ -7,7 +7,7 @@ const {acquireRunLock, createResourceGate, writeJsonAtomic} = require('./counter
 const {publishReplay, verifyReplays} = require('./tactical_demonstrations');
 const ROOT = path.resolve(__dirname, '..');
 const OPPONENTS = ['parent', 'random'];
-const SUPPORTED_OPPONENTS = [...OPPONENTS, 'pilot'];
+const SUPPORTED_OPPONENTS = [...OPPONENTS, 'pilot', 'sampled'];
 
 function wilson(score, count) {
     if (!count) return null;
@@ -71,6 +71,8 @@ function validateResume(saved, identity, config) {
                 !Number.isFinite(game.duration_seconds) || game.duration_seconds < 0)
             throw new Error('saved benchmark records do not match the deterministic schedule');
         if (game.status === 'completed') {
+            if ((game.inference_policy || 'sample') !== (config.candidate_inference_policy || 'sample'))
+                throw new Error('saved candidate inference policy differs from the configured decoder');
             if (!Array.isArray(game.choice_rejections) || !['win', 'loss', 'draw'].includes(game.result?.result))
                 throw new Error('saved completed game has no terminal result or rejection record');
             if ((game.policy_mode === 'neural') !== (config.tactical_teacher === false))
@@ -100,6 +102,8 @@ async function loadSaved(filename) {
 
 function validateConfig(config) {
     if ((config.collect_demonstrations !== undefined && typeof config.collect_demonstrations !== 'boolean') ||
+            (config.candidate_inference_policy !== undefined && !['sample', 'greedy'].includes(config.candidate_inference_policy)) ||
+            (config.candidate_inference_policy === 'greedy' && (config.tactical_teacher !== false || config.collect_demonstrations)) ||
             (config.opponents !== undefined && (!Array.isArray(config.opponents) || !config.opponents.length ||
                 config.opponents.some(opponent => !SUPPORTED_OPPONENTS.includes(opponent)) ||
                 new Set(config.opponents).size !== config.opponents.length)) ||
@@ -166,6 +170,7 @@ async function main(argv = process.argv.slice(2)) {
                     'neural_candidate_strength_benchmark' : 'tactical_teacher_strength_benchmark', run_name: name,
                 identity, status, error, training_eligible: false, target_valid_games: targetGames,
                 candidate_policy_mode: config.tactical_teacher === false ? 'neural' : 'tactical',
+                candidate_inference_policy: config.candidate_inference_policy || 'sample',
                 demonstration_purpose: config.collect_demonstrations ? 'supervised_imitation' : null,
                 ppo_eligible: false,
                 valid_games: valid, elapsed_seconds: elapsed,

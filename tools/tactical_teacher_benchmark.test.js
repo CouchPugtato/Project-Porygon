@@ -5,6 +5,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const {battleSeeds, createBattleAgents, driveRandom} = require('./tactical_teacher_smoke');
+const {AgentProcess} = require('./counterfactual_rollout');
 const {isValid, loadSaved, nextGame, summarize, validateConfig, validateResume, wilson} = require('./tactical_teacher_benchmark');
 const config = {...require('../config/experimental/tactical_teacher_benchmark.json'), games_per_side: 1, max_attempts_per_side: 2};
 
@@ -225,4 +226,39 @@ test('three-opponent confirmation freezes all models and mode while increasing t
         max_attempts_per_side: screen.max_attempts_per_side}, screen);
     const seen = new Set(seedTuples(screen));
     assert.equal(seedTuples(confirmation).some(seed => seen.has(seed)), false);
+});
+
+test('matched decoder profiles change only candidate decoding and add a same-checkpoint sampled opponent', () => {
+    const sampled = require('../config/experimental/tactical_student_decoding_sample.json');
+    const greedy = require('../config/experimental/tactical_student_decoding_greedy.json');
+    validateConfig(sampled);
+    validateConfig(greedy);
+    assert.deepEqual({...greedy, candidate_inference_policy: 'sample', opponents: sampled.opponents}, sampled);
+    assert.deepEqual(greedy.opponents, ['parent', 'random', 'sampled']);
+    assert.equal(2 * greedy.games_per_side * greedy.opponents.length, 600);
+    for (const side of [0, 1]) {
+        const agents = createBattleAgents(greedy, battleSeeds(greedy.seed, side, true), side, 'sampled', null);
+        assert.equal(agents[0].checkpoint, agents[1].checkpoint);
+        assert.equal(agents[side].inferencePolicy, 'greedy');
+        assert.equal(agents[1 - side].inferencePolicy, 'sample');
+        assert.ok(agents.every(agent => agent.tacticalTeacher === false));
+        const parent = createBattleAgents(greedy, battleSeeds(greedy.seed, side, true), side, 'parent', null);
+        assert.ok(parent[1 - side].checkpoint.endsWith('current_arch_full.chk'));
+        assert.equal(parent[1 - side].inferencePolicy, 'sample');
+    }
+    assert.throws(() => validateConfig({...greedy, tactical_teacher: true}), /bounded/);
+    assert.throws(() => validateConfig({...greedy, collect_demonstrations: true}), /bounded/);
+    assert.throws(() => validateConfig({...greedy, candidate_inference_policy: 'unknown'}), /bounded/);
+    assert.throws(() => new AgentProcess('model', 1, null, 1, true, null, 'greedy'), /evaluation-only/);
+    assert.throws(() => new AgentProcess('model', 1, {decisionIndex: 0}, 1, false, null, 'greedy'), /evaluation-only/);
+});
+
+test('greedy results cannot resume as sampled results, including the direct sampled matchup', () => {
+    const greedy = {...config, tactical_teacher: false, candidate_inference_policy: 'greedy', opponents: ['sampled']};
+    const identity = {config: greedy};
+    const game = record(nextGame(greedy, []), {policy_mode: 'neural', inference_policy: 'greedy', coverage: null});
+    assert.equal(game.opponent, 'sampled');
+    assert.deepEqual(validateResume({identity, games: [game]}, identity, greedy), [game]);
+    assert.equal(summarize([game], greedy.opponents).sampled.valid_games, 1);
+    assert.throws(() => validateResume({identity, games: [{...game, inference_policy: 'sample'}]}, identity, greedy), /inference policy/);
 });

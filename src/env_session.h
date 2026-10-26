@@ -76,6 +76,7 @@ typedef struct {
     int counterfactual_decision_index;
     int counterfactual_action_rank;
     int tactical_teacher;
+    int greedy_inference;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;
@@ -96,6 +97,7 @@ int env_runtime_set_counterfactual_intervention(
     int action_rank
 );
 int env_runtime_enable_tactical_teacher(EnvRuntime* runtime);
+int env_runtime_enable_greedy_inference(EnvRuntime* runtime);
 void env_runtime_free(EnvRuntime* runtime);
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);
 

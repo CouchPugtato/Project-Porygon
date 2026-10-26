@@ -51,3 +51,25 @@ Terminal `episode_complete` records in this mode contain coverage counts and
 `training_eligible: false` instead of episode arrays. Their policy tag is
 `tactical-eval-v1`; they are evaluation summaries and cannot be parsed as normal
 training episodes. Counters measure emitted decision attempts, including retries.
+
+## Greedy neural evaluation
+
+`--battle-agent <checkpoint> --inference-policy greedy` selects the
+highest-probability complete legal turn, including conditional targets. The
+default remains `--inference-policy sample`; training and ordinary collection
+are unchanged. Greedy mode excludes tactical overrides and counterfactual
+interventions, and non-sampling decoding is rejected outside runtime mode.
+
+The ready record advertises `capabilities.inference_policy: "greedy"` and
+`capabilities.training: false`. Actions add `inference_policy: "greedy"` and
+`training_eligible: false`. Terminal records carry `policy_tag: "greedy-eval-v1"`,
+the same decoding/eligibility fields, and `greedy_decisions` (accepted decisions).
+They omit episode arrays and cannot be parsed as on-policy PPO episodes.
+
+The decoder shares request action/target enumeration and pair legality with
+the tactical selector but does not call its power-scoring rules. It consumes
+the neural policy snapshot without advancing the model or RNG. Selection
+includes joint action mass and each move's legally normalized target mass;
+single-action turns use their slot's conditional factors. Ties keep the first
+enumerated legal turn. A legality validator changing its selected actions is
+an evaluation error, not a silent random fallback.

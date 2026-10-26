@@ -78,17 +78,20 @@ function battleSeeds(seed, index, matchedTeams) {
 }
 
 function createBattleAgents(config, seeds, candidateSide, opponent, recordTeacher) {
-    const opponentCheckpoint = opponent === 'pilot' ? config.pilot_checkpoint : config.checkpoint;
+    const opponentCheckpoint = opponent === 'pilot' ? config.pilot_checkpoint :
+        opponent === 'sampled' ? (config.candidate_checkpoint || config.checkpoint) : config.checkpoint;
     return [0, 1].map(side => opponent === 'random' && side !== candidateSide ? null : new AgentProcess(
         path.resolve(REPO_ROOT, side === candidateSide ? (config.candidate_checkpoint || config.checkpoint) : opponentCheckpoint),
         seeds.inference[side], null, config.agent_omp_threads,
-        side === candidateSide && config.tactical_teacher !== false, side === candidateSide ? recordTeacher : null));
+        side === candidateSide && config.tactical_teacher !== false, side === candidateSide ? recordTeacher : null,
+        side === candidateSide ? (config.candidate_inference_policy || 'sample') : 'sample'));
 }
 
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
     const battleId = `tactical-${opponent}-${config.seed}-${index}`;
     const teacherSide = index % 2 === 0 ? 0 : 1;
-    const opponentName = opponent === 'random' ? 'RandomPolicy' : opponent === 'pilot' ? 'PilotPolicy' : 'ParentPolicy';
+    const opponentName = opponent === 'random' ? 'RandomPolicy' : opponent === 'pilot' ? 'PilotPolicy' :
+        opponent === 'sampled' ? 'SampledCandidate' : 'ParentPolicy';
     const candidateName = config.tactical_teacher === false ? 'NeuralCandidate' : 'TacticalTeacher';
     const names = teacherSide === 0 ? [candidateName, opponentName] : [opponentName, candidateName];
     const battle = new sim.BattleStream();
@@ -116,6 +119,9 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
             const [first, second] = await results;
             const teacher = teacherSide === 0 ? first : second;
             const other = teacherSide === 0 ? second : first;
+            if (config.candidate_inference_policy === 'greedy' &&
+                    (teacher.episode.inference_policy !== 'greedy' || teacher.episode.training_eligible !== false))
+                throw new Error('greedy runtime returned an incompatible terminal record');
             if (!['win', 'loss', 'draw'].includes(teacher.result.result) ||
                     (teacher.result.result === 'draw' ? other.result.result !== 'draw' :
                         other.result.result !== (teacher.result.result === 'win' ? 'loss' : 'win'))) {
@@ -124,6 +130,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
             const game = {
                 index, status: 'completed', teacher_side: teacherSide === 0 ? 'a' : 'b', seeds,
                 result: teacher.result, policy_mode: config.tactical_teacher === false ? 'neural' : 'tactical',
+                inference_policy: config.candidate_inference_policy || 'sample',
                 policy_tag: teacher.episode.policy_tag,
                 coverage: config.tactical_teacher === false ? null : teacher.episode,
                 choice_rejections: [...first.choiceRejections, ...second.choiceRejections],

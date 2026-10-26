@@ -1,9 +1,11 @@
 #include "tactical_scoring.h"
 #include "tactical_policy.h"
+#include "policy_decoding.h"
 #include "action_semantics.h"
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int check(int condition, const char* message) {
@@ -322,6 +324,113 @@ static int test_all_adjacent_parser_and_legacy_encoding(void) {
     return ok;
 }
 
+static int refresh_greedy_mask(Observation* observation, const ParsedRequest* request) {
+    ActionMask mask;
+    if (!build_action_mask_from_request(&mask, request)) return 0;
+    memcpy(observation->legal_mask, mask.legal, sizeof(mask.legal));
+    return 1;
+}
+
+static int test_greedy_full_turn_probability(void) {
+    Observation observation, original;
+    ParsedRequest request, original_request;
+    FactorizedPolicySnapshot policy = {0}, original_policy;
+    FactorizedActionChoice choice, repeated;
+    int expected_random, ok = decision_fixture(&observation, &request);
+    if (!ok || !refresh_greedy_mask(&observation, &request)) return 0;
+    policy.has_joint_policy = 1;
+    policy.joint_policy[0] = 0.6f;
+    policy.joint_policy[1 * 14 + 1] = 0.4f;
+    /* Impossible double-Tera and duplicate-switch pairs must not win. */
+    policy.joint_policy[4 * 14 + 4] = 100.0f;
+    policy.joint_policy[10 * 14 + 10] = 100.0f;
+    for (int i = 0; i < FACTORIZED_TARGET_DIM; ++i)
+        policy.slot0_target_policy[i] = policy.slot1_target_policy[i] = 1.0f;
+    original = observation;
+    original_request = request;
+    original_policy = policy;
+    srand(51); expected_random = rand(); srand(51);
+    ok &= check(policy_decode_greedy(&observation, &request, &policy, &choice) &&
+        choice.slot0_move_index == 1 && choice.slot1_move_index == 1 &&
+        choice.slot1_target_index == FACTORIZED_TARGET_ALLY &&
+        !choice.slot0_use_tera && !choice.slot1_use_tera,
+        "Greedy ranks complete turns including conditional targets, not just the action-pair argmax");
+    ok &= check(rand() == expected_random &&
+        memcmp(&original, &observation, sizeof(original)) == 0 &&
+        memcmp(&original_request, &request, sizeof(request)) == 0 &&
+        memcmp(&original_policy, &policy, sizeof(policy)) == 0,
+        "Greedy decoding neither mutates inputs nor consumes randomness");
+    ok &= check(policy_decode_greedy(&observation, &request, &policy, &repeated) &&
+        memcmp(&choice, &repeated, sizeof(choice)) == 0, "Greedy ties and repeated calls are deterministic");
+    memset(&policy, 0, sizeof(policy));
+    policy.has_joint_policy = 1;
+    policy.joint_policy[0] = 1.0f;
+    policy.slot0_target_policy[FACTORIZED_TARGET_FOE_LEFT] = 0.2f;
+    policy.slot0_target_policy[FACTORIZED_TARGET_FOE_RIGHT] = 0.8f;
+    policy.slot1_target_policy[FACTORIZED_TARGET_FOE_LEFT] = 0.8f;
+    policy.slot1_target_policy[FACTORIZED_TARGET_FOE_RIGHT] = 0.2f;
+    ok &= check(policy_decode_greedy(&observation, &request, &policy, &choice) &&
+        choice.slot0_target_index == FACTORIZED_TARGET_FOE_RIGHT &&
+        choice.slot1_target_index == FACTORIZED_TARGET_FOE_LEFT, "Greedy selects the legal target probability maxima");
+    policy.joint_policy[0] = NAN;
+    ok &= check(!policy_decode_greedy(&observation, &request, &policy, &choice), "Nonfinite or zero-mass turns cannot win greedy selection");
+    policy.joint_policy[0] = 0.9f;
+    policy.joint_policy[1 * 14 + 1] = 0.1f;
+    policy.joint_policy[10 * 14] = 100.0f;
+    request.active[0].move_disabled[0] = 1;
+    request.slot_can_switch[0] = 0;
+    refresh_greedy_mask(&observation, &request);
+    ok &= check(policy_decode_greedy(&observation, &request, &policy, &choice) &&
+        choice.slot0_kind == FACTORIZED_ACTION_MOVE && choice.slot0_move_index == 1,
+        "Greedy cannot choose a disabled move or a switch from a trapped slot");
+    return ok;
+}
+
+static int test_greedy_single_slot_and_forced_switches(void) {
+    Observation observation;
+    ParsedRequest request;
+    FactorizedPolicySnapshot policy = {0};
+    FactorizedActionChoice choice;
+    int ok = decision_fixture(&observation, &request);
+    if (!ok) return 0;
+    request.slot_needs_choice[0] = request.slot_can_move[0] = request.slot_can_switch[0] = 0;
+    request.choice_kind[0] = REQUEST_SLOT_NONE;
+    refresh_greedy_mask(&observation, &request);
+    policy.slot1_kind_policy[0] = 0.4f;
+    policy.slot1_kind_policy[1] = 0.6f;
+    policy.slot1_move_policy[0] = 0.9f;
+    policy.slot1_move_policy[1] = 0.1f;
+    policy.slot1_tera_policy[0] = 1.0f;
+    policy.slot1_switch_policy[2] = policy.slot1_switch_policy[3] = 0.5f;
+    policy.slot1_target_policy[FACTORIZED_TARGET_FOE_RIGHT] = 1.0f;
+    ok &= check(policy_decode_greedy(&observation, &request, &policy, &choice) &&
+        !choice.slot0_has_action && choice.slot1_kind == FACTORIZED_ACTION_MOVE && choice.slot1_move_index == 0,
+        "Single-slot greedy maximizes the full factorized action instead of taking each head's argmax");
+    decision_fixture(&observation, &request);
+    request.forced_switch_any = request.force_switch[0] = request.force_switch[1] = 1;
+    request.choice_kind[0] = request.choice_kind[1] = REQUEST_SLOT_FORCE_SWITCH;
+    request.slot_can_move[0] = request.slot_can_move[1] = 0;
+    refresh_greedy_mask(&observation, &request);
+    memset(&policy, 0, sizeof(policy));
+    policy.has_joint_policy = 1;
+    policy.joint_policy[10 * 14 + 10] = 0.9f;
+    policy.joint_policy[10 * 14 + 11] = 0.08f;
+    policy.joint_policy[11 * 14 + 10] = 0.02f;
+    ok &= check(policy_decode_greedy(&observation, &request, &policy, &choice) &&
+        choice.slot0_switch_index == 2 && choice.slot1_switch_index == 3,
+        "Forced greedy switches respect distinct bench slots");
+    request.switch_available[3] = 0;
+    refresh_greedy_mask(&observation, &request);
+    policy.has_joint_policy = 0;
+    policy.slot0_kind_policy[1] = policy.slot1_kind_policy[1] = 1.0f;
+    policy.slot0_switch_policy[2] = policy.slot1_switch_policy[2] = 1.0f;
+    ok &= check(policy_decode_greedy(&observation, &request, &policy, &choice) &&
+        choice.slot0_has_action + choice.slot1_has_action == 1, "Greedy permits the required pass with one remaining bench Pokemon");
+    request.wait = 1;
+    ok &= check(!policy_decode_greedy(&observation, &request, &policy, &choice), "Greedy abstains on wait requests");
+    return ok;
+}
+
 int main(void) {
     if (!check(id_tables_init(), "load vocabulary and move metadata")) return 1;
     if (!test_target_matchups() || !test_accuracy_and_stab() ||
@@ -332,7 +441,8 @@ int main(void) {
             !test_spread_power_and_switching_partner() ||
             !test_forced_switches_and_passes() ||
             !test_selector_respects_traps_wait_and_finite_scores() ||
-            !test_all_adjacent_parser_and_legacy_encoding()) return 1;
+            !test_all_adjacent_parser_and_legacy_encoding() ||
+            !test_greedy_full_turn_probability() || !test_greedy_single_slot_and_forced_switches()) return 1;
     puts("tactical scoring tests passed");
     return 0;
 }

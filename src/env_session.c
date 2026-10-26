@@ -4,6 +4,7 @@
 #include "observation_builder.h"
 #include "request_parser.h"
 #include "tactical_policy.h"
+#include "policy_decoding.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -477,17 +478,25 @@ int env_runtime_set_counterfactual_intervention(
     int decision_index,
     int action_rank
 ) {
-    if (!runtime || runtime->tactical_teacher || decision_index < 0 || action_rank < 0) return 0;
+    if (!runtime || runtime->tactical_teacher || runtime->greedy_inference || decision_index < 0 || action_rank < 0) return 0;
     runtime->counterfactual_decision_index = decision_index;
     runtime->counterfactual_action_rank = action_rank;
     return 1;
 }
 
 int env_runtime_enable_tactical_teacher(EnvRuntime* runtime) {
-    if (!runtime || runtime->replay_only || runtime->count > 0 ||
+    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->greedy_inference ||
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->tactical_teacher = 1;
     snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "tactical-eval-v1");
+    return 1;
+}
+
+int env_runtime_enable_greedy_inference(EnvRuntime* runtime) {
+    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher ||
+            runtime->counterfactual_decision_index >= 0) return 0;
+    runtime->greedy_inference = 1;
+    snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "greedy-eval-v1");
     return 1;
 }
 
@@ -608,7 +617,15 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         pair_policy[8 + i] = slot0_kind_policy[1] * slot0_switch_policy[i];
         pair_policy[22 + i] = slot1_kind_policy[1] * slot1_switch_policy[i];
     }
-    if (use_joint_policy) {
+    if (runtime->greedy_inference) {
+        if (!policy_decode_greedy(&session->observation, &session->parsed_request, &policy, &sampled_choice)) {
+            free(pair_policy);
+            runtime_emit_error_json(json, sizeof(json), session->battle_id, "no supported greedy legal turn");
+            fprintf(out, "%s\n", json);
+            fflush(out);
+            return 0;
+        }
+    } else if (use_joint_policy) {
         int pair = sample_small_masked(joint_policy, joint_mask, FACTORIZED_JOINT_DIM);
         int local0 = pair / FACTORIZED_LOCAL_ACTION_DIM;
         int local1 = pair % FACTORIZED_LOCAL_ACTION_DIM;
@@ -656,7 +673,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             sampled_choice.slot0_switch_index = (unsigned char)sw;
         }
     }
-    if (!use_joint_policy && slot1_needs_action) {
+    if (!runtime->greedy_inference && !use_joint_policy && slot1_needs_action) {
         int kind = sample_small_masked(slot1_kind_policy, slot1_kind_mask, FACTORIZED_KIND_DIM);
         sampled_choice.slot1_has_action = 1;
         if (kind == 0) {
@@ -728,6 +745,17 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     }
     action = validated.slot0_has_action ? (int)validated.action0 : -1;
     action2 = validated.slot1_has_action ? (int)validated.action1 : -1;
+    if (runtime->greedy_inference) {
+        int selected0, selected1;
+        factorized_action_choice_to_flat_actions(&sampled_choice, &selected0, &selected1);
+        if (selected0 != action || selected1 != action2) {
+            free(pair_policy);
+            runtime_emit_error_json(json, sizeof(json), session->battle_id, "greedy choice changed by legality validation");
+            fprintf(out, "%s\n", json);
+            fflush(out);
+            return 0;
+        }
+    }
     if (tactical_applied) {
         int selected0, selected1;
         factorized_action_choice_to_flat_actions(&tactical_decision.choice, &selected0, &selected1);
@@ -866,6 +894,9 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
                 tactical_decision.evaluation.score, tactical_decision.evaluation.opponent_power,
                 tactical_decision.evaluation.friendly_power);
             fputs("}}", out);
+        } else if (runtime->greedy_inference) {
+            fprintf(out, "%.*s,\"inference_policy\":\"greedy\",\"training_eligible\":false}",
+                (int)strlen(json) - 1, json);
         } else {
             fputs(json, out);
         }
@@ -1020,6 +1051,11 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                         "\"tactical_forced_switches\":%zu,\"tactical_fallbacks\":%zu}\n",
                         session->battle_id, session->tactical_attempts, session->tactical_applied,
                         session->tactical_forced_switches, session->tactical_fallbacks);
+                } else if (runtime->greedy_inference) {
+                    fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
+                        "\"policy_tag\":\"greedy-eval-v1\",\"training_eligible\":false,"
+                        "\"inference_policy\":\"greedy\",\"greedy_decisions\":%zu}\n",
+                        session->battle_id, session->decision_count);
                 } else {
                     episode_write_json_record(out, &session->episode, session->battle_id, runtime->policy_tag);
                 }

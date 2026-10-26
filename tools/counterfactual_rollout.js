@@ -186,13 +186,16 @@ function continuationSeed(base, attempt, repeat) {
 }
 
 class AgentProcess {
-    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null) {
+    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null, inferencePolicy = 'sample') {
+        if (!['sample', 'greedy'].includes(inferencePolicy) || (inferencePolicy === 'greedy' && (tacticalTeacher || intervention)))
+            throw new Error('greedy inference is evaluation-only and excludes tactical/counterfactual overrides');
         this.checkpoint = checkpoint;
         this.inferenceSeed = inferenceSeedValue;
         this.intervention = intervention;
         this.ompThreads = ompThreads;
         this.tacticalTeacher = tacticalTeacher;
         this.onSend = onSend;
+        this.inferencePolicy = inferencePolicy;
         this.process = null;
         this.messages = [];
         this.waiters = [];
@@ -207,6 +210,7 @@ class AgentProcess {
             '--reward-mode', 'terminal',
         ];
         if (this.tacticalTeacher) args.push('--tactical-teacher', '1');
+        if (this.inferencePolicy === 'greedy') args.push('--inference-policy', 'greedy');
         if (this.intervention) {
             args.push(
                 '--counterfactual-decision', String(this.intervention.decisionIndex),
@@ -241,6 +245,9 @@ class AgentProcess {
             }
         });
         const ready = await this.nextMessage('ready');
+        if (this.inferencePolicy === 'greedy' && (ready.capabilities?.inference_policy !== 'greedy' ||
+                ready.capabilities?.training !== false))
+            throw new Error('runtime does not advertise evaluation-only greedy decoding; rebuild the client');
         if (this.tacticalTeacher && (ready.capabilities?.tactical_teacher !== true ||
                 ready.capabilities?.training !== false)) {
             throw new Error('runtime does not advertise evaluation-only tactical teacher support; rebuild the client');

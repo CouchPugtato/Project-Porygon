@@ -891,6 +891,45 @@ static int test_tactical_runtime_reports_coverage_without_training_episodes(void
     return ok;
 }
 
+static int test_greedy_runtime_is_evaluation_only(void) {
+    GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    EnvRuntime runtime = {0};
+    RuntimeMessage terminal;
+    FILE* output = tmpfile();
+    char line[4096];
+    Episode parsed = {0};
+    int ok = assert_true(model && output, "create greedy runtime fixture");
+    if (!ok) { if (output) fclose(output); gru_model_destroy(model); return 0; }
+    ok &= assert_true(env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "parent.chk") &&
+        !runtime.greedy_inference && env_runtime_enable_greedy_inference(&runtime) &&
+        !env_runtime_enable_tactical_teacher(&runtime) && !env_runtime_set_counterfactual_intervention(&runtime, 0, 0),
+        "Greedy is opt-in and excludes teacher/counterfactual overrides");
+    ok &= assert_true(send_counterfactual_test_state(&runtime, output), "Greedy produces a legal runtime action");
+    runtime_message_init(&terminal);
+    terminal.type = RUNTIME_MSG_TERMINAL;
+    strcpy(terminal.battle_id, "battle-counterfactual-test");
+    terminal.reward = 1.0f;
+    ok &= assert_true(env_runtime_handle_message(&runtime, &terminal, output), "Complete greedy runtime evaluation");
+    rewind(output);
+    ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "\"inference_policy\":\"greedy\"") &&
+        strstr(line, "\"training_eligible\":false"), "Greedy action exposes evaluation-only decoding");
+    ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "greedy-eval-v1") &&
+        !strstr(line, "\"observations\"") && !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0),
+        "Greedy terminal record cannot be consumed as on-policy PPO data");
+    env_runtime_free(&runtime);
+    ok &= assert_true(env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, NULL) &&
+        env_runtime_enable_tactical_teacher(&runtime) && !env_runtime_enable_greedy_inference(&runtime),
+        "Teacher mode blocks later greedy activation");
+    env_runtime_free(&runtime);
+    ok &= assert_true(env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, NULL) &&
+        env_runtime_set_counterfactual_intervention(&runtime, 0, 0) && !env_runtime_enable_greedy_inference(&runtime),
+        "Counterfactual mode blocks greedy activation");
+    env_runtime_free(&runtime);
+    fclose(output);
+    gru_model_destroy(model);
+    return ok;
+}
+
 static void write_counterfactual_dataset_sample(
     FILE* output,
     int rank,
@@ -6398,6 +6437,7 @@ int main(int argc, char** argv) {
     if (!test_synthetic_weather_clear_sets_unknown_duration()) return 1;
     if (!test_action_value_pairwise_preference_moves_the_value_gap()) return 1;
     if (!test_counterfactual_q_overfits_repeated_real_shape_pairs()) return 1;
+    if (!test_greedy_runtime_is_evaluation_only()) return 1;
     printf("reconstruction tests passed\n");
     return 0;
 }

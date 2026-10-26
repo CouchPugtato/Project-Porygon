@@ -585,6 +585,47 @@ Use side-pair outcomes and invalid-game records alongside the descriptive
 per-game Wilson intervals. A near-50% pilot result is inconclusive, not proof
 of equivalence and not an automatic reason for another larger training run.
 
+### Sampled versus greedy inference
+
+An imitation gain need not survive stochastic action selection. Before
+another fit, compare inference policies on the frozen larger student. Rebuild
+the client and run reconstruction, legality, and tactical tests first; copy
+the resulting client to `build-fresh/showdown_client.exe` only if tests pass.
+Then run both profiles with that same executable:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0278_student_decoding_sample_100ps --config .\config\experimental\tactical_student_decoding_sample.json
+node .\tools\tactical_teacher_benchmark.js --run-name run_0279_student_decoding_greedy_100ps --config .\config\experimental\tactical_student_decoding_greedy.json
+```
+
+The sampling control requests 100 valid games per side against parent and
+random (400 total). Greedy repeats those matchups on the same seed/team schedule
+and adds a direct matchup against the same checkpoint using sampling (600
+total). All checkpoints, seed 27801, one-thread agents, and serial 65% launch
+gates are fixed. `sampled` means the candidate's own checkpoint, not its parent
+or the smaller-data pilot. The candidate alone receives
+`--inference-policy greedy`; all native opponents retain the sampling default.
+Do not rebuild between these two runs or mix historical sampling results from
+another seed/runtime into the matched comparison.
+
+`policy_decoding.c` ranks complete legal choices by joint action probability
+and conditional legal target probabilities, or the slot-local factorized
+probability on single-action turns. It is not an independent argmax of each
+head or simply an argmax over 196 action pairs. It shares legal enumeration
+with the teacher, but never its damage heuristic. Forced replacements use
+distinct bench slots and permit a pass only where the shared rules allow it.
+Full-turn MAP can favor actions with fewer target branches; greedy is an
+experiment, not a claim that deterministic play is always better.
+
+Sampling remains the default everywhere. Greedy actions and terminal records
+are tagged evaluation-only, carry no on-policy episode arrays, and exclude
+tactical and counterfactual overrides. Startup capability checks reject an
+old client, and resume checks decoding identity as well as model/executable
+hashes. No training, checkpoint edit, or automatic default/promotion change
+occurs. Compare valid shared seed pairs, the direct sampled matchup, side
+splits, and excluded games. Confirm a promising decoding choice on fresh seeds
+before changing deployment defaults or spending another long training budget.
+
 If screening is promising but inconclusive, keep that same loss-selected
 checkpoint frozen for a larger fresh-seed evaluation:
 

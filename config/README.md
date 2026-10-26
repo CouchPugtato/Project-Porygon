@@ -66,6 +66,15 @@ games per side per opponent (3,000 total). Only seed and sample/replacement
 budgets differ from the screen. Use a new run name; reuse that command for
 resume without rebuilding or editing checkpoints during the evaluation.
 
+`experimental/tactical_student_decoding_sample.json` and
+`experimental/tactical_student_decoding_greedy.json` compare decoding on the
+same frozen epoch-3 checkpoint and seed 27801. Run sampling first, then greedy
+with the same rebuilt executable. Both face parent and random; greedy also
+faces `sampled`, the same candidate checkpoint with sampling enabled. These
+profiles request 400 and 600 valid games, respectively. The opt-in
+`candidate_inference_policy` is recorded and checked on resume. Opponents
+always sample; greedy mode cannot be used for teacher collection or PPO data.
+
 `experimental/tactical_student_confirmation.json` repeats the student test
 with fresh seed 27101 and 500 valid games per side per opponent (2,000 total).
 Only the seed, game target, and replacement budget differ from screening.
