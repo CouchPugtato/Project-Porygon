@@ -467,6 +467,44 @@ static int test_passive_decision_audit(void) {
     return ok;
 }
 
+static int test_target_only_intervention(void) {
+    Observation observation;
+    ParsedRequest request;
+    FactorizedActionChoice choice, expected, before;
+    int expected_rng, ok = decision_fixture(&observation, &request);
+    if (!ok) return 0;
+    factorized_action_choice_from_flat_actions(&choice, 0, 14);
+    choice.slot0_target_mask = build_move_target_mask(&request, 0, 0);
+    choice.slot1_target_mask = build_move_target_mask(&request, 1, 0);
+    choice.slot0_target_index = choice.slot1_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    expected = choice;
+    expected.slot0_target_index = FACTORIZED_TARGET_FOE_LEFT;
+    srand(28101); expected_rng = rand(); srand(28101);
+    ok &= check(tactical_retarget_choice(&observation, &request, &choice) &&
+        memcmp(&choice, &expected, sizeof(choice)) == 0 && rand() == expected_rng,
+        "Retargeting changes only the better target, preserving actions, masks, and RNG");
+    before = choice;
+    ok &= check(!tactical_retarget_choice(&observation, &request, &choice) &&
+        memcmp(&choice, &before, sizeof(choice)) == 0, "Optimal or tied targets remain byte-identical");
+    observation.opp_team[4].type1_known_mode = 0;
+    ok &= check(!tactical_retarget_choice(&observation, &request, &choice) &&
+        memcmp(&choice, &before, sizeof(choice)) == 0, "Unknown defensive typing causes abstention");
+    observation.opp_team[4].type1_known_mode = 2;
+    choice.slot0_use_tera = 1;
+    before = choice;
+    ok &= check(!tactical_retarget_choice(&observation, &request, &choice) &&
+        memcmp(&choice, &before, sizeof(choice)) == 0, "Tera choices are not overwritten by an unsupported score");
+    choice.slot0_use_tera = 0;
+    choice.slot0_move_index = 1;
+    before = choice;
+    ok &= check(!tactical_retarget_choice(&observation, &request, &choice) &&
+        memcmp(&choice, &before, sizeof(choice)) == 0, "Protect and mixed unsupported turns remain unchanged");
+    request.forced_switch_any = 1;
+    ok &= check(!tactical_retarget_choice(&observation, &request, &choice) &&
+        memcmp(&choice, &before, sizeof(choice)) == 0, "Forced replacements are not interventions");
+    return ok;
+}
+
 int main(void) {
     if (!check(id_tables_init(), "load vocabulary and move metadata")) return 1;
     if (!test_target_matchups() || !test_accuracy_and_stab() ||
@@ -479,7 +517,7 @@ int main(void) {
             !test_selector_respects_traps_wait_and_finite_scores() ||
             !test_all_adjacent_parser_and_legacy_encoding() ||
             !test_greedy_full_turn_probability() || !test_greedy_single_slot_and_forced_switches() ||
-            !test_passive_decision_audit()) return 1;
+            !test_passive_decision_audit() || !test_target_only_intervention()) return 1;
     puts("tactical scoring tests passed");
     return 0;
 }

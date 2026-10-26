@@ -1176,3 +1176,29 @@ excluded from gap averages. An effective-power gap is not an HP-damage loss or
 proof of a worse battle decision: status, switching, abilities, speed, and
 protection can make the simple attack heuristic wrong. Use this audit to pick
 a concrete transfer problem, not to select another checkpoint on these games.
+
+## Target-only causal screen
+
+After the native regression tests pass, freeze one executable for both runs:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0281_target_control_100ps --config .\config\experimental\tactical_target_control.json
+node .\tools\tactical_teacher_benchmark.js --run-name run_0282_target_intervention_100ps --config .\config\experimental\tactical_target_intervention.json
+```
+
+The profiles differ only in `tactical_targets`, request 400 valid games each,
+and share seed 28101, checkpoints, and parent/random opponents. Keep the
+executable and inputs unchanged between modes and on resume. Serial battles,
+one agent thread, and the existing 65% launch gates remain in effect. This is
+an evaluation-only hybrid; it does not train or promote a neural checkpoint.
+
+Predeclared analysis: compare candidate win scores against each opponent on
+shared valid seed pairs, retaining side splits, approximate pair-level score
+difference intervals, invalid games, and accepted intervention counts. A
+positive point difference against both opponents without a legality regression
+is a reason to consider fresh-seed confirmation, not proof of improvement.
+An uncertain result stays uncertain. Do not tune the retargeting rule on these
+games or automatically start the 500-per-side confirmation. Flat or harmful
+results close this intervention and redirect the next learning experiment
+toward action selection. A positive confirmation instead motivates learning
+move/target relationships on student-visited boards.

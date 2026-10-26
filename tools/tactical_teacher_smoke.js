@@ -86,7 +86,8 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
         seeds.inference[side], null, config.agent_omp_threads,
         side === candidateSide && config.tactical_teacher !== false, side === candidateSide ? recordTeacher : null,
         side === candidateSide ? (config.candidate_inference_policy || 'sample') : 'sample',
-        side === candidateSide && config.decision_audit === true));
+        side === candidateSide && config.decision_audit === true,
+        side === candidateSide && config.tactical_targets === true));
 }
 
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
@@ -142,6 +143,15 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
             };
             if (config.tactical_teacher !== false) aggregateGames([game]);
             if (audit) game.decision_audit = audit.finish(teacher.episode);
+            if (config.tactical_targets) {
+                const report = teacher.episode;
+                if (report.policy_tag !== 'tactical-targets-v1' || report.training_eligible !== false ||
+                        !Number.isSafeInteger(report.target_decisions) || report.target_decisions <= 0 ||
+                        !Number.isSafeInteger(report.retargeted_decisions) || report.retargeted_decisions < 0 ||
+                        report.retargeted_decisions > report.target_decisions)
+                    throw new Error('invalid evaluation-only target intervention terminal record');
+                game.target_intervention = report;
+            }
             return game;
         })();
         game = await Promise.race([work, new Promise((_, reject) => {

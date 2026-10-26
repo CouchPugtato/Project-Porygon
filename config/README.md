@@ -83,6 +83,13 @@ data. The usual summary gains `decision_audit` totals per opponent; each game
 retains its accepted decision records. Serial battles, one thread per agent,
 65% launch gates, and identity-checked resume remain in effect.
 
+`experimental/tactical_target_control.json` and
+`experimental/tactical_target_intervention.json` freeze the same student,
+parent/random opponents, and seed 28101. They differ only in `tactical_targets`.
+Each requests 400 valid games (100 per side per opponent). The intervention
+keeps sampled actions fixed and retargets only fully supported strict
+effective-power improvements. It is evaluation-only, not a learned checkpoint.
+
 `experimental/tactical_student_confirmation.json` repeats the student test
 with fresh seed 27101 and 500 valid games per side per opponent (2,000 total).
 Only the seed, game target, and replacement budget differ from screening.

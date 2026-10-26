@@ -479,14 +479,14 @@ int env_runtime_set_counterfactual_intervention(
     int decision_index,
     int action_rank
 ) {
-    if (!runtime || runtime->tactical_teacher || runtime->greedy_inference || runtime->tactical_audit || decision_index < 0 || action_rank < 0) return 0;
+    if (!runtime || runtime->tactical_teacher || runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets || decision_index < 0 || action_rank < 0) return 0;
     runtime->counterfactual_decision_index = decision_index;
     runtime->counterfactual_action_rank = action_rank;
     return 1;
 }
 
 int env_runtime_enable_tactical_teacher(EnvRuntime* runtime) {
-    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->greedy_inference || runtime->tactical_audit ||
+    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets ||
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->tactical_teacher = 1;
     snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "tactical-eval-v1");
@@ -494,7 +494,7 @@ int env_runtime_enable_tactical_teacher(EnvRuntime* runtime) {
 }
 
 int env_runtime_enable_greedy_inference(EnvRuntime* runtime) {
-    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher ||
+    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher || runtime->tactical_targets ||
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->greedy_inference = 1;
     snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "greedy-eval-v1");
@@ -502,9 +502,16 @@ int env_runtime_enable_greedy_inference(EnvRuntime* runtime) {
 }
 
 int env_runtime_enable_tactical_audit(EnvRuntime* runtime) {
-    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher ||
+    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher || runtime->tactical_targets ||
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->tactical_audit = 1;
+    return 1;
+}
+
+int env_runtime_enable_tactical_targets(EnvRuntime* runtime) {
+    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher ||
+            runtime->greedy_inference || runtime->tactical_audit || runtime->counterfactual_decision_index >= 0) return 0;
+    runtime->tactical_targets = 1;
     return 1;
 }
 
@@ -560,6 +567,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     unsigned char slot1_move_mask[FACTORIZED_MOVE_DIM];
     unsigned char slot1_switch_mask[FACTORIZED_SWITCH_DIM];
     char command[256];
+    char sampled_command[256] = {0};
     char json[512];
     int i;
     ValidatedRequestChoice validated;
@@ -804,6 +812,13 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             }
         }
     }
+    session->pending_retargeted = 0;
+    if (runtime->tactical_targets) {
+        if (!factorized_choice_to_command(&session->parsed_request, &session->pending_factorized_choice,
+                sampled_command, sizeof(sampled_command))) { free(pair_policy); return 0; }
+        session->pending_retargeted = tactical_retarget_choice(&session->observation,
+            &session->parsed_request, &session->pending_factorized_choice);
+    }
     session->pending_old_log_prob = 0.0f;
     if (use_joint_policy) {
         int joint_action0 = -1;
@@ -902,6 +917,10 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
                 tactical_decision.evaluation.score, tactical_decision.evaluation.opponent_power,
                 tactical_decision.evaluation.friendly_power);
             fputs("}}", out);
+        } else if (runtime->tactical_targets) {
+            fprintf(out, "%.*s,\"training_eligible\":false,\"target_intervention\":{\"applied\":%s,"
+                "\"sampled_command\":\"%s\"}}", (int)strlen(json) - 1, json,
+                session->pending_retargeted ? "true" : "false", sampled_command);
         } else if (runtime->tactical_audit) {
             fprintf(out, "%.*s,\"inference_policy\":\"%s\",\"training_eligible\":false,\"decision_audit\":",
                 (int)strlen(json) - 1, json, runtime->greedy_inference ? "greedy" : "sample");
@@ -1065,6 +1084,11 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                         "\"tactical_forced_switches\":%zu,\"tactical_fallbacks\":%zu}\n",
                         session->battle_id, session->tactical_attempts, session->tactical_applied,
                         session->tactical_forced_switches, session->tactical_fallbacks);
+                } else if (runtime->tactical_targets) {
+                    fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
+                        "\"policy_tag\":\"tactical-targets-v1\",\"training_eligible\":false,"
+                        "\"target_decisions\":%zu,\"retargeted_decisions\":%zu}\n",
+                        session->battle_id, session->decision_count, session->retargeted_decisions);
                 } else if (runtime->tactical_audit) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
                         "\"policy_tag\":\"tactical-audit-v1\",\"training_eligible\":false,"
@@ -1144,6 +1168,7 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 session->episode.old_log_probs[session->episode.count - 1] = session->pending_old_log_prob;
                 session->episode.old_values[session->episode.count - 1] = session->pending_old_value;
                 session->decision_count += 1u;
+                if (runtime->tactical_targets && session->pending_retargeted) ++session->retargeted_decisions;
                 session->pending_action = -1;
                 session->pending_action2 = -1;
                 session->pending_counterfactual = 0;

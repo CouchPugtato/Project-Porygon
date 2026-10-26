@@ -186,11 +186,13 @@ function continuationSeed(base, attempt, repeat) {
 }
 
 class AgentProcess {
-    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null, inferencePolicy = 'sample', tacticalAudit = false) {
+    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null, inferencePolicy = 'sample', tacticalAudit = false, tacticalTargets = false) {
         if (!['sample', 'greedy'].includes(inferencePolicy) || (inferencePolicy === 'greedy' && (tacticalTeacher || intervention)))
             throw new Error('greedy inference is evaluation-only and excludes tactical/counterfactual overrides');
         if (tacticalAudit && (tacticalTeacher || intervention))
             throw new Error('passive tactical audit excludes teacher/counterfactual overrides');
+        if (tacticalTargets && (tacticalTeacher || intervention || tacticalAudit || inferencePolicy !== 'sample'))
+            throw new Error('target-only intervention requires plain sampled inference');
         this.checkpoint = checkpoint;
         this.inferenceSeed = inferenceSeedValue;
         this.intervention = intervention;
@@ -199,6 +201,7 @@ class AgentProcess {
         this.onSend = onSend;
         this.inferencePolicy = inferencePolicy;
         this.tacticalAudit = tacticalAudit;
+        this.tacticalTargets = tacticalTargets;
         this.process = null;
         this.messages = [];
         this.waiters = [];
@@ -215,6 +218,7 @@ class AgentProcess {
         if (this.tacticalTeacher) args.push('--tactical-teacher', '1');
         if (this.inferencePolicy === 'greedy') args.push('--inference-policy', 'greedy');
         if (this.tacticalAudit) args.push('--tactical-audit', '1');
+        if (this.tacticalTargets) args.push('--tactical-targets', '1');
         if (this.intervention) {
             args.push(
                 '--counterfactual-decision', String(this.intervention.decisionIndex),
@@ -249,6 +253,8 @@ class AgentProcess {
             }
         });
         const ready = await this.nextMessage('ready');
+        if (this.tacticalTargets && (ready.capabilities?.tactical_targets !== true || ready.capabilities?.training !== false))
+            throw new Error('runtime does not advertise evaluation-only target intervention; rebuild the client');
         if (this.tacticalAudit && (ready.capabilities?.tactical_audit !== true || ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise passive tactical auditing; rebuild the client');
         if (this.inferencePolicy === 'greedy' && (ready.capabilities?.inference_policy !== 'greedy' ||

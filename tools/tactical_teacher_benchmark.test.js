@@ -33,6 +33,32 @@ function seedTuples(settings) {
     }).flat();
 }
 
+test('target-only experiment freezes seeds, models and sampling while routing only the candidate intervention', () => {
+    const control = require('../config/experimental/tactical_target_control.json');
+    const intervention = require('../config/experimental/tactical_target_intervention.json');
+    validateConfig(control);
+    validateConfig(intervention);
+    assert.deepEqual({...intervention, tactical_targets: false}, control);
+    for (const side of [0, 1]) {
+        const agents = createBattleAgents(intervention, battleSeeds(intervention.seed, side, true), side, 'parent', null);
+        assert.equal(agents[side].tacticalTargets, true);
+        assert.equal(agents[1 - side].tacticalTargets, false);
+        assert.ok(agents.every(agent => agent.inferencePolicy === 'sample' && !agent.tacticalTeacher));
+    }
+    for (const invalid of [{tactical_teacher: true}, {collect_demonstrations: true},
+        {decision_audit: true}, {candidate_inference_policy: 'greedy'}])
+        assert.throws(() => validateConfig({...intervention, ...invalid}), /bounded/);
+    assert.throws(() => new AgentProcess('model', 1, null, 1, false, null, 'greedy', false, true), /plain sampled/);
+    const tiny = {...intervention, games_per_side: 1, max_attempts_per_side: 2};
+    const identity = {config: tiny};
+    const game = record(nextGame(tiny, []), {policy_mode: 'neural', coverage: null, policy_tag: 'tactical-targets-v1',
+        target_intervention: {training_eligible: false, target_decisions: 10, retargeted_decisions: 3}});
+    assert.deepEqual(validateResume({identity, games: [game]}, identity, tiny), [game]);
+    assert.equal(summarize([game]).parent.target_intervention.rate, 0.3);
+    assert.throws(() => validateResume({identity, games: [game]}, identity, {...tiny, tactical_targets: false}), /plain inference/);
+    assert.throws(() => validateResume({identity, games: [{...game, target_intervention: null}]}, identity, tiny), /lacks target/);
+});
+
 function record(next, overrides = {}) {
     return {...next, status: 'completed', duration_seconds: 1, result: {result: 'win'}, choice_rejections: [],
         coverage: {policy_tag: 'tactical-eval-v1', training_eligible: false, tactical_attempts: 2,

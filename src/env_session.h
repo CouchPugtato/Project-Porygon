@@ -54,6 +54,8 @@ typedef struct {
     size_t tactical_applied;
     size_t tactical_forced_switches;
     size_t tactical_fallbacks;
+    size_t retargeted_decisions;
+    int pending_retargeted;
     int pending_counterfactual;
     int pending_counterfactual_rank;
     float pending_old_log_prob;
@@ -78,6 +80,7 @@ typedef struct {
     int tactical_teacher;
     int greedy_inference;
     int tactical_audit;
+    int tactical_targets;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;
@@ -100,6 +103,7 @@ int env_runtime_set_counterfactual_intervention(
 int env_runtime_enable_tactical_teacher(EnvRuntime* runtime);
 int env_runtime_enable_greedy_inference(EnvRuntime* runtime);
 int env_runtime_enable_tactical_audit(EnvRuntime* runtime);
+int env_runtime_enable_tactical_targets(EnvRuntime* runtime);
 void env_runtime_free(EnvRuntime* runtime);
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);
 

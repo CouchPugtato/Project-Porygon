@@ -937,16 +937,20 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
     float hidden[8];
     int next_rng = 0, mode, ok = assert_true(model != NULL, "create passive runtime audit fixture");
     if (!ok) return 0;
-    for (mode = 0; mode < 2; ++mode) {
+    for (mode = 0; mode < 3; ++mode) {
         FILE* output = tmpfile();
         RuntimeMessage terminal;
         char line[4096];
         Episode parsed = {0};
         if (!output) { ok = 0; break; }
         ok &= env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "parent.chk");
-        if (mode) ok &= assert_true(env_runtime_enable_tactical_audit(&runtime) &&
+        if (mode == 1) ok &= assert_true(env_runtime_enable_tactical_audit(&runtime) &&
             !env_runtime_enable_tactical_teacher(&runtime) && !env_runtime_set_counterfactual_intervention(&runtime, 0, 0),
             "Audit blocks behavior overrides");
+        if (mode == 2) ok &= assert_true(env_runtime_enable_tactical_targets(&runtime) &&
+            !env_runtime_enable_tactical_teacher(&runtime) && !env_runtime_enable_greedy_inference(&runtime) &&
+            !env_runtime_enable_tactical_audit(&runtime) && !env_runtime_set_counterfactual_intervention(&runtime, 0, 0),
+            "Target intervention blocks other evaluation overrides");
         srand(28001);
         ok &= assert_true(send_counterfactual_test_state(&runtime, output), "emit sampled action with passive audit");
         if (runtime.count) {
@@ -955,12 +959,17 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                 memcpy(hidden, runtime.sessions[0].hidden_state, sizeof(hidden));
                 next_rng = rand();
             } else {
-                ok &= assert_true(memcmp(&baseline, &runtime.sessions[0].pending_factorized_choice, sizeof(baseline)) == 0 &&
+                FactorizedActionChoice observed = runtime.sessions[0].pending_factorized_choice;
+                if (mode == 2) {
+                    observed.slot0_target_index = baseline.slot0_target_index;
+                    observed.slot1_target_index = baseline.slot1_target_index;
+                }
+                ok &= assert_true(memcmp(&baseline, &observed, sizeof(baseline)) == 0 &&
                     memcmp(hidden, runtime.sessions[0].hidden_state, sizeof(hidden)) == 0 && rand() == next_rng,
                     "Audit leaves sampled choices, recurrent state, and RNG unchanged");
             }
         }
-        if (mode) {
+        if (mode == 1) {
             runtime_message_init(&terminal);
             terminal.type = RUNTIME_MSG_TERMINAL;
             strcpy(terminal.battle_id, "battle-counterfactual-test");
@@ -971,6 +980,30 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                 strstr(line, "\"training_eligible\":false"), "Audit action carries passive telemetry");
             ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "tactical-audit-v1") &&
                 !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0), "Audit terminal cannot become PPO data");
+        }
+        if (mode == 2) {
+            RuntimeMessage accepted;
+            runtime_message_init(&accepted);
+            accepted.type = RUNTIME_MSG_DECISION;
+            accepted.accepted = 1;
+            accepted.request_id = 17;
+            strcpy(accepted.battle_id, "battle-counterfactual-test");
+            strcpy(accepted.command, runtime.sessions[0].pending_command);
+            accepted.action = runtime.sessions[0].pending_action;
+            accepted.action2 = runtime.sessions[0].pending_action2;
+            ok &= env_runtime_handle_message(&runtime, &accepted, output);
+            runtime_message_init(&terminal);
+            terminal.type = RUNTIME_MSG_TERMINAL;
+            strcpy(terminal.battle_id, "battle-counterfactual-test");
+            terminal.reward = 1.0f;
+            ok &= env_runtime_handle_message(&runtime, &terminal, output);
+            rewind(output);
+            ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "\"target_intervention\":{") &&
+                strstr(line, "\"sampled_command\":") && strstr(line, "\"training_eligible\":false"),
+                "Target intervention retains the original sampled command");
+            ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "tactical-targets-v1") &&
+                strstr(line, "\"target_decisions\":1") &&
+                !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0), "Target intervention is not PPO data");
         }
         env_runtime_free(&runtime);
         fclose(output);

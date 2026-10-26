@@ -93,3 +93,21 @@ Terminal records use `policy_tag: "tactical-audit-v1"`, `audit_decisions`
 (accepted choices), decoding mode, and `training_eligible: false`. They omit
 PPO arrays. The benchmark matches proposals to acceptance/rejection messages,
 retains only accepted decisions, and verifies the terminal count.
+
+## Target-only evaluation intervention
+
+`--battle-agent <checkpoint> --tactical-targets 1` first samples and validates
+the usual neural choice, then considers alternative targets for those exact
+actions. Only a fully scored strict effective-power improvement changes target
+indices. Forced replacements, unsupported turns (including Protect and Tera),
+and ties remain unchanged. It consumes no extra RNG and preserves both flat
+actions, target masks, and recurrent state at that decision. Later trajectories
+can diverge because the resulting targets affect the battle.
+
+This mode excludes greedy decoding, the passive audit, teacher overrides, and
+counterfactual interventions. Ready capabilities include `tactical_targets: true`
+and `training: false`. Actions add `training_eligible: false` and
+`target_intervention: {applied, sampled_command}`, retaining the original
+pre-intervention command. Terminal records use `policy_tag: "tactical-targets-v1"`
+and contain `target_decisions` and `retargeted_decisions`, both counting accepted
+choices only. They omit PPO arrays. No deployment default changes.

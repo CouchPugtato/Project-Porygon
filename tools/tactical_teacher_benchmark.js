@@ -41,6 +41,12 @@ function summarize(games, opponents = OPPONENTS) {
             [side, tally(records.filter(game => game.teacher_side === side))])),
         coverage: records.some(game => game.policy_mode === 'neural') ? null : aggregateGames(records.filter(isValid)),
         choice_rejections: records.reduce((sum, game) => sum + (game.choice_rejections?.length || 0), 0)};
+        if (records.some(game => game.target_intervention)) {
+            const valid = records.filter(isValid);
+            const decisions = valid.reduce((sum, game) => sum + game.target_intervention.target_decisions, 0);
+            const changed = valid.reduce((sum, game) => sum + game.target_intervention.retargeted_decisions, 0);
+            results[opponent].target_intervention = {decisions, changed, rate: decisions ? changed / decisions : null};
+        }
     }
     return results;
 }
@@ -72,6 +78,14 @@ function validateResume(saved, identity, config) {
                 !Number.isFinite(game.duration_seconds) || game.duration_seconds < 0)
             throw new Error('saved benchmark records do not match the deterministic schedule');
         if (game.status === 'completed') {
+            if (config.tactical_targets && (game.policy_tag !== 'tactical-targets-v1' ||
+                    game.target_intervention?.training_eligible !== false ||
+                    !Number.isSafeInteger(game.target_intervention.target_decisions) || game.target_intervention.target_decisions <= 0 ||
+                    !Number.isSafeInteger(game.target_intervention.retargeted_decisions) || game.target_intervention.retargeted_decisions < 0 ||
+                    game.target_intervention.retargeted_decisions > game.target_intervention.target_decisions))
+                throw new Error('saved game lacks target intervention counts');
+            if (!config.tactical_targets && game.target_intervention)
+                throw new Error('saved target intervention cannot resume as plain inference');
             if (config.decision_audit) summarizeDecisions([game]);
             if ((game.inference_policy || 'sample') !== (config.candidate_inference_policy || 'sample'))
                 throw new Error('saved candidate inference policy differs from the configured decoder');
@@ -104,6 +118,9 @@ async function loadSaved(filename) {
 
 function validateConfig(config) {
     if ((config.collect_demonstrations !== undefined && typeof config.collect_demonstrations !== 'boolean') ||
+            (config.tactical_targets !== undefined && typeof config.tactical_targets !== 'boolean') ||
+            (config.tactical_targets && (config.tactical_teacher !== false || config.collect_demonstrations ||
+                config.decision_audit || (config.candidate_inference_policy || 'sample') !== 'sample')) ||
             (config.decision_audit !== undefined && typeof config.decision_audit !== 'boolean') ||
             (config.decision_audit && (config.tactical_teacher !== false || config.collect_demonstrations)) ||
             (config.candidate_inference_policy !== undefined && !['sample', 'greedy'].includes(config.candidate_inference_policy)) ||

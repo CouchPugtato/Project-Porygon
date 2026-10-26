@@ -34,6 +34,23 @@ int tactical_audit_choice(const Observation* observation, const ParsedRequest* r
     return 1;
 }
 
+int tactical_retarget_choice(const Observation* observation, const ParsedRequest* request,
+    FactorizedActionChoice* choice
+) {
+    TacticalChoiceEvaluation selected;
+    TacticalDecision retargeted;
+    int actions[2];
+    if (!observation || !request || !choice || request->forced_switch_any ||
+            !factorized_action_choice_to_flat_actions(choice, &actions[0], &actions[1]) ||
+            !tactical_evaluate_power(observation, request, choice, &selected, NULL) ||
+            selected.unscored_moves ||
+            !tactical_select_choice(observation, request, evaluate_targets, actions, &retargeted) ||
+            !(retargeted.evaluation.score > selected.score)) return 0;
+    choice->slot0_target_index = retargeted.choice.slot0_target_index;
+    choice->slot1_target_index = retargeted.choice.slot1_target_index;
+    return 1;
+}
+
 void tactical_audit_write_json(FILE* out, const Observation* observation,
     const ParsedRequest* request, const FactorizedActionChoice* choice
 ) {
