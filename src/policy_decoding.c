@@ -3,6 +3,16 @@
 
 #include <math.h>
 
+int policy_decode_target_argmax(const float policy[4], unsigned char legal) {
+    int target, selected = -1;
+    if (!policy || !legal || (legal & ~15)) return -1;
+    for (target = 0; target < 4; ++target) if (legal & (1 << target)) {
+        if (!isfinite(policy[target]) || policy[target] < 0) return -1;
+        if (selected < 0 || policy[target] > policy[selected]) selected = target;
+    }
+    return selected;
+}
+
 typedef struct {
     const FactorizedPolicySnapshot* policy;
     const unsigned char* legal;

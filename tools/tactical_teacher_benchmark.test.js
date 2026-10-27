@@ -94,6 +94,19 @@ test('context evaluation resumes only context-tagged, training-ineligible record
     assert.throws(() => validateResume({identity, games: [game]}, identity, legacy), /learned target accounting/);
 });
 
+test('argmax targets cannot resume as sampled targets or hide their decoder', () => {
+    const settings = require('../config/experimental/target_argmax_smoke.json');
+    const identity = {config: settings};
+    const game = record(nextGame(settings, []), {policy_mode: 'neural', coverage: null,
+        policy_tag: 'target-context-argmax-v1', learned_targets: {training_eligible: false,
+            target_decoder: 'argmax', target_decisions: 10, learned_target_decisions: 4}});
+    assert.deepEqual(validateResume({identity, games: [game]}, identity, settings), [game]);
+    for (const change of [{policy_tag: 'target-context-v1'},
+        {learned_targets: {...game.learned_targets, target_decoder: undefined}}])
+        assert.throws(() => validateResume({identity, games: [{...game, ...change}]}, identity, settings), /learned target accounting/);
+    assert.throws(() => validateResume({identity, games: [game]}, identity, {...settings, target_decoder: 'sample'}), /learned target accounting/);
+});
+
 test('paired seeds swap teams and preserve policy-role inference seeds', () => {
     const a = battleSeeds(26601, 0, true);
     const b = battleSeeds(26601, 1, true);

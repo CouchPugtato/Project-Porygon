@@ -11,6 +11,7 @@ const {
 const REPO_ROOT = path.resolve(__dirname, '..');
 const {createDecisionAudit} = require('./tactical_decision_audit');
 const {createTargetCollector} = require('./target_learning');
+const {targetPolicyTag} = require('./target_context');
 
 async function hashFile(filename) {
     const hash = crypto.createHash('sha256');
@@ -92,7 +93,8 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
         {labels: side === candidateSide && config.collect_target_labels === true,
             contextVersion: side === candidateSide ? (config.target_context_version || 0) : 0,
             sidecar: side === candidateSide && config.target_sidecar ? path.resolve(REPO_ROOT, config.target_sidecar) : null,
-            contextual: side === candidateSide && config.context_target_evaluation === true}));
+            contextual: side === candidateSide && config.context_target_evaluation === true,
+            decoder: side === candidateSide ? (config.target_decoder || 'sample') : 'sample'}));
 }
 
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
@@ -159,7 +161,8 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
             }
             if (config.target_sidecar) {
                 const report = teacher.episode;
-                if (report.policy_tag !== (config.context_target_evaluation ? 'target-context-v1' : 'target-sidecar-v1') || report.training_eligible !== false ||
+                if (report.policy_tag !== targetPolicyTag(config) ||
+                        (report.target_decoder || 'sample') !== (config.target_decoder || 'sample') || report.training_eligible !== false ||
                         !Number.isSafeInteger(report.target_decisions) || report.target_decisions <= 0 ||
                         !Number.isSafeInteger(report.learned_target_decisions) || report.learned_target_decisions < 0 ||
                         report.learned_target_decisions > report.target_decisions)

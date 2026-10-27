@@ -7,6 +7,7 @@ const {acquireRunLock, createResourceGate, writeJsonAtomic} = require('./counter
 const {publishReplay, verifyReplays} = require('./tactical_demonstrations');
 const {summarizeDecisions} = require('./tactical_decision_audit');
 const {publishLabels, readLabels, targetFitEligible} = require('./target_learning');
+const {targetPolicyTag} = require('./target_context');
 const ROOT = path.resolve(__dirname, '..');
 const OPPONENTS = ['parent', 'random'];
 const SUPPORTED_OPPONENTS = [...OPPONENTS, 'pilot', 'sampled'];
@@ -79,7 +80,8 @@ function validateResume(saved, identity, config) {
                 !Number.isFinite(game.duration_seconds) || game.duration_seconds < 0)
             throw new Error('saved benchmark records do not match the deterministic schedule');
         if (game.status === 'completed') {
-            if (config.target_sidecar && (game.policy_tag !== (config.context_target_evaluation ? 'target-context-v1' : 'target-sidecar-v1') ||
+            if (config.target_sidecar && (game.policy_tag !== targetPolicyTag(config) ||
+                    (game.learned_targets?.target_decoder || 'sample') !== (config.target_decoder || 'sample') ||
                     game.learned_targets?.training_eligible !== false ||
                     !Number.isSafeInteger(game.learned_targets.target_decisions) || game.learned_targets.target_decisions <= 0 ||
                     !Number.isSafeInteger(game.learned_targets.learned_target_decisions) || game.learned_targets.learned_target_decisions < 0 ||
@@ -129,6 +131,9 @@ async function loadSaved(filename) {
 }
 
 function validateConfig(config) {
+    if (config.target_decoder !== undefined && (!['sample', 'argmax'].includes(config.target_decoder) ||
+            !config.target_sidecar || (config.target_decoder === 'argmax' && !config.context_target_evaluation)))
+        throw new Error('target decoder requires an explicit sidecar; argmax requires contextual evaluation');
     if (config.context_target_evaluation !== undefined && (typeof config.context_target_evaluation !== 'boolean' ||
             (config.context_target_evaluation && (!config.target_sidecar || config.exploratory_target_evaluation))))
         throw new Error('context target evaluation requires a distinct, explicit context sidecar');

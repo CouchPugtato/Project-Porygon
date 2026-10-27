@@ -127,4 +127,9 @@ async function exportContext(comparisonDirectory, parentPath, outputDirectory) {
     console.log(`[target-context] evaluation export=${sidecar}; exact reproduction verified; no gameplay started`);
 }
 
-module.exports = {validateContext, writeContext, compareContext, verifyReproduction, exportContext, contextFitEligible};
+function targetPolicyTag(config) {
+    if (config.target_decoder === 'argmax') return 'target-context-argmax-v1';
+    return config.context_target_evaluation ? 'target-context-v1' : 'target-sidecar-v1';
+}
+
+module.exports = {validateContext, writeContext, compareContext, verifyReproduction, exportContext, contextFitEligible, targetPolicyTag};

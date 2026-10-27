@@ -86,6 +86,7 @@ typedef struct {
     int tactical_targets;
     int target_labels;
     TargetSidecar* target_sidecar;
+    int target_argmax;
     uint64_t target_parent_fingerprint;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
@@ -112,6 +113,7 @@ int env_runtime_enable_tactical_audit(EnvRuntime* runtime);
 int env_runtime_enable_tactical_targets(EnvRuntime* runtime);
 int env_runtime_enable_target_labels(EnvRuntime* runtime);
 int env_runtime_enable_target_sidecar(EnvRuntime* runtime, const char* path);
+int env_runtime_enable_target_argmax(EnvRuntime* runtime);
 void env_runtime_free(EnvRuntime* runtime);
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);
 

@@ -1466,3 +1466,57 @@ The next proposed experiment is target-only argmax decoding, not another
 fit or architecture change; it still needs separate approval. All 69
 JavaScript tests pass. Recorded game durations exclude some orchestration
 overhead and the interruption, so they underestimate end-to-end elapsed time.
+
+### Target-only argmax experiment
+
+`--target-decoder argmax` is an evaluation-only option requiring a contextual
+sidecar. The default remains `sample`. It leaves move, switch and Tera
+selection sampled, computes the same legal context target distribution,
+consumes the normal target-sampling draw, then selects the first legal
+maximum. Unsupported turns keep their original sampled targets. This is not
+the existing full-turn `--inference-policy greedy` decoder and uses no
+teacher ranking rules. It changes no model or sidecar weights.
+
+Argmax readiness and terminal records advertise `target_decoder: argmax`;
+the policy tag is `target-context-argmax-v1`, still training-ineligible.
+The JavaScript bridge verifies the decoder before play, and resume rejects
+sample/argmax mixing. Decoder selection in configs uses `target_decoder`.
+
+Run_0299 completed a four-game runtime smoke against parent/random on both
+sides, with zero exclusions or choice rejections. Native tests cover legal
+maxima, ties, non-mutation, unchanged moves/recurrent state/RNG, and unchanged
+Helping Hand/revival fallbacks. All native suites and 71 JavaScript tests pass.
+
+The approved matched screen uses `target_argmax_control.json`,
+`target_argmax_sampled.json` and `target_argmax_argmax.json`, fresh seed 30001,
+and runs 0300/0301/0302 respectively. Each mode collects 100 valid games per
+side against parent/random, 1,200 total, using the exact run_0294 sidecar.
+One-thread serial agents and 65% resource launch gates are unchanged. No
+training, automatic promotion or extra confirmation is part of this test.
+
+Runs 0300-0302 completed all 1,200 valid games with frozen weights and runtime:
+
+| Policy | Parent wins/200 | Random wins/200 |
+| --- | ---: | ---: |
+| Unchanged sampling | 115 (57.5%) | 100 (50.0%) |
+| Sampled context targets | 119 (59.5%) | 93 (46.5%) |
+| Argmax context targets | 114 (57.0%) | 100 (50.0%) |
+
+Argmax minus sampled context was -3.54 percentage points against parent
+(nominal paired 95% interval -12.90 to +5.82) and +3.5 against random (-7.49
+to +14.49). Argmax minus unchanged play was -1.52 (-12.18 to +9.15) and 0.0
+(-11.40 to +11.40), respectively. Parent comparisons involving argmax use 99
+common-valid side-swapped pairs; random uses 100. The nominal intervals are
+unadjusted and do not establish improvement, regression or absence of smaller
+effects. Do not pool this screen with the earlier seed as though the variants
+and runtime were unchanged.
+
+Argmax excluded two parent attempts for trapped switches; the other modes
+excluded none. There were no target-choice rejections or crashes. Resource
+pressure triggered a temporary memory-gate pause without raising the limit.
+All native suites and 71 JavaScript tests pass. The complete comparison is
+`models/diagnostics/run_0300_0302_target_argmax_comparison.json`.
+
+Neither contextual decoder is promoted. The next proposed step is a small
+passive audit of actual targeting disagreements and their impact, not another
+fit, decoding sweep or larger confirmation. It requires separate approval.

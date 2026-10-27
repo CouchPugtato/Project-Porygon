@@ -187,6 +187,9 @@ function continuationSeed(base, attempt, repeat) {
 
 class AgentProcess {
     constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null, inferencePolicy = 'sample', tacticalAudit = false, tacticalTargets = false, targetOptions = {}) {
+        if (targetOptions.decoder !== undefined && (!['sample', 'argmax'].includes(targetOptions.decoder) ||
+                (targetOptions.decoder === 'argmax' && (!targetOptions.sidecar || !targetOptions.contextual))))
+            throw new Error('target argmax requires a contextual sidecar');
         if (targetOptions.labels && (tacticalTeacher || intervention || tacticalAudit || tacticalTargets || inferencePolicy !== 'sample'))
             throw new Error('target labels require unchanged sampled play');
         if (targetOptions.sidecar && (targetOptions.labels || tacticalTeacher || intervention || tacticalAudit || tacticalTargets || inferencePolicy !== 'sample'))
@@ -226,6 +229,7 @@ class AgentProcess {
         if (this.tacticalTargets) args.push('--tactical-targets', '1');
         if (this.targetOptions.labels) args.push('--target-labels', '1');
         if (this.targetOptions.sidecar) args.push('--target-sidecar', this.targetOptions.sidecar);
+        if (this.targetOptions.decoder === 'argmax') args.push('--target-decoder', 'argmax');
         if (this.intervention) {
             args.push(
                 '--counterfactual-decision', String(this.intervention.decisionIndex),
@@ -264,6 +268,8 @@ class AgentProcess {
             throw new Error('runtime does not advertise evaluation-only learned targets; rebuild the client');
         if (this.targetOptions.sidecar && (ready.capabilities?.target_context_version === 1) !== !!this.targetOptions.contextual)
             throw new Error('loaded target sidecar format differs from the configured context mode');
+        if (this.targetOptions.sidecar && (ready.capabilities?.target_decoder || 'sample') !== (this.targetOptions.decoder || 'sample'))
+            throw new Error('runtime target decoder differs from the configured evaluation mode');
         if (this.targetOptions.labels && (ready.capabilities?.target_labels !== true || ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise passive target labels; rebuild the client');
         if (this.targetOptions.contextVersion === 1 && ready.capabilities?.target_context_version !== 1)

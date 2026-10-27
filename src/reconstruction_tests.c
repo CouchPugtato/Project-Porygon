@@ -11,6 +11,7 @@
 #include "target_sidecar.h"
 #include "target_context.h"
 #include "target_context_fit.h"
+#include "policy_decoding.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -934,6 +935,20 @@ static int test_greedy_runtime_is_evaluation_only(void) {
     return ok;
 }
 
+static int save_context_runtime_fixture(const GruModel* model, const char* path) {
+    TargetSidecar* sidecar = target_sidecar_create(model);
+    if (!sidecar) return 0;
+    sidecar->contextual = 1;
+    float* weights = realloc(sidecar->weights, target_sidecar_parameter_count(sidecar) * sizeof(float));
+    if (!weights) { target_sidecar_free(sidecar); return 0; }
+    sidecar->weights = weights;
+    size_t base = 32 * (sidecar->hidden_dim + 1), k;
+    for (k = 0; k < TARGET_CONTEXT_PARAMETER_COUNT; ++k) weights[base + k] = (float)(k % 19) * 2;
+    int ok = target_sidecar_save(sidecar, path);
+    target_sidecar_free(sidecar);
+    return ok;
+}
+
 static int test_tactical_audit_preserves_sampled_runtime(void) {
     GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
     EnvRuntime runtime = {0};
@@ -945,21 +960,15 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
     if (!assert_true(initial_targets && target_sidecar_save(initial_targets, "test_runtime_targets.tmp"),
             "create unchanged live target sidecar")) return 0;
     target_sidecar_free(initial_targets);
-    initial_targets = target_sidecar_create(model);
-    initial_targets->contextual = 1;
-    initial_targets->weights = realloc(initial_targets->weights, target_sidecar_parameter_count(initial_targets) * sizeof(float));
-    if (!assert_true(initial_targets->weights != NULL, "allocate contextual runtime sidecar")) return 0;
-    size_t base_parameters = 32 * (initial_targets->hidden_dim + 1), k;
-    for (k = 0; k < TARGET_CONTEXT_PARAMETER_COUNT; ++k) initial_targets->weights[base_parameters + k] = (float)(k % 19) * 2;
-    if (!assert_true(target_sidecar_save(initial_targets, "test_runtime_context.tmp"), "save contextual runtime sidecar")) return 0;
-    target_sidecar_free(initial_targets);
-    for (mode = 0; mode < 6; ++mode) {
+    if (!assert_true(save_context_runtime_fixture(model, "test_runtime_context.tmp"), "save contextual runtime sidecar")) return 0;
+    for (mode = 0; mode < 7; ++mode) {
         FILE* output = tmpfile();
         RuntimeMessage terminal;
         char line[4096];
         Episode parsed = {0};
         if (!output) { ok = 0; break; }
         ok &= env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "parent.chk");
+        ok &= assert_true(!env_runtime_enable_target_argmax(&runtime), "target argmax cannot enable without a context sidecar");
         if (mode == 1) ok &= assert_true(env_runtime_enable_tactical_audit(&runtime) &&
             !env_runtime_enable_tactical_teacher(&runtime) && !env_runtime_set_counterfactual_intervention(&runtime, 0, 0),
             "Audit blocks behavior overrides");
@@ -973,13 +982,15 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
             !env_runtime_set_counterfactual_intervention(&runtime, 0, 0), "Passive target labels block behavior overrides");
         if (mode == 4) ok &= assert_true(env_runtime_enable_target_sidecar(&runtime, "test_runtime_targets.tmp") &&
             !env_runtime_enable_target_labels(&runtime) && !env_runtime_enable_tactical_targets(&runtime) &&
-            !env_runtime_enable_greedy_inference(&runtime), "Learned targeting excludes teacher and other decoders");
-        if (mode == 5) ok &= assert_true(env_runtime_enable_target_sidecar(&runtime, "test_runtime_context.tmp") &&
+            !env_runtime_enable_greedy_inference(&runtime) && !env_runtime_enable_target_argmax(&runtime),
+            "Legacy learned targets exclude contextual argmax and other decoders");
+        if (mode >= 5) ok &= assert_true(env_runtime_enable_target_sidecar(&runtime, "test_runtime_context.tmp") &&
             runtime.target_sidecar->contextual && !env_runtime_enable_tactical_teacher(&runtime) &&
             !env_runtime_enable_target_labels(&runtime), "Context targeting is explicit and excludes teacher labels");
+        if (mode == 6) ok &= assert_true(env_runtime_enable_target_argmax(&runtime), "enable target-only argmax");
         srand(28001);
         ok &= assert_true(send_counterfactual_test_state(&runtime, output), "emit sampled action with passive audit");
-        if (mode == 5) ok &= assert_true(runtime.sessions[0].pending_learned_targets,
+        if (mode >= 5) ok &= assert_true(runtime.sessions[0].pending_learned_targets,
             "context runtime fixture exercises learned targeting, not only fallback");
         if (runtime.count) {
             if (!mode) {
@@ -988,11 +999,27 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                 next_rng = rand();
             } else {
                 FactorizedActionChoice observed = runtime.sessions[0].pending_factorized_choice;
-                if (mode == 5) ok &= assert_true(
+                if (mode >= 5) ok &= assert_true(
                     (!observed.slot0_target_mask || (observed.slot0_target_mask & (1u << observed.slot0_target_index))) &&
                     (!observed.slot1_target_mask || (observed.slot1_target_mask & (1u << observed.slot1_target_index))),
                     "context target samples stay inside each selected move's legal mask");
-                if (mode == 2 || mode == 5) {
+                if (mode == 6) {
+                    int slot;
+                    EnvSession* session = &runtime.sessions[0];
+                    for (slot = 0; slot < 2; ++slot) {
+                        unsigned char legal = slot ? observed.slot1_target_mask : observed.slot0_target_mask;
+                        if (!legal) continue;
+                        TargetContext context;
+                        float policy[4];
+                        int move = slot ? observed.slot1_move_index : observed.slot0_move_index;
+                        target_context_collect(&session->observation, &session->parsed_request, &observed, slot, &context);
+                        ok &= target_sidecar_predict_context(runtime.target_sidecar, session->hidden_state, slot, move, legal, &context, policy);
+                        ok &= assert_true((slot ? observed.slot1_target_index : observed.slot0_target_index) ==
+                            policy_decode_target_argmax(policy, legal), "live target argmax selects its learned legal maximum");
+                    }
+                    ok &= assert_true(!env_runtime_enable_target_argmax(&runtime), "decoder cannot change after a battle starts");
+                }
+                if (mode == 2 || mode >= 5) {
                     observed.slot0_target_index = baseline.slot0_target_index;
                     observed.slot1_target_index = baseline.slot1_target_index;
                 }
@@ -1013,7 +1040,7 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
             ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "tactical-audit-v1") &&
                 !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0), "Audit terminal cannot become PPO data");
         }
-        if (mode == 2 || mode == 5) {
+        if (mode == 2 || mode >= 5) {
             RuntimeMessage accepted;
             runtime_message_init(&accepted);
             accepted.type = RUNTIME_MSG_DECISION;
@@ -1031,12 +1058,13 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
             ok &= env_runtime_handle_message(&runtime, &terminal, output);
             rewind(output);
             ok &= assert_true(fgets(line, sizeof(line), output) &&
-                (mode == 5 ? strstr(line, "\"learned_targets\":true") != NULL :
+                (mode >= 5 ? strstr(line, "\"learned_targets\":true") != NULL :
                     (strstr(line, "\"target_intervention\":{") && strstr(line, "\"sampled_command\":"))) &&
                 strstr(line, "\"training_eligible\":false"),
                 "Target intervention retains the original sampled command");
             ok &= assert_true(fgets(line, sizeof(line), output) &&
-                strstr(line, mode == 5 ? "target-context-v1" : "tactical-targets-v1") &&
+                strstr(line, mode == 6 ? "target-context-argmax-v1" : (mode == 5 ? "target-context-v1" : "tactical-targets-v1")) &&
+                (mode != 6 || strstr(line, "\"target_decoder\":\"argmax\"")) &&
                 strstr(line, "\"target_decisions\":1") &&
                 !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0), "Target intervention is not PPO data");
         }
@@ -1054,7 +1082,8 @@ static int test_runtime_handles_recorded_no_choice_requests(void) {
     GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
     int fixture, mode, ok = assert_true(model != NULL, "create recorded-request runtime fixture");
     if (!ok) return 0;
-    for (fixture = 0; fixture < 2; ++fixture) for (mode = 0; mode < 4; ++mode) {
+    if (!assert_true(save_context_runtime_fixture(model, "test_fallback_context.tmp"), "save context fallback fixture")) return 0;
+    for (fixture = 0; fixture < 2; ++fixture) for (mode = 0; mode < 6; ++mode) {
         EnvRuntime runtime = {0};
         RuntimeMessage message;
         FactorizedActionChoice decoded;
@@ -1065,6 +1094,8 @@ static int test_runtime_handles_recorded_no_choice_requests(void) {
         if (mode == 1) ok &= env_runtime_enable_tactical_teacher(&runtime);
         if (mode == 2) ok &= env_runtime_enable_greedy_inference(&runtime);
         if (mode == 3) ok &= env_runtime_enable_tactical_targets(&runtime);
+        if (mode >= 4) ok &= env_runtime_enable_target_sidecar(&runtime, "test_fallback_context.tmp");
+        if (mode == 5) ok &= env_runtime_enable_target_argmax(&runtime);
         runtime_message_init(&message);
         message.type = RUNTIME_MSG_BATTLE_START;
         strcpy(message.battle_id, "recorded-no-choice");
@@ -1077,6 +1108,8 @@ static int test_runtime_handles_recorded_no_choice_requests(void) {
             "recorded request produces an action in sampled, teacher, greedy, and target-only modes");
         if (runtime.count) {
             EnvSession* session = &runtime.sessions[0];
+            if (mode >= 4) ok &= assert_true(!session->pending_learned_targets,
+                "status and revival fallbacks do not use learned target decoding");
             ok &= assert_true(command_to_factorized_request_choice(session->pending_command,
                 &session->parsed_request, &decoded) && !decoded.slot0_has_action && decoded.slot1_has_action,
                 "runtime command roundtrips the right active slot");
@@ -1093,6 +1126,7 @@ static int test_runtime_handles_recorded_no_choice_requests(void) {
         env_runtime_free(&runtime);
         fclose(output);
     }
+    remove("test_fallback_context.tmp");
     gru_model_destroy(model);
     return ok;
 }

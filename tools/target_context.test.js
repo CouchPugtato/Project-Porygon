@@ -64,6 +64,27 @@ test('context strength screen freezes all non-target settings across three match
     assert.notEqual(control.seed, require('../config/experimental/target_context_collection.json').seed);
 });
 
+test('argmax target screen changes only target decoding and keeps opponent/action sampling', () => {
+    const control = require('../config/experimental/target_argmax_control.json');
+    const sampled = require('../config/experimental/target_argmax_sampled.json');
+    const argmax = require('../config/experimental/target_argmax_argmax.json');
+    for (const c of [control, sampled, argmax, require('../config/experimental/target_argmax_smoke.json')]) validateConfig(c);
+    assert.deepEqual({...argmax, target_decoder: 'sample'}, sampled);
+    const {target_sidecar, context_target_evaluation, target_decoder, ...base} = sampled;
+    assert.deepEqual(base, control);
+    assert.equal(control.games_per_side * control.opponents.length * 2 * 3, 1200);
+    assert.notEqual(control.seed, require('../config/experimental/target_context_control.json').seed);
+    for (const side of [0, 1]) {
+        const agents = createBattleAgents(argmax, battleSeeds(argmax.seed, side, true), side, 'parent', null);
+        assert.equal(agents[side].targetOptions.decoder, 'argmax');
+        assert.equal(agents[1 - side].targetOptions.decoder, 'sample');
+        assert.ok(agents.every(agent => agent.inferencePolicy === 'sample' && !agent.tacticalTeacher));
+    }
+    assert.throws(() => validateConfig({...control, target_decoder: 'argmax'}), /target decoder/);
+    assert.throws(() => validateConfig({...sampled, context_target_evaluation: false, target_decoder: 'argmax'}), /target decoder/);
+    assert.throws(() => validateConfig({...argmax, target_decoder: 'unknown'}), /target decoder/);
+});
+
 test('visible context uses a stable 32-byte layout and rejects unredacted or mislocated targets', () => {
     const c = context(), bytes = Buffer.alloc(32);
     validateContext(c);

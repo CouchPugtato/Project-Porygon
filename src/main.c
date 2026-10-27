@@ -2336,7 +2336,8 @@ static int run_runtime_mode(
     int tactical_audit,
     int tactical_targets,
     int target_labels,
-    const char* target_sidecar_path
+    const char* target_sidecar_path,
+    int target_argmax
 ) {
     GruModel* model = NULL;
     TrainerCheckpointState state;
@@ -2349,6 +2350,11 @@ static int run_runtime_mode(
     const char* replay_path = getenv("PORYGON_REPLAY_PATH");
     EnvRewardMode reward_mode;
     int greedy_inference = inference_policy && strcmp(inference_policy, "greedy") == 0;
+
+    if (target_argmax && !target_sidecar_path) {
+        fprintf(stderr, "[runtime] target argmax requires a contextual sidecar\n");
+        return 1;
+    }
 
     if (target_sidecar_path && (tactical_teacher || tactical_audit || tactical_targets || target_labels ||
             greedy_inference || counterfactual_decision_index >= 0 || !checkpoint_path || !*checkpoint_path)) {
@@ -2477,9 +2483,17 @@ static int run_runtime_mode(
         free(resolved_checkpoint_path);
         return 1;
     }
+    if (target_argmax && !env_runtime_enable_target_argmax(&runtime)) {
+        fprintf(stderr, "[runtime] target argmax requires a contextual sidecar\n");
+        env_runtime_free(&runtime);
+        if (replay_file) fclose(replay_file);
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
+        return 1;
+    }
     if (target_sidecar_path) snprintf(json, sizeof(json),
-        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_sidecar\":true,\"target_context_version\":%d}}",
-        runtime.target_sidecar->contextual ? 1 : 0);
+        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_sidecar\":true,\"target_context_version\":%d,\"target_decoder\":\"%s\"}}",
+        runtime.target_sidecar->contextual ? 1 : 0, runtime.target_argmax ? "argmax" : "sample");
     else if (target_labels) snprintf(json, sizeof(json),
         "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_labels\":true,\"target_context_version\":1}}");
     else if (tactical_targets) snprintf(json, sizeof(json),
@@ -4814,6 +4828,12 @@ static int showdown_client_main(int argc, char** argv) {
     int tactical_targets = parse_bool01_flag(argc, argv, "--tactical-targets", 0);
     int target_labels = parse_bool01_flag(argc, argv, "--target-labels", 0);
     const char* target_sidecar_path = parse_string_flag(argc, argv, "--target-sidecar", NULL);
+    const char* target_decoder = parse_string_flag(argc, argv, "--target-decoder", "sample");
+    if (strcmp(target_decoder, "sample") != 0 && strcmp(target_decoder, "argmax") != 0) {
+        fprintf(stderr, "[runtime] target decoder must be sample or argmax\n");
+        return 1;
+    }
+    int target_argmax = strcmp(target_decoder, "argmax") == 0;
     int counterfactual_decision_index = parse_int_flag(
         argc, argv, "--counterfactual-decision", -1);
     int counterfactual_action_rank = parse_int_flag(
@@ -4827,7 +4847,7 @@ static int showdown_client_main(int argc, char** argv) {
     int ppo_command = argc >= 2 && strcmp(argv[1], "--train-live-ppo") == 0;
     int awr_command = argc >= 2 && strcmp(argv[1], "--train-live-awr") == 0;
     int training_or_eval_mode = 0;
-    if ((tactical_audit || tactical_targets || target_labels || target_sidecar_path || strcmp(inference_policy_name, "sample") != 0) &&
+    if ((tactical_audit || tactical_targets || target_labels || target_sidecar_path || target_argmax || strcmp(inference_policy_name, "sample") != 0) &&
             !(argc >= 2 && (strcmp(argv[1], "--battle-agent") == 0 || strcmp(argv[1], "--runtime") == 0))) {
         fprintf(stderr, "[runtime] non-sampling inference and tactical auditing require --battle-agent/--runtime mode\n");
         return 1;
@@ -5096,7 +5116,8 @@ static int showdown_client_main(int argc, char** argv) {
             tactical_audit,
             tactical_targets,
             target_labels,
-            target_sidecar_path);
+            target_sidecar_path,
+            target_argmax);
     }
     if (argc >= 4 && overfit_command) {
         return run_supervised_overfit_check(
@@ -5536,7 +5557,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  showdown_client --fit-target-sidecar dataset.bin parent.chk sidecar.bin report.json [--exploratory-evaluation]\n"
         "  showdown_client --compare-target-context dataset.bin parent.chk\n"
         "  showdown_client --export-target-context-evaluation dataset.bin parent.chk sidecar.bin\n"
-        "  showdown_client --battle-agent parent.chk --target-sidecar sidecar.bin [--inference-seed N]\n"
+        "  showdown_client --battle-agent parent.chk --target-sidecar sidecar.bin [--target-decoder sample|argmax] [--inference-seed N]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"

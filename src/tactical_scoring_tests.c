@@ -568,6 +568,23 @@ static int test_visible_target_context(void) {
     return ok;
 }
 
+static int test_target_argmax(void) {
+    float policy[4] = {100, .1f, .2f, .7f}, before[4];
+    memcpy(before, policy, sizeof(policy));
+    srand(30001);
+    int next = rand();
+    srand(30001);
+    int ok = check(policy_decode_target_argmax(policy, 12) == 3 && rand() == next &&
+        memcmp(before, policy, sizeof(policy)) == 0, "Target argmax ignores illegal maxima without consuming RNG or changing probabilities");
+    policy[2] = policy[3] = .5f;
+    ok &= check(policy_decode_target_argmax(policy, 12) == 2 && policy_decode_target_argmax(policy, 8) == 3,
+        "Target argmax breaks ties by first legal target and handles a single legal target");
+    policy[2] = NAN;
+    ok &= check(policy_decode_target_argmax(policy, 12) == -1 && policy_decode_target_argmax(policy, 0) == -1,
+        "Invalid target distributions cannot select a target");
+    return ok;
+}
+
 int main(void) {
     if (!check(id_tables_init(), "load vocabulary and move metadata")) return 1;
     if (!test_target_matchups() || !test_accuracy_and_stab() ||
@@ -581,7 +598,7 @@ int main(void) {
             !test_all_adjacent_parser_and_legacy_encoding() ||
             !test_greedy_full_turn_probability() || !test_greedy_single_slot_and_forced_switches() ||
             !test_passive_decision_audit() || !test_target_only_intervention() || !test_passive_target_labels() ||
-            !test_visible_target_context()) return 1;
+            !test_visible_target_context() || !test_target_argmax()) return 1;
     puts("tactical scoring tests passed");
     return 0;
 }
