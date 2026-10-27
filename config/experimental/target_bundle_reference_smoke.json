@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "kind": "frozen-target-action-actor-v1",
+  "reference": {
+    "path": "../../models/runs/run_0275_tactical_student_1000/tactical_student_dataset_epoch003.chk",
+    "sha256": "fdd04061bc251fb944af7c67fa64c1c7780f3ab2011d0603976915e43f07ff0a"
+  },
+  "actor": {
+    "path": "../../models/runs/run_0275_tactical_student_1000/tactical_student_dataset_epoch003.chk",
+    "sha256": "fdd04061bc251fb944af7c67fa64c1c7780f3ab2011d0603976915e43f07ff0a"
+  },
+  "sidecar": {
+    "path": "../../models/runs/run_0294_target_context_evaluation/target_context.bin",
+    "sha256": "debfa06454a65e8ab8c8d6392e09a4c4eb9909909a3cc97af197f624cb83377e"
+  },
+  "executable": {
+    "path": "../../build-local/model-recovery/showdown_client.exe",
+    "sha256": "29b77f2d1804352e43f564346318a330282b2fbd7ca079c8853d307878c5c313"
+  },
+  "sidecar_parameters": "e5e2cf16c7afc360",
+  "context_version": 1,
+  "action_decoder": "sample",
+  "target_decoder": "argmax",
+  "eligibility": "slot-local-v1",
+  "inference_seed": 31601,
+  "omp_threads": 1,
+  "training_eligible": false
+}

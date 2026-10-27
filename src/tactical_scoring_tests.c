@@ -594,6 +594,39 @@ static int test_target_argmax(void) {
     return ok;
 }
 
+static int test_decoded_turn_likelihood(void) {
+    FactorizedPolicySnapshot policy = {0};
+    FactorizedActionChoice choice;
+    unsigned char legal[OBS_NUM_ACTIONS] = {0};
+    double likelihood;
+    legal[0] = legal[14] = legal[15] = 1;
+    policy.has_joint_policy = 1;
+    policy.joint_policy[0] = .25f; policy.joint_policy[1] = .75f;
+    policy.slot0_target_policy[2] = .2f; policy.slot0_target_policy[3] = .8f;
+    factorized_action_choice_from_flat_actions(&choice, 0, 15);
+    choice.slot0_target_mask = 12; choice.slot0_target_index = 2;
+    int ok = check(policy_choice_log_probability(&policy, legal, &choice, &likelihood) &&
+        fabs(exp(likelihood) - .15) < 1e-7, "Full-turn likelihood combines the legal joint action and conditional target");
+    policy.joint_policy[0] = 1; policy.joint_policy[1] = 1e-30f;
+    ok &= check(policy_choice_log_probability(&policy, legal, &choice, &likelihood) && likelihood < -65,
+        "Very small action probabilities are not replaced by a likelihood floor");
+    policy.slot0_target_policy[2] = 0; policy.slot0_target_policy[3] = 1;
+    ok &= check(policy_choice_log_probability(&policy, legal, &choice, &likelihood) &&
+        isinf(likelihood) && likelihood < 0, "An alternative to a deterministic target has zero probability");
+    policy.joint_policy[0] = NAN;
+    ok &= check(!policy_choice_log_probability(&policy, legal, &choice, &likelihood),
+        "Non-finite policy data cannot enter likelihood replay");
+    memset(&policy, 0, sizeof(policy)); memset(legal, 0, sizeof(legal));
+    legal[0] = legal[1] = legal[8] = 1;
+    policy.slot0_kind_policy[0] = .6f; policy.slot0_kind_policy[1] = .4f;
+    policy.slot0_move_policy[0] = .25f; policy.slot0_move_policy[1] = .75f;
+    policy.slot0_tera_policy[0] = .1f; policy.slot0_tera_policy[1] = .9f;
+    factorized_action_choice_from_flat_actions(&choice, 1, -1);
+    ok &= check(policy_choice_log_probability(&policy, legal, &choice, &likelihood) &&
+        fabs(exp(likelihood) - .45) < 1e-7, "Single-slot likelihood renormalizes Tera only over legal choices");
+    return ok;
+}
+
 static int test_diagnostic_retargeting(void) {
     Observation observation, before;
     ParsedRequest request, original;
@@ -654,7 +687,7 @@ int main(void) {
             !test_all_adjacent_parser_and_legacy_encoding() ||
             !test_greedy_full_turn_probability() || !test_greedy_single_slot_and_forced_switches() ||
             !test_passive_decision_audit() || !test_target_only_intervention() || !test_passive_target_labels() ||
-            !test_visible_target_context() || !test_target_argmax() || !test_diagnostic_retargeting()) return 1;
+            !test_visible_target_context() || !test_target_argmax() || !test_decoded_turn_likelihood() || !test_diagnostic_retargeting()) return 1;
     puts("tactical scoring tests passed");
     return 0;
 }

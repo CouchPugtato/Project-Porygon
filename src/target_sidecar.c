@@ -279,6 +279,23 @@ TargetSidecar* target_sidecar_load(const char* path, const GruModel* parent) {
     return s;
 }
 
+TargetSidecar* target_sidecar_load_for_action_actor(const char* path, const GruModel* reference,
+    const GruModel* actor, uint64_t expected_sidecar_fingerprint, const char** failure_reason
+) {
+    const char* reason = gru_model_action_head_compatibility_reason(reference, actor);
+    TargetSidecar* sidecar = NULL;
+    if (!reason && (!path || !*path)) reason = "missing_sidecar_path";
+    if (!reason && !expected_sidecar_fingerprint) reason = "missing_sidecar_identity";
+    if (!reason) {
+        sidecar = target_sidecar_load(path, reference);
+        if (!sidecar) reason = "sidecar_load_or_binding";
+        else if (target_sidecar_fingerprint(sidecar) != expected_sidecar_fingerprint) reason = "sidecar_identity";
+    }
+    if (reason) { target_sidecar_free(sidecar); sidecar = NULL; }
+    if (failure_reason) *failure_reason = reason;
+    return sidecar;
+}
+
 typedef struct { unsigned char validation, slot, move, legal, best; } Example;
 typedef struct { double nll; size_t count, correct; } Metrics;
 

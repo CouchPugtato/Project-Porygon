@@ -100,7 +100,8 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
             slotLocal: side === candidateSide && config.target_slot_local === true}));
 }
 
-async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
+async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null,
+    agentFactory = createBattleAgents} = {}) {
     const battleId = `tactical-${opponent}-${config.seed}-${index}`;
     const teacherSide = index % 2 === 0 ? 0 : 1;
     const opponentName = opponent === 'random' ? 'RandomPolicy' : opponent === 'pilot' ? 'PilotPolicy' :
@@ -112,7 +113,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
     const seeds = battleSeeds(config.seed, index, matchedTeams);
     const audit = config.target_audit ? createTargetAudit() : config.collect_target_labels ? createTargetCollector(config.target_context_version || 0) : config.decision_audit ? createDecisionAudit() : null;
     const observe = audit ? line => { audit.observe(line); if (recordTeacher) recordTeacher(line); } : recordTeacher;
-    const agents = createBattleAgents(config, seeds, teacherSide, opponent, observe);
+    const agents = agentFactory(config, seeds, teacherSide, opponent, observe);
     let timeout;
     let game;
     try {

@@ -2324,6 +2324,13 @@ static int run_demo_gru(void) {
         return 0;
 }
 
+typedef struct {
+    const char* reference_path;
+    const char* sidecar_identity;
+    const char* manifest_sha256;
+    int records;
+} ActionBundleRuntimeOptions;
+
 static int run_runtime_mode(
     const char* checkpoint_path,
     const char* reward_mode_name,
@@ -2339,7 +2346,8 @@ static int run_runtime_mode(
     const char* target_sidecar_path,
     int target_argmax,
     int target_audit,
-    int target_slot_local
+    int target_slot_local,
+    const ActionBundleRuntimeOptions* bundle
 ) {
     GruModel* model = NULL;
     TrainerCheckpointState state;
@@ -2352,6 +2360,7 @@ static int run_runtime_mode(
     const char* replay_path = getenv("PORYGON_REPLAY_PATH");
     EnvRewardMode reward_mode;
     int greedy_inference = inference_policy && strcmp(inference_policy, "greedy") == 0;
+    GruModel* bundle_reference = NULL;
 
     if ((target_argmax || target_audit || target_slot_local) && !target_sidecar_path) {
         fprintf(stderr, "[runtime] target argmax requires a contextual sidecar\n");
@@ -2396,6 +2405,18 @@ static int run_runtime_mode(
         fprintf(stderr, "[runtime] unsupported reward mode '%s'\n", reward_mode_name ? reward_mode_name : "");
         return 1;
     }
+    if (bundle->reference_path) {
+        TrainerCheckpointState reference_state = {0};
+        CheckpointLoadResult reference_result = {0};
+        if (inference_seed < 0) return 1;
+        /* Checkpoint construction consumes RNG before importing weights. Load
+         * the extra reference before resetting the ordinary actor RNG stream. */
+        bundle_reference = load_current_checkpoint(bundle->reference_path, &reference_state, &reference_result);
+        if (!bundle_reference) {
+            report_checkpoint_load_failure("[runtime] bundle reference", bundle->reference_path, &reference_result);
+            return 1;
+        }
+    }
     if (inference_seed >= 0) srand((unsigned int)inference_seed);
 
     memset(&state, 0, sizeof(state));
@@ -2404,11 +2425,13 @@ static int run_runtime_mode(
         resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path);
         if (!resolved_checkpoint_path) {
             fprintf(stderr, "[runtime] failed to resolve checkpoint path '%s'\n", checkpoint_path);
+            gru_model_destroy(bundle_reference);
             return 1;
         }
         model = load_current_checkpoint(resolved_checkpoint_path, &state, &checkpoint_result);
         if (!model) {
             report_checkpoint_load_failure("[runtime] failed to load", resolved_checkpoint_path, &checkpoint_result);
+            gru_model_destroy(bundle_reference);
             free(resolved_checkpoint_path);
             return 1;
         }
@@ -2420,6 +2443,7 @@ static int run_runtime_mode(
     }
     if (!model) {
         fprintf(stderr, "Failed to initialize runtime model\n");
+        gru_model_destroy(bundle_reference);
         return 1;
     }
     if (replay_path && *replay_path) {
@@ -2428,6 +2452,7 @@ static int run_runtime_mode(
     if (!env_runtime_init(&runtime, model, replay_file, 0, reward_mode, dense_reward_config,
             resolved_checkpoint_path ? resolved_checkpoint_path : checkpoint_path)) {
         fprintf(stderr, "Failed to initialize runtime\n");
+        gru_model_destroy(bundle_reference);
         if (replay_file) fclose(replay_file);
         gru_model_destroy(model);
         return 1;
@@ -2477,7 +2502,13 @@ static int run_runtime_mode(
         free(resolved_checkpoint_path);
         return 1;
     }
-    if (target_sidecar_path && !env_runtime_enable_target_sidecar(&runtime, target_sidecar_path)) {
+    int target_enabled = 1;
+    if (target_sidecar_path && bundle->reference_path) {
+        target_enabled = env_runtime_enable_action_actor_bundle(&runtime, bundle_reference,
+            target_sidecar_path, bundle->sidecar_identity, bundle->manifest_sha256);
+        gru_model_destroy(bundle_reference);
+    } else if (target_sidecar_path) target_enabled = env_runtime_enable_target_sidecar(&runtime, target_sidecar_path);
+    if (!target_enabled) {
         fprintf(stderr, "[runtime] target sidecar is corrupt or does not match the parent checkpoint\n");
         env_runtime_free(&runtime);
         if (replay_file) fclose(replay_file);
@@ -2525,7 +2556,12 @@ static int run_runtime_mode(
     else if (tactical_teacher) snprintf(json, sizeof(json),
         "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"tactical_teacher\":true}}");
     else runtime_emit_ready_json(json, sizeof(json));
-    puts(json);
+    runtime.target_bundle_records = bundle->records;
+    if (runtime.target_bundle_manifest_sha256[0]) {
+        printf("%.*s,\"behavior_policy\":", (int)strlen(json) - 1, json);
+        env_runtime_write_target_identity(&runtime, stdout);
+        puts(bundle->records ? ",\"accepted_records\":true}" : "}");
+    } else puts(json);
     fflush(stdout);
 
     while (fgets(line, sizeof(line), stdin)) {
@@ -4847,6 +4883,22 @@ static int showdown_client_main(int argc, char** argv) {
     int tactical_targets = parse_bool01_flag(argc, argv, "--tactical-targets", 0);
     int target_labels = parse_bool01_flag(argc, argv, "--target-labels", 0);
     const char* target_sidecar_path = parse_string_flag(argc, argv, "--target-sidecar", NULL);
+    ActionBundleRuntimeOptions bundle = {
+        parse_string_flag(argc, argv, "--action-bundle-reference", NULL),
+        parse_string_flag(argc, argv, "--action-bundle-sidecar-id", NULL),
+        parse_string_flag(argc, argv, "--action-bundle-manifest-sha256", NULL),
+        parse_bool01_flag(argc, argv, "--action-bundle-records", 0)
+    };
+    int bundle_fields = !!bundle.reference_path + !!bundle.sidecar_identity + !!bundle.manifest_sha256;
+    if (bundle.records && !bundle_fields) {
+        fprintf(stderr, "[runtime] accepted records require an explicit action bundle\n");
+        return 1;
+    }
+    if (bundle_fields && (bundle_fields != 3 || !target_sidecar_path ||
+            !(argc >= 2 && (strcmp(argv[1], "--battle-agent") == 0 || strcmp(argv[1], "--runtime") == 0)))) {
+        fprintf(stderr, "[runtime] action bundle requires reference, sidecar identity, manifest SHA256 and runtime sidecar\n");
+        return 1;
+    }
     const char* target_decoder = parse_string_flag(argc, argv, "--target-decoder", "sample");
     if (strcmp(target_decoder, "sample") != 0 && strcmp(target_decoder, "argmax") != 0) {
         fprintf(stderr, "[runtime] target decoder must be sample or argmax\n");
@@ -5140,7 +5192,7 @@ static int showdown_client_main(int argc, char** argv) {
             target_sidecar_path,
             target_argmax,
             target_audit,
-            target_slot_local);
+            target_slot_local, &bundle);
     }
     if (argc >= 4 && overfit_command) {
         return run_supervised_overfit_check(

@@ -1,0 +1,9 @@
+{
+  "run_name": "run_0318_target_record_live_smoke_recheck",
+  "manifest": "models/diagnostics/run_0317_accepted_records_bundle.json",
+  "manifest_sha256": "8785064987785ffd0e3b54e27a83634f6305a21021c5059e1a04fbfcb6b76284",
+  "games": 6,
+  "seed": 31801,
+  "format": "gen9randomdoublesbattle",
+  "battle_timeout_seconds": 180
+}

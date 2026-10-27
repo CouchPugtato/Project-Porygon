@@ -242,12 +242,7 @@ class AgentProcess {
                 '--counterfactual-rank', String(this.intervention.actionRank)
             );
         }
-        this.process = spawn(CLIENT_EXE, args, {
-            cwd: REPO_ROOT,
-            env: {...process.env, PORYGON_OMP_THREADS: String(this.ompThreads)},
-            windowsHide: true,
-            stdio: ['pipe', 'pipe', 'pipe'],
-        });
+        this.process = await this.launch(args);
         const stdout = readline.createInterface({input: this.process.stdout});
         const stderr = readline.createInterface({input: this.process.stderr});
         stdout.on('line', line => {
@@ -295,6 +290,15 @@ class AgentProcess {
                 ready.capabilities?.training !== false)) {
             throw new Error('runtime does not advertise evaluation-only tactical teacher support; rebuild the client');
         }
+    }
+
+    launch(args) {
+        return spawn(CLIENT_EXE, args, {
+            cwd: REPO_ROOT,
+            env: {...process.env, PORYGON_OMP_THREADS: String(this.ompThreads)},
+            windowsHide: true,
+            stdio: ['pipe', 'pipe', 'pipe'],
+        });
     }
 
     pushMessage(message) {

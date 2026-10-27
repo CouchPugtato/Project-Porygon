@@ -35,10 +35,10 @@ int policy_target_distribution(const float policy[4], unsigned char legal, int a
 static double masked_probability(const float* policy, const unsigned char* mask, int count, int selected) {
     double total = 0.0;
     int first = -1, i;
-    if (selected < 0 || selected >= count || !mask[selected]) return 0.0;
+    if (selected < 0 || selected >= count || !mask[selected]) return NAN;
     for (i = 0; i < count; ++i) {
         if (!mask[i]) continue;
-        if (!isfinite(policy[i]) || policy[i] < 0.0f) return 0.0;
+        if (!isfinite(policy[i]) || policy[i] < 0.0f) return NAN;
         if (first < 0) first = i;
         total += policy[i];
     }
@@ -46,22 +46,28 @@ static double masked_probability(const float* policy, const unsigned char* mask,
     return total <= 1.0e-8 ? (selected == first ? 1.0 : 0.0) : policy[selected] / total;
 }
 
-static int evaluate_policy_choice(
-    const Observation* observation, const ParsedRequest* request,
-    const FactorizedActionChoice* choice, TacticalChoiceEvaluation* evaluation, void* context
+int policy_choice_log_probability(const FactorizedPolicySnapshot* p, const unsigned char* legal,
+    const FactorizedActionChoice* choice, double* log_probability
 ) {
-    const GreedyContext* greedy = context;
-    const FactorizedPolicySnapshot* p = greedy->policy;
     int actions[2], slot;
-    double probability = 1.0;
-    (void)observation;
-    (void)request;
-    if (!factorized_action_choice_to_flat_actions(choice, &actions[0], &actions[1])) return 0;
-    if ((actions[0] >= 0 && !greedy->legal[actions[0]]) ||
-            (actions[1] >= 0 && !greedy->legal[actions[1]])) return 0;
+    double result = 0;
+    if (!p || !legal || !choice || !log_probability ||
+            !factorized_action_choice_to_flat_actions(choice, &actions[0], &actions[1]) ||
+            (actions[0] < 0 && actions[1] < 0)) return 0;
+    if ((actions[0] >= 0 && !legal[actions[0]]) || (actions[1] >= 0 && !legal[actions[1]])) return 0;
     if (actions[0] >= 0 && actions[1] >= 0) {
+        unsigned char mask[FACTORIZED_JOINT_DIM];
+        int i;
         if (!p->has_joint_policy) return 0;
-        probability = p->joint_policy[actions[0] * FACTORIZED_LOCAL_ACTION_DIM + actions[1] - FACTORIZED_LOCAL_ACTION_DIM];
+        for (i = 0; i < FACTORIZED_JOINT_DIM; ++i) {
+            if (!isfinite(p->joint_policy[i]) || p->joint_policy[i] < 0) return 0;
+            mask[i] = p->joint_policy[i] > 0;
+        }
+        int selected = actions[0] * FACTORIZED_LOCAL_ACTION_DIM + actions[1] - FACTORIZED_LOCAL_ACTION_DIM;
+        /* A joint zero is outside the sampler's support, including forbidden
+         * duplicate switches and double Tera. */
+        if (!mask[selected]) return 0;
+        result += log(masked_probability(p->joint_policy, mask, FACTORIZED_JOINT_DIM, selected));
     }
     for (slot = 0; slot < 2; ++slot) {
         int base = slot * FACTORIZED_LOCAL_ACTION_DIM;
@@ -77,23 +83,38 @@ static int evaluate_policy_choice(
         if (actions[1 - slot] < 0) {
             unsigned char kind_mask[2] = {0}, move_mask[4] = {0}, switch_mask[6] = {0};
             int i;
-            for (i = 0; i < 8; ++i) if (greedy->legal[base + i]) kind_mask[0] = move_mask[i % 4] = 1;
-            for (i = 0; i < 6; ++i) if (greedy->legal[base + 8 + i]) kind_mask[1] = switch_mask[i] = 1;
-            probability *= masked_probability(kind_policy, kind_mask, 2, local < 8 ? 0 : 1);
+            for (i = 0; i < 8; ++i) if (legal[base + i]) kind_mask[0] = move_mask[i % 4] = 1;
+            for (i = 0; i < 6; ++i) if (legal[base + 8 + i]) kind_mask[1] = switch_mask[i] = 1;
+            result += log(masked_probability(kind_policy, kind_mask, 2, local < 8 ? 0 : 1));
             if (local < 8) {
-                unsigned char tera_mask[2] = {greedy->legal[base + local % 4], greedy->legal[base + 4 + local % 4]};
-                probability *= masked_probability(move_policy, move_mask, 4, local % 4);
-                probability *= masked_probability(tera_policy, tera_mask, 2, local / 4);
-            } else probability *= masked_probability(switch_policy, switch_mask, 6, local - 8);
+                unsigned char tera_mask[2] = {legal[base + local % 4], legal[base + 4 + local % 4]};
+                result += log(masked_probability(move_policy, move_mask, 4, local % 4));
+                result += log(masked_probability(tera_policy, tera_mask, 2, local / 4));
+            } else result += log(masked_probability(switch_policy, switch_mask, 6, local - 8));
         }
         if (local < 8 && targets) {
             unsigned char mask[FACTORIZED_TARGET_DIM];
             factorized_target_mask_to_array(targets, mask);
-            probability *= masked_probability(target_policy, mask, FACTORIZED_TARGET_DIM, target);
+            if (target < 0 || target >= FACTORIZED_TARGET_DIM || !mask[target]) return 0;
+            result += log(masked_probability(target_policy, mask, FACTORIZED_TARGET_DIM, target));
         }
     }
-    if (!(probability > 0.0) || !isfinite(probability)) return 0;
-    evaluation->score = (float)log(probability);
+    if (isnan(result) || result > 0) return 0;
+    *log_probability = result;
+    return 1;
+}
+
+static int evaluate_policy_choice(
+    const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, TacticalChoiceEvaluation* evaluation, void* context
+) {
+    const GreedyContext* greedy = context;
+    double log_probability;
+    (void)observation;
+    (void)request;
+    if (!policy_choice_log_probability(greedy->policy, greedy->legal, choice, &log_probability) ||
+            !isfinite(log_probability)) return 0;
+    evaluation->score = (float)log_probability;
     return 1;
 }
 

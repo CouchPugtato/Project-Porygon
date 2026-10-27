@@ -1830,3 +1830,10 @@ from PPO, including records with attached training arrays. See
 [the learned-target behavior contract](target_behavior_contract.md) for the
 collection/trainer trace, schema, tests and remaining training decisions.
 This does not enable another collection or training run.
+
+The frozen-target experiment now has a SHA256-pinned, evaluation-only runtime
+launcher, `tools/target_bundle.js`. Its manifest binds reference/actor/sidecar,
+executable, decoder and eligibility without relaxing ordinary loading. See
+[the runtime launch contract](target_behavior_contract.md#manifest-pinned-runtime-launch)
+for the pinned reference smoke command and limitations. It does not collect
+episodes or enable PPO.

@@ -40,6 +40,10 @@ double target_sidecar_gradient(const TargetSidecar* sidecar, const float* hidden
     int slot, int move, unsigned char legal, unsigned char best, float* gradient);
 int target_sidecar_save(const TargetSidecar* sidecar, const char* path);
 TargetSidecar* target_sidecar_load(const char* path, const GruModel* parent);
+/* Explicit experiment boundary: retain the sidecar's original reference
+ * binding and verify the actor's frozen region plus the expected sidecar. */
+TargetSidecar* target_sidecar_load_for_action_actor(const char* path, const GruModel* reference,
+    const GruModel* actor, uint64_t expected_sidecar_fingerprint, const char** failure_reason);
 
 /* The dataset is a bounded binary cache produced by the accepted-label
  * collector. No base-model parameters are updated by this command. */

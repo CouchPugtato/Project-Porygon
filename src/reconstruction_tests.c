@@ -1002,6 +1002,31 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
         if (runtime.count) {
             if (mode >= 4) {
                 EnvSession* session = &runtime.sessions[0];
+                FactorizedPolicySnapshot replay_policy;
+                unsigned char replay_slots = 0;
+                double replay_log_probability;
+                float before_hidden[8];
+                memcpy(before_hidden, session->hidden_state, sizeof(before_hidden));
+                ok &= gru_model_evaluate_policy_snapshot(model, before_hidden, session->observation.legal_mask,
+                    session->pending_factorized_choice.slot0_has_action && session->pending_factorized_choice.slot1_has_action,
+                    &replay_policy, NULL);
+                ok &= assert_true(session->pending_behavior_replayable && target_behavior_log_probability(runtime.target_sidecar,
+                    runtime.target_argmax, runtime.target_slot_local, &replay_policy, before_hidden,
+                    &session->observation, &session->parsed_request, &session->pending_factorized_choice,
+                    &replay_log_probability, &replay_slots) &&
+                    fabs(exp(replay_log_probability - session->pending_behavior_log_prob) - 1) < 1e-12 &&
+                    fabs(replay_log_probability - session->pending_old_log_prob) < 1e-5 &&
+                    replay_slots == session->pending_learned_target_slots &&
+                    !memcmp(before_hidden, session->hidden_state, sizeof(before_hidden)),
+                    "Unchanged bundle likelihood replay gives ratio one without advancing recurrent state");
+                FactorizedActionChoice wrong_mask = session->pending_factorized_choice;
+                if (wrong_mask.slot0_target_mask) wrong_mask.slot0_target_mask ^= 1;
+                else if (wrong_mask.slot1_target_mask) wrong_mask.slot1_target_mask ^= 1;
+                if (memcmp(&wrong_mask, &session->pending_factorized_choice, sizeof(wrong_mask)))
+                    ok &= assert_true(!target_behavior_log_probability(runtime.target_sidecar, runtime.target_argmax,
+                        runtime.target_slot_local, &replay_policy, before_hidden, &session->observation,
+                        &session->parsed_request, &wrong_mask, &replay_log_probability, NULL),
+                        "Replay refuses target masks that disagree with the selected move's public request");
                 FactorizedActionChoice* choice = &session->pending_factorized_choice;
                 float target_log_probability = 0;
                 int slot;
@@ -1065,6 +1090,21 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                     "Audit leaves sampled choices, recurrent state, and RNG unchanged");
             }
         }
+        if (mode == 4) {
+            RuntimeMessage rejected;
+            runtime_message_init(&rejected);
+            rejected.type = RUNTIME_MSG_DECISION;
+            rejected.accepted = 0;
+            rejected.request_id = 17;
+            strcpy(rejected.battle_id, "battle-counterfactual-test");
+            ok &= env_runtime_handle_message(&runtime, &rejected, output);
+            ok &= assert_true(runtime.sessions[0].decision_count == 0 &&
+                runtime.sessions[0].episode.actions[runtime.sessions[0].episode.count - 1] == -1 &&
+                runtime.sessions[0].behavior_supported_decisions == 0 &&
+                runtime.sessions[0].behavior_unsupported_decisions == 0 &&
+                !runtime.sessions[0].pending_behavior_replayable,
+                "Rejected proposals never count as accepted likelihood records and clear pending replay state");
+        }
         if (mode == 1) {
             runtime_message_init(&terminal);
             terminal.type = RUNTIME_MSG_TERMINAL;
@@ -1079,6 +1119,12 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
         }
         if (mode == 2 || mode >= 5) {
             RuntimeMessage accepted;
+            Observation recorded_observation = runtime.sessions[0].observation;
+            ParsedRequest recorded_request = runtime.sessions[0].parsed_request;
+            FactorizedActionChoice recorded_choice = runtime.sessions[0].pending_factorized_choice;
+            float recorded_hidden[8];
+            double recorded_log_probability = runtime.sessions[0].pending_behavior_log_prob;
+            memcpy(recorded_hidden, runtime.sessions[0].hidden_state, sizeof(recorded_hidden));
             runtime_message_init(&accepted);
             accepted.type = RUNTIME_MSG_DECISION;
             accepted.accepted = 1;
@@ -1088,6 +1134,20 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
             accepted.action = runtime.sessions[0].pending_action;
             accepted.action2 = runtime.sessions[0].pending_action2;
             ok &= env_runtime_handle_message(&runtime, &accepted, output);
+            if (mode >= 5) {
+                FactorizedPolicySnapshot replay_policy;
+                double replay_log_probability;
+                ok &= gru_model_evaluate_policy_snapshot(model, recorded_hidden, recorded_observation.legal_mask,
+                    recorded_choice.slot0_has_action && recorded_choice.slot1_has_action, &replay_policy, NULL);
+                ok &= assert_true(target_behavior_log_probability(runtime.target_sidecar, runtime.target_argmax,
+                    runtime.target_slot_local, &replay_policy, recorded_hidden, &recorded_observation,
+                    &recorded_request, &recorded_choice, &replay_log_probability, NULL) &&
+                    fabs(exp(replay_log_probability - recorded_log_probability) - 1) < 1e-12 &&
+                    runtime.sessions[0].behavior_supported_decisions == 1 &&
+                    runtime.sessions[0].behavior_unsupported_decisions == 0 &&
+                    !runtime.sessions[0].pending_behavior_replayable,
+                    "Accepted immutable decision snapshot replays at ratio one after pending state is cleared");
+            }
             runtime_message_init(&terminal);
             terminal.type = RUNTIME_MSG_TERMINAL;
             strcpy(terminal.battle_id, "battle-counterfactual-test");
@@ -1100,7 +1160,7 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                 strstr(line, "\"training_eligible\":false"),
                 "Target intervention retains the original sampled command");
             if (mode >= 5) ok &= assert_true(strstr(line, "\"behavior_policy\":{\"version\":1") &&
-                strstr(line, "\"scope\":\"conditional_targets_only\"") && strstr(line, "\"ppo_ready\":false"),
+                strstr(line, "\"scope\":\"full_turn_diagnostic\"") && strstr(line, "\"ppo_ready\":false"),
                 "Target behavior telemetry names its bundle and incomplete training scope");
             if (mode == 7) ok &= assert_true(strstr(line, "\"target_audit\":{\"version\":2,") &&
                 strstr(line, "\"support_reason\":\"supported\"") && strstr(line, "\"target_scores\":["),
@@ -1263,6 +1323,8 @@ static int test_runtime_handles_recorded_no_choice_requests(void) {
             EnvSession* session = &runtime.sessions[0];
             if (mode >= 4) ok &= assert_true(!session->pending_learned_targets,
                 "status and revival fallbacks do not use learned target decoding");
+            if (mode >= 4) ok &= assert_true(session->pending_behavior_replayable &&
+                isfinite(session->pending_behavior_log_prob), "Recorded single-slot status and revival choices have finite replay likelihoods");
             ok &= assert_true(command_to_factorized_request_choice(session->pending_command,
                 &session->parsed_request, &decoded) && !decoded.slot0_has_action && decoded.slot1_has_action,
                 "runtime command roundtrips the right active slot");
@@ -1281,6 +1343,36 @@ static int test_runtime_handles_recorded_no_choice_requests(void) {
     }
     remove("test_fallback_context.tmp");
     gru_model_destroy(model);
+    return ok;
+}
+
+static int test_scarce_bench_likelihood_abstains(void) {
+    /* Run 0313, sampled case 1, request 349: two replacements, one survivor. */
+    const char* payload = "{\"forceSwitch\":[true,true],\"side\":{\"pokemon\":["
+        "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91\",\"condition\":\"0 fnt\",\"active\":true},"
+        "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77\",\"condition\":\"0 fnt\",\"active\":true},"
+        "{\"ident\":\"p1: C\",\"details\":\"Terrakion, L78\",\"condition\":\"270/270\",\"active\":false}]}}";
+    GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    EnvRuntime runtime = {0};
+    FILE* out = tmpfile();
+    int ok = model && out && save_context_runtime_fixture(model, "test_scarce_bench_context.tmp");
+    if (ok) ok = env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "fixture.chk") &&
+        env_runtime_enable_target_sidecar(&runtime, "test_scarce_bench_context.tmp") &&
+        env_runtime_enable_target_argmax(&runtime) && env_runtime_enable_target_slot_local(&runtime) &&
+        send_counterfactual_test_request(&runtime, out, payload);
+    if (ok) {
+        EnvSession* session = &runtime.sessions[0];
+        char line[4096];
+        ok &= assert_true(!session->pending_behavior_replayable &&
+            strcmp(session->pending_command, "/choose switch 3, pass") == 0,
+            "Scarce-bench validation keeps its legal command but does not invent a sampled final-action likelihood");
+        rewind(out);
+        ok &= assert_true(fgets(line, sizeof(line), out) && strstr(line, "\"full_turn_log_probability\":null") &&
+            strstr(line, "\"likelihood_status\":\"unsupported\""), "Remapped choice exposes diagnostic abstention");
+    }
+    env_runtime_free(&runtime);
+    if (out) fclose(out);
+    remove("test_scarce_bench_context.tmp"); gru_model_destroy(model);
     return ok;
 }
 
@@ -6619,6 +6711,391 @@ cleanup:
     return ok;
 }
 
+static int action_head_frozen_parameters_match(const GruModel* model, const float* before, const float* after) {
+    size_t h = gru_model_hidden_dim(model), input = gru_model_input_dim(model);
+    size_t count = gru_model_parameter_count(model);
+    unsigned char* trainable = calloc(count, 1);
+    if (!trainable) return 0;
+    /* Independent export-layout check: only action heads and their derived
+     * legacy flat cache may change. The entity encoder/value tail stays frozen. */
+    size_t offset = 3 * (h * input + h * h + h);
+    size_t flat = OBS_NUM_ACTIONS * (h + 1), local = 14 * (h + 1), targets = 4 * (h + 1);
+    memset(trainable + offset, 1, flat); offset += flat;
+    memset(trainable + offset, 1, local); offset += local + targets;
+    memset(trainable + offset, 1, local); offset += local + targets;
+    memset(trainable + offset, 1, FACTORIZED_PAIR_DIM * (h + 1));
+    int ok = 1;
+    size_t i;
+    for (i = 0; i < count; ++i) if (!trainable[i] && memcmp(before + i, after + i, sizeof(float))) { ok = 0; break; }
+    free(trainable);
+    return assert_true(ok, "Every frozen recurrent, target, entity encoder/decoder and value parameter remains byte-identical");
+}
+
+static int test_action_head_only_update_directions(void) {
+    int mode, sign, ok = 1;
+    for (mode = 0; mode < 3; ++mode) for (sign = -1; sign <= 1; sign += 2) {
+        srand(31401);
+        GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+        GruActionHeadOptimizer* optimizer = gru_action_head_optimizer_create(model);
+        size_t count = gru_model_parameter_count(model);
+        float* before = malloc(count * sizeof(float)), *after = malloc(count * sizeof(float));
+        float hidden[8] = {.2f, -.3f, .1f, .4f}, hidden_copy[8];
+        FactorizedActionChoice choice, action_only;
+        FactorizedPolicySnapshot policy;
+        unsigned char legal[OBS_NUM_ACTIONS] = {0};
+        double before_log = NAN, after_log = NAN;
+        memcpy(hidden_copy, hidden, sizeof(hidden));
+        if (!model || !optimizer || !before || !after) ok = 0;
+        int slot;
+        for (slot = 0; slot < 2; ++slot) if (!mode || slot == mode - 1) {
+            int base = slot * 14;
+            legal[base] = legal[base + 1] = legal[base + 4] = legal[base + 5] = legal[base + 8] = legal[base + 9] = 1;
+        }
+        factorized_action_choice_from_flat_actions(&choice, mode == 2 ? -1 : (mode == 1 ? 8 : 0), mode == 1 ? -1 : (mode == 2 ? 18 : 15));
+        choice.slot0_target_mask = choice.slot1_target_mask = 12;
+        choice.slot0_target_index = choice.slot1_target_index = 2;
+        action_only = choice; action_only.slot0_target_mask = action_only.slot1_target_mask = 0;
+        if (ok) ok &= gru_model_export_parameters(model, before, count) &&
+            gru_model_evaluate_policy_snapshot(model, hidden, legal, mode == 0, &policy, NULL) &&
+            policy_choice_log_probability(&policy, legal, &action_only, &before_log) &&
+            gru_action_head_accumulate_hidden(optimizer, hidden, legal, &choice, (float)sign);
+        if (ok) {
+            ok &= assert_true(!gru_action_head_accumulate_hidden(optimizer, hidden, legal, &choice, NAN) &&
+                !gru_action_head_apply_adam(optimizer, .001f, 1, .999f, 1e-8f, 1),
+                "Invalid scoped samples/settings are rejected before applying a queued valid update");
+            ok &= gru_action_head_apply_adam(optimizer, .001f, .9f, .999f, 1e-8f, 1) &&
+                gru_model_evaluate_policy_snapshot(model, hidden, legal, mode == 0, &policy, NULL) &&
+                policy_choice_log_probability(&policy, legal, &action_only, &after_log) &&
+                gru_model_export_parameters(model, after, count);
+            ok &= assert_true(sign > 0 ? after_log > before_log : after_log < before_log,
+                "Signed action-head update moves joint or single-slot action probability in the expected direction");
+            ok &= action_head_frozen_parameters_match(model, before, after);
+            if (mode == 0) {
+                size_t pair_offset = 3 * (8 * observation_flat_size() + 8 * 8 + 8) +
+                    OBS_NUM_ACTIONS * 9 + 2 * (14 + 4) * 9;
+                ok &= assert_true(memcmp(before + pair_offset, after + pair_offset,
+                    FACTORIZED_PAIR_DIM * 9 * sizeof(float)) != 0, "Dual-action updates train the joint-pair coordination head");
+            }
+            ok &= assert_true(!memcmp(hidden, hidden_copy, sizeof(hidden)), "Head-only updates do not advance or mutate supplied hidden state");
+        }
+        free(before); free(after); gru_action_head_optimizer_free(optimizer); gru_model_destroy(model);
+        if (!ok) return 0;
+    }
+    return ok;
+}
+
+static int test_action_head_optimizer_isolates_existing_momentum(void) {
+    srand(31402);
+    GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    GruModel* control = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    size_t count = gru_model_parameter_count(model);
+    float* before = malloc(count * sizeof(float)), *after = malloc(count * sizeof(float));
+    float hidden[8] = {.2f, -.3f, .1f, .4f};
+    unsigned char legal[OBS_NUM_ACTIONS] = {0};
+    FactorizedActionChoice choice;
+    int ok = model && control && before && after;
+    legal[0] = legal[1] = legal[14] = legal[15] = 1;
+    factorized_action_choice_from_flat_actions(&choice, 0, 15);
+    choice.slot0_target_mask = choice.slot1_target_mask = 12;
+    choice.slot0_target_index = choice.slot1_target_index = 2;
+    if (ok) ok &= gru_model_export_parameters(model, before, count) && gru_model_import_parameters(control, before, count);
+    GruModel* models[2] = {model, control};
+    int index;
+    for (index = 0; ok && index < 2; ++index) ok &=
+        gru_model_accumulate_factorized_preference_hidden(models[index], NULL, hidden, legal, &choice, &choice, 0, 1, 0) &&
+        gru_model_critic_head_accumulate_hidden(models[index], hidden, 1, NULL) &&
+        gru_model_apply_accumulated_adam_updates(models[index], .001f, .9f, .999f, 1e-8f, 1);
+    GruActionHeadOptimizer* optimizer = gru_action_head_optimizer_create(model);
+    if (!optimizer) ok = 0;
+    if (ok) {
+        ok &= gru_model_export_parameters(model, before, count) &&
+            gru_action_head_accumulate_hidden(optimizer, hidden, legal, &choice, 0) &&
+            gru_action_head_apply_adam(optimizer, .001f, .9f, .999f, 1e-8f, 1) &&
+            gru_model_export_parameters(model, after, count);
+        ok &= assert_true(!memcmp(before, after, count * sizeof(float)),
+            "Fresh scoped optimizer does not inherit any broader Adam momentum");
+        float target_before[36], target_after[36];
+        ok &= gru_model_export_target_head(control, 0, target_before, 36) &&
+            gru_model_accumulate_factorized_preference_hidden(control, NULL, hidden, legal, &choice, &choice, 0, 0, 0) &&
+            gru_model_apply_accumulated_policy_adam_updates(control, .001f, .9f, .999f, 1e-8f, 1) &&
+            gru_model_export_target_head(control, 0, target_after, 36);
+        ok &= assert_true(memcmp(target_before, target_after, sizeof(target_before)) != 0,
+            "Control demonstrates that existing target momentum would move frozen targets despite zero current target gradients");
+        /* Give this optimizer its own momentum, and queue unrelated gradients
+         * in the broader trainer before another scoped step. */
+        ok &= gru_action_head_accumulate_hidden(optimizer, hidden, legal, &choice, 1) &&
+            gru_action_head_apply_adam(optimizer, .001f, .9f, .999f, 1e-8f, 1) &&
+            gru_model_critic_head_accumulate_hidden(model, hidden, -1, NULL) &&
+            gru_action_head_accumulate_hidden(optimizer, hidden, legal, &choice, 0) &&
+            gru_action_head_apply_adam(optimizer, .001f, .9f, .999f, 1e-8f, 1) &&
+            gru_model_export_parameters(model, after, count);
+        ok &= assert_true(memcmp(before, after, count * sizeof(float)) != 0, "Scoped action momentum still updates its allowed parameters");
+        ok &= action_head_frozen_parameters_match(model, before, after);
+    }
+    gru_action_head_optimizer_free(optimizer); free(before); free(after);
+    gru_model_destroy(control); gru_model_destroy(model);
+    return ok;
+}
+
+static int test_action_head_update_preserves_target_function(void) {
+    srand(31403);
+    GruModel* reference = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    GruModel* actor = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    size_t count = gru_model_parameter_count(reference);
+    float* parameters = malloc(count * sizeof(float)), *after = malloc(count * sizeof(float));
+    EnvRuntime runtime = {0};
+    FILE* out = tmpfile();
+    int mode, attack_slot, ok = reference && actor && parameters && after && out;
+    if (ok) ok &= gru_model_export_parameters(reference, parameters, count) &&
+        save_context_runtime_fixture(reference, "test_frozen_action_targets.tmp");
+    for (mode = 0; ok && mode < 2; ++mode) for (attack_slot = 0; ok && attack_slot < 2; ++attack_slot) {
+        ok &= gru_model_import_parameters(actor, parameters, count) &&
+            env_runtime_init(&runtime, reference, NULL, 0, ENV_REWARD_TERMINAL, NULL, "reference.chk") &&
+            env_runtime_enable_target_sidecar(&runtime, "test_frozen_action_targets.tmp") &&
+            env_runtime_enable_target_argmax(&runtime);
+        if (mode) ok &= env_runtime_enable_target_slot_local(&runtime);
+        if (ok) ok &= send_counterfactual_test_state(&runtime, out);
+        GruActionHeadOptimizer* optimizer = gru_action_head_optimizer_create(actor);
+        if (!optimizer || !ok) { gru_action_head_optimizer_free(optimizer); break; }
+        EnvSession* session = &runtime.sessions[0];
+        FactorizedPolicySnapshot before_policy = {0}, after_policy = {0};
+        FactorizedActionChoice choice, action_only;
+        factorized_action_choice_from_flat_actions(&choice, attack_slot ? 0 : 1, attack_slot ? 15 : 14);
+        choice.slot0_target_mask = build_move_target_mask(&session->parsed_request, 0, choice.slot0_move_index);
+        choice.slot1_target_mask = build_move_target_mask(&session->parsed_request, 1, choice.slot1_move_index);
+        ok &= gru_model_evaluate_policy_snapshot(actor, session->hidden_state, session->observation.legal_mask, 1, &before_policy, NULL);
+        int slot;
+        for (slot = 0; slot < 2; ++slot) {
+            unsigned char legal = slot ? choice.slot1_target_mask : choice.slot0_target_mask;
+            float targets[4];
+            memcpy(targets, slot ? before_policy.slot1_target_policy : before_policy.slot0_target_policy, sizeof(targets));
+            if (!legal) continue;
+            if (mode && slot == attack_slot) {
+                TargetContext context;
+                target_context_collect(&session->observation, &session->parsed_request, &choice, slot, &context);
+                ok &= target_sidecar_predict_context(runtime.target_sidecar, session->hidden_state, slot, 1, legal, &context, targets);
+            }
+            int selected = policy_decode_target_argmax(targets, legal);
+            if (slot) choice.slot1_target_index = (unsigned char)selected;
+            else choice.slot0_target_index = (unsigned char)selected;
+        }
+        action_only = choice; action_only.slot0_target_mask = action_only.slot1_target_mask = 0;
+        double old_bundle = NAN, new_bundle = NAN, old_action = NAN, new_action = NAN;
+        unsigned char old_sources = 0, new_sources = 0;
+        uint64_t sidecar_before = target_sidecar_fingerprint(runtime.target_sidecar);
+        ok &= target_behavior_log_probability(runtime.target_sidecar, 1, mode, &before_policy, session->hidden_state,
+            &session->observation, &session->parsed_request, &choice, &old_bundle, &old_sources) &&
+            policy_choice_log_probability(&before_policy, session->observation.legal_mask, &action_only, &old_action) &&
+            gru_action_head_accumulate_hidden(optimizer, session->hidden_state, session->observation.legal_mask, &choice, 1) &&
+            gru_action_head_apply_adam(optimizer, .001f, .9f, .999f, 1e-8f, 1) &&
+            gru_model_evaluate_policy_snapshot(actor, session->hidden_state, session->observation.legal_mask, 1, &after_policy, NULL) &&
+            target_behavior_log_probability(runtime.target_sidecar, 1, mode, &after_policy, session->hidden_state,
+                &session->observation, &session->parsed_request, &choice, &new_bundle, &new_sources) &&
+            policy_choice_log_probability(&after_policy, session->observation.legal_mask, &action_only, &new_action);
+        ok &= assert_true(new_action > old_action && old_sources == new_sources &&
+            old_sources == (mode ? (1u << attack_slot) : 0) &&
+            fabs((new_bundle - old_bundle) - (new_action - old_action)) < 1e-6 &&
+            !memcmp(before_policy.slot0_target_policy, after_policy.slot0_target_policy, 4 * sizeof(float)) &&
+            !memcmp(before_policy.slot1_target_policy, after_policy.slot1_target_policy, 4 * sizeof(float)) &&
+            sidecar_before == target_sidecar_fingerprint(runtime.target_sidecar),
+            "Action probabilities improve while sidecar eligibility, argmax targets and sampled checkpoint fallback stay fixed");
+        float reference_hidden[8], actor_hidden[8], reference_value, actor_value;
+        gru_model_forward_step(reference, session->flat_observation, session->hidden_state, reference_hidden, NULL, &reference_value);
+        gru_model_forward_step(actor, session->flat_observation, session->hidden_state, actor_hidden, NULL, &actor_value);
+        ok &= assert_true(!memcmp(reference_hidden, actor_hidden, sizeof(reference_hidden)) &&
+            !memcmp(&reference_value, &actor_value, sizeof(reference_value)),
+            "Updated action heads preserve the next recurrent state and frozen value prediction");
+        ok &= gru_model_export_parameters(actor, after, count) && action_head_frozen_parameters_match(actor, parameters, after);
+        gru_action_head_optimizer_free(optimizer); env_runtime_free(&runtime);
+    }
+    env_runtime_free(&runtime);
+    if (out) fclose(out);
+    remove("test_frozen_action_targets.tmp");
+    free(parameters); free(after); gru_model_destroy(actor); gru_model_destroy(reference);
+    return ok;
+}
+
+static int test_action_actor_bundle_compatibility(void) {
+    srand(31501);
+    GruModel* reference = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    GruModel* actor = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    size_t count = gru_model_parameter_count(reference);
+    float* parameters = malloc(count * sizeof(float));
+    TargetSidecar* expected = NULL;
+    GruActionHeadOptimizer* optimizer = NULL;
+    const char* reason = NULL;
+    int ok = reference && actor && parameters;
+    if (ok) ok &= gru_model_export_parameters(reference, parameters, count) &&
+        gru_model_import_parameters(actor, parameters, count) && save_context_runtime_fixture(reference, "test_action_bundle_context.tmp");
+    if (ok) expected = target_sidecar_load("test_action_bundle_context.tmp", reference);
+    if (!expected) ok = 0;
+    if (ok) {
+        ok &= assert_true(!gru_model_action_head_compatibility_reason(reference, actor), "Unchanged reference actor is compatible");
+        optimizer = gru_action_head_optimizer_create(actor);
+        float hidden[8] = {.2f, -.3f, .1f, .4f};
+        unsigned char legal[OBS_NUM_ACTIONS];
+        FactorizedActionChoice choice;
+        memset(legal, 1, sizeof(legal));
+        factorized_action_choice_from_flat_actions(&choice, 0, 15);
+        ok &= optimizer && gru_action_head_accumulate_hidden(optimizer, hidden, legal, &choice, 1) &&
+            gru_action_head_apply_adam(optimizer, .001f, .9f, .999f, 1e-8f, 1);
+    }
+    if (ok) {
+        uint64_t reference_identity = target_parent_fingerprint(reference), actor_identity = target_parent_fingerprint(actor);
+        uint64_t sidecar_identity = target_sidecar_fingerprint(expected);
+        int next_random;
+        srand(31502); next_random = rand(); srand(31502);
+        TargetSidecar* bundle = target_sidecar_load_for_action_actor("test_action_bundle_context.tmp", reference, actor, sidecar_identity, &reason);
+        ok &= assert_true(bundle && !reason && reference_identity != actor_identity &&
+            bundle->parent_fingerprint == reference_identity && target_sidecar_fingerprint(bundle) == sidecar_identity &&
+            target_parent_fingerprint(reference) == reference_identity && target_parent_fingerprint(actor) == actor_identity &&
+            rand() == next_random, "Explicit bundle load accepts scoped updates without rebinding, mutation or RNG consumption");
+        target_sidecar_free(bundle);
+        {
+            EnvRuntime runtime = {0};
+            FILE* output = tmpfile();
+            char identity[17], manifest[65], line[4096];
+            snprintf(identity, sizeof(identity), "%016llx", (unsigned long long)sidecar_identity);
+            memset(manifest, 'a', 64); manifest[64] = 0;
+            ok &= output && env_runtime_init(&runtime, actor, NULL, 0, ENV_REWARD_TERMINAL, NULL, "updated-actor.chk");
+            if (output) {
+                ok &= assert_true(!env_runtime_enable_action_actor_bundle(&runtime, reference, "test_action_bundle_context.tmp", identity, "invalid") &&
+                    !runtime.target_sidecar, "Malformed manifest identity cannot partially configure a runtime bundle");
+                ok &= env_runtime_enable_action_actor_bundle(&runtime, reference, "test_action_bundle_context.tmp", identity, manifest) &&
+                    env_runtime_enable_target_argmax(&runtime) && env_runtime_enable_target_slot_local(&runtime);
+                runtime.target_bundle_records = 1;
+                ok &= send_counterfactual_test_state(&runtime, output);
+                rewind(output);
+                ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "\"kind\":\"frozen-target-action-actor-v1\"") &&
+                    strstr(line, "\"reference_parameters\":") && strstr(line, "\"actor_parameters\":") &&
+                    strstr(line, manifest) && strstr(line, "\"training_eligible\":false") &&
+                    runtime.target_actor_fingerprint == actor_identity &&
+                    runtime.target_sidecar->parent_fingerprint == reference_identity,
+                    "Updated-actor runtime retains distinct actor/reference identities and the pinned manifest, without training eligibility");
+                ok &= assert_true(!fgets(line, sizeof(line), output), "Proposed choices emit no accepted snapshot");
+                fseek(output, 0, SEEK_END);
+                EnvSession* session = &runtime.sessions[0];
+                RuntimeMessage accepted;
+                runtime_message_init(&accepted);
+                accepted.type = RUNTIME_MSG_DECISION; accepted.accepted = 1; accepted.request_id = 17;
+                strcpy(accepted.battle_id, session->battle_id);
+                strcpy(accepted.command, session->pending_command);
+                accepted.action = session->pending_action; accepted.action2 = session->pending_action2;
+                uint32_t first_hidden_bits;
+                memcpy(&first_hidden_bits, session->hidden_state, sizeof(first_hidden_bits));
+                char first_hidden_hex[9];
+                snprintf(first_hidden_hex, sizeof(first_hidden_hex), "%08x", (unsigned)first_hidden_bits);
+                long snapshot_offset = ftell(output);
+                ok &= env_runtime_handle_message(&runtime, &accepted, output);
+                fseek(output, snapshot_offset, SEEK_SET);
+                ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "\"type\":\"bundle_decision\"") &&
+                    strstr(line, "\"hidden_f32_hex\":") && strstr(line, first_hidden_hex) &&
+                    strstr(line, "\"public_context\":") && strstr(line, "\"full_turn_log_probability\":") &&
+                    strstr(line, "\"training_eligible\":false") && session->decision_count == 1 &&
+                    !session->pending_command[0], "Accepted bundle snapshot preserves frozen hidden bits, context and likelihood after clearing pending state");
+                fseek(output, 0, SEEK_END);
+                long completed_size = ftell(output);
+                ok &= assert_true(!env_runtime_handle_message(&runtime, &accepted, output) && ftell(output) == completed_size &&
+                    session->decision_count == 1, "Duplicate acceptance cannot append another bundle snapshot");
+                accepted.accepted = 0;
+                ok &= assert_true(env_runtime_handle_message(&runtime, &accepted, output) && ftell(output) == completed_size,
+                    "Rejected choices append no accepted snapshot");
+                env_runtime_free(&runtime); fclose(output);
+            }
+        }
+        bundle = target_sidecar_load("test_action_bundle_context.tmp", actor);
+        ok &= assert_true(!bundle, "Historical sidecar loader still rejects the updated full checkpoint");
+        target_sidecar_free(bundle);
+        bundle = target_sidecar_load_for_action_actor("test_action_bundle_context.tmp", reference, actor, 0, &reason);
+        ok &= assert_true(!bundle && reason && !strcmp(reason, "missing_sidecar_identity"), "Bundle cannot omit its expected sidecar identity");
+        target_sidecar_free(bundle);
+        expected->weights[0] += 1;
+        ok &= target_sidecar_save(expected, "test_action_bundle_wrong.tmp");
+        bundle = target_sidecar_load_for_action_actor("test_action_bundle_wrong.tmp", reference, actor, sidecar_identity, &reason);
+        ok &= assert_true(!bundle && reason && !strcmp(reason, "sidecar_identity"), "A valid same-parent but different sidecar is rejected");
+        target_sidecar_free(bundle);
+        GruModel* other_parent = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+        TargetSidecar* other_sidecar = target_sidecar_create(other_parent);
+        ok &= other_sidecar && target_sidecar_save(other_sidecar, "test_action_bundle_wrong.tmp");
+        bundle = target_sidecar_load_for_action_actor("test_action_bundle_wrong.tmp", reference, actor, sidecar_identity, &reason);
+        ok &= assert_true(!bundle && reason && !strcmp(reason, "sidecar_load_or_binding"), "A different-parent sidecar fails the original binding check");
+        target_sidecar_free(bundle); target_sidecar_free(other_sidecar); gru_model_destroy(other_parent);
+
+        struct { size_t offset; const char* reason; } mutations[18];
+        size_t offset = 0, index = 0, gate;
+#define FROZEN_REGION(length, label) do { mutations[index].offset = offset; mutations[index++].reason = (label); offset += (length); } while (0)
+        for (gate = 0; gate < 3; ++gate) {
+            FROZEN_REGION(8 * observation_flat_size(), "recurrent_parameters");
+            FROZEN_REGION(8 * 8, "recurrent_parameters");
+            FROZEN_REGION(8, "recurrent_parameters");
+        }
+        size_t flat_offset = offset;
+        offset += OBS_NUM_ACTIONS * 9;
+        size_t action_offset = offset;
+        offset += 14 * 9;
+        FROZEN_REGION(4 * 8, "target_parameters"); FROZEN_REGION(4, "target_parameters");
+        offset += 14 * 9;
+        FROZEN_REGION(4 * 8, "target_parameters"); FROZEN_REGION(4, "target_parameters");
+        offset += FACTORIZED_PAIR_DIM * 9;
+        FROZEN_REGION(GRU_ENTITY_EMBED_DIM * OBS_POKEMON_FEATURES, "entity_parameters");
+        FROZEN_REGION(GRU_ENTITY_EMBED_DIM, "entity_parameters");
+        FROZEN_REGION(OBS_POKEMON_FEATURES * GRU_ENTITY_EMBED_DIM, "entity_parameters");
+        FROZEN_REGION(8, "value_parameters"); FROZEN_REGION(1, "value_parameters");
+#undef FROZEN_REGION
+        ok &= assert_true(index == 18 && offset == count, "Compatibility mutations cover each exported frozen parameter region");
+        ok &= gru_model_export_parameters(actor, parameters, count);
+        for (index = 0; ok && index < 18; ++index) {
+            float saved = parameters[mutations[index].offset];
+            parameters[mutations[index].offset] += .125f;
+            ok &= gru_model_import_parameters(actor, parameters, count);
+            reason = gru_model_action_head_compatibility_reason(reference, actor);
+            ok &= assert_true(reason && !strcmp(reason, mutations[index].reason), "Frozen-region mutation is rejected with the matching diagnostic");
+            bundle = target_sidecar_load_for_action_actor("test_action_bundle_context.tmp", reference, actor, sidecar_identity, &reason);
+            ok &= assert_true(!bundle && reason && !strcmp(reason, mutations[index].reason), "Bundle load enforces each frozen-region rejection");
+            target_sidecar_free(bundle);
+            parameters[mutations[index].offset] = saved;
+        }
+        ok &= gru_model_import_parameters(actor, parameters, count);
+        float saved = parameters[flat_offset]; parameters[flat_offset] += .125f;
+        ok &= gru_model_import_parameters(actor, parameters, count);
+        reason = gru_model_action_head_compatibility_reason(reference, actor);
+        ok &= assert_true(reason && !strcmp(reason, "flat_policy_cache"), "Arbitrary flat-cache changes cannot masquerade as derived action updates");
+        parameters[flat_offset] = saved;
+        saved = parameters[action_offset]; parameters[action_offset] = NAN;
+        ok &= gru_model_import_parameters(actor, parameters, count);
+        reason = gru_model_action_head_compatibility_reason(reference, actor);
+        ok &= assert_true(reason && !strcmp(reason, "nonfinite_parameters"), "Even allowlisted action parameters must remain finite");
+        parameters[action_offset] = saved;
+        ok &= gru_model_import_parameters(actor, parameters, count);
+        int dimension;
+        for (dimension = 0; dimension < 3; ++dimension) {
+            GruModel* wrong = gru_model_create(dimension == 0 ? 4 : observation_flat_size(),
+                dimension == 1 ? 9 : 8, dimension == 2 ? OBS_NUM_ACTIONS + 1 : OBS_NUM_ACTIONS);
+            reason = gru_model_action_head_compatibility_reason(reference, wrong);
+            ok &= assert_true(wrong && reason && !strcmp(reason, "model_dimensions"), "Input, hidden and action dimensions must match");
+            gru_model_destroy(wrong);
+        }
+        ok &= assert_true(!gru_model_action_head_compatibility_reason(reference, actor), "Negative compatibility checks leave the valid actor recoverable");
+        float* legacy = malloc(count * sizeof(float));
+        if (!legacy) ok = 0;
+        if (legacy) {
+            ok &= gru_model_export_parameters(reference, legacy, count);
+            float reference_cache = legacy[flat_offset];
+            legacy[flat_offset] += .125f;
+            ok &= gru_model_import_parameters(reference, legacy, count) && gru_model_import_parameters(actor, legacy, count);
+            ok &= assert_true(!gru_model_action_head_compatibility_reason(reference, actor),
+                "Identical legacy reference/actor remains compatible without normalizing its historical flat cache");
+            legacy[flat_offset] = reference_cache;
+            ok &= gru_model_import_parameters(reference, legacy, count) && gru_model_import_parameters(actor, parameters, count);
+            free(legacy);
+        }
+    }
+    gru_action_head_optimizer_free(optimizer); target_sidecar_free(expected); free(parameters);
+    gru_model_destroy(actor); gru_model_destroy(reference);
+    remove("test_action_bundle_context.tmp"); remove("test_action_bundle_wrong.tmp");
+    return ok;
+}
+
 static int test_validation_split_is_stable_and_seeded(void) {
     uint64_t expected = UINT64_C(5406646322143240280);
     if (!assert_true(validation_split_hash("battle-4", 1337u) == expected,
@@ -6871,6 +7348,10 @@ int main(int argc, char** argv) {
     if (!test_supervised_overfit_diagnostic_learns()) return 1;
     if (!test_real_batch_ppo_update_audit_tracks_actor_direction()) return 1;
     if (!test_ppo_update_moves_policy_and_value_in_expected_directions()) return 1;
+    if (!test_action_head_only_update_directions()) return 1;
+    if (!test_action_head_optimizer_isolates_existing_momentum()) return 1;
+    if (!test_action_head_update_preserves_target_function()) return 1;
+    if (!test_action_actor_bundle_compatibility()) return 1;
     if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
     if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
     if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;
@@ -6990,6 +7471,7 @@ int main(int argc, char** argv) {
     if (!test_tactical_audit_preserves_sampled_runtime()) return 1;
     if (!test_slot_local_target_runtime()) return 1;
     if (!test_runtime_handles_recorded_no_choice_requests()) return 1;
+    if (!test_scarce_bench_likelihood_abstains()) return 1;
     printf("reconstruction tests passed\n");
     return 0;
 }

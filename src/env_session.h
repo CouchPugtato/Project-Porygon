@@ -60,6 +60,10 @@ typedef struct {
     int pending_learned_targets;
     unsigned char pending_learned_target_slots;
     float pending_target_distribution[2][4];
+    int pending_behavior_replayable;
+    double pending_behavior_log_prob;
+    size_t behavior_supported_decisions;
+    size_t behavior_unsupported_decisions;
     size_t learned_target_decisions;
     int pending_counterfactual;
     int pending_counterfactual_rank;
@@ -93,6 +97,9 @@ typedef struct {
     int target_slot_local;
     uint64_t target_parent_fingerprint;
     uint64_t target_sidecar_fingerprint;
+    uint64_t target_actor_fingerprint;
+    char target_bundle_manifest_sha256[65];
+    int target_bundle_records;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;
@@ -118,6 +125,9 @@ int env_runtime_enable_tactical_audit(EnvRuntime* runtime);
 int env_runtime_enable_tactical_targets(EnvRuntime* runtime);
 int env_runtime_enable_target_labels(EnvRuntime* runtime);
 int env_runtime_enable_target_sidecar(EnvRuntime* runtime, const char* path);
+int env_runtime_enable_action_actor_bundle(EnvRuntime* runtime, const GruModel* reference,
+    const char* sidecar_path, const char* sidecar_identity, const char* manifest_sha256);
+void env_runtime_write_target_identity(const EnvRuntime* runtime, FILE* out);
 int env_runtime_enable_target_argmax(EnvRuntime* runtime);
 int env_runtime_enable_target_audit(EnvRuntime* runtime);
 int env_runtime_enable_target_slot_local(EnvRuntime* runtime);

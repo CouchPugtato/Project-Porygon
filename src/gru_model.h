@@ -15,6 +15,7 @@
 #define GRU_ENTITY_EMBED_DIM 32
 
 typedef struct GruModel GruModel;
+typedef struct GruActionHeadOptimizer GruActionHeadOptimizer;
 
 typedef struct {
     float joint_policy[FACTORIZED_JOINT_DIM];
@@ -242,6 +243,18 @@ int gru_model_apply_accumulated_policy_adam_updates(
     float epsilon,
     float gradient_clip
 );
+/* Diagnostic-only action-head update boundary. The model must outlive this
+ * state. Gradients/moments are separate from ordinary trainer state; targets,
+ * encoder, recurrence and value parameters are never optimizer destinations. */
+GruActionHeadOptimizer* gru_action_head_optimizer_create(GruModel* model);
+void gru_action_head_optimizer_free(GruActionHeadOptimizer* optimizer);
+int gru_action_head_accumulate_hidden(GruActionHeadOptimizer* optimizer, const float* hidden,
+    const unsigned char* legal, const FactorizedActionChoice* choice, float advantage);
+int gru_action_head_apply_adam(GruActionHeadOptimizer* optimizer, float learning_rate,
+    float beta1, float beta2, float epsilon, float gradient_clip);
+/* NULL on compatibility, otherwise a stable diagnostic reason. Read-only;
+ * changed actors must have a correctly derived legacy flat-policy cache. */
+const char* gru_model_action_head_compatibility_reason(const GruModel* reference, const GruModel* actor);
 void gru_model_clear_accumulated_supervised_updates(GruModel* model);
 int gru_model_policy_gradient_update_heads(
     GruModel* model,

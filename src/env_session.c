@@ -9,6 +9,7 @@
 #include "target_sidecar.h"
 #include "target_audit.h"
 #include "target_behavior.h"
+#include "target_records.h"
 #include "policy_decoding.h"
 
 #include <math.h>
@@ -542,13 +543,44 @@ int env_runtime_enable_target_labels(EnvRuntime* runtime) {
     return 1;
 }
 
-int env_runtime_enable_target_sidecar(EnvRuntime* runtime, const char* path) {
-    if (!runtime || runtime->target_sidecar || runtime->target_labels || runtime->replay_only || runtime->count ||
+static int can_enable_target_sidecar(const EnvRuntime* runtime) {
+    return runtime && !(runtime->target_sidecar || runtime->target_labels || runtime->replay_only || runtime->count ||
             runtime->tactical_teacher || runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets ||
-            runtime->counterfactual_decision_index >= 0) return 0;
+            runtime->counterfactual_decision_index >= 0);
+}
+
+int env_runtime_enable_target_sidecar(EnvRuntime* runtime, const char* path) {
+    if (!can_enable_target_sidecar(runtime)) return 0;
     runtime->target_sidecar = target_sidecar_load(path, runtime->model);
     runtime->target_sidecar_fingerprint = target_sidecar_fingerprint(runtime->target_sidecar);
     return runtime->target_sidecar != NULL;
+}
+
+int env_runtime_enable_action_actor_bundle(EnvRuntime* runtime, const GruModel* reference,
+    const char* sidecar_path, const char* sidecar_identity, const char* manifest_sha256
+) {
+    if (!can_enable_target_sidecar(runtime) || !reference || !sidecar_identity || strlen(sidecar_identity) != 16 ||
+            strspn(sidecar_identity, "0123456789abcdef") != 16 || !manifest_sha256 || strlen(manifest_sha256) != 64 ||
+            strspn(manifest_sha256, "0123456789abcdef") != 64) return 0;
+    uint64_t identity = (uint64_t)strtoull(sidecar_identity, NULL, 16);
+    TargetSidecar* sidecar = target_sidecar_load_for_action_actor(sidecar_path, reference, runtime->model, identity, NULL);
+    if (!sidecar || !sidecar->contextual) { target_sidecar_free(sidecar); return 0; }
+    uint64_t actor = target_parent_fingerprint(runtime->model);
+    if (!actor) { target_sidecar_free(sidecar); return 0; }
+    runtime->target_sidecar = sidecar;
+    runtime->target_sidecar_fingerprint = identity;
+    runtime->target_actor_fingerprint = actor;
+    memcpy(runtime->target_bundle_manifest_sha256, manifest_sha256, 65);
+    return 1;
+}
+
+void env_runtime_write_target_identity(const EnvRuntime* runtime, FILE* out) {
+    if (runtime->target_bundle_manifest_sha256[0]) target_action_bundle_identity_write(out,
+        runtime->target_sidecar->parent_fingerprint, runtime->target_actor_fingerprint,
+        runtime->target_sidecar_fingerprint, runtime->target_argmax, runtime->target_slot_local,
+        runtime->target_bundle_manifest_sha256);
+    else target_behavior_identity_write(out, runtime->target_sidecar->parent_fingerprint,
+        runtime->target_sidecar_fingerprint, runtime->target_sidecar->contextual, runtime->target_argmax, runtime->target_slot_local);
 }
 
 int env_runtime_enable_target_argmax(EnvRuntime* runtime) {
@@ -660,6 +692,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     FactorizedActionChoice sampled_choice;
     TacticalDecision tactical_decision = {0};
     int tactical_applied = 0;
+    int action_remapped = 0;
     const char* tactical_reason = "no_supported_choice";
     if (!runtime || !session || !out || runtime->replay_only) {
         return 1;
@@ -877,6 +910,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         int sampled_action1 = -1;
         factorized_action_choice_to_flat_actions(&sampled_choice, &sampled_action0, &sampled_action1);
         factorized_action_choice_from_flat_actions(&session->pending_factorized_choice, action, action2);
+        action_remapped = action != sampled_action0 || action2 != sampled_action1;
         if (action != sampled_action0) session->pending_learned_target_slots &= (unsigned char)~1u;
         if (action2 != sampled_action1) session->pending_learned_target_slots &= (unsigned char)~2u;
         if (action >= 0 && action == sampled_action0) {
@@ -994,6 +1028,18 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     }
     }
     session->pending_old_value = value;
+    session->pending_behavior_replayable = 0;
+    if (runtime->target_sidecar && !action_remapped) {
+        FactorizedPolicySnapshot actor_policy = policy;
+        unsigned char replay_slots = 0;
+        memcpy(actor_policy.slot0_target_policy, original_targets[0], sizeof(original_targets[0]));
+        memcpy(actor_policy.slot1_target_policy, original_targets[1], sizeof(original_targets[1]));
+        session->pending_behavior_replayable = target_behavior_log_probability(runtime->target_sidecar,
+            runtime->target_argmax, runtime->target_slot_local, &actor_policy, session->hidden_state,
+            &session->observation, &session->parsed_request, &session->pending_factorized_choice,
+            &session->pending_behavior_log_prob, &replay_slots) &&
+            replay_slots == session->pending_learned_target_slots && isfinite(session->pending_behavior_log_prob);
+    }
     if (!factorized_choice_to_command(&session->parsed_request, &session->pending_factorized_choice, command, sizeof(command))) {
         free(pair_policy);
         return 0;
@@ -1030,12 +1076,11 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             fprintf(out, "%.*s,\"training_eligible\":false,\"target_decoder\":\"%s\",\"learned_targets\":%s", (int)strlen(json) - 1, json,
                 runtime->target_argmax ? "argmax" : "sample", session->pending_learned_targets ? "true" : "false");
             fputs(",\"behavior_policy\":", out);
-            target_behavior_identity_write(out, runtime->target_sidecar->parent_fingerprint,
-                runtime->target_sidecar_fingerprint, runtime->target_sidecar->contextual,
-                runtime->target_argmax, runtime->target_slot_local);
+            env_runtime_write_target_identity(runtime, out);
             fputs(",\"target_behavior\":", out);
             target_behavior_write(out, &session->pending_factorized_choice,
-                session->pending_learned_target_slots, session->pending_target_distribution);
+                session->pending_learned_target_slots, session->pending_target_distribution,
+                session->pending_behavior_replayable ? &session->pending_behavior_log_prob : NULL);
             if (runtime->target_audit) {
                 fputs(",\"target_audit\":", out);
                 target_audit_write(out, &session->observation, &session->parsed_request,
@@ -1226,10 +1271,9 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                         runtime->target_argmax ? "argmax" : "sample", runtime->target_audit ? "true" : "false",
                         runtime->target_slot_local ? "true" : "false",
                         session->decision_count, session->learned_target_decisions);
-                    target_behavior_identity_write(out, runtime->target_sidecar->parent_fingerprint,
-                        runtime->target_sidecar_fingerprint, runtime->target_sidecar->contextual,
-                        runtime->target_argmax, runtime->target_slot_local);
-                    fputs("}\n", out);
+                    env_runtime_write_target_identity(runtime, out);
+                    fprintf(out, ",\"likelihood_replay\":{\"accepted_supported\":%zu,\"accepted_unsupported\":%zu}}\n",
+                        session->behavior_supported_decisions, session->behavior_unsupported_decisions);
                 } else if (runtime->target_labels) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
                         "\"policy_tag\":\"target-labels-v1\",\"training_eligible\":false,\"label_decisions\":%zu}\n",
@@ -1273,6 +1317,8 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 return 1;
             }
             if (msg->accepted > 0 && session->episode.count > 0) {
+                if (runtime->target_bundle_records && (!session->pending_command[0] ||
+                        msg->request_id != session->last_request_id)) return 0;
                 int accepted_action = msg->action;
                 int accepted_action2 = msg->action2;
                 int labels_missing = accepted_action < 0 || accepted_action2 < 0;
@@ -1318,6 +1364,18 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 session->episode.old_log_probs[session->episode.count - 1] = session->pending_old_log_prob;
                 session->episode.old_values[session->episode.count - 1] = session->pending_old_value;
                 session->decision_count += 1u;
+                if (runtime->target_sidecar) {
+                    int matches_pending = accepted_action == session->pending_action &&
+                        accepted_action2 == session->pending_action2 &&
+                        msg->request_id == session->last_request_id &&
+                        strcmp(msg->command, session->pending_command) == 0;
+                    if (session->pending_behavior_replayable && matches_pending) ++session->behavior_supported_decisions;
+                    else ++session->behavior_unsupported_decisions;
+                    if (runtime->target_bundle_records && out) {
+                        target_records_write(out, runtime, session, session->pending_behavior_replayable && matches_pending);
+                        fflush(out);
+                    }
+                }
                 if (runtime->tactical_targets && session->pending_retargeted) ++session->retargeted_decisions;
                 if (runtime->target_sidecar && session->pending_learned_targets) ++session->learned_target_decisions;
                 session->pending_action = -1;
@@ -1326,6 +1384,7 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 session->pending_counterfactual_rank = -1;
                 session->pending_old_log_prob = 0.0f;
                 session->pending_old_value = 0.0f;
+                session->pending_behavior_replayable = 0;
                 factorized_action_choice_init(&session->pending_factorized_choice);
                 session->pending_command[0] = '\0';
             } else if (msg->accepted == 0) {
@@ -1335,6 +1394,7 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 session->pending_counterfactual_rank = -1;
                 session->pending_old_log_prob = 0.0f;
                 session->pending_old_value = 0.0f;
+                session->pending_behavior_replayable = 0;
                 factorized_action_choice_init(&session->pending_factorized_choice);
                 session->pending_command[0] = '\0';
             }

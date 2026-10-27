@@ -1,6 +1,7 @@
 #include "gru_model.h"
 #include "action_mapper.h"
 #include "observation.h"
+#include "policy_decoding.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -1982,6 +1983,159 @@ int gru_model_accumulate_factorized_preference_hidden(
 cleanup:
     free(grad_h);
     return ok;
+}
+
+typedef struct {
+    float* parameters;
+    size_t count;
+    size_t offset;
+} ActionHeadArray;
+
+struct GruActionHeadOptimizer {
+    GruModel* model;
+    ActionHeadArray arrays[18];
+    JointHeadGradients sample_gradients;
+    float* storage;
+    float* gradient;
+    float* first;
+    float* second;
+    float* sample;
+    float* hidden_gradient;
+    size_t count;
+    size_t samples;
+    size_t step;
+};
+
+void gru_action_head_optimizer_free(GruActionHeadOptimizer* optimizer) {
+    if (!optimizer) return;
+    free(optimizer->storage);
+    free(optimizer);
+}
+
+GruActionHeadOptimizer* gru_action_head_optimizer_create(GruModel* model) {
+    if (!model || model->num_actions != OBS_NUM_ACTIONS) return NULL;
+    GruActionHeadOptimizer* optimizer = calloc(1, sizeof(*optimizer));
+    if (!optimizer) return NULL;
+    optimizer->model = model;
+    optimizer->count = (2 * (FACTORIZED_KIND_DIM + FACTORIZED_MOVE_DIM + FACTORIZED_SWITCH_DIM + FACTORIZED_TERA_DIM) +
+        FACTORIZED_PAIR_DIM) * (model->hidden_dim + 1);
+    optimizer->storage = calloc(4 * optimizer->count + model->hidden_dim, sizeof(float));
+    if (!optimizer->storage) { gru_action_head_optimizer_free(optimizer); return NULL; }
+    optimizer->gradient = optimizer->storage;
+    optimizer->first = optimizer->gradient + optimizer->count;
+    optimizer->second = optimizer->first + optimizer->count;
+    optimizer->sample = optimizer->second + optimizer->count;
+    optimizer->hidden_gradient = optimizer->sample + optimizer->count;
+    size_t index = 0, offset = 0;
+#define ADD_ACTION_ARRAY(parameter, member, length) \
+    do { \
+        optimizer->arrays[index++] = (ActionHeadArray){(parameter), (length), offset}; \
+        optimizer->sample_gradients.member = optimizer->sample + offset; \
+        offset += (length); \
+    } while (0)
+#define ADD_ACTION_SLOT(slot) \
+    ADD_ACTION_ARRAY(model->slot##_kind_head.data, slot##_kind_head, FACTORIZED_KIND_DIM * model->hidden_dim); \
+    ADD_ACTION_ARRAY(model->slot##_kind_bias, slot##_kind_bias, FACTORIZED_KIND_DIM); \
+    ADD_ACTION_ARRAY(model->slot##_move_head.data, slot##_move_head, FACTORIZED_MOVE_DIM * model->hidden_dim); \
+    ADD_ACTION_ARRAY(model->slot##_move_bias, slot##_move_bias, FACTORIZED_MOVE_DIM); \
+    ADD_ACTION_ARRAY(model->slot##_switch_head.data, slot##_switch_head, FACTORIZED_SWITCH_DIM * model->hidden_dim); \
+    ADD_ACTION_ARRAY(model->slot##_switch_bias, slot##_switch_bias, FACTORIZED_SWITCH_DIM); \
+    ADD_ACTION_ARRAY(model->slot##_tera_head.data, slot##_tera_head, FACTORIZED_TERA_DIM * model->hidden_dim); \
+    ADD_ACTION_ARRAY(model->slot##_tera_bias, slot##_tera_bias, FACTORIZED_TERA_DIM)
+    ADD_ACTION_SLOT(slot0);
+    ADD_ACTION_SLOT(slot1);
+    ADD_ACTION_ARRAY(model->joint_pair_head.data, pair_head, FACTORIZED_PAIR_DIM * model->hidden_dim);
+    ADD_ACTION_ARRAY(model->joint_pair_bias, pair_bias, FACTORIZED_PAIR_DIM);
+#undef ADD_ACTION_SLOT
+#undef ADD_ACTION_ARRAY
+    if (index != 18 || offset != optimizer->count) { gru_action_head_optimizer_free(optimizer); return NULL; }
+    return optimizer;
+}
+
+int gru_action_head_accumulate_hidden(GruActionHeadOptimizer* optimizer, const float* hidden,
+    const unsigned char* legal, const FactorizedActionChoice* choice, float advantage
+) {
+    if (!optimizer || !hidden || !legal || !choice || !isfinite(advantage)) return 0;
+    GruModel* model = optimizer->model;
+    FactorizedActionChoice actions = *choice;
+    FactorizedPolicySnapshot policy;
+    double log_probability;
+    size_t i;
+    for (i = 0; i < model->hidden_dim; ++i) if (!isfinite(hidden[i])) return 0;
+    /* Targets are fixed conditional behavior, not part of this objective. */
+    actions.slot0_target_mask = actions.slot1_target_mask = 0;
+    int dual = actions.slot0_has_action && actions.slot1_has_action;
+    if (!gru_model_evaluate_policy_snapshot(model, hidden, legal, dual, &policy, NULL) ||
+            !policy_choice_log_probability(&policy, legal, &actions, &log_probability) ||
+            !isfinite(log_probability)) return 0;
+    memset(optimizer->sample, 0, (optimizer->count + model->hidden_dim) * sizeof(float));
+    float ignored_loss = 0, ignored_accuracy = 0;
+    JointHeadGradients* gradients = &optimizer->sample_gradients;
+    if (dual) {
+        if (!joint_policy_gradients(model, hidden, legal, &actions, advantage, 0, NULL, 0,
+                &ignored_loss, &ignored_accuracy, optimizer->hidden_gradient, gradients)) return 0;
+    } else {
+        int slot = actions.slot1_has_action ? 1 : 0;
+        factorized_slot_policy_gradients(model, hidden, legal, slot, &actions, advantage, 0, NULL, 0,
+            &ignored_loss, &ignored_accuracy, optimizer->hidden_gradient,
+            slot ? gradients->slot1_kind_head : gradients->slot0_kind_head,
+            slot ? gradients->slot1_kind_bias : gradients->slot0_kind_bias,
+            slot ? gradients->slot1_move_head : gradients->slot0_move_head,
+            slot ? gradients->slot1_move_bias : gradients->slot0_move_bias,
+            slot ? gradients->slot1_switch_head : gradients->slot0_switch_head,
+            slot ? gradients->slot1_switch_bias : gradients->slot0_switch_bias,
+            slot ? gradients->slot1_tera_head : gradients->slot0_tera_head,
+            slot ? gradients->slot1_tera_bias : gradients->slot0_tera_bias, NULL, NULL);
+    }
+    /* A failed sample must not poison an already accumulated minibatch. */
+    for (i = 0; i < optimizer->count; ++i)
+        if (!isfinite(optimizer->gradient[i] + optimizer->sample[i])) return 0;
+    for (i = 0; i < optimizer->count; ++i) optimizer->gradient[i] += optimizer->sample[i];
+    ++optimizer->samples;
+    return 1;
+}
+
+int gru_action_head_apply_adam(GruActionHeadOptimizer* optimizer, float learning_rate,
+    float beta1, float beta2, float epsilon, float gradient_clip
+) {
+    if (!optimizer || !isfinite(learning_rate) || learning_rate <= 0 ||
+            !isfinite(beta1) || beta1 < 0 || beta1 >= 1 || !isfinite(beta2) || beta2 < 0 || beta2 >= 1 ||
+            !isfinite(epsilon) || epsilon <= 0 || !isfinite(gradient_clip) || gradient_clip < 0) return 0;
+    if (!optimizer->samples) return 1;
+    float scale = 1.0f / optimizer->samples;
+    double norm_squared = 0;
+    size_t i, array_index;
+    for (i = 0; i < optimizer->count; ++i) {
+        double gradient = (double)optimizer->gradient[i] * scale;
+        norm_squared += gradient * gradient;
+    }
+    if (!isfinite(norm_squared)) return 0;
+    if (gradient_clip > 0 && sqrt(norm_squared) > gradient_clip) scale *= gradient_clip / sqrt(norm_squared);
+    float correction1 = 1 - powf(beta1, (float)(optimizer->step + 1));
+    float correction2 = 1 - powf(beta2, (float)(optimizer->step + 1));
+    /* Check the whole update before touching any parameters or moments. */
+    for (array_index = 0; array_index < 18; ++array_index) {
+        ActionHeadArray* array = &optimizer->arrays[array_index];
+        for (i = 0; i < array->count; ++i) {
+            size_t at = array->offset + i;
+            float g = optimizer->gradient[at] * scale;
+            float m = beta1 * optimizer->first[at] + (1 - beta1) * g;
+            float v = beta2 * optimizer->second[at] + (1 - beta2) * g * g;
+            float next = array->parameters[i] - learning_rate * (m / correction1) / (sqrtf(v / correction2) + epsilon);
+            if (!isfinite(m) || !isfinite(v) || !isfinite(next)) return 0;
+        }
+    }
+    for (i = 0; i < optimizer->count; ++i) optimizer->gradient[i] *= scale;
+    for (array_index = 0; array_index < 18; ++array_index) {
+        ActionHeadArray* array = &optimizer->arrays[array_index];
+        adam_apply_array(array->parameters, optimizer->first + array->offset, optimizer->second + array->offset,
+            optimizer->gradient + array->offset, array->count, learning_rate, beta1, beta2, epsilon, correction1, correction2);
+    }
+    ++optimizer->step;
+    optimizer->samples = 0;
+    memset(optimizer->gradient, 0, optimizer->count * sizeof(float));
+    sync_flat_heads_from_factorized(optimizer->model);
+    return 1;
 }
 
 static void evaluate_hidden_internal(
@@ -4307,6 +4461,78 @@ int gru_model_export_parameters(const GruModel* model, float* out, size_t count)
     copy_out(out, &idx, model->value_head, model->hidden_dim);
     out[idx++] = model->value_bias;
     return idx == gru_model_parameter_count(model);
+}
+
+static int flat_policy_cache_matches(const GruModel* model) {
+    int slot, local;
+    size_t column;
+    /* Keep the addition order used by sync_flat_heads_from_factorized. */
+    for (slot = 0; slot < 2; ++slot) for (local = 0; local < 14; ++local) {
+        const Matrix* kind = slot ? &model->slot1_kind_head : &model->slot0_kind_head;
+        const Matrix* move = slot ? &model->slot1_move_head : &model->slot0_move_head;
+        const Matrix* tera = slot ? &model->slot1_tera_head : &model->slot0_tera_head;
+        const Matrix* sw = slot ? &model->slot1_switch_head : &model->slot0_switch_head;
+        const float* kb = slot ? model->slot1_kind_bias : model->slot0_kind_bias;
+        const float* mb = slot ? model->slot1_move_bias : model->slot0_move_bias;
+        const float* tb = slot ? model->slot1_tera_bias : model->slot0_tera_bias;
+        const float* sb = slot ? model->slot1_switch_bias : model->slot0_switch_bias;
+        int action = slot * 14 + local;
+        float expected = local < 8 ? kb[0] + mb[local % 4] + tb[local / 4] : kb[1] + sb[local - 8];
+        if (memcmp(&expected, model->policy_bias + action, sizeof(float))) return 0;
+        for (column = 0; column < model->hidden_dim; ++column) {
+            size_t width = model->hidden_dim;
+            expected = local < 8 ? kind->data[column] + move->data[(local % 4) * width + column] +
+                tera->data[(local / 4) * width + column] : kind->data[width + column] + sw->data[(local - 8) * width + column];
+            if (memcmp(&expected, model->policy_head.data + action * width + column, sizeof(float))) return 0;
+        }
+    }
+    return 1;
+}
+
+const char* gru_model_action_head_compatibility_reason(const GruModel* reference, const GruModel* actor) {
+    if (!reference || !actor) return "missing_model";
+    if (reference->input_dim != actor->input_dim || reference->hidden_dim != actor->hidden_dim ||
+            reference->num_actions != actor->num_actions || actor->num_actions != OBS_NUM_ACTIONS ||
+            reference->entity_encoder_enabled != actor->entity_encoder_enabled) return "model_dimensions";
+    size_t count = gru_model_parameter_count(reference), i;
+    float* parameters = malloc(count * sizeof(float));
+    if (!parameters) return "allocation_failure";
+    int unchanged = 1, finite = 1;
+    if (!gru_model_export_parameters(reference, parameters, count)) { free(parameters); return "parameter_layout"; }
+    for (i = 0; i < count; ++i) if (!isfinite(parameters[i])) finite = 0;
+    float* actor_parameters = malloc(count * sizeof(float));
+    if (!actor_parameters) { free(parameters); return "allocation_failure"; }
+    if (!gru_model_export_parameters(actor, actor_parameters, count)) {
+        free(parameters); free(actor_parameters); return "parameter_layout";
+    }
+    for (i = 0; i < count; ++i) if (!isfinite(actor_parameters[i])) finite = 0;
+    unchanged = memcmp(parameters, actor_parameters, count * sizeof(float)) == 0;
+    free(parameters); free(actor_parameters);
+    if (!finite) return "nonfinite_parameters";
+#define SAME_ARRAY(member, length, reason) \
+    do { if (memcmp(reference->member, actor->member, (length) * sizeof(float))) return (reason); } while (0)
+#define SAME_MATRIX(member, reason) SAME_ARRAY(member.data, reference->member.rows * reference->member.cols, reason)
+    SAME_MATRIX(wzx, "recurrent_parameters"); SAME_MATRIX(wzh, "recurrent_parameters");
+    SAME_ARRAY(bz, reference->hidden_dim, "recurrent_parameters");
+    SAME_MATRIX(wrx, "recurrent_parameters"); SAME_MATRIX(wrh, "recurrent_parameters");
+    SAME_ARRAY(br, reference->hidden_dim, "recurrent_parameters");
+    SAME_MATRIX(wnx, "recurrent_parameters"); SAME_MATRIX(wnh, "recurrent_parameters");
+    SAME_ARRAY(bn, reference->hidden_dim, "recurrent_parameters");
+    SAME_MATRIX(slot0_target_head, "target_parameters"); SAME_MATRIX(slot1_target_head, "target_parameters");
+    SAME_ARRAY(slot0_target_bias, FACTORIZED_TARGET_DIM, "target_parameters");
+    SAME_ARRAY(slot1_target_bias, FACTORIZED_TARGET_DIM, "target_parameters");
+    if (reference->entity_encoder_enabled) {
+        SAME_MATRIX(entity_encoder, "entity_parameters"); SAME_MATRIX(entity_decoder, "entity_parameters");
+        SAME_ARRAY(entity_bias, GRU_ENTITY_EMBED_DIM, "entity_parameters");
+    }
+    SAME_ARRAY(value_head, reference->hidden_dim, "value_parameters");
+    if (memcmp(&reference->value_bias, &actor->value_bias, sizeof(float))) return "value_parameters";
+#undef SAME_MATRIX
+#undef SAME_ARRAY
+    /* Preserve unchanged legacy references, even if their historical cache
+     * predates canonical factorized-to-flat synchronization. */
+    if (!unchanged && !flat_policy_cache_matches(actor)) return "flat_policy_cache";
+    return NULL;
 }
 
 int gru_model_import_parameters(GruModel* model, const float* in, size_t count) {
