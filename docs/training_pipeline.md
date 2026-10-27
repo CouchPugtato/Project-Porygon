@@ -1432,3 +1432,37 @@ This small smoke is integration evidence only, not a strength result.
 All native regression suites and 68 JavaScript tests pass. No default policy
 or main checkpoint was changed. The proposed 1,200-game matched development
 screen still requires separate approval.
+
+### Matched contextual-target development screen
+
+Runs 0296/0297/0298 completed the subsequently approved 1,200-game screen.
+The reusable configs are `target_context_control.json`,
+`target_context_learned.json` and `target_context_heuristic.json` under
+`config/experimental/`. They differ only in targeting, with matched seed
+29601, 100 valid games per side against parent/random, one-thread serial
+agents and unchanged 65% launch gates. The interrupted context run resumed
+from 289 saved valid games with identical provenance.
+
+| Policy | Parent wins/200 | Random wins/200 |
+| --- | ---: | ---: |
+| Unchanged sampling | 107 (53.5%) | 89 (44.5%) |
+| Learned context | 92 (46.0%) | 88 (44.0%) |
+| Heuristic targets | 116 (58.0%) | 117 (58.5%) |
+
+Learned minus control was -7.5 percentage points against parent (nominal
+paired 95% interval -16.35 to +1.35), and -0.5 against random (-8.91 to
++7.91). Both comparisons contain 100 complete shared seed pairs. These do
+not demonstrate improvement or establish a real regression. The heuristic
+outscored the learned policy in both matchups; the full report retains all
+three contrasts, side splits and exclusions:
+`models/diagnostics/run_0296_0298_target_context_comparison.json`.
+
+Control and context each excluded the same two disabled-Protect attempts;
+the heuristic excluded none. Comparisons involving the heuristic therefore
+use 99 shared parent seed pairs, rather than comparing unmatched replacements.
+The nominal intervals are not adjusted for multiple comparisons. No model
+was promoted, no additional training started, and all frozen hashes match.
+The next proposed experiment is target-only argmax decoding, not another
+fit or architecture change; it still needs separate approval. All 69
+JavaScript tests pass. Recorded game durations exclude some orchestration
+overhead and the interruption, so they underestimate end-to-end elapsed time.

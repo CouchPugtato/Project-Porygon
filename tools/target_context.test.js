@@ -49,6 +49,21 @@ test('context evaluation is explicitly routed and cannot reuse legacy fit eligib
     assert.equal(smoke.agent_omp_threads, 1);
 });
 
+test('context strength screen freezes all non-target settings across three matched policies', () => {
+    const control = require('../config/experimental/target_context_control.json');
+    const {target_sidecar, context_target_evaluation, ...learned} = require('../config/experimental/target_context_learned.json');
+    const {tactical_targets, ...heuristic} = require('../config/experimental/target_context_heuristic.json');
+    for (const name of ['control', 'learned', 'heuristic']) validateConfig(require(`../config/experimental/target_context_${name}.json`));
+    assert.deepEqual(learned, control);
+    assert.deepEqual(heuristic, control);
+    assert.equal(context_target_evaluation, true);
+    assert.equal(tactical_targets, true);
+    assert.ok(target_sidecar.includes('run_0294'));
+    assert.equal(control.games_per_side * control.opponents.length * 2 * 3, 1200);
+    assert.notEqual(control.seed, require('../config/experimental/target_exploratory_control.json').seed);
+    assert.notEqual(control.seed, require('../config/experimental/target_context_collection.json').seed);
+});
+
 test('visible context uses a stable 32-byte layout and rejects unredacted or mislocated targets', () => {
     const c = context(), bytes = Buffer.alloc(32);
     validateContext(c);
