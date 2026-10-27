@@ -1,7 +1,7 @@
 'use strict';
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const {createTargetCollector, packDataset, publishLabels, readLabels, splitBattle, validateLabels} = require('./target_learning');
+const {createTargetCollector, packDataset, publishLabels, readLabels, splitBattle, validateLabels, targetFitEligible} = require('./target_learning');
 const {validateConfig} = require('./tactical_teacher_benchmark');
 const {createBattleAgents, battleSeeds} = require('./tactical_teacher_smoke');
 
@@ -82,4 +82,34 @@ test('learned targets route only to the candidate and reject other overrides', (
     }
     for (const change of [{collect_target_labels: true}, {tactical_targets: true}, {candidate_inference_policy: 'greedy'}])
         assert.throws(() => validateConfig({...config, ...change}), /learned target/);
+});
+
+test('exploratory publication preserves a failed gate and needs consent at both boundaries', () => {
+    const report = {passed: false, sidecar_published: true, exploratory_exception: true, evaluation_only: true,
+        parent_unchanged: true, holdout_nll_before: .69, holdout_nll_after: .63,
+        failure_reasons: ['holdout_accuracy_decreased']};
+    assert.equal(targetFitEligible({}, report), false);
+    assert.equal(targetFitEligible({exploratory_evaluation: true}, report, false), false);
+    assert.equal(targetFitEligible({}, report, true), false);
+    assert.equal(targetFitEligible({exploratory_evaluation: true}, report, true), true);
+    for (const change of [{parent_unchanged: false}, {holdout_nll_after: .7}, {sidecar_published: false},
+        {failure_reasons: ['holdout_nll_did_not_improve']}])
+        assert.equal(targetFitEligible({exploratory_evaluation: true}, {...report, ...change}, true), false);
+    assert.equal(targetFitEligible({}, {passed: true, sidecar_published: true}), true);
+});
+
+test('exploratory screen freezes models, seed and resources across all three modes', () => {
+    const control = require('../config/experimental/target_exploratory_control.json');
+    const learned = require('../config/experimental/target_exploratory_learned.json');
+    const heuristic = require('../config/experimental/target_exploratory_heuristic.json');
+    for (const config of [control, learned, heuristic]) validateConfig(config);
+    const {target_sidecar, exploratory_target_evaluation, ...learnedBase} = learned;
+    const {tactical_targets, ...heuristicBase} = heuristic;
+    assert.deepEqual(learnedBase, control);
+    assert.deepEqual(heuristicBase, control);
+    assert.equal(exploratory_target_evaluation, true);
+    assert.equal(tactical_targets, true);
+    assert.equal(control.games_per_side * control.opponents.length * 2 * 3, 1200);
+    assert.notEqual(control.seed, require('../config/experimental/target_learning_collection.json').seed);
+    assert.throws(() => validateConfig({...control, exploratory_target_evaluation: true}), /explicit sidecar/);
 });

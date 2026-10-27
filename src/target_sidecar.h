@@ -28,5 +28,7 @@ TargetSidecar* target_sidecar_load(const char* path, const GruModel* parent);
  * collector. No base-model parameters are updated by this command. */
 int target_sidecar_fit(const char* dataset, const GruModel* parent,
     const char* output_path, const char* report_path);
+int target_sidecar_fit_for_evaluation(const char* dataset, const GruModel* parent,
+    const char* output_path, const char* report_path);
 
 #endif

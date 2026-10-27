@@ -6,7 +6,7 @@ const {aggregateGames, hashFile, playGame} = require('./tactical_teacher_smoke')
 const {acquireRunLock, createResourceGate, writeJsonAtomic} = require('./counterfactual_rollout');
 const {publishReplay, verifyReplays} = require('./tactical_demonstrations');
 const {summarizeDecisions} = require('./tactical_decision_audit');
-const {publishLabels, readLabels} = require('./target_learning');
+const {publishLabels, readLabels, targetFitEligible} = require('./target_learning');
 const ROOT = path.resolve(__dirname, '..');
 const OPPONENTS = ['parent', 'random'];
 const SUPPORTED_OPPONENTS = [...OPPONENTS, 'pilot', 'sampled'];
@@ -129,6 +129,9 @@ async function loadSaved(filename) {
 }
 
 function validateConfig(config) {
+    if (config.exploratory_target_evaluation !== undefined && (typeof config.exploratory_target_evaluation !== 'boolean' ||
+            (config.exploratory_target_evaluation && !config.target_sidecar)))
+        throw new Error('exploratory target evaluation requires an explicit sidecar');
     if (config.target_sidecar !== undefined && (typeof config.target_sidecar !== 'string' || !config.target_sidecar.trim() ||
             config.tactical_teacher !== false || config.tactical_targets || config.collect_target_labels || config.decision_audit ||
             config.collect_demonstrations || (config.candidate_inference_policy || 'sample') !== 'sample'))
@@ -196,9 +199,9 @@ async function main(argv = process.argv.slice(2)) {
         const metadataPath = `${sidecar}.meta.json`, reportPath = path.join(path.dirname(sidecar), 'target_fit.json');
         const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
         const report = JSON.parse(await fs.readFile(reportPath, 'utf8'));
-        if (!report.passed || !report.sidecar_published || metadata.parent_sha256 !== identity.candidate_checkpoint_sha256 ||
+        if (!targetFitEligible(metadata, report, config.exploratory_target_evaluation === true) || metadata.parent_sha256 !== identity.candidate_checkpoint_sha256 ||
                 metadata.sidecar_sha256 !== await hashFile(sidecar) || metadata.fit_report_sha256 !== await hashFile(reportPath))
-            throw new Error('learned target sidecar lacks a passing fit or its parent/artifacts changed');
+            throw new Error('learned target sidecar lacks an eligible fit or its parent/artifacts changed');
         identity.target_sidecar = {sha256: metadata.sidecar_sha256, metadata_sha256: await hashFile(metadataPath),
             fit_report_sha256: metadata.fit_report_sha256};
     }
@@ -223,6 +226,7 @@ async function main(argv = process.argv.slice(2)) {
                 'tactical_teacher_demonstration_collection' : config.tactical_teacher === false ?
                     'neural_candidate_strength_benchmark' : 'tactical_teacher_strength_benchmark', run_name: name,
                 identity, status, error, training_eligible: false, target_valid_games: targetGames,
+                exploratory_target_evaluation: config.exploratory_target_evaluation === true,
                 candidate_policy_mode: config.tactical_teacher === false ? 'neural' : 'tactical',
                 candidate_inference_policy: config.candidate_inference_policy || 'sample',
                 decision_audit: config.decision_audit ? Object.fromEntries(Object.keys(results).map(opponent =>

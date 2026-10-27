@@ -231,7 +231,7 @@ static Metrics evaluate(const TargetSidecar* s, const Example* examples, const f
     return m;
 }
 
-int target_sidecar_fit(const char* dataset, const GruModel* parent, const char* output, const char* report) {
+static int fit_target_sidecar(const char* dataset, const GruModel* parent, const char* output, const char* report, int exploratory) {
     TargetSidecar* s = target_sidecar_create(parent);
     FILE* file = fopen(dataset, "rb");
     char magic[9], temporary[4096];
@@ -297,16 +297,20 @@ int target_sidecar_fit(const char* dataset, const GruModel* parent, const char* 
     train_after = evaluate(s, examples, hidden, count, 0, -1);
     passed = best_epoch > 0 && after.nll < before.nll && after.correct >= before.correct &&
         isfinite(train_after.nll) && target_parent_fingerprint(parent) == s->parent_fingerprint;
-    if (passed && !target_sidecar_save(s, output)) goto cleanup;
+    int exploratory_exception = !passed && exploratory && best_epoch > 0 && after.nll < before.nll &&
+        isfinite(train_after.nll) && target_parent_fingerprint(parent) == s->parent_fingerprint;
+    int published = passed || exploratory_exception;
+    if (published && !target_sidecar_save(s, output)) goto cleanup;
     if (snprintf(temporary, sizeof(temporary), "%s.tmp", report) >= (int)sizeof(temporary)) goto cleanup;
     FILE* json = fopen(temporary, "w");
     if (!json) goto cleanup;
-    fprintf(json, "{\"passed\":%s,\"sidecar_published\":%s,\"best_epoch\":%d,\"epochs_completed\":%d,\"max_epochs\":10,"
+    fprintf(json, "{\"passed\":%s,\"sidecar_published\":%s,\"exploratory_exception\":%s,\"evaluation_only\":true,\"best_epoch\":%d,\"epochs_completed\":%d,\"max_epochs\":10,"
         "\"optimizer\":\"adam\",\"learning_rate\":0.001,\"minibatch_examples\":64,"
         "\"train_examples\":%zu,\"holdout_examples\":%zu,\"train_nll_before\":%.9g,\"train_nll_after\":%.9g,"
         "\"holdout_nll_before\":%.9g,\"holdout_nll_after\":%.9g,\"accuracy_before\":%.9g,\"accuracy_after\":%.9g,"
         "\"parent_fingerprint\":\"%016llx\",\"parent_unchanged\":true,\"holdout_groups\":[",
-        passed ? "true" : "false", passed ? "true" : "false", best_epoch, epochs_completed, train_before.count, before.count,
+        passed ? "true" : "false", published ? "true" : "false", exploratory_exception ? "true" : "false",
+        best_epoch, epochs_completed, train_before.count, before.count,
         train_before.nll, train_after.nll, before.nll, after.nll,
         (double)before.correct / before.count, (double)after.correct / after.count,
         (unsigned long long)s->parent_fingerprint);
@@ -329,4 +333,12 @@ cleanup:
     target_sidecar_free(s);
     if (!ok) fprintf(stderr, "[target-fit] failed to read, fit, or publish the bounded target dataset\n");
     return ok;
+}
+
+int target_sidecar_fit(const char* dataset, const GruModel* parent, const char* output, const char* report) {
+    return fit_target_sidecar(dataset, parent, output, report, 0);
+}
+
+int target_sidecar_fit_for_evaluation(const char* dataset, const GruModel* parent, const char* output, const char* report) {
+    return fit_target_sidecar(dataset, parent, output, report, 1);
 }

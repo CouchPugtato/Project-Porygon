@@ -6513,6 +6513,10 @@ static int test_move_conditioned_target_sidecar(void) {
             "a failed holdout gate still writes a diagnostic")) return 0;
     FILE* forbidden = fopen("test_target_fit.tmp", "rb");
     if (!assert_true(forbidden == NULL, "failed holdout gate cannot publish a target sidecar")) return 0;
+    if (!assert_true(target_sidecar_fit_for_evaluation("test_target_labels.tmp", parent,
+            "test_target_fit.tmp", "test_target_report.tmp"), "exploratory evaluation retains NLL safety gate")) return 0;
+    forbidden = fopen("test_target_fit.tmp", "rb");
+    if (!assert_true(forbidden == NULL, "exploratory exception cannot publish a worse-NLL model")) return 0;
     remove("test_target_labels.tmp"); remove("test_target_report.tmp");
     gru_model_destroy(other); target_sidecar_free(loaded); target_sidecar_free(sidecar);
     free(gradient); gru_model_destroy(parent);

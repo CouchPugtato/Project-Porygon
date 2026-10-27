@@ -5531,7 +5531,7 @@ static int showdown_client_main(int argc, char** argv) {
         "  Passive decision audit: --tactical-audit 1 (evaluation-only; does not change choices)\n"
         "  Target-only intervention: --tactical-targets 1 (evaluation-only; sampled actions stay fixed)\n"
         "  showdown_client --battle-agent [checkpoint] [--tactical-teacher 0|1] [--target-labels 0|1] [--inference-seed N] [--counterfactual-decision N --counterfactual-rank N] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
-        "  showdown_client --fit-target-sidecar dataset.bin parent.chk sidecar.bin report.json\n"
+        "  showdown_client --fit-target-sidecar dataset.bin parent.chk sidecar.bin report.json [--exploratory-evaluation]\n"
         "  showdown_client --battle-agent parent.chk --target-sidecar sidecar.bin [--inference-seed N]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
@@ -5561,12 +5561,13 @@ static int showdown_client_main(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-    if (argc == 6 && strcmp(argv[1], "--fit-target-sidecar") == 0) {
+    if ((argc == 6 || (argc == 7 && strcmp(argv[6], "--exploratory-evaluation") == 0)) && strcmp(argv[1], "--fit-target-sidecar") == 0) {
         TrainerCheckpointState state = {0};
         CheckpointLoadResult result = {0};
         GruModel* parent = load_current_checkpoint(argv[3], &state, &result);
         if (!parent) { report_checkpoint_load_failure("[target-fit] parent", argv[3], &result); return 1; }
-        int ok = target_sidecar_fit(argv[2], parent, argv[4], argv[5]);
+        int ok = argc == 7 ? target_sidecar_fit_for_evaluation(argv[2], parent, argv[4], argv[5]) :
+            target_sidecar_fit(argv[2], parent, argv[4], argv[5]);
         gru_model_destroy(parent);
         return ok ? 0 : 1;
     }

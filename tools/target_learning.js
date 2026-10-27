@@ -118,8 +118,18 @@ function packDataset(battles, seed) {
         train: rows.filter(row => !row.validation).length, holdout: rows.filter(row => row.validation).length}};
 }
 
+function targetFitEligible(metadata, report, exploratory = false) {
+    if (!report.sidecar_published) return false;
+    if (!exploratory) return report.passed === true && metadata.exploratory_evaluation !== true;
+    return metadata.exploratory_evaluation === true && report.passed === false &&
+        report.exploratory_exception === true && report.evaluation_only === true && report.parent_unchanged === true &&
+        Number.isFinite(report.holdout_nll_after) && report.holdout_nll_after < report.holdout_nll_before &&
+        JSON.stringify(report.failure_reasons) === '["holdout_accuracy_decreased"]';
+}
+
 async function main(argv) {
-    if (argv.length !== 2) throw new Error('usage: node tools/target_learning.js COLLECTION_RUN OUTPUT_DIRECTORY');
+    const exploratory = argv.length === 3 && argv[2] === '--exploratory-evaluation';
+    if (argv.length !== 2 && !exploratory) throw new Error('usage: node tools/target_learning.js COLLECTION_RUN OUTPUT_DIRECTORY [--exploratory-evaluation]');
     const root = path.resolve(__dirname, '..'), directory = path.join(root, 'matches/runs', argv[0]);
     const output = path.resolve(root, argv[1]);
     const {isValid} = require('./tactical_teacher_benchmark');
@@ -147,16 +157,26 @@ async function main(argv) {
         dataset_sha256: await hashFile(dataset), parent_sha256: await hashFile(parent),
         collection_executable_sha256: summary.identity.executable_sha256,
         fit_executable_sha256: await hashFile(executable), fitter_source_sha256: await hashFile(__filename)});
-    const run = spawnSync(executable, ['--fit-target-sidecar', dataset, parent, sidecar, report],
+    const run = spawnSync(executable, ['--fit-target-sidecar', dataset, parent, sidecar, report,
+        ...(exploratory ? ['--exploratory-evaluation'] : [])],
         {cwd: root, windowsHide: true, env: {...process.env, PORYGON_OMP_THREADS: '1', OMP_NUM_THREADS: '1'}, stdio: 'inherit'});
     if (run.error || run.status !== 0) throw new Error(`target fit failed: ${run.error || run.status}`);
     const result = JSON.parse(await fs.readFile(report, 'utf8'));
-    if (result.passed) await writeJsonAtomic(`${sidecar}.meta.json`, {parent_sha256: await hashFile(parent),
+    if (exploratory) {
+        const original = JSON.parse(await fs.readFile(path.join(root,
+            'models/runs/run_0286_move_conditioned_targets/target_fit.json'), 'utf8'));
+        for (const key of ['best_epoch', 'train_nll_before', 'train_nll_after', 'holdout_nll_before',
+            'holdout_nll_after', 'accuracy_before', 'accuracy_after', 'parent_fingerprint'])
+            if (result[key] !== original[key]) throw new Error(`exploratory replay changed the fixed candidate: ${key}`);
+    }
+    if (targetFitEligible({exploratory_evaluation: exploratory}, result, exploratory))
+        await writeJsonAtomic(`${sidecar}.meta.json`, {parent_sha256: await hashFile(parent),
         sidecar_sha256: await hashFile(sidecar), dataset_sha256: await hashFile(dataset),
-        executable_sha256: await hashFile(executable), fit_report_sha256: await hashFile(report)});
+        executable_sha256: await hashFile(executable), fit_report_sha256: await hashFile(report),
+        exploratory_evaluation: exploratory});
     console.log(`[target-fit] ${JSON.stringify({...result, counts: packed.counts})}`);
-    if (!result.passed) process.exitCode = 2;
+    if (!targetFitEligible({exploratory_evaluation: exploratory}, result, exploratory)) process.exitCode = 2;
 }
 
-module.exports = {createTargetCollector, packDataset, publishLabels, readLabels, splitBattle, validateLabels};
+module.exports = {createTargetCollector, packDataset, publishLabels, readLabels, splitBattle, validateLabels, targetFitEligible};
 if (require.main === module) main(process.argv.slice(2)).catch(error => {console.error(error); process.exitCode = 1;});

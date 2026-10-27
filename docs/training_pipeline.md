@@ -1296,3 +1296,35 @@ label collection and other decoders in this mode. Native direct evaluation is
 `showdown_client --battle-agent parent.chk --target-sidecar sidecar.bin`;
 these episodes remain ineligible for PPO. None of this changes the default
 policy or treats the failed run as deployable.
+
+The subsequently approved exploratory screen explicitly waives only the
+accuracy veto, without changing the original failed result. Publication uses
+`--exploratory-evaluation`; its report keeps `passed: false`, the failure reason
+and `exploratory_exception: true`. The benchmark additionally requires
+`exploratory_target_evaluation: true`. Neither option bypasses finite-output,
+parent-binding or improved-validation-NLL checks. This exception is for
+evaluation, not promotion or PPO training.
+
+```powershell
+node .\tools\target_learning.js run_0285_target_learning_collection models/runs/run_0287_target_exploratory --exploratory-evaluation
+node .\tools\tactical_teacher_benchmark.js --run-name run_0288_target_exploratory_control --config .\config\experimental\target_exploratory_control.json
+node .\tools\tactical_teacher_benchmark.js --run-name run_0289_target_exploratory_learned --config .\config\experimental\target_exploratory_learned.json
+node .\tools\tactical_teacher_benchmark.js --run-name run_0290_target_exploratory_heuristic --config .\config\experimental\target_exploratory_heuristic.json
+```
+
+Reproduction must match the original selected epoch and aggregate metrics
+exactly. The three screen modes share seed 28801, models, executable and
+resource settings, with 100 valid games per side against parent/random each.
+Keep paired uncertainty separate by opponent; these are development results.
+
+The approved screen completed cleanly: all 1,200 games were valid and all
+three modes shared model/executable/source hashes. Sampling, learned targets
+and heuristic targets scored 53.0%, 56.0% and 55.0% against parent; against
+random they scored 44.5%, 41.5% and 53.0%. Learned-minus-sampling differences
+were +3 points against parent (approximate paired 95% interval -7.41 to +13.41)
+and -3 against random (-11.90 to +5.90), each over 100 complete seed pairs.
+There is no demonstrated learned-strength gain and no automatic promotion.
+See `models/diagnostics/run_0288_0290_target_exploratory_comparison.json` for
+the side splits, coverage, full comparisons and provenance. Intervals are
+nominal development intervals, without multiplicity adjustment; don't pool
+opponents or reinterpret this as passing the original learning gate.
