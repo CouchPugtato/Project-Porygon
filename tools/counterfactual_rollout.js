@@ -190,6 +190,8 @@ class AgentProcess {
         if (targetOptions.decoder !== undefined && (!['sample', 'argmax'].includes(targetOptions.decoder) ||
                 (targetOptions.decoder === 'argmax' && (!targetOptions.sidecar || !targetOptions.contextual))))
             throw new Error('target argmax requires a contextual sidecar');
+        if (targetOptions.audit && (!targetOptions.contextual || targetOptions.decoder !== 'argmax'))
+            throw new Error('passive target audit requires contextual argmax inference');
         if (targetOptions.labels && (tacticalTeacher || intervention || tacticalAudit || tacticalTargets || inferencePolicy !== 'sample'))
             throw new Error('target labels require unchanged sampled play');
         if (targetOptions.sidecar && (targetOptions.labels || tacticalTeacher || intervention || tacticalAudit || tacticalTargets || inferencePolicy !== 'sample'))
@@ -230,6 +232,7 @@ class AgentProcess {
         if (this.targetOptions.labels) args.push('--target-labels', '1');
         if (this.targetOptions.sidecar) args.push('--target-sidecar', this.targetOptions.sidecar);
         if (this.targetOptions.decoder === 'argmax') args.push('--target-decoder', 'argmax');
+        if (this.targetOptions.audit) args.push('--target-audit', '1');
         if (this.intervention) {
             args.push(
                 '--counterfactual-decision', String(this.intervention.decisionIndex),
@@ -270,6 +273,8 @@ class AgentProcess {
             throw new Error('loaded target sidecar format differs from the configured context mode');
         if (this.targetOptions.sidecar && (ready.capabilities?.target_decoder || 'sample') !== (this.targetOptions.decoder || 'sample'))
             throw new Error('runtime target decoder differs from the configured evaluation mode');
+        if (this.targetOptions.audit && ready.capabilities?.target_audit !== true)
+            throw new Error('runtime does not advertise passive target auditing');
         if (this.targetOptions.labels && (ready.capabilities?.target_labels !== true || ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise passive target labels; rebuild the client');
         if (this.targetOptions.contextVersion === 1 && ready.capabilities?.target_context_version !== 1)

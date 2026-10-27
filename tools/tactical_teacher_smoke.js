@@ -12,6 +12,7 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const {createDecisionAudit} = require('./tactical_decision_audit');
 const {createTargetCollector} = require('./target_learning');
 const {targetPolicyTag} = require('./target_context');
+const {createTargetAudit} = require('./target_audit');
 
 async function hashFile(filename) {
     const hash = crypto.createHash('sha256');
@@ -94,7 +95,8 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
             contextVersion: side === candidateSide ? (config.target_context_version || 0) : 0,
             sidecar: side === candidateSide && config.target_sidecar ? path.resolve(REPO_ROOT, config.target_sidecar) : null,
             contextual: side === candidateSide && config.context_target_evaluation === true,
-            decoder: side === candidateSide ? (config.target_decoder || 'sample') : 'sample'}));
+            decoder: side === candidateSide ? (config.target_decoder || 'sample') : 'sample',
+            audit: side === candidateSide && config.target_audit === true}));
 }
 
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
@@ -107,7 +109,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
     const battle = new sim.BattleStream();
     const streams = sim.getPlayerStreams(battle);
     const seeds = battleSeeds(config.seed, index, matchedTeams);
-    const audit = config.collect_target_labels ? createTargetCollector(config.target_context_version || 0) : config.decision_audit ? createDecisionAudit() : null;
+    const audit = config.target_audit ? createTargetAudit() : config.collect_target_labels ? createTargetCollector(config.target_context_version || 0) : config.decision_audit ? createDecisionAudit() : null;
     const observe = audit ? line => { audit.observe(line); if (recordTeacher) recordTeacher(line); } : recordTeacher;
     const agents = createBattleAgents(config, seeds, teacherSide, opponent, observe);
     let timeout;
@@ -149,7 +151,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
                 choice_rejections: [...first.choiceRejections, ...second.choiceRejections],
             };
             if (config.tactical_teacher !== false) aggregateGames([game]);
-            if (audit) game[config.collect_target_labels ? 'target_examples' : 'decision_audit'] = audit.finish(teacher.episode);
+            if (audit) game[config.target_audit ? 'target_audit' : config.collect_target_labels ? 'target_examples' : 'decision_audit'] = audit.finish(teacher.episode);
             if (config.tactical_targets) {
                 const report = teacher.episode;
                 if (report.policy_tag !== 'tactical-targets-v1' || report.training_eligible !== false ||

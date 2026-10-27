@@ -133,18 +133,18 @@ double target_sidecar_gradient(const TargetSidecar* s, const float* hidden,
     return target_sidecar_backward(s, hidden, slot, move, legal, best, policy, gradient);
 }
 
-int target_sidecar_supports(const Observation* observation, const ParsedRequest* request,
+const char* target_sidecar_support_reason(const Observation* observation, const ParsedRequest* request,
     const FactorizedActionChoice* choice
 ) {
     int slot, i;
-    if (request->forced_switch_any) return 0;
+    if (request->forced_switch_any) return "forced_switch";
     for (i = 0; i < OBS_TEAM_SIZE; ++i) {
         const ObsPokemon* teams[2] = {&observation->self_team[i], &observation->opp_team[i]};
         int team;
         for (team = 0; team < 2; ++team) {
             const ObsPokemon* p = teams[team];
             if (p->active && !p->fainted && (!p->type1_known_mode || !p->type2_known_mode ||
-                    p->type1_id <= 0 || p->type1_id >= OBS_NUM_TYPES || p->type2_id < 0 || p->type2_id >= OBS_NUM_TYPES)) return 0;
+                    p->type1_id <= 0 || p->type1_id >= OBS_NUM_TYPES || p->type2_id < 0 || p->type2_id >= OBS_NUM_TYPES)) return "unknown_visible_types";
         }
     }
     for (slot = 0; slot < 2; ++slot) {
@@ -155,15 +155,23 @@ int target_sidecar_supports(const Observation* observation, const ParsedRequest*
         MoveSemanticMetadata metadata;
         if (!has_action || kind != FACTORIZED_ACTION_MOVE) continue;
         int id = request->active[slot].move_id[move];
-        if (tera || (request->active_team_idx_known[slot] && request->side_tera_used[request->active_team_idx[slot]]) ||
-                !move_semantics_from_id(id, &metadata) || !metadata.damaging || metadata.base_power <= 0 ||
+        if (tera || (request->active_team_idx_known[slot] && request->side_tera_used[request->active_team_idx[slot]])) return "tera";
+        if (!move_semantics_from_id(id, &metadata)) return "unknown_move";
+        if (!metadata.damaging) return "status_move";
+        if (metadata.base_power <= 0 ||
                 (metadata.category != 2 && metadata.category != 3) || metadata.accuracy <= 0 || metadata.accuracy > 100 ||
-                move_type_from_id(id) <= 0) return 0;
+                move_type_from_id(id) <= 0) return "unsupported_move_metadata";
         if (!build_move_target_mask(request, slot, move) &&
                 request->active[slot].move_target[move] != REQUEST_TARGET_ALL_ADJACENT &&
-                request->active[slot].move_target[move] != REQUEST_TARGET_ALL_ADJACENT_FOES) return 0;
+                request->active[slot].move_target[move] != REQUEST_TARGET_ALL_ADJACENT_FOES) return "unsupported_target_kind";
     }
-    return 1;
+    return NULL;
+}
+
+int target_sidecar_supports(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice
+) {
+    return target_sidecar_support_reason(observation, request, choice) == NULL;
 }
 
 static int publish_file(const char* temporary, const char* path) {

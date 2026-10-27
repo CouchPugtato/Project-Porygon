@@ -1520,3 +1520,58 @@ All native suites and 71 JavaScript tests pass. The complete comparison is
 Neither contextual decoder is promoted. The next proposed step is a small
 passive audit of actual targeting disagreements and their impact, not another
 fit, decoding sweep or larger confirmation. It requires separate approval.
+
+### Passive target audit
+
+`--target-audit 1` adds passive diagnostics to contextual argmax inference;
+it cannot run without that policy. The serializer lives in `target_audit.c`,
+and `tools/target_audit.js` retains only accepted choices. Rejected retries
+are not examples. Resume checks the policy mode and terminal decision/use
+counts, and audited games cannot resume as unaudited strength games.
+
+`config/experimental/target_policy_audit.json` runs 100 distinct battles:
+25 per side against parent/random on seed 30301, with unpaired game seeds
+and a disjoint random-opponent seed range. The candidate, sidecar and decoder
+remain frozen. One-thread serial agents and 65% launch gates are unchanged.
+This is not training, a strength confirmation or permission to change rules.
+
+The audit records player-visible move/target context and support reasons.
+Joint gaps compare the chosen targets with heuristic retargeting of the
+same actions. Slot gaps change one target while holding the partner target
+fixed; they are not an additional loss to add to joint gaps. Agreement is
+tie-aware and restricted to informative scored slots. Groups retain move
+IDs/types, selected target types, self/ally/foe relation and battle stage.
+All scores are effective-power heuristic proxies, not actual HP damage or
+counterfactual win effects.
+
+Run_0303 completed 100 valid battles, zero exclusions, in 84.4 seconds of
+recorded runtime. There were 1,956 accepted decisions, 1,337 explicit
+multi-target opportunities, 628 supported opportunities, and 1,028 informative
+target slots. The policy used learned targeting on 32.1% of accepted decisions;
+only 47.0% of multi-target opportunities were supported. Status-move turns
+accounted for 601 of 709 unsupported opportunities. The current whole-turn
+guard can suppress an ordinary attack when its partner chooses a status move.
+
+Raw heuristic agreement was 914/1,028 (88.9%). However, 30 informative selections
+addressed observed-absent foe slots while another foe was present. Twenty-nine
+were disagreements and contributed 25.6% of the raw score gap. A compiled
+Showdown fixture verifies that an ordinary doubles attack at a fainted foe
+location retargets to the sole surviving foe. The heuristic currently scores
+an absent target as zero, so these gaps must not be called wasted attacks.
+The retained audit does not independently verify simulator state for each
+observed-absent slot; keep this limitation explicit.
+
+The secondary present-target view gives 913/998 agreement (91.5%), with 85
+remaining disagreements. Twenty-one selected targets had a type-chart
+immunity despite a higher-scoring alternative, ignoring abilities and move
+exceptions. No informative selected target was an ally. Present-target
+disagreements occurred in 25/383 opening slots, 50/538 middle slots and 10/77
+late slots; these are descriptive correlated observations, not causal stage
+effects. The complete report preserves raw metrics and this secondary view:
+`models/diagnostics/run_0303_target_policy_audit.json`.
+
+Native regressions prove passive actions, hidden state and RNG match unaudited
+inference. All native suites and 75 JavaScript tests pass. Weights, teacher
+rules and decoding remain unchanged. Next proposal: repair the diagnostic
+scorer's auto-retarget equivalence first; assess slot-local coverage separately
+after that. Neither change nor further training is authorized by this audit.

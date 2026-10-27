@@ -52,6 +52,7 @@ set(SHOWDOWN_CLIENT_SOURCES
 	src/policy_decoding.c
 	src/tactical_audit.c
 	src/target_sidecar.c
+	src/target_audit.c
 	src/target_context_fit.c
 	src/target_labels.c
 	src/target_context.c
@@ -110,6 +111,7 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/policy_decoding.c
 	src/tactical_audit.c
 	src/target_sidecar.c
+	src/target_audit.c
 	src/target_context_fit.c
 	src/target_labels.c
 	src/target_context.c

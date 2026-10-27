@@ -15,6 +15,8 @@ typedef struct {
 /* Passive comparison: no model step, RNG use, or choice replacement. */
 int tactical_audit_choice(const Observation* observation, const ParsedRequest* request,
     const FactorizedActionChoice* choice, TacticalAudit* audit);
+int tactical_audit_targets(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, TacticalAudit* audit);
 /* Returns one only for a fully scored strict improvement; changes target
  * indices only. Unsupported, forced, and tied choices remain byte-identical. */
 int tactical_retarget_choice(const Observation* observation, const ParsedRequest* request,

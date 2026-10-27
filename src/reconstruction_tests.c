@@ -961,7 +961,7 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
             "create unchanged live target sidecar")) return 0;
     target_sidecar_free(initial_targets);
     if (!assert_true(save_context_runtime_fixture(model, "test_runtime_context.tmp"), "save contextual runtime sidecar")) return 0;
-    for (mode = 0; mode < 7; ++mode) {
+    for (mode = 0; mode < 8; ++mode) {
         FILE* output = tmpfile();
         RuntimeMessage terminal;
         char line[4096];
@@ -987,7 +987,8 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
         if (mode >= 5) ok &= assert_true(env_runtime_enable_target_sidecar(&runtime, "test_runtime_context.tmp") &&
             runtime.target_sidecar->contextual && !env_runtime_enable_tactical_teacher(&runtime) &&
             !env_runtime_enable_target_labels(&runtime), "Context targeting is explicit and excludes teacher labels");
-        if (mode == 6) ok &= assert_true(env_runtime_enable_target_argmax(&runtime), "enable target-only argmax");
+        if (mode >= 6) ok &= assert_true(env_runtime_enable_target_argmax(&runtime), "enable target-only argmax");
+        if (mode == 7) ok &= assert_true(env_runtime_enable_target_audit(&runtime), "enable passive target audit");
         srand(28001);
         ok &= assert_true(send_counterfactual_test_state(&runtime, output), "emit sampled action with passive audit");
         if (mode >= 5) ok &= assert_true(runtime.sessions[0].pending_learned_targets,
@@ -1003,7 +1004,7 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                     (!observed.slot0_target_mask || (observed.slot0_target_mask & (1u << observed.slot0_target_index))) &&
                     (!observed.slot1_target_mask || (observed.slot1_target_mask & (1u << observed.slot1_target_index))),
                     "context target samples stay inside each selected move's legal mask");
-                if (mode == 6) {
+                if (mode >= 6) {
                     int slot;
                     EnvSession* session = &runtime.sessions[0];
                     for (slot = 0; slot < 2; ++slot) {
@@ -1062,9 +1063,13 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                     (strstr(line, "\"target_intervention\":{") && strstr(line, "\"sampled_command\":"))) &&
                 strstr(line, "\"training_eligible\":false"),
                 "Target intervention retains the original sampled command");
+            if (mode == 7) ok &= assert_true(strstr(line, "\"target_audit\":{") &&
+                strstr(line, "\"support_reason\":\"supported\"") && strstr(line, "\"target_scores\":["),
+                "passive target audit serializes scored accepted-choice candidates");
             ok &= assert_true(fgets(line, sizeof(line), output) &&
-                strstr(line, mode == 6 ? "target-context-argmax-v1" : (mode == 5 ? "target-context-v1" : "tactical-targets-v1")) &&
-                (mode != 6 || strstr(line, "\"target_decoder\":\"argmax\"")) &&
+                strstr(line, mode >= 6 ? "target-context-argmax-v1" : (mode == 5 ? "target-context-v1" : "tactical-targets-v1")) &&
+                (mode < 6 || strstr(line, "\"target_decoder\":\"argmax\"")) &&
+                (mode != 7 || strstr(line, "\"target_audit\":true")) &&
                 strstr(line, "\"target_decisions\":1") &&
                 !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0), "Target intervention is not PPO data");
         }
@@ -1083,7 +1088,7 @@ static int test_runtime_handles_recorded_no_choice_requests(void) {
     int fixture, mode, ok = assert_true(model != NULL, "create recorded-request runtime fixture");
     if (!ok) return 0;
     if (!assert_true(save_context_runtime_fixture(model, "test_fallback_context.tmp"), "save context fallback fixture")) return 0;
-    for (fixture = 0; fixture < 2; ++fixture) for (mode = 0; mode < 6; ++mode) {
+    for (fixture = 0; fixture < 2; ++fixture) for (mode = 0; mode < 7; ++mode) {
         EnvRuntime runtime = {0};
         RuntimeMessage message;
         FactorizedActionChoice decoded;
@@ -1095,7 +1100,8 @@ static int test_runtime_handles_recorded_no_choice_requests(void) {
         if (mode == 2) ok &= env_runtime_enable_greedy_inference(&runtime);
         if (mode == 3) ok &= env_runtime_enable_tactical_targets(&runtime);
         if (mode >= 4) ok &= env_runtime_enable_target_sidecar(&runtime, "test_fallback_context.tmp");
-        if (mode == 5) ok &= env_runtime_enable_target_argmax(&runtime);
+        if (mode >= 5) ok &= env_runtime_enable_target_argmax(&runtime);
+        if (mode == 6) ok &= env_runtime_enable_target_audit(&runtime);
         runtime_message_init(&message);
         message.type = RUNTIME_MSG_BATTLE_START;
         strcpy(message.battle_id, "recorded-no-choice");

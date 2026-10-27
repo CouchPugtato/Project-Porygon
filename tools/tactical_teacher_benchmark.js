@@ -8,6 +8,7 @@ const {publishReplay, verifyReplays} = require('./tactical_demonstrations');
 const {summarizeDecisions} = require('./tactical_decision_audit');
 const {publishLabels, readLabels, targetFitEligible} = require('./target_learning');
 const {targetPolicyTag} = require('./target_context');
+const {summarizeTargetAudit} = require('./target_audit');
 const ROOT = path.resolve(__dirname, '..');
 const OPPONENTS = ['parent', 'random'];
 const SUPPORTED_OPPONENTS = [...OPPONENTS, 'pilot', 'sampled'];
@@ -80,6 +81,12 @@ function validateResume(saved, identity, config) {
                 !Number.isFinite(game.duration_seconds) || game.duration_seconds < 0)
             throw new Error('saved benchmark records do not match the deterministic schedule');
         if (game.status === 'completed') {
+            if (config.target_audit) {
+                summarizeTargetAudit([game]);
+                if (game.learned_targets?.target_audit !== true || game.target_audit.length !== game.learned_targets.target_decisions ||
+                        game.target_audit.filter(d => d.learned_used).length !== game.learned_targets.learned_target_decisions)
+                    throw new Error('saved target audit has inconsistent terminal accounting');
+            } else if (game.target_audit || game.learned_targets?.target_audit) throw new Error('audited play cannot resume as an unaudited run');
             if (config.target_sidecar && (game.policy_tag !== targetPolicyTag(config) ||
                     (game.learned_targets?.target_decoder || 'sample') !== (config.target_decoder || 'sample') ||
                     game.learned_targets?.training_eligible !== false ||
@@ -131,6 +138,9 @@ async function loadSaved(filename) {
 }
 
 function validateConfig(config) {
+    if (config.target_audit !== undefined && (typeof config.target_audit !== 'boolean' ||
+            (config.target_audit && (!config.context_target_evaluation || !config.target_sidecar || config.target_decoder !== 'argmax'))))
+        throw new Error('passive target audit requires contextual argmax evaluation');
     if (config.target_decoder !== undefined && (!['sample', 'argmax'].includes(config.target_decoder) ||
             !config.target_sidecar || (config.target_decoder === 'argmax' && !config.context_target_evaluation)))
         throw new Error('target decoder requires an explicit sidecar; argmax requires contextual evaluation');
@@ -193,7 +203,7 @@ async function main(argv = process.argv.slice(2)) {
     validateConfig(config);
     const targetGames = 2 * config.games_per_side * (config.opponents || OPPONENTS).length;
     const sources = ['tools/tactical_teacher_benchmark.js', 'tools/tactical_teacher_smoke.js',
-        'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'tools/tactical_decision_audit.js', 'tools/target_learning.js', 'tools/target_context.js',
+        'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'tools/tactical_decision_audit.js', 'tools/target_learning.js', 'tools/target_context.js', 'tools/target_audit.js',
         'external/pokemon-showdown/dist/sim/battle.js',
         'external/pokemon-showdown/dist/sim/battle-stream.js',
         'external/pokemon-showdown/dist/sim/tools/random-player-ai.js'];
@@ -235,7 +245,7 @@ async function main(argv = process.argv.slice(2)) {
             const results = summarize(games, config.opponents);
             const valid = Object.values(results).reduce((sum, result) => sum + result.valid_games, 0);
             const elapsed = games.reduce((sum, game) => sum + game.duration_seconds, 0);
-            await writeJsonAtomic(filename, {diagnostic: config.collect_demonstrations ?
+            await writeJsonAtomic(filename, {diagnostic: config.target_audit ? 'passive_context_target_audit' : config.collect_demonstrations ?
                 'tactical_teacher_demonstration_collection' : config.tactical_teacher === false ?
                     'neural_candidate_strength_benchmark' : 'tactical_teacher_strength_benchmark', run_name: name,
                 identity, status, error, training_eligible: false, target_valid_games: targetGames,
@@ -244,6 +254,8 @@ async function main(argv = process.argv.slice(2)) {
                 candidate_inference_policy: config.candidate_inference_policy || 'sample',
                 decision_audit: config.decision_audit ? Object.fromEntries(Object.keys(results).map(opponent =>
                     [opponent, summarizeDecisions(games.filter(game => game.opponent === opponent && isValid(game)))])) : null,
+                target_audit: config.target_audit ? Object.fromEntries(Object.keys(results).map(opponent =>
+                    [opponent, summarizeTargetAudit(games.filter(game => game.opponent === opponent && isValid(game)))])) : null,
                 demonstration_purpose: config.collect_demonstrations ? 'supervised_imitation' : null,
                 ppo_eligible: false,
                 valid_games: valid, elapsed_seconds: elapsed,
@@ -262,7 +274,7 @@ async function main(argv = process.argv.slice(2)) {
                     `attempt=${Math.floor(next.index / 2) + 1}/${config.max_attempts_per_side}`);
                 await gate.waitForLaunch();
                 const replay = [];
-                const collecting = config.collect_demonstrations || config.collect_target_labels;
+                const collecting = config.collect_demonstrations || config.collect_target_labels || config.target_audit;
                 const battleConfig = collecting && next.opponent === 'random' ?
                     {...config, seed: config.seed + 10000000} : config;
                 const game = await playGame(sim, battleConfig, next.index, {opponent: next.opponent,

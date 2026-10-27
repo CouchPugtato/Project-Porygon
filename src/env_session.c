@@ -7,6 +7,7 @@
 #include "tactical_audit.h"
 #include "target_labels.h"
 #include "target_sidecar.h"
+#include "target_audit.h"
 #include "policy_decoding.h"
 
 #include <math.h>
@@ -554,6 +555,12 @@ int env_runtime_enable_target_argmax(EnvRuntime* runtime) {
     return 1;
 }
 
+int env_runtime_enable_target_audit(EnvRuntime* runtime) {
+    if (!runtime || runtime->count || !runtime->target_argmax || !runtime->target_sidecar) return 0;
+    runtime->target_audit = 1;
+    return 1;
+}
+
 static int prepare_target_policy(EnvRuntime* runtime, EnvSession* session,
     const FactorizedActionChoice* choice, int slot, const float* original, float* policy
 ) {
@@ -988,8 +995,14 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
                 tactical_decision.evaluation.friendly_power);
             fputs("}}", out);
         } else if (runtime->target_sidecar) {
-            fprintf(out, "%.*s,\"training_eligible\":false,\"target_decoder\":\"%s\",\"learned_targets\":%s}", (int)strlen(json) - 1, json,
+            fprintf(out, "%.*s,\"training_eligible\":false,\"target_decoder\":\"%s\",\"learned_targets\":%s", (int)strlen(json) - 1, json,
                 runtime->target_argmax ? "argmax" : "sample", session->pending_learned_targets ? "true" : "false");
+            if (runtime->target_audit) {
+                fputs(",\"target_audit\":", out);
+                target_audit_write(out, &session->observation, &session->parsed_request,
+                    &session->pending_factorized_choice, session->raw_state.turn_number, session->pending_learned_targets);
+            }
+            fputc('}', out);
         } else if (runtime->target_labels) {
             fprintf(out, "%.*s,\"training_eligible\":false,\"target_labels\":", (int)strlen(json) - 1, json);
             target_labels_write(out, &session->observation, &session->parsed_request,
@@ -1166,10 +1179,10 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 } else if (runtime->target_sidecar) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
                         "\"policy_tag\":\"%s\",\"training_eligible\":false,"
-                        "\"target_decoder\":\"%s\",\"target_decisions\":%zu,\"learned_target_decisions\":%zu}\n",
+                        "\"target_decoder\":\"%s\",\"target_audit\":%s,\"target_decisions\":%zu,\"learned_target_decisions\":%zu}\n",
                         session->battle_id, runtime->target_argmax ? "target-context-argmax-v1" :
                             (runtime->target_sidecar->contextual ? "target-context-v1" : "target-sidecar-v1"),
-                        runtime->target_argmax ? "argmax" : "sample",
+                        runtime->target_argmax ? "argmax" : "sample", runtime->target_audit ? "true" : "false",
                         session->decision_count, session->learned_target_decisions);
                 } else if (runtime->target_labels) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","

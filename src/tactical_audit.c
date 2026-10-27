@@ -21,7 +21,7 @@ static int evaluate_targets(const Observation* observation, const ParsedRequest*
         evaluation->unscored_moves == 0;
 }
 
-int tactical_audit_choice(const Observation* observation, const ParsedRequest* request,
+int tactical_audit_targets(const Observation* observation, const ParsedRequest* request,
     const FactorizedActionChoice* choice, TacticalAudit* audit
 ) {
     int actions[2];
@@ -29,8 +29,15 @@ int tactical_audit_choice(const Observation* observation, const ParsedRequest* r
     memset(audit, 0, sizeof(*audit));
     if (!factorized_action_choice_to_flat_actions(choice, &actions[0], &actions[1]) ||
             !tactical_evaluate_power(observation, request, choice, &audit->selected, NULL)) return 0;
-    audit->teacher_available = tactical_select_choice(observation, request, evaluate_teacher, NULL, &audit->teacher);
     audit->retargeted_available = tactical_select_choice(observation, request, evaluate_targets, actions, &audit->retargeted);
+    return 1;
+}
+
+int tactical_audit_choice(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, TacticalAudit* audit
+) {
+    if (!tactical_audit_targets(observation, request, choice, audit)) return 0;
+    audit->teacher_available = tactical_select_choice(observation, request, evaluate_teacher, NULL, &audit->teacher);
     return 1;
 }
 

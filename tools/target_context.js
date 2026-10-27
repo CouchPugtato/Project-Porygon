@@ -5,8 +5,8 @@ const path = require('node:path');
 const {spawnSync} = require('node:child_process');
 const {writeJsonAtomic, writeTextAtomic} = require('./counterfactual_rollout');
 
-function validateContext(c) {
-    if (c?.version !== 1 || !Number.isInteger(c.move_id) || c.move_id <= 0 || c.move_id > 65535 ||
+function validateContext(c, allowUnknownMove = false) {
+    if (c?.version !== 1 || !Number.isInteger(c.move_id) || c.move_id < (allowUnknownMove ? 0 : 1) || c.move_id > 65535 ||
             !Number.isInteger(c.move_type_id) || c.move_type_id < 0 || c.move_type_id >= 19 ||
             typeof c.move_type_known !== 'boolean' || c.move_type_known !== (c.move_type_id !== 0) ||
             !Array.isArray(c.targets) || c.targets.length !== 4) throw new Error('invalid selected-move context');
