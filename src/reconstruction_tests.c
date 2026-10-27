@@ -945,7 +945,15 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
     if (!assert_true(initial_targets && target_sidecar_save(initial_targets, "test_runtime_targets.tmp"),
             "create unchanged live target sidecar")) return 0;
     target_sidecar_free(initial_targets);
-    for (mode = 0; mode < 5; ++mode) {
+    initial_targets = target_sidecar_create(model);
+    initial_targets->contextual = 1;
+    initial_targets->weights = realloc(initial_targets->weights, target_sidecar_parameter_count(initial_targets) * sizeof(float));
+    if (!assert_true(initial_targets->weights != NULL, "allocate contextual runtime sidecar")) return 0;
+    size_t base_parameters = 32 * (initial_targets->hidden_dim + 1), k;
+    for (k = 0; k < TARGET_CONTEXT_PARAMETER_COUNT; ++k) initial_targets->weights[base_parameters + k] = (float)(k % 19) * 2;
+    if (!assert_true(target_sidecar_save(initial_targets, "test_runtime_context.tmp"), "save contextual runtime sidecar")) return 0;
+    target_sidecar_free(initial_targets);
+    for (mode = 0; mode < 6; ++mode) {
         FILE* output = tmpfile();
         RuntimeMessage terminal;
         char line[4096];
@@ -966,8 +974,13 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
         if (mode == 4) ok &= assert_true(env_runtime_enable_target_sidecar(&runtime, "test_runtime_targets.tmp") &&
             !env_runtime_enable_target_labels(&runtime) && !env_runtime_enable_tactical_targets(&runtime) &&
             !env_runtime_enable_greedy_inference(&runtime), "Learned targeting excludes teacher and other decoders");
+        if (mode == 5) ok &= assert_true(env_runtime_enable_target_sidecar(&runtime, "test_runtime_context.tmp") &&
+            runtime.target_sidecar->contextual && !env_runtime_enable_tactical_teacher(&runtime) &&
+            !env_runtime_enable_target_labels(&runtime), "Context targeting is explicit and excludes teacher labels");
         srand(28001);
         ok &= assert_true(send_counterfactual_test_state(&runtime, output), "emit sampled action with passive audit");
+        if (mode == 5) ok &= assert_true(runtime.sessions[0].pending_learned_targets,
+            "context runtime fixture exercises learned targeting, not only fallback");
         if (runtime.count) {
             if (!mode) {
                 baseline = runtime.sessions[0].pending_factorized_choice;
@@ -975,7 +988,11 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                 next_rng = rand();
             } else {
                 FactorizedActionChoice observed = runtime.sessions[0].pending_factorized_choice;
-                if (mode == 2) {
+                if (mode == 5) ok &= assert_true(
+                    (!observed.slot0_target_mask || (observed.slot0_target_mask & (1u << observed.slot0_target_index))) &&
+                    (!observed.slot1_target_mask || (observed.slot1_target_mask & (1u << observed.slot1_target_index))),
+                    "context target samples stay inside each selected move's legal mask");
+                if (mode == 2 || mode == 5) {
                     observed.slot0_target_index = baseline.slot0_target_index;
                     observed.slot1_target_index = baseline.slot1_target_index;
                 }
@@ -996,7 +1013,7 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
             ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "tactical-audit-v1") &&
                 !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0), "Audit terminal cannot become PPO data");
         }
-        if (mode == 2) {
+        if (mode == 2 || mode == 5) {
             RuntimeMessage accepted;
             runtime_message_init(&accepted);
             accepted.type = RUNTIME_MSG_DECISION;
@@ -1013,10 +1030,13 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
             terminal.reward = 1.0f;
             ok &= env_runtime_handle_message(&runtime, &terminal, output);
             rewind(output);
-            ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "\"target_intervention\":{") &&
-                strstr(line, "\"sampled_command\":") && strstr(line, "\"training_eligible\":false"),
+            ok &= assert_true(fgets(line, sizeof(line), output) &&
+                (mode == 5 ? strstr(line, "\"learned_targets\":true") != NULL :
+                    (strstr(line, "\"target_intervention\":{") && strstr(line, "\"sampled_command\":"))) &&
+                strstr(line, "\"training_eligible\":false"),
                 "Target intervention retains the original sampled command");
-            ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "tactical-targets-v1") &&
+            ok &= assert_true(fgets(line, sizeof(line), output) &&
+                strstr(line, mode == 5 ? "target-context-v1" : "tactical-targets-v1") &&
                 strstr(line, "\"target_decisions\":1") &&
                 !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0), "Target intervention is not PPO data");
         }
@@ -1024,6 +1044,7 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
         fclose(output);
     }
     remove("test_runtime_targets.tmp");
+    remove("test_runtime_context.tmp");
     gru_model_destroy(model);
     return ok;
 }
@@ -6556,7 +6577,39 @@ static int test_context_comparison_learns_when_frozen_states_are_identical(void)
     rewind(report);
     ok &= fgets(json, sizeof(json), report) != NULL && strstr(json, "\"context_lower_validation_nll\":true") &&
         strstr(json, "\"weights_published\":false") && target_parent_fingerprint(parent) == fingerprint;
-    fclose(report); remove("test_context_compare.tmp"); gru_model_destroy(parent);
+    fclose(report);
+    report = tmpfile();
+    ok &= target_context_compare_for_evaluation("test_context_compare.tmp", parent, report, "test_context_weights.tmp");
+    TargetSidecar* loaded = target_sidecar_load("test_context_weights.tmp", parent);
+    ok &= loaded && loaded->contextual && target_sidecar_parameter_count(loaded) == 1010;
+    if (loaded) {
+        TargetContext c = {0};
+        float policy[4], original[4];
+        int target;
+        c.move_id = 1; c.move_type_id = 1; c.move_type_known = 1;
+        for (target = 0; target < 4; ++target) {
+            c.targets[target].position = (unsigned char)target;
+            c.targets[target].friendly = target < 2; c.targets[target].present = 1;
+            c.targets[target].type1_id = (unsigned char)(target + 1);
+            c.targets[target].type1_known_mode = c.targets[target].type2_known_mode = 2;
+        }
+        ok &= target_sidecar_predict_context(loaded, hidden, 0, 0, 12, &c, policy) &&
+            policy[0] == 0 && policy[1] == 0 && policy[2] > policy[3];
+        c.move_type_known = 0; c.move_type_id = 0;
+        ok &= target_sidecar_predict_context(loaded, hidden, 0, 0, 12, &c, policy) &&
+            target_sidecar_predict(loaded, hidden, 0, 0, 12, original) && !memcmp(policy, original, sizeof(policy));
+        c.targets[2].type1_known_mode = 0;
+        ok &= !target_sidecar_predict_context(loaded, hidden, 0, 0, 12, &c, policy);
+        GruModel* other = gru_model_create(4, 8, OBS_NUM_ACTIONS);
+        ok &= !target_sidecar_load("test_context_weights.tmp", other);
+        gru_model_destroy(other);
+        FILE* damaged = fopen("test_context_weights.tmp", "r+b");
+        if (damaged) { fseek(damaged, -1, SEEK_END); fputc(255, damaged); fclose(damaged); }
+        ok &= damaged && !target_sidecar_load("test_context_weights.tmp", parent);
+    }
+    ok &= target_parent_fingerprint(parent) == fingerprint;
+    target_sidecar_free(loaded);
+    fclose(report); remove("test_context_weights.tmp"); remove("test_context_compare.tmp"); gru_model_destroy(parent);
     return assert_true(ok, "Visible move context learns opposite targets without changing frozen states or publishing weights");
 }
 

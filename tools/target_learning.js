@@ -174,6 +174,10 @@ async function auditTargetInputs(directory, summary) {
 }
 
 async function main(argv) {
+    if (argv[0] === '--export-context-evaluation') {
+        if (argv.length !== 4) throw new Error('usage: node tools/target_learning.js --export-context-evaluation COMPARISON_DIRECTORY PARENT_CHECKPOINT OUTPUT_DIRECTORY');
+        return require('./target_context').exportContext(argv[1], argv[2], argv[3]);
+    }
     if (argv[0] === '--compare-context') {
         if (argv.length !== 3) throw new Error('usage: node tools/target_learning.js --compare-context COLLECTION_RUN OUTPUT_DIRECTORY');
         return require('./target_context').compareContext(argv[1], argv[2]);

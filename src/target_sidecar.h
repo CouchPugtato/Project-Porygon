@@ -3,11 +3,13 @@
 
 #include <stdint.h>
 #include "gru_model.h"
+#include "target_context.h"
 
 typedef struct {
     size_t hidden_dim;
     uint64_t parent_fingerprint;
     float* weights;
+    int contextual;
 } TargetSidecar;
 
 uint64_t target_parent_fingerprint(const GruModel* model);
@@ -18,6 +20,8 @@ int target_sidecar_predict(const TargetSidecar* sidecar, const float* hidden,
     int slot, int move, unsigned char legal, float* policy);
 int target_sidecar_predict_residual(const TargetSidecar* sidecar, const float* hidden,
     int slot, int move, unsigned char legal, const float residual[4], float* policy);
+int target_sidecar_predict_context(const TargetSidecar* sidecar, const float* hidden,
+    int slot, int move, unsigned char legal, const TargetContext* context, float* policy);
 double target_sidecar_backward(const TargetSidecar* sidecar, const float* hidden,
     int slot, int move, unsigned char legal, unsigned char best, const float policy[4], float* gradient);
 void target_fit_adam_batch(float* weights, size_t count, float* gradient, float* first,

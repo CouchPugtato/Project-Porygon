@@ -80,6 +80,20 @@ function record(next, overrides = {}) {
             tactical_applied: 1, tactical_forced_switches: 0, tactical_fallbacks: 1}, ...overrides};
 }
 
+test('context evaluation resumes only context-tagged, training-ineligible records', () => {
+    const settings = require('../config/experimental/target_context_smoke.json');
+    const identity = {config: settings};
+    const game = record(nextGame(settings, []), {policy_mode: 'neural', coverage: null,
+        policy_tag: 'target-context-v1', learned_targets: {training_eligible: false,
+            target_decisions: 10, learned_target_decisions: 4}});
+    assert.deepEqual(validateResume({identity, games: [game]}, identity, settings), [game]);
+    for (const change of [{policy_tag: 'target-sidecar-v1'}, {policy_tag: 'target-labels-v1'},
+        {learned_targets: {...game.learned_targets, training_eligible: true}}])
+        assert.throws(() => validateResume({identity, games: [{...game, ...change}]}, identity, settings), /learned target accounting/);
+    const legacy = {...settings, context_target_evaluation: false};
+    assert.throws(() => validateResume({identity, games: [game]}, identity, legacy), /learned target accounting/);
+});
+
 test('paired seeds swap teams and preserve policy-role inference seeds', () => {
     const a = battleSeeds(26601, 0, true);
     const b = battleSeeds(26601, 1, true);

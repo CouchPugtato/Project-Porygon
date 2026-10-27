@@ -70,4 +70,61 @@ async function compareContext(name, outputDirectory) {
     console.log(`[target-context] ${JSON.stringify({...report, counts: packed.counts})}`);
 }
 
-module.exports = {validateContext, writeContext, compareContext};
+function verifyReproduction(reference, replay, published = false) {
+    const {isDeepStrictEqual} = require('node:util');
+    const {provenance, ...expected} = reference;
+    if (expected.weights_published !== false || expected.gameplay_authorized !== false ||
+            expected.parent_unchanged !== true || expected.context_lower_validation_nll !== true ||
+            !isDeepStrictEqual({...replay, weights_published: false}, expected) ||
+            replay.weights_published !== published) throw new Error('context fit did not reproduce the recorded comparison exactly');
+}
+
+function contextFitEligible(metadata, report) {
+    return metadata.format === 'PGTARGTC1' && metadata.evaluation_only === true && metadata.reproduced_exactly === true &&
+        report.evaluation_only === true && report.reproduced_exactly === true && report.parent_unchanged === true &&
+        report.weights_published === true && report.gameplay_authorized === false && report.context_lower_validation_nll === true;
+}
+
+async function exportContext(comparisonDirectory, parentPath, outputDirectory) {
+    const root = path.resolve(__dirname, '..');
+    const {hashFile} = require('./tactical_teacher_smoke');
+    const directory = path.resolve(root, comparisonDirectory), output = path.resolve(root, outputDirectory);
+    const referencePath = path.join(directory, 'context_comparison.json');
+    const reference = JSON.parse(await fs.readFile(referencePath, 'utf8'));
+    const dataset = path.join(directory, 'target_context.bin'), parent = path.resolve(root, parentPath);
+    const executable = path.join(root, 'build-fresh/showdown_client.exe');
+    if (await hashFile(dataset) !== reference.provenance.dataset_sha256 ||
+            await hashFile(parent) !== reference.provenance.parent_sha256)
+        throw new Error('context comparison data or frozen parent changed');
+    await fs.mkdir(output, {recursive: true});
+    const sidecar = path.join(output, 'target_context.bin'), staged = `${sidecar}.pending`;
+    const reportPath = path.join(output, 'context_export.json'), metadataPath = `${sidecar}.meta.json`;
+    for (const filename of [sidecar, staged, reportPath, metadataPath]) {
+        try { await fs.access(filename); throw new Error(`refusing to overwrite ${filename}`); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    function fit(publish) {
+        const run = spawnSync(executable, [publish ? '--export-target-context-evaluation' : '--compare-target-context',
+            dataset, parent, ...(publish ? [staged] : [])], {cwd: root, windowsHide: true, encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'inherit'], env: {...process.env, PORYGON_OMP_THREADS: '1', OMP_NUM_THREADS: '1'}});
+        if (run.error || run.status !== 0) throw new Error(`context reproduction failed: ${run.error || run.status}`);
+        const result = JSON.parse(run.stdout);
+        verifyReproduction(reference, result, publish);
+        return result;
+    }
+    fit(false);
+    const replay = fit(true);
+    if (await hashFile(parent) !== reference.provenance.parent_sha256 ||
+            await hashFile(dataset) !== reference.provenance.dataset_sha256) throw new Error('frozen inputs changed during reproduction');
+    await fs.rename(staged, sidecar);
+    const provenance = {reference_report: referencePath, reference_report_sha256: await hashFile(referencePath),
+        dataset_sha256: await hashFile(dataset), parent_sha256: await hashFile(parent),
+        executable_sha256: await hashFile(executable), wrapper_sha256: await hashFile(__filename)};
+    await writeJsonAtomic(reportPath, {...replay, evaluation_only: true, reproduced_exactly: true, provenance});
+    await writeJsonAtomic(metadataPath, {format: 'PGTARGTC1', evaluation_only: true, reproduced_exactly: true,
+        parent_sha256: provenance.parent_sha256, sidecar_sha256: await hashFile(sidecar),
+        fit_report_sha256: await hashFile(reportPath)});
+    console.log(`[target-context] evaluation export=${sidecar}; exact reproduction verified; no gameplay started`);
+}
+
+module.exports = {validateContext, writeContext, compareContext, verifyReproduction, exportContext, contextFitEligible};

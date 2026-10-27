@@ -553,9 +553,17 @@ static void prepare_target_policy(EnvRuntime* runtime, EnvSession* session,
 ) {
     int move = slot ? choice->slot1_move_index : choice->slot0_move_index;
     memcpy(policy, original, 4 * sizeof(float));
-    if (runtime->target_sidecar && target_sidecar_supports(&session->observation, &session->parsed_request, choice) &&
-            target_sidecar_predict(runtime->target_sidecar, session->hidden_state, slot, move, 15, policy))
-        session->pending_learned_targets = 1;
+    if (runtime->target_sidecar && target_sidecar_supports(&session->observation, &session->parsed_request, choice)) {
+        int applied;
+        if (runtime->target_sidecar->contextual) {
+            TargetContext context;
+            target_context_collect(&session->observation, &session->parsed_request, choice, slot, &context);
+            unsigned char legal = build_move_target_mask(&session->parsed_request, slot, move);
+            applied = target_sidecar_predict_context(runtime->target_sidecar, session->hidden_state, slot, move, legal, &context, policy);
+        } else applied = target_sidecar_predict(runtime->target_sidecar, session->hidden_state, slot, move, 15, policy);
+        if (applied) session->pending_learned_targets = 1;
+        else memcpy(policy, original, 4 * sizeof(float));
+    }
 }
 
 static int evaluate_supported_tactical_choice(
@@ -1136,9 +1144,10 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                         session->tactical_forced_switches, session->tactical_fallbacks);
                 } else if (runtime->target_sidecar) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
-                        "\"policy_tag\":\"target-sidecar-v1\",\"training_eligible\":false,"
+                        "\"policy_tag\":\"%s\",\"training_eligible\":false,"
                         "\"target_decisions\":%zu,\"learned_target_decisions\":%zu}\n",
-                        session->battle_id, session->decision_count, session->learned_target_decisions);
+                        session->battle_id, runtime->target_sidecar->contextual ? "target-context-v1" : "target-sidecar-v1",
+                        session->decision_count, session->learned_target_decisions);
                 } else if (runtime->target_labels) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
                         "\"policy_tag\":\"target-labels-v1\",\"training_eligible\":false,\"label_decisions\":%zu}\n",

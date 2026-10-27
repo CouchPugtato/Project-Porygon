@@ -262,6 +262,8 @@ class AgentProcess {
         const ready = await this.nextMessage('ready');
         if (this.targetOptions.sidecar && (ready.capabilities?.target_sidecar !== true || ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise evaluation-only learned targets; rebuild the client');
+        if (this.targetOptions.sidecar && (ready.capabilities?.target_context_version === 1) !== !!this.targetOptions.contextual)
+            throw new Error('loaded target sidecar format differs from the configured context mode');
         if (this.targetOptions.labels && (ready.capabilities?.target_labels !== true || ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise passive target labels; rebuild the client');
         if (this.targetOptions.contextVersion === 1 && ready.capabilities?.target_context_version !== 1)

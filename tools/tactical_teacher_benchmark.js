@@ -79,7 +79,7 @@ function validateResume(saved, identity, config) {
                 !Number.isFinite(game.duration_seconds) || game.duration_seconds < 0)
             throw new Error('saved benchmark records do not match the deterministic schedule');
         if (game.status === 'completed') {
-            if (config.target_sidecar && (game.policy_tag !== 'target-sidecar-v1' ||
+            if (config.target_sidecar && (game.policy_tag !== (config.context_target_evaluation ? 'target-context-v1' : 'target-sidecar-v1') ||
                     game.learned_targets?.training_eligible !== false ||
                     !Number.isSafeInteger(game.learned_targets.target_decisions) || game.learned_targets.target_decisions <= 0 ||
                     !Number.isSafeInteger(game.learned_targets.learned_target_decisions) || game.learned_targets.learned_target_decisions < 0 ||
@@ -129,6 +129,9 @@ async function loadSaved(filename) {
 }
 
 function validateConfig(config) {
+    if (config.context_target_evaluation !== undefined && (typeof config.context_target_evaluation !== 'boolean' ||
+            (config.context_target_evaluation && (!config.target_sidecar || config.exploratory_target_evaluation))))
+        throw new Error('context target evaluation requires a distinct, explicit context sidecar');
     if (config.target_context_version !== undefined && (config.target_context_version !== 1 || !config.collect_target_labels))
         throw new Error('visible target context requires target-label collection');
     if (config.exploratory_target_evaluation !== undefined && (typeof config.exploratory_target_evaluation !== 'boolean' ||
@@ -198,10 +201,13 @@ async function main(argv = process.argv.slice(2)) {
         identity.pilot_checkpoint_sha256 = await hashFile(path.resolve(ROOT, config.pilot_checkpoint));
     if (config.target_sidecar) {
         const sidecar = path.resolve(ROOT, config.target_sidecar);
-        const metadataPath = `${sidecar}.meta.json`, reportPath = path.join(path.dirname(sidecar), 'target_fit.json');
+        const metadataPath = `${sidecar}.meta.json`, reportPath = path.join(path.dirname(sidecar),
+            config.context_target_evaluation ? 'context_export.json' : 'target_fit.json');
         const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
         const report = JSON.parse(await fs.readFile(reportPath, 'utf8'));
-        if (!targetFitEligible(metadata, report, config.exploratory_target_evaluation === true) || metadata.parent_sha256 !== identity.candidate_checkpoint_sha256 ||
+        const eligible = config.context_target_evaluation ? require('./target_context').contextFitEligible(metadata, report) :
+            targetFitEligible(metadata, report, config.exploratory_target_evaluation === true);
+        if (!eligible || metadata.parent_sha256 !== identity.candidate_checkpoint_sha256 ||
                 metadata.sidecar_sha256 !== await hashFile(sidecar) || metadata.fit_report_sha256 !== await hashFile(reportPath))
             throw new Error('learned target sidecar lacks an eligible fit or its parent/artifacts changed');
         identity.target_sidecar = {sha256: metadata.sidecar_sha256, metadata_sha256: await hashFile(metadataPath),

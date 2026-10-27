@@ -91,7 +91,8 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
         side === candidateSide && config.tactical_targets === true,
         {labels: side === candidateSide && config.collect_target_labels === true,
             contextVersion: side === candidateSide ? (config.target_context_version || 0) : 0,
-            sidecar: side === candidateSide && config.target_sidecar ? path.resolve(REPO_ROOT, config.target_sidecar) : null}));
+            sidecar: side === candidateSide && config.target_sidecar ? path.resolve(REPO_ROOT, config.target_sidecar) : null,
+            contextual: side === candidateSide && config.context_target_evaluation === true}));
 }
 
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
@@ -158,7 +159,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
             }
             if (config.target_sidecar) {
                 const report = teacher.episode;
-                if (report.policy_tag !== 'target-sidecar-v1' || report.training_eligible !== false ||
+                if (report.policy_tag !== (config.context_target_evaluation ? 'target-context-v1' : 'target-sidecar-v1') || report.training_eligible !== false ||
                         !Number.isSafeInteger(report.target_decisions) || report.target_decisions <= 0 ||
                         !Number.isSafeInteger(report.learned_target_decisions) || report.learned_target_decisions < 0 ||
                         report.learned_target_decisions > report.target_decisions)

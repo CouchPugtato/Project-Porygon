@@ -1392,5 +1392,43 @@ This is a validation imitation improvement, not a win-rate result or proof
 that all relevant information was absent from the frozen state. The variant
 adds both explicit type interactions and 722 shared trainable coefficients.
 Its 90.28% argmax agreement is not its sampled target success rate. Model
-checkpoints are unchanged and no learned weights were published; live wiring
-and strength evaluation need a separately approved step.
+checkpoints were unchanged and that diagnostic published no learned weights.
+
+### Evaluation-only context scorer
+
+The separately approved runtime step exports the exact selected run_0293 fit:
+
+```powershell
+node .\tools\target_learning.js --export-context-evaluation models/runs/run_0293_target_context_comparison models/runs/run_0275_tactical_student_1000/tactical_student_dataset_epoch003.chk models/runs/run_0294_target_context_evaluation
+```
+
+This refuses existing output files. It checks the original dataset and parent
+SHA-256, reproduces both complete fit reports before export, and repeats the
+same fixed fit for publication. Changed metrics or selected epochs fail the
+check; a lower loss does not excuse a mismatch. No settings are tuned. The
+native export also reloads its saved weights and verifies validation metrics.
+The wrapper publishes checksummed metadata only after exact reproduction.
+
+`PGTARGTC1` is a separate, parent-fingerprint-bound format containing the
+4,128 target-head parameters plus 722 learned type-pair coefficients. The
+older `PGTARGET1` format remains supported and unchanged. Runtime loading
+uses the existing `--target-sidecar` flag; contextual prediction calls the
+same visible-context extractor and predictor as fitting. Probabilities are
+normalized within the selected move's legal target mask. Unsupported turns
+retain the original policy. Move, switch and Tera selection are unchanged;
+there is no heuristic ranking in this inference path.
+
+Benchmark configs must explicitly set `context_target_evaluation: true` and
+identify the sidecar. The runner verifies its export metadata, report hashes
+and frozen parent, checks the advertised runtime format, and rejects legacy
+policy tags on resume. Context records use `target-context-v1`, remain
+`training_eligible: false`, and omit on-policy PPO arrays.
+
+Run_0294 reproduced epoch 10 and every recorded learning metric exactly.
+Run_0295 used `target_context_smoke.json` for four runtime checks: both sides
+against parent and random. All four completed with zero rejections or
+exclusions; context predictions were used on 28/92 accepted decisions.
+This small smoke is integration evidence only, not a strength result.
+All native regression suites and 68 JavaScript tests pass. No default policy
+or main checkpoint was changed. The proposed 1,200-game matched development
+screen still requires separate approval.

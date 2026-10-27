@@ -34,7 +34,8 @@ uint64_t target_parent_fingerprint(const GruModel* model) {
 }
 
 size_t target_sidecar_parameter_count(const TargetSidecar* sidecar) {
-    return sidecar ? 32 * (sidecar->hidden_dim + 1) : 0;
+    return sidecar ? 32 * (sidecar->hidden_dim + 1) +
+        (sidecar->contextual ? TARGET_CONTEXT_PARAMETER_COUNT : 0) : 0;
 }
 
 TargetSidecar* target_sidecar_create(const GruModel* parent) {
@@ -87,6 +88,20 @@ int target_sidecar_predict(const TargetSidecar* s, const float* hidden,
     int slot, int move, unsigned char legal, float* policy
 ) {
     return target_sidecar_predict_residual(s, hidden, slot, move, legal, NULL, policy);
+}
+
+int target_sidecar_predict_context(const TargetSidecar* s, const float* hidden,
+    int slot, int move, unsigned char legal, const TargetContext* context, float* policy
+) {
+    float residual[4] = {0};
+    int target;
+    if (!s || !s->contextual || !context || !target_context_valid(context)) return 0;
+    size_t base = 32 * (s->hidden_dim + 1);
+    for (target = 0; target < 4; ++target) {
+        size_t indices[2], k, n = target_context_feature_indices(context, target, indices);
+        for (k = 0; k < n; ++k) residual[target] += s->weights[base + indices[k]];
+    }
+    return target_sidecar_predict_residual(s, hidden, slot, move, legal, residual, policy);
 }
 
 double target_sidecar_backward(const TargetSidecar* s, const float* hidden,
@@ -181,7 +196,7 @@ int target_sidecar_save(const TargetSidecar* s, const char* path) {
     if (snprintf(temporary, sizeof(temporary), "%s.tmp", path) >= (int)sizeof(temporary)) return 0;
     file = fopen(temporary, "wb");
     if (!file) return 0;
-    ok = fwrite("PGTARGET1", 1, 9, file) == 9 && fwrite(&dimensions, 4, 1, file) == 1 &&
+    ok = fwrite(s->contextual ? "PGTARGTC1" : "PGTARGET1", 1, 9, file) == 9 && fwrite(&dimensions, 4, 1, file) == 1 &&
         fwrite(&s->parent_fingerprint, 8, 1, file) == 1 && fwrite(&checksum, 8, 1, file) == 1 &&
         fwrite(s->weights, sizeof(float), target_sidecar_parameter_count(s), file) == target_sidecar_parameter_count(s);
     if (!finish_file(file)) ok = 0;
@@ -195,7 +210,15 @@ TargetSidecar* target_sidecar_load(const char* path, const GruModel* parent) {
     uint32_t dimensions;
     uint64_t fingerprint, checksum;
     size_t i;
-    int ok = file && s && fread(magic, 1, 9, file) == 9 && !memcmp(magic, "PGTARGET1", 9) &&
+    int ok = file && s && fread(magic, 1, 9, file) == 9 &&
+        (!memcmp(magic, "PGTARGET1", 9) || !memcmp(magic, "PGTARGTC1", 9));
+    if (ok && !memcmp(magic, "PGTARGTC1", 9)) {
+        s->contextual = 1;
+        float* weights = realloc(s->weights, target_sidecar_parameter_count(s) * sizeof(float));
+        if (!weights) ok = 0;
+        else s->weights = weights;
+    }
+    ok = ok &&
         fread(&dimensions, 4, 1, file) == 1 && dimensions == s->hidden_dim &&
         fread(&fingerprint, 8, 1, file) == 1 && fingerprint == s->parent_fingerprint &&
         fread(&checksum, 8, 1, file) == 1 &&

@@ -16,13 +16,9 @@ typedef struct {
 } Fit;
 
 static int predict(const Fit* fit, const Example* e, const float* hidden, float policy[4]) {
-    float residual[4] = {0};
-    int target;
-    if (fit->contextual) for (target = 0; target < 4; ++target) {
-        size_t indices[2], k, count = target_context_feature_indices(&e->context, target, indices);
-        for (k = 0; k < count; ++k) residual[target] += fit->sidecar->weights[fit->base_parameters + indices[k]];
-    }
-    return target_sidecar_predict_residual(fit->sidecar, hidden, e->slot, e->move, e->legal, residual, policy);
+    if (fit->contextual) return target_sidecar_predict_context(fit->sidecar, hidden,
+        e->slot, e->move, e->legal, &e->context, policy);
+    return target_sidecar_predict(fit->sidecar, hidden, e->slot, e->move, e->legal, policy);
 }
 
 static Metrics evaluate(const Fit* fit, const Example* examples, const float* hidden, size_t count, int validation) {
@@ -65,6 +61,7 @@ static int fit_model(Fit* fit, const GruModel* parent, const Example* examples,
     float* weights = realloc(fit->sidecar->weights, fit->parameters * sizeof(float));
     if (!weights) return 0;
     fit->sidecar->weights = weights;
+    fit->sidecar->contextual = contextual;
     if (contextual) memset(weights + fit->base_parameters, 0, TARGET_CONTEXT_PARAMETER_COUNT * sizeof(float));
     fit->gradient = calloc(fit->parameters, sizeof(float)); fit->first = calloc(fit->parameters, sizeof(float));
     fit->second = calloc(fit->parameters, sizeof(float)); fit->best = malloc(fit->parameters * sizeof(float));
@@ -114,7 +111,7 @@ static void write_metrics(FILE* out, const Metrics* m) {
         m->count, m->nll, (double)m->correct / m->count, m->preferred_mass);
 }
 
-int target_context_compare(const char* dataset, const GruModel* parent, FILE* report) {
+int target_context_compare_for_evaluation(const char* dataset, const GruModel* parent, FILE* report, const char* output) {
     FILE* file = fopen(dataset, "rb");
     uint32_t dimensions, count;
     uint64_t fingerprint = target_parent_fingerprint(parent), stored;
@@ -141,9 +138,21 @@ int target_context_compare(const char* dataset, const GruModel* parent, FILE* re
     if (fgetc(file) != EOF) goto cleanup;
     for (mode = 0; mode < 2; ++mode) if (!fit_model(&fits[mode], parent, examples, hidden, count, mode)) goto cleanup;
     if (target_parent_fingerprint(parent) != fingerprint || fits[0].before.nll != fits[1].before.nll) goto cleanup;
-    fprintf(report, "{\"diagnostic\":\"target_context_comparison\",\"parent_unchanged\":true,\"weights_published\":false,"
+    if (output && !(fits[1].validation.nll < fits[0].validation.nll && target_sidecar_save(fits[1].sidecar, output))) goto cleanup;
+    if (output) {
+        Fit restored = {0};
+        restored.sidecar = target_sidecar_load(output, parent);
+        restored.contextual = 1;
+        if (!restored.sidecar || !restored.sidecar->contextual) { free_fit(&restored); goto cleanup; }
+        Metrics m = evaluate(&restored, examples, hidden, count, 1);
+        int identical = m.nll == fits[1].validation.nll && m.correct == fits[1].validation.correct &&
+            m.count == fits[1].validation.count && m.preferred_mass == fits[1].validation.preferred_mass;
+        free_fit(&restored);
+        if (!identical) goto cleanup;
+    }
+    fprintf(report, "{\"diagnostic\":\"target_context_comparison\",\"parent_unchanged\":true,\"weights_published\":%s,"
         "\"gameplay_authorized\":false,\"optimizer\":\"adam\",\"learning_rate\":0.001,\"minibatch_examples\":64,"
-        "\"max_epochs\":10,\"early_stop_patience\":3,\"context_parameters\":%d,\"before\":", TARGET_CONTEXT_PARAMETER_COUNT);
+        "\"max_epochs\":10,\"early_stop_patience\":3,\"context_parameters\":%d,\"before\":", output ? "true" : "false", TARGET_CONTEXT_PARAMETER_COUNT);
     write_metrics(report, &fits[0].before);
     for (mode = 0; mode < 2; ++mode) {
         fprintf(report, ",\"%s\":{\"best_epoch\":%d,\"epochs_completed\":%d,\"parameters\":%zu,\"train\":",
@@ -156,6 +165,10 @@ cleanup:
     if (file) fclose(file);
     for (mode = 0; mode < 2; ++mode) free_fit(&fits[mode]);
     free(examples); free(hidden);
-    if (!ok) fprintf(stderr, "[target-context] comparison failed; no weights published\n");
+    if (!ok) fprintf(stderr, "[target-context] comparison/export failed; any staged weights are unusable\n");
     return ok;
+}
+
+int target_context_compare(const char* dataset, const GruModel* parent, FILE* report) {
+    return target_context_compare_for_evaluation(dataset, parent, report, NULL);
 }

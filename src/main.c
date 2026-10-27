@@ -2478,7 +2478,8 @@ static int run_runtime_mode(
         return 1;
     }
     if (target_sidecar_path) snprintf(json, sizeof(json),
-        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_sidecar\":true}}");
+        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_sidecar\":true,\"target_context_version\":%d}}",
+        runtime.target_sidecar->contextual ? 1 : 0);
     else if (target_labels) snprintf(json, sizeof(json),
         "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_labels\":true,\"target_context_version\":1}}");
     else if (tactical_targets) snprintf(json, sizeof(json),
@@ -5533,6 +5534,8 @@ static int showdown_client_main(int argc, char** argv) {
         "  Target-only intervention: --tactical-targets 1 (evaluation-only; sampled actions stay fixed)\n"
         "  showdown_client --battle-agent [checkpoint] [--tactical-teacher 0|1] [--target-labels 0|1] [--inference-seed N] [--counterfactual-decision N --counterfactual-rank N] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
         "  showdown_client --fit-target-sidecar dataset.bin parent.chk sidecar.bin report.json [--exploratory-evaluation]\n"
+        "  showdown_client --compare-target-context dataset.bin parent.chk\n"
+        "  showdown_client --export-target-context-evaluation dataset.bin parent.chk sidecar.bin\n"
         "  showdown_client --battle-agent parent.chk --target-sidecar sidecar.bin [--inference-seed N]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
@@ -5562,12 +5565,13 @@ static int showdown_client_main(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-    if (argc == 4 && strcmp(argv[1], "--compare-target-context") == 0) {
+    if ((argc == 4 && strcmp(argv[1], "--compare-target-context") == 0) ||
+            (argc == 5 && strcmp(argv[1], "--export-target-context-evaluation") == 0)) {
         TrainerCheckpointState state = {0};
         CheckpointLoadResult result = {0};
         GruModel* parent = load_current_checkpoint(argv[3], &state, &result);
         if (!parent) { report_checkpoint_load_failure("[target-context] parent", argv[3], &result); return 1; }
-        int ok = target_context_compare(argv[2], parent, stdout);
+        int ok = target_context_compare_for_evaluation(argv[2], parent, stdout, argc == 5 ? argv[4] : NULL);
         gru_model_destroy(parent);
         return ok ? 0 : 1;
     }
