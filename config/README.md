@@ -90,6 +90,12 @@ Each requests 400 valid games (100 per side per opponent). The intervention
 keeps sampled actions fixed and retargets only fully supported strict
 effective-power improvements. It is evaluation-only, not a learned checkpoint.
 
+The corresponding `tactical_target_control_confirmation.json` and
+`tactical_target_intervention_confirmation.json` freeze the rule and models
+for a matched fresh-seed confirmation. Each requests 2,000 valid games at
+500 per side per opponent, seed 28301, with at most 625 attempts per side.
+These change only seed and game/replacement budgets from screening.
+
 `experimental/tactical_student_confirmation.json` repeats the student test
 with fresh seed 27101 and 500 valid games per side per opponent (2,000 total).
 Only the seed, game target, and replacement budget differ from screening.

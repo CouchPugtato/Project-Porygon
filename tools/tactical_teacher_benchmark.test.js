@@ -59,6 +59,21 @@ test('target-only experiment freezes seeds, models and sampling while routing on
     assert.throws(() => validateResume({identity, games: [{...game, target_intervention: null}]}, identity, tiny), /lacks target/);
 });
 
+test('target confirmation changes only sample size and fresh seeds, retaining matched treatment and controls', () => {
+    const screen = require('../config/experimental/tactical_target_control.json');
+    const control = require('../config/experimental/tactical_target_control_confirmation.json');
+    const intervention = require('../config/experimental/tactical_target_intervention_confirmation.json');
+    validateConfig(control);
+    validateConfig(intervention);
+    assert.deepEqual({...intervention, tactical_targets: false}, control);
+    assert.deepEqual({...control, seed: screen.seed, games_per_side: screen.games_per_side,
+        max_attempts_per_side: screen.max_attempts_per_side}, screen);
+    assert.equal(control.games_per_side, 500);
+    assert.equal(control.max_attempts_per_side, 625);
+    const seen = new Set(seedTuples(screen));
+    assert.equal(seedTuples(control).some(seed => seen.has(seed)), false);
+});
+
 function record(next, overrides = {}) {
     return {...next, status: 'completed', duration_seconds: 1, result: {result: 'win'}, choice_rejections: [],
         coverage: {policy_tag: 'tactical-eval-v1', training_eligible: false, tactical_attempts: 2,

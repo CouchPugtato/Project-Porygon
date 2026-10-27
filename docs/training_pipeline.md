@@ -1202,3 +1202,36 @@ games or automatically start the 500-per-side confirmation. Flat or harmful
 results close this intervention and redirect the next learning experiment
 toward action selection. A positive confirmation instead motivates learning
 move/target relationships on student-visited boards.
+
+The approved fresh-seed confirmation uses the same frozen executable as the
+screen, without rebuilding between control and treatment:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0283_target_control_confirmation_500ps --config .\config\experimental\tactical_target_control_confirmation.json
+node .\tools\tactical_teacher_benchmark.js --run-name run_0284_target_intervention_confirmation_500ps --config .\config\experimental\tactical_target_intervention_confirmation.json
+```
+
+Each mode requests 2,000 valid games on seed 28301. Keep control/treatment
+paired analysis separate by opponent and separate from the consulted screen.
+Intervals are approximate pair-level normal intervals, not independent-game
+intervals. Improvement is supported against an opponent when the paired score
+difference interval excludes zero in the positive direction. Describe a
+positive but zero-crossing interval as uncertain, not confirmed. Retain side
+splits and exclusions; a legality regression limits interpretation. Neither
+an intervention gain nor beating random establishes a learned-policy gain.
+
+Completed confirmation (runs 0283/0284): sampling versus intervention scored
+53.2% versus 61.6% against parent and 49.9% versus 53.4% against random,
+1,000 valid games per opponent per mode. Shared complete seed pairs give
+paired differences of +8.23 points (approximate 95% interval +4.02 to +12.44;
+498 pairs) and +3.51 points (-0.93 to +7.95; 499 pairs), respectively.
+The parent gain confirmed; the random gain remains uncertain. Do not pool
+the consulted development screen to call that uncertainty resolved.
+
+All model/executable/runtime-source hashes matched screening. Ten control and
+twelve intervention games were excluded and replaced. These include known
+trapped/disabled-choice rejections, revival requests with no legal actions,
+and two intervention-side one-survivor no-legal-action failures. Their retained
+records require targeted runtime follow-up; no rule or runtime fixes were
+made during confirmation. The result is a hybrid-policy gain against parent,
+not evidence of improved neural weights or a clean legality certification.
