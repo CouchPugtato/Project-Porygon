@@ -264,6 +264,8 @@ class AgentProcess {
             throw new Error('runtime does not advertise evaluation-only learned targets; rebuild the client');
         if (this.targetOptions.labels && (ready.capabilities?.target_labels !== true || ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise passive target labels; rebuild the client');
+        if (this.targetOptions.contextVersion === 1 && ready.capabilities?.target_context_version !== 1)
+            throw new Error('runtime does not advertise visible target context; rebuild the client');
         if (this.tacticalTargets && (ready.capabilities?.tactical_targets !== true || ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise evaluation-only target intervention; rebuild the client');
         if (this.tacticalAudit && (ready.capabilities?.tactical_audit !== true || ready.capabilities?.training !== false))

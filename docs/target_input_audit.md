@@ -1,6 +1,6 @@
 # Target learner input audit
 
-The full model receives move identity, move type, visible Pokemon types and
+The full model receives in-vocabulary move identity, move type, visible Pokemon types and
 active positions. The experimental target sidecar does not receive these
 fields directly: it receives a frozen recurrent state, active slot, selected
 move-slot number and legal target mask. Missing direct inputs do not prove
@@ -68,3 +68,23 @@ that supports one frozen-model, whole-battle-split comparison. Keep the old
 cache and results intact. Do not silently substitute teacher-played data,
 infer hidden team information, add teacher scores as inputs, or start a model
 size/optimizer sweep to work around the missing fields.
+
+## Completed context follow-up
+
+The separately approved run 0292 retained compact visible context in all
+5,482 labels from 500 fresh battles. Run 0293 compared the baseline head with
+one zero-initialized, learned move-type/target-type residual table on the same
+whole-battle validation split. Target accuracy improved from 71.90% to 90.28%,
+NLL from 0.661749 to 0.550746, and preferred-target probability mass from
+69.87% to 75.79%. These are validation learning results, not playing strength.
+The original model stayed frozen and neither diagnostic head was published.
+Explicit context plus 722 shared coefficients helped this fixed experiment;
+it is not proof that the frozen state contained none of the information.
+
+A related coverage limitation is now measured: 167 of these informative labels
+(3.05%) selected native move IDs at least 920. `flatten_pokemon` cannot encode
+those identities in its 920-wide move one-hot, although it still encodes move
+type separately. Context capture preserves the real IDs as uint16 without
+changing checkpoint dimensions. This does not establish the cause of flat
+strength results, and the new variant does not use move ID as an extra input.
+Any vocabulary-layout repair needs its own compatibility plan.

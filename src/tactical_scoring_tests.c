@@ -3,6 +3,7 @@
 #include "policy_decoding.h"
 #include "tactical_audit.h"
 #include "target_labels.h"
+#include "target_context.h"
 #include "action_semantics.h"
 
 #include <math.h>
@@ -535,6 +536,38 @@ static int test_passive_target_labels(void) {
     return ok;
 }
 
+static int test_visible_target_context(void) {
+    Observation observation, before;
+    ParsedRequest request;
+    FactorizedActionChoice choice;
+    TargetContext c;
+    size_t indices[2];
+    int ok = decision_fixture(&observation, &request);
+    if (!ok) return 0;
+    factorized_action_choice_from_flat_actions(&choice, 0, 14);
+    before = observation;
+    target_context_collect(&observation, &request, &choice, 0, &c);
+    ok &= check(target_context_valid(&c) && c.move_id == move_id_from_name("flamethrower") &&
+        c.move_type_id == type_id_from_name("fire") && c.targets[2].position == FACTORIZED_TARGET_FOE_LEFT &&
+        c.targets[2].type1_id == type_id_from_name("grass") && c.targets[2].type2_id == type_id_from_name("steel") &&
+        !c.targets[2].friendly && c.targets[1].friendly && memcmp(&observation, &before, sizeof(before)) == 0,
+        "Context identifies the selected move and visible target geometry without mutating the board");
+    ok &= check(target_context_feature_indices(&c, 2, indices) == 2 && indices[0] != indices[1],
+        "Dual visible defensive types yield two categorical interaction features");
+    observation.opp_team[4].type1_known_mode = 0;
+    target_context_collect(&observation, &request, &choice, 0, &c);
+    ok &= check(c.targets[2].type1_id == 0 && c.targets[2].type1_known_mode == 0 &&
+        target_context_feature_indices(&c, 2, indices) == 0, "Unknown target type is redacted and supplies no interaction");
+    factorized_action_choice_from_flat_actions(&choice, 0, 24);
+    target_context_collect(&observation, &request, &choice, 0, &c);
+    ok &= check(c.targets[1].type1_id == type_id_from_name("electric"), "Target context accounts for the chosen incoming partner");
+    observation.opp_team[5].fainted = 1;
+    target_context_collect(&observation, &request, &choice, 0, &c);
+    ok &= check(!c.targets[3].present && c.targets[3].type1_id == 0 && c.targets[3].type2_known_mode == 0,
+        "Absent targets do not expose stale type information");
+    return ok;
+}
+
 int main(void) {
     if (!check(id_tables_init(), "load vocabulary and move metadata")) return 1;
     if (!test_target_matchups() || !test_accuracy_and_stab() ||
@@ -547,7 +580,8 @@ int main(void) {
             !test_selector_respects_traps_wait_and_finite_scores() ||
             !test_all_adjacent_parser_and_legacy_encoding() ||
             !test_greedy_full_turn_probability() || !test_greedy_single_slot_and_forced_switches() ||
-            !test_passive_decision_audit() || !test_target_only_intervention() || !test_passive_target_labels()) return 1;
+            !test_passive_decision_audit() || !test_target_only_intervention() || !test_passive_target_labels() ||
+            !test_visible_target_context()) return 1;
     puts("tactical scoring tests passed");
     return 0;
 }

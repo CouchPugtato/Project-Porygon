@@ -9,6 +9,8 @@
 #include "validation_split.h"
 #include "request_failure_fixtures.h"
 #include "target_sidecar.h"
+#include "target_context.h"
+#include "target_context_fit.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -6523,7 +6525,43 @@ static int test_move_conditioned_target_sidecar(void) {
     return 1;
 }
 
+static int test_context_comparison_learns_when_frozen_states_are_identical(void) {
+    GruModel* parent = gru_model_create(4, 8, OBS_NUM_ACTIONS);
+    uint64_t fingerprint = target_parent_fingerprint(parent);
+    uint32_t dimensions = 8, count = 500;
+    float hidden[8] = {0};
+    FILE* dataset = fopen("test_context_compare.tmp", "wb");
+    FILE* report = tmpfile();
+    size_t i;
+    char json[4096];
+    int ok;
+    if (!assert_true(parent && dataset && report, "create context comparison fixture")) return 0;
+    fwrite("PGTCONTX1", 1, 9, dataset); fwrite(&dimensions, 4, 1, dataset);
+    fwrite(&count, 4, 1, dataset); fwrite(&fingerprint, 8, 1, dataset);
+    for (i = 0; i < count; ++i) {
+        unsigned char e[5] = {i % 5 == 0, 0, 0, 12, i % 2 ? 8 : 4};
+        TargetContext c = {0};
+        int target;
+        c.move_id = 1; c.move_type_id = (unsigned char)(1 + i % 2); c.move_type_known = 1;
+        for (target = 0; target < 4; ++target) {
+            c.targets[target].position = (unsigned char)target;
+            c.targets[target].friendly = target < 2; c.targets[target].present = 1;
+            c.targets[target].type1_id = (unsigned char)(target + 1);
+            c.targets[target].type1_known_mode = c.targets[target].type2_known_mode = 2;
+        }
+        fwrite(e, 1, 5, dataset); fwrite(hidden, sizeof(float), 8, dataset); fwrite(&c, sizeof(c), 1, dataset);
+    }
+    fclose(dataset);
+    ok = target_context_compare("test_context_compare.tmp", parent, report);
+    rewind(report);
+    ok &= fgets(json, sizeof(json), report) != NULL && strstr(json, "\"context_lower_validation_nll\":true") &&
+        strstr(json, "\"weights_published\":false") && target_parent_fingerprint(parent) == fingerprint;
+    fclose(report); remove("test_context_compare.tmp"); gru_model_destroy(parent);
+    return assert_true(ok, "Visible move context learns opposite targets without changing frozen states or publishing weights");
+}
+
 int main(int argc, char** argv) {
+    if (!test_context_comparison_learns_when_frozen_states_are_identical()) return 1;
     if (!test_move_conditioned_target_sidecar()) return 1;
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");

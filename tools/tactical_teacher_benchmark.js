@@ -129,6 +129,8 @@ async function loadSaved(filename) {
 }
 
 function validateConfig(config) {
+    if (config.target_context_version !== undefined && (config.target_context_version !== 1 || !config.collect_target_labels))
+        throw new Error('visible target context requires target-label collection');
     if (config.exploratory_target_evaluation !== undefined && (typeof config.exploratory_target_evaluation !== 'boolean' ||
             (config.exploratory_target_evaluation && !config.target_sidecar)))
         throw new Error('exploratory target evaluation requires an explicit sidecar');
@@ -183,7 +185,7 @@ async function main(argv = process.argv.slice(2)) {
     validateConfig(config);
     const targetGames = 2 * config.games_per_side * (config.opponents || OPPONENTS).length;
     const sources = ['tools/tactical_teacher_benchmark.js', 'tools/tactical_teacher_smoke.js',
-        'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'tools/tactical_decision_audit.js', 'tools/target_learning.js',
+        'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'tools/tactical_decision_audit.js', 'tools/target_learning.js', 'tools/target_context.js',
         'external/pokemon-showdown/dist/sim/battle.js',
         'external/pokemon-showdown/dist/sim/battle-stream.js',
         'external/pokemon-showdown/dist/sim/tools/random-player-ai.js'];

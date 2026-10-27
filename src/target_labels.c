@@ -1,4 +1,5 @@
 #include "target_labels.h"
+#include "target_context.h"
 #include <float.h>
 #include <math.h>
 #include <string.h>
@@ -59,8 +60,12 @@ void target_labels_write(FILE* out, const Observation* observation, const Parsed
     int count = target_labels_collect(observation, request, choice, &labels);
     fprintf(out, "{\"parent_fingerprint\":\"%016llx\",\"examples\":[", (unsigned long long)fingerprint);
     for (slot = 0; slot < 2; ++slot) if (labels.best[slot]) {
-        fprintf(out, "%s{\"slot\":%d,\"move\":%u,\"legal\":%u,\"best\":%u}", first ? "" : ",", slot,
+        TargetContext context;
+        target_context_collect(observation, request, choice, slot, &context);
+        fprintf(out, "%s{\"slot\":%d,\"move\":%u,\"legal\":%u,\"best\":%u,\"context\":", first ? "" : ",", slot,
             slot ? choice->slot1_move_index : choice->slot0_move_index, labels.legal[slot], labels.best[slot]);
+        target_context_write(out, &context);
+        fputc('}', out);
         first = 0;
     }
     fputs("],\"hidden\":[", out);

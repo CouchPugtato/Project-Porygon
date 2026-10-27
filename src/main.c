@@ -10,6 +10,7 @@
 #include "runtime_protocol.h"
 #include "validation_split.h"
 #include "target_sidecar.h"
+#include "target_context_fit.h"
 #include <errno.h>
 #include <math.h>
 #include <stdlib.h>
@@ -2479,7 +2480,7 @@ static int run_runtime_mode(
     if (target_sidecar_path) snprintf(json, sizeof(json),
         "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_sidecar\":true}}");
     else if (target_labels) snprintf(json, sizeof(json),
-        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_labels\":true}}");
+        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_labels\":true,\"target_context_version\":1}}");
     else if (tactical_targets) snprintf(json, sizeof(json),
         "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"tactical_targets\":true}}");
     else if (tactical_audit) snprintf(json, sizeof(json),
@@ -5561,6 +5562,15 @@ static int showdown_client_main(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 4 && strcmp(argv[1], "--compare-target-context") == 0) {
+        TrainerCheckpointState state = {0};
+        CheckpointLoadResult result = {0};
+        GruModel* parent = load_current_checkpoint(argv[3], &state, &result);
+        if (!parent) { report_checkpoint_load_failure("[target-context] parent", argv[3], &result); return 1; }
+        int ok = target_context_compare(argv[2], parent, stdout);
+        gru_model_destroy(parent);
+        return ok ? 0 : 1;
+    }
     if ((argc == 6 || (argc == 7 && strcmp(argv[6], "--exploratory-evaluation") == 0)) && strcmp(argv[1], "--fit-target-sidecar") == 0) {
         TrainerCheckpointState state = {0};
         CheckpointLoadResult result = {0};

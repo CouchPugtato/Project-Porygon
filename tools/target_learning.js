@@ -5,6 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const {spawnSync} = require('node:child_process');
 const {writeJsonAtomic, writeTextAtomic} = require('./counterfactual_rollout');
+const {validateContext, writeContext} = require('./target_context');
 
 function validateLabels(labels) {
     if (!/^[0-9a-f]{16}$/.test(labels?.parent_fingerprint) || !Array.isArray(labels.examples) ||
@@ -18,16 +19,19 @@ function validateLabels(labels) {
                 (e.best & ~e.legal) || e.best === e.legal || slots.has(e.slot))
             throw new Error('invalid or uninformative target label');
         slots.add(e.slot);
+        if (e.context !== undefined) validateContext(e.context);
     }
 }
 
-function createTargetCollector() {
+function createTargetCollector(contextVersion = 0) {
     let pending = null;
     const decisions = [];
     return {
         propose(action) {
             if (pending || action.training_eligible !== false) throw new Error('invalid target label proposal');
             validateLabels(action.target_labels);
+            if (contextVersion === 1 && action.target_labels.examples.some(e => e.context === undefined))
+                throw new Error('runtime omitted required target context');
             pending = action;
         },
         observe(line) {
@@ -77,7 +81,7 @@ function splitBattle(battleId, seed) {
     return crypto.createHash('sha256').update(`${seed}:${battleId}`).digest().readUInt32LE(0) % 5 === 0;
 }
 
-function packDataset(battles, seed) {
+function packDataset(battles, seed, includeContext = false) {
     const rows = [];
     const battleIds = new Set();
     let decisions = 0, informative = 0;
@@ -103,13 +107,14 @@ function packDataset(battles, seed) {
     }
     if (!dimensions || rows.length < 300 || rows.length > 100000) throw new Error('insufficient or excessive target examples');
     rows.sort((a, b) => a.order.localeCompare(b.order));
-    const bytes = Buffer.alloc(25 + rows.length * (5 + 4 * dimensions));
-    bytes.write('PGTLABEL1'); bytes.writeUInt32LE(dimensions, 9); bytes.writeUInt32LE(rows.length, 13);
+    const bytes = Buffer.alloc(25 + rows.length * (5 + 4 * dimensions + (includeContext ? 32 : 0)));
+    bytes.write(includeContext ? 'PGTCONTX1' : 'PGTLABEL1'); bytes.writeUInt32LE(dimensions, 9); bytes.writeUInt32LE(rows.length, 13);
     bytes.writeBigUInt64LE(BigInt(`0x${fingerprint}`), 17);
     let offset = 25;
     for (const row of rows) {
         for (const key of ['validation', 'slot', 'move', 'legal', 'best']) bytes[offset++] = row[key];
         for (const value of row.hidden) { bytes.writeFloatLE(value, offset); offset += 4; }
+        if (includeContext) offset = writeContext(bytes, offset, row.context);
     }
     return {bytes, counts: {battles: battles.length, examples: rows.length,
         train_battles: battles.filter(battle => !splitBattle(battle.battle_id, seed)).length,
@@ -169,6 +174,10 @@ async function auditTargetInputs(directory, summary) {
 }
 
 async function main(argv) {
+    if (argv[0] === '--compare-context') {
+        if (argv.length !== 3) throw new Error('usage: node tools/target_learning.js --compare-context COLLECTION_RUN OUTPUT_DIRECTORY');
+        return require('./target_context').compareContext(argv[1], argv[2]);
+    }
     if (argv[0] === '--audit-inputs') {
         if (argv.length !== 3 || !/^[A-Za-z0-9_-]+$/.test(argv[1]))
             throw new Error('usage: node tools/target_learning.js --audit-inputs COLLECTION_RUN REPORT.json');

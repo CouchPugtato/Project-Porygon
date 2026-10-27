@@ -56,8 +56,8 @@ TargetSidecar* target_sidecar_create(const GruModel* parent) {
 
 void target_sidecar_free(TargetSidecar* s) { if (s) { free(s->weights); free(s); } }
 
-int target_sidecar_predict(const TargetSidecar* s, const float* hidden,
-    int slot, int move, unsigned char legal, float* policy
+int target_sidecar_predict_residual(const TargetSidecar* s, const float* hidden,
+    int slot, int move, unsigned char legal, const float residual[4], float* policy
 ) {
     float largest = -FLT_MAX;
     float sum = 0;
@@ -69,6 +69,7 @@ int target_sidecar_predict(const TargetSidecar* s, const float* hidden,
         const float* row = s->weights + ((slot * 4 + move) * 4 + target) * (s->hidden_dim + 1);
         float logit = row[s->hidden_dim];
         for (h = 0; h < s->hidden_dim; ++h) logit += row[h] * hidden[h];
+        if (residual) logit += residual[target];
         if (!isfinite(logit)) return 0;
         policy[target] = logit;
         if ((legal & (1 << target)) && logit > largest) largest = logit;
@@ -82,14 +83,19 @@ int target_sidecar_predict(const TargetSidecar* s, const float* hidden,
     return 1;
 }
 
-double target_sidecar_gradient(const TargetSidecar* s, const float* hidden,
-    int slot, int move, unsigned char legal, unsigned char best, float* gradient
+int target_sidecar_predict(const TargetSidecar* s, const float* hidden,
+    int slot, int move, unsigned char legal, float* policy
 ) {
-    float policy[4];
+    return target_sidecar_predict_residual(s, hidden, slot, move, legal, NULL, policy);
+}
+
+double target_sidecar_backward(const TargetSidecar* s, const float* hidden,
+    int slot, int move, unsigned char legal, unsigned char best, const float policy[4], float* gradient
+) {
     double loss = 0;
     int target, count = 0;
     size_t h;
-    if (!best || (best & ~legal) || !target_sidecar_predict(s, hidden, slot, move, legal, policy)) return NAN;
+    if (!best || (best & ~legal)) return NAN;
     for (target = 0; target < 4; ++target) count += !!(best & (1 << target));
     for (target = 0; target < 4; ++target) {
         float label = best & (1 << target) ? 1.0f / count : 0;
@@ -102,6 +108,14 @@ double target_sidecar_gradient(const TargetSidecar* s, const float* hidden,
         }
     }
     return loss;
+}
+
+double target_sidecar_gradient(const TargetSidecar* s, const float* hidden,
+    int slot, int move, unsigned char legal, unsigned char best, float* gradient
+) {
+    float policy[4];
+    if (!target_sidecar_predict(s, hidden, slot, move, legal, policy)) return NAN;
+    return target_sidecar_backward(s, hidden, slot, move, legal, best, policy, gradient);
 }
 
 int target_sidecar_supports(const Observation* observation, const ParsedRequest* request,
@@ -198,14 +212,14 @@ TargetSidecar* target_sidecar_load(const char* path, const GruModel* parent) {
 typedef struct { unsigned char validation, slot, move, legal, best; } Example;
 typedef struct { double nll; size_t count, correct; } Metrics;
 
-static void adam_batch(TargetSidecar* s, float* gradient, float* first, float* second, size_t batch, size_t update) {
+void target_fit_adam_batch(float* weights, size_t count, float* gradient, float* first, float* second, size_t batch, size_t update) {
     size_t j;
     double correction1 = 1 - pow(.9, (double)update), correction2 = 1 - pow(.999, (double)update);
-    for (j = 0; j < target_sidecar_parameter_count(s); ++j) {
+    for (j = 0; j < count; ++j) {
         float g = gradient[j] / batch;
         first[j] = .9f * first[j] + .1f * g;
         second[j] = .999f * second[j] + .001f * g * g;
-        s->weights[j] -= .001f * (first[j] / correction1) / (sqrt(second[j] / correction2) + 1e-8);
+        weights[j] -= .001f * (first[j] / correction1) / (sqrt(second[j] / correction2) + 1e-8);
         gradient[j] = 0;
     }
 }
@@ -272,13 +286,13 @@ static int fit_target_sidecar(const char* dataset, const GruModel* parent, const
             if (!isfinite(target_sidecar_gradient(s, hidden + i * dimensions, e->slot, e->move, e->legal, e->best, gradient))) goto cleanup;
             ++batch;
             if (batch == 64) {
-                adam_batch(s, gradient, first, second, batch, ++updates);
+                target_fit_adam_batch(s->weights, parameters, gradient, first, second, batch, ++updates);
                 batch = 0;
             }
         }
         /* A trailing validation row must not strand the last training batch. */
         if (batch) {
-            adam_batch(s, gradient, first, second, batch, ++updates);
+            target_fit_adam_batch(s->weights, parameters, gradient, first, second, batch, ++updates);
             batch = 0;
         }
         Metrics current = evaluate(s, examples, hidden, count, 1, -1);

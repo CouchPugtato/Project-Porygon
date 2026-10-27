@@ -16,6 +16,12 @@ void target_sidecar_free(TargetSidecar* sidecar);
 size_t target_sidecar_parameter_count(const TargetSidecar* sidecar);
 int target_sidecar_predict(const TargetSidecar* sidecar, const float* hidden,
     int slot, int move, unsigned char legal, float* policy);
+int target_sidecar_predict_residual(const TargetSidecar* sidecar, const float* hidden,
+    int slot, int move, unsigned char legal, const float residual[4], float* policy);
+double target_sidecar_backward(const TargetSidecar* sidecar, const float* hidden,
+    int slot, int move, unsigned char legal, unsigned char best, const float policy[4], float* gradient);
+void target_fit_adam_batch(float* weights, size_t count, float* gradient, float* first,
+    float* second, size_t batch, size_t update);
 /* Metadata/visibility eligibility only: no teacher score or target ranking. */
 int target_sidecar_supports(const Observation* observation, const ParsedRequest* request,
     const FactorizedActionChoice* choice);

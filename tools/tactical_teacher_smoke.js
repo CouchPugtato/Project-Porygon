@@ -90,6 +90,7 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
         side === candidateSide && config.decision_audit === true,
         side === candidateSide && config.tactical_targets === true,
         {labels: side === candidateSide && config.collect_target_labels === true,
+            contextVersion: side === candidateSide ? (config.target_context_version || 0) : 0,
             sidecar: side === candidateSide && config.target_sidecar ? path.resolve(REPO_ROOT, config.target_sidecar) : null}));
 }
 
@@ -103,7 +104,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
     const battle = new sim.BattleStream();
     const streams = sim.getPlayerStreams(battle);
     const seeds = battleSeeds(config.seed, index, matchedTeams);
-    const audit = config.collect_target_labels ? createTargetCollector() : config.decision_audit ? createDecisionAudit() : null;
+    const audit = config.collect_target_labels ? createTargetCollector(config.target_context_version || 0) : config.decision_audit ? createDecisionAudit() : null;
     const observe = audit ? line => { audit.observe(line); if (recordTeacher) recordTeacher(line); } : recordTeacher;
     const agents = createBattleAgents(config, seeds, teacherSide, opponent, observe);
     let timeout;

@@ -1345,3 +1345,52 @@ exist upstream in the model's observations, but cannot be supplied directly
 to a new target head from this cache. No focused explicit-input fit was run.
 New context capture and collection require a separately approved bounded step;
 do not fabricate features from the labels or overwrite the original data.
+
+### Visible-context comparison
+
+The separately approved context collection retains the actual selected move
+ID/type and four relative target records (self, ally, foe-left, foe-right),
+including presence, friendly/foe relation, visible types and knowledge flags.
+Unknown or absent types are redacted. The cache accepts native move IDs beyond
+the frozen model's 920-entry one-hot width; it does not change that model's
+input dimensions or backfill the old cache.
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0292_target_context_collection --config .\config\experimental\target_context_collection.json
+node .\tools\target_learning.js --compare-context run_0292_target_context_collection models/runs/run_0293_target_context_comparison
+```
+
+This is 500 fresh student-played battles against parent/random, with unchanged
+serial resource gates. Capability/version checks reject a client that omits
+the context. Accepted-choice filtering and per-battle checksums still apply.
+
+The comparison trains the old frozen-state head and one head with an added
+shared move-type/defender-type residual table. Friendly and opposing targets
+have separate learned coefficients; dual types add two contributions. Missing
+type knowledge contributes no residual. The 722 new coefficients start at
+zero and contain no built-in type-chart or teacher-score values. Move IDs are
+retained for audit but are not a further feature in this fixed comparison.
+
+Both fits receive exactly the same examples, deterministic ordering and
+whole-battle validation split (seed 20261026). Adam LR 0.001, batch size 64,
+ten maximum epochs and patience three are shared. Each branch selects its
+lowest validation-NLL epoch. Reports retain tie-aware accuracy and preferred-
+target probability mass alongside NLL. The native command prints JSON; the
+wrapper atomically saves it with dataset/model/executable provenance.
+No weights are published and no gameplay is started by this diagnostic.
+
+Run 0292 completed 500 valid battles from 504 attempts in 9.2 minutes. Four
+games with trapped/disabled-choice rejections were excluded and retained.
+All 5,482 labels have complete context; the split is 405/95 battles and
+4,443/1,039 labels. On the same validation examples, the trained baseline
+reached NLL 0.661749, accuracy 71.90% and preferred-target probability mass
+69.87%. The context variant reached 0.550746, 90.28% and 75.79%, respectively.
+Both selected epoch 10 without extending the predeclared budget. The report
+is `models/runs/run_0293_target_context_comparison/context_comparison.json`.
+
+This is a validation imitation improvement, not a win-rate result or proof
+that all relevant information was absent from the frozen state. The variant
+adds both explicit type interactions and 722 shared trainable coefficients.
+Its 90.28% argmax agreement is not its sampled target success rate. Model
+checkpoints are unchanged and no learned weights were published; live wiring
+and strength evaluation need a separately approved step.
