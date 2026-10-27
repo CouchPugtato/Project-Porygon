@@ -43,3 +43,46 @@ test('cleanup failures still close every agent and remain reportable', async () 
         error => error instanceof AggregateError && error.errors[0].message === 'cleanup fixture');
     assert.equal(closed, 2);
 });
+
+function requestChoiceBattle(team) {
+    const {Battle} = require('../external/pokemon-showdown/dist/sim');
+    const battle = new Battle({formatid: 'gen9doublescustomgame', seed: [1, 2, 3, 4],
+        p1: {name: 'RequestFixture', team}, p2: {name: 'Opponent', team: [
+            {species: 'Magikarp', moves: ['splash']}, {species: 'Magikarp', moves: ['splash']}]} });
+    if (battle.requestState === 'teampreview')
+        battle.makeChoices(`team ${team.map((_, index) => index + 1).join('')}`, 'team 12');
+    battle.p1.active[0].fainted = true;
+    battle.p1.active[0].hp = 0;
+    battle.p1.pokemonLeft = team.length - 1;
+    return battle;
+}
+
+test('Showdown accepts the lone-survivor fallback at a fainted ally location', () => {
+    const battle = requestChoiceBattle([{species: 'Deoxys-Speed', moves: ['superpower']},
+        {species: 'Cresselia', moves: ['lunarblessing', 'helpinghand', 'psychic', 'icywind']}]);
+    try {
+        battle.p1.active[1].moveSlots.forEach((move, index) => { if (index !== 1) move.pp = 0; });
+        battle.makeRequest('move');
+        assert.equal(battle.p1.choose('move 2 -1'), true);
+        assert.equal(battle.p1.choice.error, '');
+        assert.deepEqual(battle.p1.choice.actions.map(action => action.choice), ['pass', 'move']);
+        assert.equal(battle.p1.choice.actions[1].moveid, 'helpinghand');
+        assert.equal(battle.p1.choice.actions[1].targetLoc, -1);
+    } finally { battle.destroy(); }
+});
+
+test('Showdown revival selection can name a fainted active partner', () => {
+    const battle = requestChoiceBattle([{species: 'Klawf', moves: ['rockslide']},
+        {species: 'Rabsca', moves: ['revivalblessing']}, {species: 'Mew', moves: ['psychic']}]);
+    try {
+        battle.p1.slotConditions[1].revivalblessing = {id: 'revivalblessing', target: battle.p1.active[1]};
+        battle.p1.active[0].switchFlag = false;
+        battle.p1.active[1].switchFlag = true;
+        battle.makeRequest('switch');
+        assert.deepEqual(battle.p1.activeRequest.forceSwitch, [false, true]);
+        assert.equal(battle.p1.choose('pass, switch 1'), true);
+        assert.equal(battle.p1.choice.error, '');
+        assert.deepEqual(battle.p1.choice.actions.map(action => action.choice), ['pass', 'revivalblessing']);
+        assert.equal(battle.p1.choice.actions[1].target, battle.p1.active[0]);
+    } finally { battle.destroy(); }
+});

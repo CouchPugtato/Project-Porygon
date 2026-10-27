@@ -7,6 +7,7 @@
 #include "learning_diagnostics.h"
 #include "policy_evaluation.h"
 #include "validation_split.h"
+#include "request_failure_fixtures.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -1005,6 +1006,54 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                 strstr(line, "\"target_decisions\":1") &&
                 !episode_parse_json_record(line, &parsed, NULL, 0, NULL, 0), "Target intervention is not PPO data");
         }
+        env_runtime_free(&runtime);
+        fclose(output);
+    }
+    gru_model_destroy(model);
+    return ok;
+}
+
+static int test_runtime_handles_recorded_no_choice_requests(void) {
+    const char* payloads[] = {lone_cresselia_request, rabsca_revives_active_request};
+    GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    int fixture, mode, ok = assert_true(model != NULL, "create recorded-request runtime fixture");
+    if (!ok) return 0;
+    for (fixture = 0; fixture < 2; ++fixture) for (mode = 0; mode < 4; ++mode) {
+        EnvRuntime runtime = {0};
+        RuntimeMessage message;
+        FactorizedActionChoice decoded;
+        FILE* output = tmpfile();
+        char line[4096];
+        if (!output) { gru_model_destroy(model); return 0; }
+        ok &= env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "fixture.chk");
+        if (mode == 1) ok &= env_runtime_enable_tactical_teacher(&runtime);
+        if (mode == 2) ok &= env_runtime_enable_greedy_inference(&runtime);
+        if (mode == 3) ok &= env_runtime_enable_tactical_targets(&runtime);
+        runtime_message_init(&message);
+        message.type = RUNTIME_MSG_BATTLE_START;
+        strcpy(message.battle_id, "recorded-no-choice");
+        message.is_doubles = 1;
+        ok &= env_runtime_handle_message(&runtime, &message, output);
+        message.type = RUNTIME_MSG_REQUEST;
+        message.request_id = 1;
+        strcpy(message.payload, payloads[fixture]);
+        ok &= assert_true(env_runtime_handle_message(&runtime, &message, output),
+            "recorded request produces an action in sampled, teacher, greedy, and target-only modes");
+        if (runtime.count) {
+            EnvSession* session = &runtime.sessions[0];
+            ok &= assert_true(command_to_factorized_request_choice(session->pending_command,
+                &session->parsed_request, &decoded) && !decoded.slot0_has_action && decoded.slot1_has_action,
+                "runtime command roundtrips the right active slot");
+            if (fixture == 0) ok &= assert_true(decoded.slot1_kind == FACTORIZED_ACTION_MOVE &&
+                decoded.slot1_move_index == 1 && decoded.slot1_target_index == FACTORIZED_TARGET_ALLY,
+                "runtime retains Helping Hand with its explicit fainted-ally target");
+            else ok &= assert_true(decoded.slot1_kind == FACTORIZED_ACTION_SWITCH &&
+                decoded.slot1_switch_index == 0 && strcmp(session->pending_command, "/choose pass, switch 1") == 0,
+                "runtime selects fainted active Klawf for Revival Blessing");
+        }
+        rewind(output);
+        ok &= assert_true(fgets(line, sizeof(line), output) && strstr(line, "\"type\":\"action\"") &&
+            !strstr(line, "\"type\":\"error\""), "runtime emits an action instead of no-legal-actions error");
         env_runtime_free(&runtime);
         fclose(output);
     }
@@ -6521,6 +6570,7 @@ int main(int argc, char** argv) {
     if (!test_counterfactual_q_overfits_repeated_real_shape_pairs()) return 1;
     if (!test_greedy_runtime_is_evaluation_only()) return 1;
     if (!test_tactical_audit_preserves_sampled_runtime()) return 1;
+    if (!test_runtime_handles_recorded_no_choice_requests()) return 1;
     printf("reconstruction tests passed\n");
     return 0;
 }

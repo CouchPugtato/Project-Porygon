@@ -1235,3 +1235,15 @@ and two intervention-side one-survivor no-legal-action failures. Their retained
 records require targeted runtime follow-up; no rule or runtime fixes were
 made during confirmation. The result is a hybrid-policy gain against parent,
 not evidence of improved neural weights or a clean legality certification.
+
+The two no-legal-action cases now have minimized native/runtime fixtures and
+Showdown choice-validation tests. The one-survivor request had Helping Hand
+as its only enabled move: it is legal to select the fainted ally's position,
+even though the move then fails. The mask restores enabled ally-only moves
+only when the slot otherwise has no move or switch choice. Attacks and legal
+switches retain priority over this fallback; disabled moves stay disabled.
+Revival Blessing may select a fainted active teammate, unlike an ordinary
+switch. Its target check now applies the revival rule before excluding active
+positions. These repairs do not change checkpoint layout or the targeting
+intervention rule. Existing confirmation artifacts describe the older runtime;
+do not merge later games into those frozen runs after rebuilding.

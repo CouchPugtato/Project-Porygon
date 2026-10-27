@@ -1,6 +1,7 @@
 #include "action_mapper.h"
 #include "id_tables.h"
 #include "request_parser.h"
+#include "request_failure_fixtures.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -320,6 +321,58 @@ static int test_revival_blessing_selects_a_fainted_teammate(void) {
     return 1;
 }
 
+static int test_lone_survivor_keeps_last_usable_move(void) {
+    ParsedRequest req;
+    ActionMask mask;
+    char command[256];
+    FactorizedActionChoice choice, decoded;
+    if (!assert_true(parse_request_payload(&req, lone_cresselia_request, 1, 1) &&
+            build_action_mask_from_request(&mask, &req), "parse lone Cresselia request")) return 0;
+    if (!assert_true(mask.legal[OBS_A2_MOVE2] && mask.legal[OBS_A2_MOVE2_TERA] &&
+            !mask.legal[OBS_A1_MOVE1] && !mask.legal[OBS_A2_MOVE1] && !mask.legal[OBS_A2_MOVE3],
+            "retain Helping Hand only when its exclusion would leave no choice")) return 0;
+    factorized_action_choice_from_flat_actions(&choice, -1, OBS_A2_MOVE2);
+    choice.slot1_target_index = FACTORIZED_TARGET_ALLY;
+    if (!assert_true(factorized_choice_to_command(&req, &choice, command, sizeof(command)) &&
+            strcmp(command, "/choose move 2 -1") == 0 &&
+            command_to_factorized_request_choice(command, &req, &decoded) &&
+            decoded.slot1_target_index == FACTORIZED_TARGET_ALLY,
+            "target the fainted partner's position explicitly and roundtrip the right slot")) return 0;
+    req.active[1].move_disabled[2] = 0;
+    if (!assert_true(build_action_mask_from_request(&mask, &req) &&
+            mask.legal[OBS_A2_MOVE3] && !mask.legal[OBS_A2_MOVE2],
+            "do not restore failing ally moves when an attack is available")) return 0;
+    req.active[1].move_disabled[2] = 1;
+    req.switch_available[2] = 1;
+    req.switch_fainted[2] = 0;
+    req.slot_can_switch[1] = 1;
+    if (!assert_true(build_action_mask_from_request(&mask, &req) &&
+            mask.legal[OBS_A2_SWITCH3] && !mask.legal[OBS_A2_MOVE2],
+            "do not restore failing ally moves when a legal switch is available")) return 0;
+    req.slot_can_switch[1] = 0;
+    req.active[1].move_disabled[1] = 1;
+    if (!assert_true(build_action_mask_from_request(&mask, &req) && !mask.legal[OBS_A2_MOVE2],
+            "fallback never re-enables disabled Helping Hand")) return 0;
+    return 1;
+}
+
+static int test_revival_can_select_fainted_active_partner(void) {
+    ParsedRequest req;
+    ActionMask mask;
+    char command[256];
+    if (!assert_true(parse_request_payload(&req, rabsca_revives_active_request, 1, 1) &&
+            req.revival_switch[1] && build_action_mask_from_request(&mask, &req), "parse Rabsca revival request")) return 0;
+    if (!assert_true(mask.legal[OBS_A2_SWITCH1] && !mask.legal[OBS_A2_SWITCH2] && !mask.legal[OBS_A2_SWITCH3],
+            "revive fainted active Klawf, not live Rabsca or live bench")) return 0;
+    if (!assert_true(request_choice_to_command(&req, 0, OBS_A1_MOVE1, 1, OBS_A2_SWITCH1,
+            command, sizeof(command)) && strcmp(command, "/choose pass, switch 1") == 0,
+            "right-slot revival uses pass plus the fainted active roster index")) return 0;
+    req.revival_switch[1] = 0;
+    if (!assert_true(build_action_mask_from_request(&mask, &req) && !mask.legal[OBS_A2_SWITCH1] &&
+            mask.legal[OBS_A2_SWITCH3], "ordinary replacements still reject active/fainted targets")) return 0;
+    return 1;
+}
+
 int main(void) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
@@ -346,6 +399,8 @@ int main(void) {
     }
     if (!test_recharge_is_a_forced_move_choice()) return 1;
     if (!test_revival_blessing_selects_a_fainted_teammate()) return 1;
+    if (!test_lone_survivor_keeps_last_usable_move()) return 1;
+    if (!test_revival_can_select_fainted_active_partner()) return 1;
     printf("legality tests passed\n");
     return 0;
 }

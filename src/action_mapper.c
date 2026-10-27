@@ -249,7 +249,9 @@ unsigned char build_move_target_mask(const ParsedRequest* req, int active_slot, 
             }
             break;
         case REQUEST_TARGET_ADJACENT_ALLY:
-            if (ally_available) {
+            /* Choice validation checks the slot's geometry, not whether its
+             * occupant survived. An ally-only move can be legal but fail. */
+            if (req->is_doubles) {
                 mask |= FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_ALLY);
             }
             break;
@@ -287,9 +289,11 @@ static int move_has_available_required_target(
         case REQUEST_TARGET_NORMAL:
         case REQUEST_TARGET_ADJACENT_FOE:
         case REQUEST_TARGET_ANY:
-        case REQUEST_TARGET_ADJACENT_ALLY:
         case REQUEST_TARGET_ADJACENT_ALLY_OR_SELF:
             return build_move_target_mask(req, active_slot, move_slot) != 0u;
+        case REQUEST_TARGET_ADJACENT_ALLY:
+            return req->is_doubles && req->slot_present[1 - active_slot] &&
+                !req->active[1 - active_slot].fainted;
         default:
             return 1;
     }
@@ -490,6 +494,25 @@ int build_action_mask_from_request(ActionMask* out, const ParsedRequest* req) {
             out->legal[OBS_A2_SWITCH1 + i] = (unsigned char)(
                 req->force_switch[1] &&
                 parsed_request_switch_target_legal(req, 1, i));
+        }
+    }
+
+    if (req->is_doubles && !req->forced_switch_any) {
+        for (i = 0; i < req->active_count && i < PARSED_REQUEST_ACTIVE_SLOTS; ++i) {
+            int action, has_choice = 0;
+            int base = i * 14;
+            if (!parsed_request_slot_can_move(req, i)) continue;
+            for (action = base; action < base + 14; ++action) has_choice |= out->legal[action];
+            if (has_choice) continue;
+            /* Do not turn Helping Hand into an empty mask when it is the
+             * last usable move. Showdown accepts the fainted ally's location. */
+            for (action = 0; action < PARSED_REQUEST_MOVE_SLOTS; ++action) {
+                if (req->active[i].move_id[action] > 0 && !req->active[i].move_disabled[action] &&
+                        req->active[i].move_target[action] == REQUEST_TARGET_ADJACENT_ALLY) {
+                    out->legal[base + action] = 1;
+                    out->legal[base + 4 + action] = req->active[i].can_tera ? 1 : 0;
+                }
+            }
         }
     }
 

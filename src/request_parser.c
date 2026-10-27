@@ -771,12 +771,14 @@ int parsed_request_switch_target_legal(
     int team_index
 ) {
     if (!req || slot < 0 || slot >= PARSED_REQUEST_ACTIVE_SLOTS ||
-            team_index < 0 || team_index >= PARSED_REQUEST_TEAM_SIZE ||
-            req->switch_active[team_index]) {
+            team_index < 0 || team_index >= PARSED_REQUEST_TEAM_SIZE) {
         return 0;
     }
     if (req->revival_switch[slot]) {
+        /* Revival Blessing may select a fainted partner still in an active
+         * position; Showdown's ordinary switch restriction does not apply. */
         return req->switch_fainted[team_index] ? 1 : 0;
     }
-    return req->switch_available[team_index] && !req->switch_fainted[team_index];
+    return !req->switch_active[team_index] &&
+        req->switch_available[team_index] && !req->switch_fainted[team_index];
 }
