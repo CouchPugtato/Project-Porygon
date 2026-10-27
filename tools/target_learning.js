@@ -127,7 +127,67 @@ function targetFitEligible(metadata, report, exploratory = false) {
         JSON.stringify(report.failure_reasons) === '["holdout_accuracy_decreased"]';
 }
 
+async function auditTargetInputs(directory, summary) {
+    const {isValid} = require('./tactical_teacher_benchmark');
+    const games = summary.games.filter(isValid);
+    if (summary.status !== 'completed' || !summary.identity.config.collect_target_labels ||
+            games.length !== summary.valid_games) throw new Error('audit requires a completed target collection');
+    const recordFields = new Set(), exampleFields = new Set(), dimensions = new Set(), battleIds = new Set();
+    const counts = {battles: games.length, accepted_decisions: 0, informative_decisions: 0, examples: 0,
+        train_battles: 0, holdout_battles: 0, train_examples: 0, holdout_examples: 0};
+    const contextKeys = ['observation', 'request', 'context', 'move_id', 'move_type_id', 'targets', 'target_types'];
+    const contextCounts = Object.fromEntries(contextKeys.map(key => [key, 0]));
+    let fingerprint;
+    for (const game of games) {
+        const battle = await readLabels(directory, game.target_labels);
+        if (battleIds.has(battle.battle_id)) throw new Error('duplicate battle in input audit');
+        battleIds.add(battle.battle_id);
+        const holdout = splitBattle(battle.battle_id, 20261026);
+        ++counts[holdout ? 'holdout_battles' : 'train_battles'];
+        for (const decision of battle.decisions) {
+            ++counts.accepted_decisions;
+            Object.keys(decision).forEach(key => recordFields.add(key));
+            if (!fingerprint) fingerprint = decision.parent_fingerprint;
+            if (fingerprint !== decision.parent_fingerprint) throw new Error('input audit mixes different parents');
+            for (const key of contextKeys) if (Object.hasOwn(decision, key)) ++contextCounts[key];
+            if (decision.examples.length) {
+                ++counts.informative_decisions;
+                dimensions.add(decision.hidden.length);
+            }
+            for (const example of decision.examples) {
+                ++counts.examples;
+                ++counts[holdout ? 'holdout_examples' : 'train_examples'];
+                Object.keys(example).forEach(key => exampleFields.add(key));
+                for (const key of contextKeys) if (Object.hasOwn(example, key)) ++contextCounts[key];
+            }
+        }
+    }
+    return {diagnostic: 'target_input_cache_audit', read_only: true, training_run: false,
+        split_seed: 20261026, counts, hidden_dimensions: [...dimensions].sort((a, b) => a - b),
+        decision_fields: [...recordFields].sort(), example_fields: [...exampleFields].sort(),
+        retained_context_field_counts: contextCounts, parent_fingerprint: fingerprint};
+}
+
 async function main(argv) {
+    if (argv[0] === '--audit-inputs') {
+        if (argv.length !== 3 || !/^[A-Za-z0-9_-]+$/.test(argv[1]))
+            throw new Error('usage: node tools/target_learning.js --audit-inputs COLLECTION_RUN REPORT.json');
+        const root = path.resolve(__dirname, '..'), directory = path.join(root, 'matches/runs', argv[1]);
+        const summaryPath = path.join(directory, `${argv[1]}_summary.json`);
+        const summary = JSON.parse(await fs.readFile(summaryPath, 'utf8'));
+        const report = await auditTargetInputs(directory, summary);
+        const {hashFile} = require('./tactical_teacher_smoke');
+        report.source_summary = summaryPath;
+        report.source_summary_sha256 = await hashFile(summaryPath);
+        report.source_sha256 = Object.fromEntries(await Promise.all([
+            'tools/target_learning.js', 'src/target_sidecar.c', 'src/target_labels.c', 'src/observation.c', 'src/gru_model.c',
+        ].map(async file => [file, await hashFile(path.join(root, file))])));
+        const output = path.resolve(root, argv[2]);
+        await fs.mkdir(path.dirname(output), {recursive: true});
+        await writeJsonAtomic(output, report);
+        console.log(`[target-input-audit] ${JSON.stringify(report)}`);
+        return;
+    }
     const exploratory = argv.length === 3 && argv[2] === '--exploratory-evaluation';
     if (argv.length !== 2 && !exploratory) throw new Error('usage: node tools/target_learning.js COLLECTION_RUN OUTPUT_DIRECTORY [--exploratory-evaluation]');
     const root = path.resolve(__dirname, '..'), directory = path.join(root, 'matches/runs', argv[0]);
@@ -178,5 +238,5 @@ async function main(argv) {
     if (!targetFitEligible({exploratory_evaluation: exploratory}, result, exploratory)) process.exitCode = 2;
 }
 
-module.exports = {createTargetCollector, packDataset, publishLabels, readLabels, splitBattle, validateLabels, targetFitEligible};
+module.exports = {createTargetCollector, packDataset, publishLabels, readLabels, splitBattle, validateLabels, targetFitEligible, auditTargetInputs};
 if (require.main === module) main(process.argv.slice(2)).catch(error => {console.error(error); process.exitCode = 1;});

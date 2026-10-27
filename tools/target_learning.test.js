@@ -1,7 +1,7 @@
 'use strict';
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const {createTargetCollector, packDataset, publishLabels, readLabels, splitBattle, validateLabels, targetFitEligible} = require('./target_learning');
+const {createTargetCollector, packDataset, publishLabels, readLabels, splitBattle, validateLabels, targetFitEligible, auditTargetInputs} = require('./target_learning');
 const {validateConfig} = require('./tactical_teacher_benchmark');
 const {createBattleAgents, battleSeeds} = require('./tactical_teacher_smoke');
 
@@ -51,6 +51,30 @@ test('cached labels resume only with intact accepted-choice files', async t => {
     await fs.unlink(path.join(directory, reference.path));
     await assert.rejects(readLabels(directory, reference), {code: 'ENOENT'});
     await assert.rejects(readLabels(directory, {...reference, path: '../wrong.json'}), /missing target/);
+});
+
+test('input audit reports retained fields without inventing move or target context', async t => {
+    const fs = require('node:fs/promises'), path = require('node:path'), os = require('node:os');
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'porygon-target-inputs-'));
+    t.after(() => fs.rm(directory, {recursive: true, force: true}));
+    const game = {status: 'completed', result: {result: 'loss'}, choice_rejections: [],
+        target_examples: [{request_id: 1, ...labels()}]};
+    game.target_labels = await publishLabels(directory, game, 'parent', 0);
+    const summary = {status: 'completed', valid_games: 1, identity: {config: {collect_target_labels: true}}, games: [game]};
+    const report = await auditTargetInputs(directory, summary);
+    assert.equal(report.training_run, false);
+    assert.equal(report.counts.accepted_decisions, 1);
+    assert.equal(report.counts.examples, 1);
+    assert.equal(report.counts.train_examples + report.counts.holdout_examples, 1);
+    assert.deepEqual(report.hidden_dimensions, [2]);
+    assert.deepEqual(report.example_fields, ['best', 'legal', 'move', 'slot']);
+    assert.ok(Object.values(report.retained_context_field_counts).every(n => n === 0));
+    const invalid = {...game, choice_rejections: [{message: 'trapped'}], target_labels: undefined};
+    const withInvalid = await auditTargetInputs(directory, {...summary, games: [game, invalid]});
+    assert.deepEqual(withInvalid.counts, report.counts);
+    await assert.rejects(auditTargetInputs(directory, {...summary, status: 'in_progress'}), /completed/);
+    await fs.appendFile(path.join(directory, game.target_labels.path), ' ');
+    await assert.rejects(auditTargetInputs(directory, summary), /checksum/);
 });
 
 test('collection freezes student play and routes passive labels to the candidate only', () => {

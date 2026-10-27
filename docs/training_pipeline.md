@@ -1328,3 +1328,20 @@ See `models/diagnostics/run_0288_0290_target_exploratory_comparison.json` for
 the side splits, coverage, full comparisons and provenance. Intervals are
 nominal development intervals, without multiplicity adjustment; don't pool
 opponents or reinterpret this as passing the original learning gate.
+
+### Target-input audit
+
+`docs/target_input_audit.md` traces the raw observation fields to the frozen
+target sidecar and records what the collection actually retained. Reproduce
+the checksum-verified, read-only cache inspection with:
+
+```powershell
+node .\tools\target_learning.js --audit-inputs run_0285_target_learning_collection models/diagnostics/run_0291_target_input_audit.json
+```
+
+The 500-battle cache contains frozen states and slot/move-index/target labels,
+not the original move identity/type or target-board context. Those fields
+exist upstream in the model's observations, but cannot be supplied directly
+to a new target head from this cache. No focused explicit-input fit was run.
+New context capture and collection require a separately approved bounded step;
+do not fabricate features from the labels or overwrite the original data.
