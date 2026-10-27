@@ -463,6 +463,96 @@ The frozen executable used by run 0318 still exists, so its old bundle pin does
 not need to be changed. Next: scoped learner integration and its training-state
 recovery tests before any learning pilot. Records remain PPO-ineligible.
 
+## Bounded action-record learner diagnostic (run 0320)
+
+The new diagnostic joins replay-verified accepted records to the action-only
+update kernel. It is **not PPO**, a full trainer, or evidence of stronger play.
+Its objective is a terminal-return-weighted log-action probability: win/loss/
+draw records receive +1/-1/0 weights, with no learned baseline, discounting,
+importance weighting or repeated epochs. This intentionally simple objective
+tests the data/update/resume path before a separately approved learning pilot.
+
+`tools/action_record_learner.js` requires an explicit JSON config; there is no
+default command that starts updating the research model. The config has exactly
+these fields: `run_name`, `manifest`, `manifest_sha256`, `sources` (an ordered
+array of `{path, sha256}`), `record_limit`, `minibatch`, `max_updates`,
+`learning_rate` and `max_abs_log_ratio`. Each source is either a run 0317
+accepted-record artifact or a run 0318 live battle envelope. Paths are relative
+to the repository or absolute. The operator must supply trusted pins and obtain
+approval for the actual data/update experiment separately.
+
+The wrapper verifies source bytes, bundle members, complete native replay and
+each supported snapshot before preparing an internal `PGACTREC1` pack. It
+excludes unsupported accepted snapshots, rejects duplicate battles/decisions,
+and selects the first `record_limit` supported records in source/record order.
+Rejected requests remain replay history, never gradient examples. Terminal
+rewards must be -1/0/+1. Selected record bytes, input file pins, all settings,
+wrapper/replay source hashes and the learner executable SHA256 define the
+resume identity; changing them needs a new run name.
+
+Bounds are 128 selected records, minibatches of at most eight, eight updates
+**total across resumes**, learning rate at most 0.0001, and an absolute log
+likelihood-ratio limit at most 0.05. Native Adam uses beta1=0.9, beta2=0.999,
+epsilon=1e-8 and gradient clipping at 1. The process is serial, uses one OpenMP
+thread, retains the 65% resource launch gates and has a 30-second native timeout
+after the gate. Those gates are not OS-enforced utilization caps. The learner
+executable is fixed to the local model-recovery build, not a config override;
+the frozen behavior bundle still uses its own separately pinned executable.
+
+The native diagnostic rechecks behavior action likelihoods against the frozen
+behavior actor and combines them with replay-verified conditional target logs.
+The representation, checkpoint target heads, sidecar and value head remain
+frozen. For these same recorded states/actions, conditional target likelihoods
+therefore stay fixed while the action distribution changes. Every proposed
+update is checked against **all selected diagnostic records**, not just its
+minibatch. An excessive absolute full-turn log-ratio rolls back weights and
+optimizer moments, leaves the cursor unchanged, and records a sticky guard
+stop. `max_abs_log_ratio` describes admitted state; `rejected_abs_log_ratio`
+records the rejected candidate. This is a sampled-record drift guard, not an
+exact-policy KL guarantee or a PPO clipping objective.
+
+The small native implementation lives in `action_record_learner.c`; pack I/O
+and CLI routing are separate. `--diagnose-action-records` is an internal bridge
+for the verified Node wrapper, not a standalone JSON/bundle authenticity check.
+It cannot promote these artifacts into ordinary PPO episode batches.
+
+The wrapper publishes immutable generation directories containing actor,
+optimizer, prepared input and hashed state manifest. Files are synchronized
+before publishing the generation, then one atomic `current.json` pointer
+commits the actor/optimizer/cursor together. An interrupted, unreferenced
+`.pending-*` or generation directory is not credited and is retained for
+inspection. Corrupt committed files fail closed rather than silently falling
+back to a cursor that may replay already committed updates. Dataset order is
+fixed and no training RNG is used, so cursor plus optimizer/model state fully
+specify continuation for this diagnostic; stochastic trainer recovery is not
+claimed.
+
+After a separate experiment approval, the invocation shape is:
+
+```powershell
+node .\tools\action_record_learner.js --config <approved-diagnostic.json> --steps 2
+node .\tools\action_record_learner.js --config <approved-diagnostic.json>
+```
+
+`--steps` caps only the current invocation, not the experiment's total budget.
+Rerunning verifies the sources/replay and committed generation first, continues
+from the next unprocessed record, and does nothing further after completion or
+a guard stop. Each update uses records once; no shuffle or automatic data
+collection starts. Outputs stay under `models/diagnostics/<run_name>`, never in
+the research checkpoint run directories.
+
+Run 0320 executes **only synthetic small tests**. Native tests cover signed
+joint/single-slot switch/Tera updates, frozen parameters, full-turn conditional
+likelihoods, all-record validation, guard rollback and checkpoint/optimizer/cursor
+resume. The actual packed native entry point also runs a toy pause/resume and
+matches uninterrupted weights byte-for-byte. Six Node tests cover replay/source
+gates, float32 bit-preserving packing, exact cursor progression, partial-write
+recovery, changed/corrupt inputs and sticky guard stops. Three native suites
+and 112 JavaScript tests pass. No collected research record was used for
+updates, no learning pilot or collection ran, and no deployed model changed.
+The next decision is the objective and evaluation design for a bounded learning
+pilot—not an unapproved scale-up of this diagnostic objective.
+
 The run 0313 serial smoke compared six matched cases on both deployed and local
 builds (12 games, seed 31301): sampled targets, whole-turn argmax, and slot-local
 argmax, each on both sides against random. All completed without rejections;

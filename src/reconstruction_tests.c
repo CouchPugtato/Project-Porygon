@@ -15,6 +15,7 @@
 #include "policy_decoding.h"
 
 int test_action_optimizer_state(void);
+int test_action_record_learner(void);
 
 #include <math.h>
 #include <stdlib.h>
@@ -7355,6 +7356,7 @@ int main(int argc, char** argv) {
     if (!test_action_head_update_preserves_target_function()) return 1;
     if (!test_action_actor_bundle_compatibility()) return 1;
     if (!test_action_optimizer_state()) return 1;
+    if (!test_action_record_learner()) return 1;
     if (!test_ppo_normalizes_advantages_across_minibatch()) return 1;
     if (!test_advantage_weighted_imitation_updates_only_policy_heads()) return 1;
     if (!test_action_value_head_learns_legal_joint_and_target_credit()) return 1;

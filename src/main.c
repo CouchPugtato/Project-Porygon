@@ -1,4 +1,5 @@
 #include "checkpoint.h"
+#include "action_record_learner.h"
 #include "counterfactual_data.h"
 #include "env_session.h"
 #include "gru_model.h"
@@ -5663,6 +5664,7 @@ static int showdown_client_main(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && !strcmp(argv[1], "--diagnose-action-records")) return action_record_learner_cli(argc, argv);
     if ((argc == 4 && strcmp(argv[1], "--compare-target-context") == 0) ||
             (argc == 5 && strcmp(argv[1], "--export-target-context-evaluation") == 0)) {
         TrainerCheckpointState state = {0};

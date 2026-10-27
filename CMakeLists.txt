@@ -54,6 +54,8 @@ set(SHOWDOWN_CLIENT_SOURCES
 	src/target_sidecar.c
 	src/artifact_io.c
 	src/action_optimizer_state.c
+	src/action_record_learner.c
+	src/action_record_learner_cli.c
 	src/target_behavior.c
 	src/target_records.c
 	src/target_audit.c
@@ -104,6 +106,7 @@ add_executable(showdown_tactical_tests
 set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/reconstruction_tests.c
 	src/action_optimizer_state_tests.c
+	src/action_record_learner_tests.c
 	src/neural_net.c
 	src/observation.c
 	src/episode.c
@@ -118,6 +121,8 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/target_sidecar.c
 	src/artifact_io.c
 	src/action_optimizer_state.c
+	src/action_record_learner.c
+	src/action_record_learner_cli.c
 	src/target_behavior.c
 	src/target_records.c
 	src/target_audit.c
