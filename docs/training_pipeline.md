@@ -1652,3 +1652,181 @@ guards, recorded Helping Hand/revival fallbacks and resume identity checks.
 Report: `models/diagnostics/run_0304_target_policy_slot_local_audit.json`.
 Next proposal: a fresh matched strength screen against whole-turn targeting
 and the unchanged student. Further experiments require separate approval.
+
+### Matched slot-local strength screen
+
+The approved screen freezes the executable, student and context sidecar, with
+fresh seed 30501 shared across three configs:
+
+- `target_slot_local_control.json`: unchanged student targeting.
+- `target_slot_local_whole_turn.json`: whole-turn contextual argmax.
+- `target_slot_local_local.json`: slot-local contextual argmax.
+
+Each uses 100 valid games per side against parent and random, for 1,200 valid
+games total. Run sequentially with the shared benchmark; each command resumes
+only when its saved executable, source hashes and config still match:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0305_target_slot_local_control --config config/experimental/target_slot_local_control.json
+node .\tools\tactical_teacher_benchmark.js --run-name run_0306_target_slot_local_whole_turn --config config/experimental/target_slot_local_whole_turn.json
+node .\tools\tactical_teacher_benchmark.js --run-name run_0307_target_slot_local_local --config config/experimental/target_slot_local_local.json
+```
+
+The read-only comparison checks complete quotas, frozen identities and actual
+seed tuples. Rejected/failed attempts remain in raw summaries but do not count
+as valid games. Every contrast uses complete common-valid side-swapped seed
+pairs across all three policies, separately for each opponent. The statistical
+unit is a pair's mean score, not its two correlated games. Draws count half.
+Report nominal approximate normal 95% intervals over pair-mean differences;
+there is no multiplicity adjustment or automatic promotion. All-valid point
+estimates and side splits remain separate from the matched subset. Excluding
+invalid games cannot prove that missing outcomes are unbiased.
+
+After all three commands finish, inspect the reproducible comparison:
+
+```powershell
+node .\tools\target_comparison.js .\matches\runs\run_0305_target_slot_local_control\run_0305_target_slot_local_control_summary.json .\matches\runs\run_0306_target_slot_local_whole_turn\run_0306_target_slot_local_whole_turn_summary.json .\matches\runs\run_0307_target_slot_local_local\run_0307_target_slot_local_local_summary.json
+```
+
+The primary contrast is `local_minus_whole_turn`; comparisons with the
+unchanged student are secondary. Keep parent and random results separate.
+No training, policy selection from intermediate results, or promotion is part
+of this screen.
+
+The screen completed with 1,200 valid games, ten excluded trapped-switch
+attempts and no process crashes. Recorded game/launch-gate time was 1,016.1
+seconds (16.9 minutes), excluding some orchestration overhead.
+
+| Policy | Against parent | Against random |
+| --- | ---: | ---: |
+| Unchanged student | 47.5% | 43.0% |
+| Whole-turn targets | 54.0% | 52.0% |
+| Slot-local targets | 60.5% | 52.5% |
+
+Each cell has 200 valid games. The matched contrasts instead use 99 complete
+common-valid side-swapped seed pairs per opponent. Slot-local minus whole-turn
+is +5.56 percentage points against parent (nominal 95% interval -3.11 to
++14.22) and +0.51 points against random (-7.99 to +9.01). The primary effect
+is inconclusive for both opponents.
+
+Slot-local minus unchanged student is +12.12 points against parent (+1.68 to
++22.56) and +9.60 against random (-1.45 to +20.65). The parent result is a
+promising nominal signal that needs fresh confirmation, not a promotion gate.
+Whole-turn minus control against random has a borderline nominal positive
+interval too; there are six unadjusted development contrasts, not one
+prespecified confirmatory claim.
+
+Eight exclusions were parent-opponent trapped-switch rejections; two were
+student rejections. All exact messages and indices are preserved. The invalid
+rate is small, but replacements and complete-case matching do not establish
+that missing outcomes are unbiased. Slot-local side splits are 61%/60%
+against parent and 53%/52% against random. Learned-target use is 59.5%/58.0%
+of accepted decisions versus whole-turn's 32.3%/32.8%; this measures use, not
+necessarily changes from the original target.
+
+Report: `models/diagnostics/run_0305_0307_target_slot_local_comparison.json`.
+The report retains raw-summary hashes, frozen identities, common/excluded seed
+pairs and all contrasts. Native suites and 84 JavaScript tests pass. No runtime
+behavior, weights or defaults changed during this screen, and no model was
+promoted. The next proposal is independent matched confirmation with the
+candidate still frozen; it requires separate approval.
+
+### Independent slot-local confirmation
+
+The approved follow-up changes only sample size and seed: 500 valid games per
+side/opponent/policy, 625 maximum attempts per side, fresh seed 30801. The three
+`target_slot_local_*_confirmation.json` configs retain the same frozen models,
+runtime settings, serial battles and 65% resource launch gates. Total target:
+6,000 valid games. Estimated runtime: 85-110 minutes, longer with launch pauses.
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0308_target_slot_local_control_confirmation --config config/experimental/target_slot_local_control_confirmation.json
+node .\tools\tactical_teacher_benchmark.js --run-name run_0309_target_slot_local_whole_turn_confirmation --config config/experimental/target_slot_local_whole_turn_confirmation.json
+node .\tools\tactical_teacher_benchmark.js --run-name run_0310_target_slot_local_local_confirmation --config config/experimental/target_slot_local_local_confirmation.json
+```
+
+These commands resume only when identity checks match. The primary contrast
+is still local minus whole-turn targeting, separately against parent/random.
+Use complete common-valid swapped seed pairs across all three arms and the
+same nominal approximate normal intervals; comparisons with the unchanged
+student are secondary. Preserve invalid attempts and all-valid side splits.
+No adaptive stopping from intermediate scores, retraining or promotion is
+included in this approval.
+
+The independent confirmation completed 6,000 valid games with 14 excluded
+trapped-switch attempts and zero process crashes. Recorded game/launch-gate
+time was 4,916.6 seconds (81.9 minutes), not end-to-end wall time. All original
+screen artifacts and frozen input hashes remain intact.
+
+| Policy | Against parent | Against random |
+| --- | ---: | ---: |
+| Unchanged student | 56.3% | 46.2% |
+| Whole-turn targets | 62.3% | 56.3% |
+| Slot-local targets | 66.2% | 59.7% |
+
+Each cell uses 1,000 valid games; matched contrasts use 498 common-valid
+complete seed pairs per opponent (996 games per policy). Primary local minus
+whole-turn differences are +3.71 percentage points against parent (nominal
+95% interval -0.45 to +7.88) and +3.61 against random (-0.39 to +7.62).
+Neither establishes superiority over whole-turn targeting.
+
+Local minus unchanged student is +9.94 points against parent (+5.05 to +14.83)
+and +13.55 against random (+8.41 to +18.70). Whole-turn targeting also has
+positive nominal intervals against the unchanged student for both opponents.
+The learned-targeting benefit has replicated independently; the additional
+benefit of local eligibility remains uncertain. Intervals are unadjusted and
+matchup-specific. Do not pool this confirmation with the development screen.
+
+Slot-local side splits are 66.8%/65.6% against parent and 59.8%/59.6% against
+random. Learned-target use is 59.3%/59.0% of accepted decisions, compared with
+whole-turn's 32.3%/32.2%. Exclusions are eight parent-opponent and six candidate
+trapped-switch rejections; exact commands, indices and messages are retained.
+These low failure counts do not prove unbiased missing outcomes.
+
+Reproduce the read-only comparison:
+
+```powershell
+node .\tools\target_comparison.js .\matches\runs\run_0308_target_slot_local_control_confirmation\run_0308_target_slot_local_control_confirmation_summary.json .\matches\runs\run_0309_target_slot_local_whole_turn_confirmation\run_0309_target_slot_local_whole_turn_confirmation_summary.json .\matches\runs\run_0310_target_slot_local_local_confirmation\run_0310_target_slot_local_local_confirmation_summary.json
+```
+
+Report: `models/diagnostics/run_0308_0310_target_slot_local_confirmation.json`.
+All three native suites and 85 JavaScript tests pass. No weights, defaults or
+runtime behavior changed during confirmation, and no model was promoted.
+
+The verified candidate is an inference bundle: student checkpoint, context
+sidecar, target decoder and eligibility setting. Copying its .chk alone does
+not preserve the stronger policy. Keep the bundle frozen; resolve the retained
+trapped-switch cases separately before further training. Its evaluation-only
+episodes remain PPO-ineligible until collection and training can both account
+for the actual sidecar behavior probabilities. That work requires a new plan.
+
+### Hidden-trap diagnostic follow-up
+
+Run 0311 reproduced all 14 excluded confirmation games. Each rejection was
+Showdown disclosing a hidden trap: a switchable slot had `maybeTrapped: true`,
+then an `[Unavailable choice]` rejection supplied an otherwise identical
+updated request with `trapped: true`. The native agent already retried without
+switching that slot. No runtime legality repair was needed. Masking every
+`maybeTrapped` switch would wrongly suppress legal switches when the opponent
+does not have its trapping ability.
+
+The shared player bridge now annotates only verified public same-phase updates
+as `classification: "trap_disclosure"`, retaining the original rejection.
+All rejection-based exclusions remain in force; old runs and scores are not
+rewritten. A future rule allowing recovered disclosures requires a separate
+evaluation decision, tests and new provenance, not a silent exception here.
+
+Before/after replay covered the 14 retained cases plus 12 fresh matched smoke
+games (seed 31101). All 26 completed with identical native action hashes,
+outcomes and target-use counters; all 14 disclosures were identified. The
+fresh games had no rejections. Three native suites and 88 JavaScript tests
+pass, including real Showdown cases with and without the hidden trapping
+ability. Weights, deployed executable and decoder settings are unchanged.
+Report: `models/diagnostics/run_0311_trap_disclosure_diagnostics.json`.
+
+The next bounded step adds decoder-aware target probability diagnostics and
+an explicit loaded-policy bundle descriptor. Sidecar episodes remain blocked
+from PPO, including records with attached training arrays. See
+[the learned-target behavior contract](target_behavior_contract.md) for the
+collection/trainer trace, schema, tests and remaining training decisions.
+This does not enable another collection or training run.

@@ -9,6 +9,7 @@
 #include "validation_split.h"
 #include "request_failure_fixtures.h"
 #include "target_sidecar.h"
+#include "target_behavior.h"
 #include "target_context.h"
 #include "target_context_fit.h"
 #include "policy_decoding.h"
@@ -958,6 +959,7 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
     EnvRuntime runtime = {0};
     FactorizedActionChoice baseline;
     float hidden[8];
+    float sampled_action_log_probability = 0;
     int next_rng = 0, mode, ok = assert_true(model != NULL, "create passive runtime audit fixture");
     if (!ok) return 0;
     TargetSidecar* initial_targets = target_sidecar_create(model);
@@ -998,6 +1000,36 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
         if (mode >= 5) ok &= assert_true(runtime.sessions[0].pending_learned_targets,
             "context runtime fixture exercises learned targeting, not only fallback");
         if (runtime.count) {
+            if (mode >= 4) {
+                EnvSession* session = &runtime.sessions[0];
+                FactorizedActionChoice* choice = &session->pending_factorized_choice;
+                float target_log_probability = 0;
+                int slot;
+                for (slot = 0; slot < 2; ++slot) {
+                    unsigned char legal = slot ? choice->slot1_target_mask : choice->slot0_target_mask;
+                    int selected = slot ? choice->slot1_target_index : choice->slot0_target_index;
+                    int move = slot ? choice->slot1_move_index : choice->slot0_move_index;
+                    if (!legal) continue;
+                    float expected[4], total = 0;
+                    if (runtime.target_sidecar->contextual) {
+                        TargetContext context;
+                        target_context_collect(&session->observation, &session->parsed_request, choice, slot, &context);
+                        ok &= target_sidecar_predict_context(runtime.target_sidecar, session->hidden_state, slot, move, legal, &context, expected);
+                    } else ok &= target_sidecar_predict(runtime.target_sidecar, session->hidden_state, slot, move, legal, expected);
+                    int target;
+                    for (target = 0; target < 4; ++target) if (legal & (1u << target)) total += expected[target];
+                    for (target = 0; target < 4; ++target) {
+                        float probability = mode >= 6 ? (target == selected ? 1.0f : 0.0f) :
+                            (legal & (1u << target) ? expected[target] / total : 0.0f);
+                        ok &= assert_true(fabsf(session->pending_target_distribution[slot][target] - probability) < 1e-6f,
+                            "Recorded conditional probability matches the decoder that selected the live target");
+                    }
+                    target_log_probability += logf(session->pending_target_distribution[slot][selected]);
+                }
+                if (mode == 5) sampled_action_log_probability = session->pending_old_log_prob - target_log_probability;
+                if (mode >= 6) ok &= assert_true(fabsf(session->pending_old_log_prob - sampled_action_log_probability) < 1e-5f,
+                    "Argmax target log probability is zero, leaving the sampled action probability");
+            }
             if (!mode) {
                 baseline = runtime.sessions[0].pending_factorized_choice;
                 memcpy(hidden, runtime.sessions[0].hidden_state, sizeof(hidden));
@@ -1067,6 +1099,9 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                     (strstr(line, "\"target_intervention\":{") && strstr(line, "\"sampled_command\":"))) &&
                 strstr(line, "\"training_eligible\":false"),
                 "Target intervention retains the original sampled command");
+            if (mode >= 5) ok &= assert_true(strstr(line, "\"behavior_policy\":{\"version\":1") &&
+                strstr(line, "\"scope\":\"conditional_targets_only\"") && strstr(line, "\"ppo_ready\":false"),
+                "Target behavior telemetry names its bundle and incomplete training scope");
             if (mode == 7) ok &= assert_true(strstr(line, "\"target_audit\":{\"version\":2,") &&
                 strstr(line, "\"support_reason\":\"supported\"") && strstr(line, "\"target_scores\":["),
                 "passive target audit serializes scored accepted-choice candidates");
@@ -1119,6 +1154,24 @@ static int test_slot_local_target_runtime(void) {
             ParsedRequest req = s->parsed_request;
             Observation obs = s->observation;
             int partner = 1 - attack_slot;
+            FactorizedPolicySnapshot snapshot;
+            ok &= gru_model_evaluate_policy_snapshot(model, s->hidden_state, s->observation.legal_mask, 1, &snapshot, NULL);
+            int slot;
+            for (slot = 0; slot < 2; ++slot) {
+                unsigned char legal = slot ? observed.slot1_target_mask : observed.slot0_target_mask;
+                int selected = slot ? observed.slot1_target_index : observed.slot0_target_index;
+                const float* parent_targets = slot ? snapshot.slot1_target_policy : snapshot.slot0_target_policy;
+                float total = 0;
+                int target;
+                if (!legal) continue;
+                for (target = 0; target < 4; ++target) if (legal & (1u << target)) total += parent_targets[target];
+                for (target = 0; target < 4; ++target) {
+                    float expected = mode && slot == attack_slot ? (target == selected ? 1.0f : 0.0f) :
+                        (legal & (1u << target) ? parent_targets[target] / total : 0.0f);
+                    ok &= assert_true(fabsf(s->pending_target_distribution[slot][target] - expected) < 1e-6f,
+                        "Mixed-turn telemetry records sidecar argmax only where applied and preserves sampled checkpoint fallback");
+                }
+            }
             ok &= assert_true(target_sidecar_support_reason(&obs, &req, &observed) != NULL &&
                 !target_sidecar_slot_support_reason(&obs, &req, &observed, attack_slot) &&
                 strcmp(target_sidecar_slot_support_reason(&obs, &req, &observed, partner), "status_move") == 0,
@@ -3991,6 +4044,28 @@ static int test_episode_target_roundtrip(void) {
         file = NULL;
         ok &= assert_true(episode_parse_json_record(json, &parsed, battle_id, sizeof(battle_id), policy_tag, sizeof(policy_tag)),
             "parse target replay JSON");
+        {
+            const char* blocked_fields[] = {",\"training_eligible\" : false}",
+                ",\"behavior_policy\":{\"version\":1}}", ",\"target_behavior\":{\"ppo_ready\":false}}"};
+            size_t k;
+            for (k = 0; k < sizeof(blocked_fields) / sizeof(blocked_fields[0]); ++k) {
+                char blocked[sizeof(json) + 128];
+                Episode rejected = {0};
+                snprintf(blocked, sizeof(blocked), "%.*s%s", (int)(strrchr(json, '}') - json), json, blocked_fields[k]);
+                ok &= assert_true(!episode_parse_json_record(blocked, &rejected, NULL, 0, NULL, 0) && !rejected.observations,
+                    "Explicitly ineligible or unsupported bundle records stay blocked even with complete episode arrays");
+                episode_free(&rejected);
+            }
+            {
+                char allowed[sizeof(json) + 64];
+                Episode ordinary = {0};
+                snprintf(allowed, sizeof(allowed), "%.*s,\"training_eligible\" : true}",
+                    (int)(strrchr(json, '}') - json), json);
+                ok &= assert_true(episode_parse_json_record(allowed, &ordinary, NULL, 0, NULL, 0),
+                    "Ordinary eligible records retain compatibility");
+                episode_free(&ordinary);
+            }
+        }
         ok &= assert_true(parsed.factorized_actions[0].slot0_target_index == FACTORIZED_TARGET_FOE_RIGHT,
             "target replay preserves selected target");
         ok &= assert_true(parsed.factorized_actions[0].slot0_target_mask == episode.factorized_actions[0].slot0_target_mask,
@@ -6629,6 +6704,25 @@ static int test_move_conditioned_target_sidecar(void) {
     TargetSidecar* loaded = target_sidecar_load("test_target_sidecar.tmp", parent);
     if (!assert_true(loaded && memcmp(loaded->weights, sidecar->weights, count * sizeof(float)) == 0,
             "load exact parent-bound target sidecar")) return 0;
+    uint64_t sidecar_identity = target_sidecar_fingerprint(sidecar);
+    if (!assert_true(sidecar_identity == target_sidecar_fingerprint(loaded), "Reloading a sidecar preserves parameter identity")) return 0;
+    loaded->weights[0] += 1;
+    if (!assert_true(sidecar_identity != target_sidecar_fingerprint(loaded), "Changed sidecar weights change policy identity")) return 0;
+    loaded->weights[0] = sidecar->weights[0];
+    {
+        char descriptors[3][512];
+        int mode;
+        for (mode = 0; mode < 3; ++mode) {
+            FILE* out = tmpfile();
+            if (!out) return 0;
+            target_behavior_identity_write(out, fingerprint, sidecar_identity, 1, mode > 0, mode == 2);
+            rewind(out);
+            if (!fgets(descriptors[mode], sizeof(descriptors[mode]), out)) { fclose(out); return 0; }
+            fclose(out);
+        }
+        if (!assert_true(strcmp(descriptors[0], descriptors[1]) != 0 && strcmp(descriptors[1], descriptors[2]) != 0,
+                "Target decoder and eligibility are part of behavior identity, not just weight paths")) return 0;
+    }
     GruModel* other = gru_model_create(4, 8, OBS_NUM_ACTIONS);
     if (!assert_true(!target_sidecar_load("test_target_sidecar.tmp", other), "reject another parent")) return 0;
     FILE* damaged = fopen("test_target_sidecar.tmp", "r+b");

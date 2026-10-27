@@ -14,6 +14,7 @@ const {
     battleFailureReason,
     buildCounterfactualSample,
     choiceRejectionReason,
+    trapDisclosureSlots,
     choicesDiffer,
     continuationSeed,
     cpuPercentBetween,
@@ -204,6 +205,58 @@ test('choice errors are rejected and retried before accepting a decision', async
     ]);
     assert.equal(result.choiceRejections.length, 1);
     assert.equal(result.choiceRejections[0].request_id, 0);
+});
+
+test('trap disclosures require an exact public same-phase uncertainty update', () => {
+    const before = {active: [{moves: [{id: 'protect'}], trapped: true},
+        {moves: [{id: 'tackle'}], maybeTrapped: true}], side: {id: 'p2'}};
+    const after = structuredClone(before); delete after.active[1].maybeTrapped;
+    after.active[1].trapped = true; after.update = true;
+    const rejection = {command: '/choose move 1, switch 6',
+        message: "|error|[Unavailable choice] Can't switch: The active Pokémon is trapped"};
+    const original = JSON.stringify([before, after]);
+    assert.deepEqual(trapDisclosureSlots(before, rejection, after), [1]);
+    assert.equal(JSON.stringify([before, after]), original);
+    for (const change of [
+        a => { a.update = false; },
+        a => { a.active[1].moves[0].id = 'protect'; },
+        a => { a.side.id = 'p1'; },
+    ]) {
+        const changed = structuredClone(after); change(changed);
+        assert.deepEqual(trapDisclosureSlots(before, rejection, changed), []);
+    }
+    assert.deepEqual(trapDisclosureSlots(after, rejection, after), [], 'a known trap is not a new disclosure');
+    assert.deepEqual(trapDisclosureSlots(before, {...rejection, command: '/choose switch 6, move 1'}, after), []);
+    assert.deepEqual(trapDisclosureSlots(before, {...rejection, message: rejection.message.replace('Unavailable', 'Invalid')}, after), []);
+});
+
+test('drivePlayer annotates disclosed traps without changing rejection or retry handling', async () => {
+    const before = {active: [{moves: [{id: 'protect'}]}, {moves: [{id: 'tackle'}], maybeTrapped: true}]};
+    const after = structuredClone(before); delete after.active[1].maybeTrapped;
+    after.active[1].trapped = true; after.update = true;
+    const sent = [], writes = [], actions = [
+        {action: 0, action2: 27, command: '/choose move 1, switch 6'},
+        {action: 0, action2: 14, command: '/choose move 1, move 1 1'},
+    ];
+    const agent = {send(m) { sent.push(m); }, async nextMessage(type) {
+        return type === 'action' ? actions.shift() : {type: 'episode_complete'};
+    }};
+    const stream = {async *[Symbol.asyncIterator]() {
+        yield `|request|${JSON.stringify(before)}\n`;
+        yield "|error|[Unavailable choice] Can't switch: The active Pokémon is trapped\n" +
+            `|request|${JSON.stringify(after)}\n`;
+        yield '|move|p1a: A|Protect\n|win|Candidate\n';
+    }, async write(c) { writes.push(c); }};
+    const r = await drivePlayer(stream, agent, 'disclosure-test', 'Candidate', 'gen9randomdoublesbattle');
+    assert.deepEqual(writes, ['move 1, switch 6', 'move 1, move 1 1']);
+    assert.deepEqual(sent.filter(m => m.type.startsWith('decision_')).map(m => m.type),
+        ['decision_rejected', 'decision_accepted']);
+    assert.equal(r.choiceRejections.length, 1);
+    assert.equal(r.choiceRejections[0].classification, 'trap_disclosure');
+    assert.deepEqual(r.choiceRejections[0].confirmed_trap_slots, [1]);
+    const {isValid} = require('./tactical_teacher_benchmark');
+    assert.equal(isValid({status: 'completed', result: {result: 'win'}, choice_rejections: r.choiceRejections}), false,
+        'diagnostic annotation does not silently relax evaluation validity');
 });
 
 test('failure categories and durable JSONL retain exact messages', async t => {

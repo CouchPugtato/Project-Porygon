@@ -26,9 +26,13 @@ static const char* find_after_key(const char* json, const char* key) {
     pattern[0] = '"';
     memcpy(pattern + 1, key, n);
     pattern[n + 1] = '"';
-    pattern[n + 2] = ':';
-    pattern[n + 3] = '\0';
-    return strstr(json, pattern);
+    pattern[n + 2] = '\0';
+    const char* match = json;
+    while ((match = strstr(match, pattern)) != NULL) {
+        if (*skip_ws(match + n + 2) == ':') return match;
+        match += n + 2;
+    }
+    return NULL;
 }
 
 static int extract_json_string_value(const char* json, const char* key, char* out, size_t out_len) {
@@ -552,6 +556,11 @@ int episode_parse_json_record(
     if (!extract_json_string_value(json, "type", type, sizeof(type)) || strcmp(type, "episode_complete") != 0) {
         return 0;
     }
+    /* Sidecar records are diagnostic-only until the trainer can replay their
+     * policy and context. Arrays alone must not make them valid PPO input. */
+    const char* eligible = find_after_key(json, "training_eligible");
+    if ((eligible && strncmp(skip_ws(strchr(eligible, ':') + 1), "true", 4) != 0) ||
+            find_after_key(json, "behavior_policy") || find_after_key(json, "target_behavior")) return 0;
     if (battle_id && battle_id_len > 0) {
         extract_json_string_value(json, "battle_id", battle_id, battle_id_len);
     }

@@ -85,6 +85,54 @@ test('argmax target screen changes only target decoding and keeps opponent/actio
     assert.throws(() => validateConfig({...argmax, target_decoder: 'unknown'}), /target decoder/);
 });
 
+test('slot-local strength screen freezes models, seeds and resources across all three policies', () => {
+    const control = require('../config/experimental/target_slot_local_control.json');
+    const whole = require('../config/experimental/target_slot_local_whole_turn.json');
+    const local = require('../config/experimental/target_slot_local_local.json');
+    for (const c of [control, whole, local]) validateConfig(c);
+    assert.deepEqual({...local, target_slot_local: undefined}, {...whole, target_slot_local: undefined});
+    const {target_sidecar, context_target_evaluation, target_decoder, ...base} = whole;
+    assert.deepEqual(base, control);
+    assert.equal(context_target_evaluation, true); assert.equal(target_decoder, 'argmax');
+    assert.ok(target_sidecar.includes('run_0294')); assert.equal(local.target_slot_local, true);
+    assert.equal(control.games_per_side * control.opponents.length * 2 * 3, 1200);
+    for (const name of ['target_policy_slot_local_audit', 'target_policy_audit', 'target_argmax_control', 'target_context_control']) {
+        const prior = require(`../config/experimental/${name}.json`);
+        assert.notEqual(control.seed, prior.seed);
+        const seen = new Set(Array.from({length: 125}, (_, i) => JSON.stringify(battleSeeds(prior.seed, 2 * i, true).battle)));
+        for (let i = 0; i < 125; ++i) assert.equal(seen.has(JSON.stringify(battleSeeds(control.seed, 2 * i, true).battle)), false);
+    }
+    for (const side of [0, 1]) {
+        const a = battleSeeds(control.seed, side, true);
+        assert.deepEqual(a, battleSeeds(whole.seed, side, true));
+        assert.deepEqual(a, battleSeeds(local.seed, side, true));
+        const agents = createBattleAgents(local, a, side, 'parent', null);
+        assert.equal(agents[side].targetOptions.slotLocal, true);
+        assert.equal(agents[1 - side].targetOptions.slotLocal, false);
+        assert.ok(agents.every(agent => agent.inferencePolicy === 'sample' && !agent.tacticalTeacher));
+    }
+    for (const c of [control, whole, local]) {
+        assert.equal(!!c.target_audit, false); assert.equal(!!c.collect_target_labels, false);
+        assert.equal(c.agent_omp_threads, 1); assert.equal(c.max_system_cpu_percent, 65);
+        assert.equal(c.max_system_memory_percent, 65);
+    }
+});
+
+test('slot-local confirmation increases only sample size and changes to fresh matched seeds', () => {
+    const seen = new Set(Array.from({length: 125}, (_, i) => JSON.stringify(battleSeeds(30501, i * 2, true).battle)));
+    for (const name of ['control', 'whole_turn', 'local']) {
+        const screen = require(`../config/experimental/target_slot_local_${name}.json`);
+        const confirmation = require(`../config/experimental/target_slot_local_${name}_confirmation.json`);
+        validateConfig(confirmation);
+        assert.deepEqual({...confirmation, seed: screen.seed, games_per_side: screen.games_per_side,
+            max_attempts_per_side: screen.max_attempts_per_side}, screen);
+        assert.equal(confirmation.games_per_side, 500); assert.equal(confirmation.max_attempts_per_side, 625);
+        assert.equal(confirmation.seed, 30801);
+        for (let i = 0; i < 625; ++i)
+            assert.equal(seen.has(JSON.stringify(battleSeeds(confirmation.seed, i * 2, true).battle)), false);
+    }
+});
+
 test('visible context uses a stable 32-byte layout and rejects unredacted or mislocated targets', () => {
     const c = context(), bytes = Buffer.alloc(32);
     validateContext(c);

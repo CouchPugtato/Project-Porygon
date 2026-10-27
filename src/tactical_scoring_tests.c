@@ -570,11 +570,17 @@ static int test_visible_target_context(void) {
 
 static int test_target_argmax(void) {
     float policy[4] = {100, .1f, .2f, .7f}, before[4];
+    float distribution[4];
+    int ok = check(policy_target_distribution(policy, 12, 0, distribution) &&
+        distribution[0] == 0 && distribution[1] == 0 && fabsf(distribution[2] - 2.0f / 9) < 1e-6f &&
+        fabsf(distribution[3] - 7.0f / 9) < 1e-6f, "Sampled target behavior renormalizes only legal targets");
+    ok &= check(policy_target_distribution(policy, 12, 1, distribution) && distribution[2] == 0 && distribution[3] == 1,
+        "Argmax target behavior is a point mass, not its learned softmax probability");
     memcpy(before, policy, sizeof(policy));
     srand(30001);
     int next = rand();
     srand(30001);
-    int ok = check(policy_decode_target_argmax(policy, 12) == 3 && rand() == next &&
+    ok &= check(policy_decode_target_argmax(policy, 12) == 3 && rand() == next &&
         memcmp(before, policy, sizeof(policy)) == 0, "Target argmax ignores illegal maxima without consuming RNG or changing probabilities");
     policy[2] = policy[3] = .5f;
     ok &= check(policy_decode_target_argmax(policy, 12) == 2 && policy_decode_target_argmax(policy, 8) == 3,
@@ -582,6 +588,9 @@ static int test_target_argmax(void) {
     policy[2] = NAN;
     ok &= check(policy_decode_target_argmax(policy, 12) == -1 && policy_decode_target_argmax(policy, 0) == -1,
         "Invalid target distributions cannot select a target");
+    policy[2] = policy[3] = 0;
+    ok &= check(policy_target_distribution(policy, 12, 0, distribution) && distribution[2] == 1 && distribution[3] == 0,
+        "Zero legal mass records the sampler's first-legal fallback");
     return ok;
 }
 

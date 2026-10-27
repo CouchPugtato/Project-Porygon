@@ -38,6 +38,13 @@ size_t target_sidecar_parameter_count(const TargetSidecar* sidecar) {
         (sidecar->contextual ? TARGET_CONTEXT_PARAMETER_COUNT : 0) : 0;
 }
 
+uint64_t target_sidecar_fingerprint(const TargetSidecar* sidecar) {
+    if (!sidecar || !sidecar->weights) return 0;
+    uint64_t metadata[3] = {sidecar->parent_fingerprint, sidecar->hidden_dim, sidecar->contextual != 0};
+    uint64_t hash = fingerprint_bytes(UINT64_C(14695981039346656037), metadata, sizeof(metadata));
+    return fingerprint_bytes(hash, sidecar->weights, target_sidecar_parameter_count(sidecar) * sizeof(float));
+}
+
 TargetSidecar* target_sidecar_create(const GruModel* parent) {
     if (!parent) return NULL;
     TargetSidecar* s = calloc(1, sizeof(*s));

@@ -57,6 +57,34 @@ function requestChoiceBattle(team) {
     return battle;
 }
 
+test('Showdown distinguishes a hidden trap from a legal uncertain switch', () => {
+    const {Battle} = require('../external/pokemon-showdown/dist/sim');
+    const {trapDisclosureSlots} = require('./counterfactual_rollout');
+    for (const ability of ['magnetpull', 'sturdy']) {
+        const battle = new Battle({formatid: 'gen9doublesou', seed: [1, 2, 3, 4],
+            p1: {name: 'Probe', team: [{species: 'Mew', moves: ['protect']},
+                {species: 'Metagross', moves: ['protect']}, {species: 'Raichu', moves: ['protect']}]},
+            p2: {name: 'Opponent', team: [{species: 'Magnezone', ability, moves: ['protect']},
+                {species: 'Mew', moves: ['protect']}, {species: 'Raichu', moves: ['protect']}]} });
+        try {
+            battle.makeChoices('team 123', 'team 123');
+            const before = JSON.parse(JSON.stringify(battle.p1.activeRequest));
+            assert.equal(before.active[1].maybeTrapped, true);
+            assert.notEqual(before.active[1].trapped, true);
+            const accepted = battle.p1.choose('move 1, switch 3');
+            assert.equal(accepted, ability === 'sturdy');
+            if (!accepted) {
+                assert.deepEqual(trapDisclosureSlots(before, {
+                    command: '/choose move 1, switch 3',
+                    message: `|error|[Unavailable choice] ${battle.p1.choice.error}`,
+                }, battle.p1.activeRequest), [1]);
+                assert.equal(battle.p1.activeRequest.active[1].trapped, true);
+                assert.equal(battle.p1.choose('move 1, move 1'), true);
+            }
+        } finally { battle.destroy(); }
+    }
+});
+
 test('Showdown accepts the lone-survivor fallback at a fainted ally location', () => {
     const battle = requestChoiceBattle([{species: 'Deoxys-Speed', moves: ['superpower']},
         {species: 'Cresselia', moves: ['lunarblessing', 'helpinghand', 'psychic', 'icywind']}]);

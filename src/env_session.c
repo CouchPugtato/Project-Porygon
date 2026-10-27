@@ -8,6 +8,7 @@
 #include "target_labels.h"
 #include "target_sidecar.h"
 #include "target_audit.h"
+#include "target_behavior.h"
 #include "policy_decoding.h"
 
 #include <math.h>
@@ -546,6 +547,7 @@ int env_runtime_enable_target_sidecar(EnvRuntime* runtime, const char* path) {
             runtime->tactical_teacher || runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets ||
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->target_sidecar = target_sidecar_load(path, runtime->model);
+    runtime->target_sidecar_fingerprint = target_sidecar_fingerprint(runtime->target_sidecar);
     return runtime->target_sidecar != NULL;
 }
 
@@ -905,6 +907,20 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         }
     }
     session->pending_learned_targets = session->pending_learned_target_slots != 0;
+    if (runtime->target_sidecar) {
+        float* policies[2] = {slot0_target_policy, slot1_target_policy};
+        int slot;
+        memset(session->pending_target_distribution, 0, sizeof(session->pending_target_distribution));
+        for (slot = 0; slot < 2; ++slot) {
+            unsigned char legal = slot ? session->pending_factorized_choice.slot1_target_mask :
+                session->pending_factorized_choice.slot0_target_mask;
+            if (!legal) continue;
+            if (!policy_target_distribution(policies[slot], legal,
+                    runtime->target_argmax && (session->pending_learned_target_slots & (1u << slot)),
+                    session->pending_target_distribution[slot])) { free(pair_policy); return 0; }
+            memcpy(policies[slot], session->pending_target_distribution[slot], 4 * sizeof(float));
+        }
+    }
     session->pending_retargeted = 0;
     if (runtime->tactical_targets) {
         if (!factorized_choice_to_command(&session->parsed_request, &session->pending_factorized_choice,
@@ -1013,6 +1029,13 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         } else if (runtime->target_sidecar) {
             fprintf(out, "%.*s,\"training_eligible\":false,\"target_decoder\":\"%s\",\"learned_targets\":%s", (int)strlen(json) - 1, json,
                 runtime->target_argmax ? "argmax" : "sample", session->pending_learned_targets ? "true" : "false");
+            fputs(",\"behavior_policy\":", out);
+            target_behavior_identity_write(out, runtime->target_sidecar->parent_fingerprint,
+                runtime->target_sidecar_fingerprint, runtime->target_sidecar->contextual,
+                runtime->target_argmax, runtime->target_slot_local);
+            fputs(",\"target_behavior\":", out);
+            target_behavior_write(out, &session->pending_factorized_choice,
+                session->pending_learned_target_slots, session->pending_target_distribution);
             if (runtime->target_audit) {
                 fputs(",\"target_audit\":", out);
                 target_audit_write(out, &session->observation, &session->parsed_request,
@@ -1196,13 +1219,17 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 } else if (runtime->target_sidecar) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
                         "\"policy_tag\":\"%s\",\"training_eligible\":false,"
-                        "\"target_decoder\":\"%s\",\"target_audit\":%s,\"target_slot_local\":%s,\"target_decisions\":%zu,\"learned_target_decisions\":%zu}\n",
+                        "\"target_decoder\":\"%s\",\"target_audit\":%s,\"target_slot_local\":%s,\"target_decisions\":%zu,\"learned_target_decisions\":%zu,\"behavior_policy\":",
                         session->battle_id, runtime->target_slot_local ?
                             (runtime->target_argmax ? "target-context-slot-local-argmax-v1" : "target-context-slot-local-v1") : runtime->target_argmax ? "target-context-argmax-v1" :
                             (runtime->target_sidecar->contextual ? "target-context-v1" : "target-sidecar-v1"),
                         runtime->target_argmax ? "argmax" : "sample", runtime->target_audit ? "true" : "false",
                         runtime->target_slot_local ? "true" : "false",
                         session->decision_count, session->learned_target_decisions);
+                    target_behavior_identity_write(out, runtime->target_sidecar->parent_fingerprint,
+                        runtime->target_sidecar_fingerprint, runtime->target_sidecar->contextual,
+                        runtime->target_argmax, runtime->target_slot_local);
+                    fputs("}\n", out);
                 } else if (runtime->target_labels) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
                         "\"policy_tag\":\"target-labels-v1\",\"training_eligible\":false,\"label_decisions\":%zu}\n",

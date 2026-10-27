@@ -13,6 +13,7 @@ typedef struct {
 } TargetSidecar;
 
 uint64_t target_parent_fingerprint(const GruModel* model);
+uint64_t target_sidecar_fingerprint(const TargetSidecar* sidecar);
 TargetSidecar* target_sidecar_create(const GruModel* parent);
 void target_sidecar_free(TargetSidecar* sidecar);
 size_t target_sidecar_parameter_count(const TargetSidecar* sidecar);

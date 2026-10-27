@@ -18,6 +18,20 @@ typedef struct {
     const unsigned char* legal;
 } GreedyContext;
 
+int policy_target_distribution(const float policy[4], unsigned char legal, int argmax, float distribution[4]) {
+    int first = policy_decode_target_argmax(policy, legal), target;
+    float total = 0;
+    if (first < 0 || !distribution) return 0;
+    for (target = 0; target < 4; ++target) if (legal & (1u << target)) total += policy[target];
+    if (!isfinite(total)) return 0;
+    if (!argmax && total <= 1.0e-8f) {
+        for (first = 0; !(legal & (1u << first)); ++first) {}
+    }
+    for (target = 0; target < 4; ++target) distribution[target] = argmax || total <= 1.0e-8f ?
+        (target == first ? 1.0f : 0.0f) : (legal & (1u << target) ? policy[target] / total : 0.0f);
+    return 1;
+}
+
 static double masked_probability(const float* policy, const unsigned char* mask, int count, int selected) {
     double total = 0.0;
     int first = -1, i;

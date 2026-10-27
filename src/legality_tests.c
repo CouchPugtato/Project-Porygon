@@ -373,6 +373,35 @@ static int test_revival_can_select_fainted_active_partner(void) {
     return 1;
 }
 
+static int test_hidden_trap_request_update(void) {
+    int slot, phase;
+    for (slot = 0; slot < 2; ++slot) for (phase = 0; phase < 3; ++phase) {
+        const char* flags = phase == 1 ? "\"trapped\":true" : "\"maybeTrapped\":true";
+        char payload[2048];
+        ParsedRequest req;
+        ActionMask mask;
+        enum ObsAction sw = (enum ObsAction)(OBS_A1_SWITCH3 + slot * 14);
+        snprintf(payload, sizeof(payload), "{\"active\":["
+            "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"target\":\"self\"}],%s},"
+            "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"target\":\"self\"}],%s}],"
+            "\"side\":{\"pokemon\":["
+            "{\"ident\":\"p1: A\",\"details\":\"Azumarill, L83\",\"condition\":\"100/100\",\"active\":true},"
+            "{\"ident\":\"p1: B\",\"details\":\"Lucario, L86\",\"condition\":\"100/100\",\"active\":true},"
+            "{\"ident\":\"p1: C\",\"details\":\"Pelipper, L83\",\"condition\":\"100/100\",\"active\":false}]},\"update\":%s}",
+            slot == 0 ? flags : "\"trapped\":true", slot == 1 ? flags : "\"trapped\":true",
+            phase == 1 ? "true" : "false");
+        if (!assert_true(parse_request_payload(&req, payload, phase, 1) && build_action_mask_from_request(&mask, &req),
+                "parse hidden-trap request and public update")) return 0;
+        if (!assert_true(mask.legal[sw] == (phase != 1),
+                "uncertain traps allow probes; only confirmed traps mask switches; later uncertainty restores choices")) return 0;
+        if (!assert_true(mask.legal[slot == 0 ? OBS_A1_MOVE1 : OBS_A2_MOVE1],
+                "trap disclosure leaves the slot's move available")) return 0;
+        if (!assert_true(!mask.legal[slot == 0 ? OBS_A2_SWITCH3 : OBS_A1_SWITCH3],
+                "the partner's already confirmed trap is never relaxed")) return 0;
+    }
+    return 1;
+}
+
 int main(void) {
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
@@ -401,6 +430,7 @@ int main(void) {
     if (!test_revival_blessing_selects_a_fainted_teammate()) return 1;
     if (!test_lone_survivor_keeps_last_usable_move()) return 1;
     if (!test_revival_can_select_fainted_active_partner()) return 1;
+    if (!test_hidden_trap_request_update()) return 1;
     printf("legality tests passed\n");
     return 0;
 }

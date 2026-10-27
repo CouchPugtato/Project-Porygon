@@ -59,6 +59,7 @@ typedef struct {
     int pending_retargeted;
     int pending_learned_targets;
     unsigned char pending_learned_target_slots;
+    float pending_target_distribution[2][4];
     size_t learned_target_decisions;
     int pending_counterfactual;
     int pending_counterfactual_rank;
@@ -91,6 +92,7 @@ typedef struct {
     int target_audit;
     int target_slot_local;
     uint64_t target_parent_fingerprint;
+    uint64_t target_sidecar_fingerprint;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;

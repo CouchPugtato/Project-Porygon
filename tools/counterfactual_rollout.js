@@ -362,6 +362,8 @@ async function drivePlayer(stream, agent, battleId, playerName, format, beforeCh
     let pendingDecision = null;
     let result = null;
     const choiceRejections = [];
+    let lastRequest = null;
+    let rejectedChoice = null;
     agent.send({
         type: 'battle_start',
         battle_id: battleId,
@@ -380,12 +382,14 @@ async function drivePlayer(stream, agent, battleId, playerName, format, beforeCh
                     type: 'decision_rejected',
                     reason: line,
                 });
-                choiceRejections.push({
+                const rejection = {
                     player: playerName,
                     request_id: pendingDecision.request_id,
                     command: pendingDecision.command,
                     message: line,
-                });
+                };
+                choiceRejections.push(rejection);
+                rejectedChoice = {request: lastRequest, rejection};
                 pendingDecision = null;
                 ++sequence;
                 continue;
@@ -397,6 +401,15 @@ async function drivePlayer(stream, agent, battleId, playerName, format, beforeCh
             if (line.startsWith('|request|')) {
                 const request = JSON.parse(line.slice('|request|'.length));
                 if (!request || request.wait) continue;
+                if (rejectedChoice) {
+                    const slots = trapDisclosureSlots(rejectedChoice.request, rejectedChoice.rejection, request);
+                    if (slots.length) {
+                        rejectedChoice.rejection.classification = 'trap_disclosure';
+                        rejectedChoice.rejection.confirmed_trap_slots = slots;
+                    }
+                    rejectedChoice = null;
+                }
+                lastRequest = request;
                 agent.send({
                     type: 'request',
                     battle_id: battleId,
@@ -881,6 +894,29 @@ function choiceRejectionReason(message) {
     if (normalized.includes('needs a target')) return 'missing_move_target';
     if (normalized.includes('invalid target')) return 'invalid_move_target';
     return 'other_choice_rejection';
+}
+
+function trapDisclosureSlots(previous, rejection, updated) {
+    // Showdown deliberately hides some traps until a switch is attempted.
+    // Verify its public same-phase update; never infer an opponent's ability.
+    if (!rejection.message?.startsWith('|error|[Unavailable choice]') ||
+            choiceRejectionReason(rejection.message) !== 'trapped_switch' || updated?.update !== true ||
+            !Array.isArray(previous?.active) || !Array.isArray(updated.active) ||
+            previous.active.length !== updated.active.length) return [];
+    const choices = String(rejection.command).replace(/^\/choose\s+/, '').split(',');
+    if (choices.length !== previous.active.length) return [];
+    const before = structuredClone(previous), after = structuredClone(updated), slots = [];
+    delete before.update; delete after.update;
+    for (let slot = 0; slot < choices.length; ++slot) {
+        const a = before.active[slot], b = after.active[slot];
+        if (/^\s*switch\s+[1-6]\s*$/.test(choices[slot]) && a?.maybeTrapped === true &&
+                a.trapped !== true && b?.trapped === true && !b.maybeTrapped) {
+            slots.push(slot);
+            delete a.maybeTrapped; delete a.trapped;
+            delete b.maybeTrapped; delete b.trapped;
+        }
+    }
+    return slots.length && require('node:util').isDeepStrictEqual(before, after) ? slots : [];
 }
 
 function battleFailureReason(error) {
@@ -1719,6 +1755,7 @@ module.exports = {
     buildCounterfactualSample,
     choicesDiffer,
     choiceRejectionReason,
+    trapDisclosureSlots,
     continuationSeed,
     cpuPercentBetween,
     createResourceGate,

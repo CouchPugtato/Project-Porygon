@@ -1,0 +1,20 @@
+{
+  "checkpoint": "models/runs/run_0093_current_arch_full/current_arch_full.chk",
+  "candidate_checkpoint": "models/runs/run_0275_tactical_student_1000/tactical_student_dataset_epoch003.chk",
+  "tactical_teacher": false,
+  "candidate_inference_policy": "sample",
+  "opponents": ["parent", "random"],
+  "games_per_side": 100,
+  "max_attempts_per_side": 125,
+  "format": "gen9randomdoublesbattle",
+  "seed": 30501,
+  "agent_omp_threads": 1,
+  "battle_timeout_seconds": 180,
+  "max_system_memory_percent": 65,
+  "max_system_cpu_percent": 65,
+  "resource_check_seconds": 2,
+  "launch_stagger_ms": 750,
+  "target_sidecar": "models/runs/run_0294_target_context_evaluation/target_context.bin",
+  "context_target_evaluation": true,
+  "target_decoder": "argmax"
+}
