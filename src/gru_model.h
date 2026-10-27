@@ -2,6 +2,7 @@
 #define GRU_MODEL_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "action_mapper.h"
 
@@ -252,6 +253,14 @@ int gru_action_head_accumulate_hidden(GruActionHeadOptimizer* optimizer, const f
     const unsigned char* legal, const FactorizedActionChoice* choice, float advantage);
 int gru_action_head_apply_adam(GruActionHeadOptimizer* optimizer, float learning_rate,
     float beta1, float beta2, float epsilon, float gradient_clip);
+/* Moment snapshots are allowed only at completed update boundaries. Import
+ * requires fresh optimizer state and never changes model parameters. */
+const GruModel* gru_action_head_optimizer_model(const GruActionHeadOptimizer* optimizer);
+size_t gru_action_head_optimizer_state_count(const GruActionHeadOptimizer* optimizer);
+int gru_action_head_optimizer_export_state(const GruActionHeadOptimizer* optimizer,
+    float* first, float* second, size_t count, uint64_t* step);
+int gru_action_head_optimizer_import_state(GruActionHeadOptimizer* optimizer,
+    const float* first, const float* second, size_t count, uint64_t step);
 /* NULL on compatibility, otherwise a stable diagnostic reason. Read-only;
  * changed actors must have a correctly derived legacy flat-policy cache. */
 const char* gru_model_action_head_compatibility_reason(const GruModel* reference, const GruModel* actor);

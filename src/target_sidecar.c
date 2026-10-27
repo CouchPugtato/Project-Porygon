@@ -1,24 +1,12 @@
 #include "target_sidecar.h"
 #include "id_tables.h"
+#include "artifact_io.h"
 
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#include <windows.h>
-#include <io.h>
-#else
-#include <unistd.h>
-#endif
-
-static uint64_t fingerprint_bytes(uint64_t hash, const void* data, size_t count) {
-    const unsigned char* bytes = data;
-    size_t i;
-    for (i = 0; i < count; ++i) { hash ^= bytes[i]; hash *= UINT64_C(1099511628211); }
-    return hash;
-}
 
 uint64_t target_parent_fingerprint(const GruModel* model) {
     if (!model) return 0;
@@ -27,8 +15,8 @@ uint64_t target_parent_fingerprint(const GruModel* model) {
     uint64_t hash = UINT64_C(14695981039346656037);
     uint64_t dimensions[3] = {gru_model_input_dim(model), gru_model_hidden_dim(model), gru_model_num_actions(model)};
     if (!weights || !gru_model_export_parameters(model, weights, count)) { free(weights); return 0; }
-    hash = fingerprint_bytes(hash, dimensions, sizeof(dimensions));
-    hash = fingerprint_bytes(hash, weights, count * sizeof(float));
+    hash = artifact_fingerprint_bytes(hash, dimensions, sizeof(dimensions));
+    hash = artifact_fingerprint_bytes(hash, weights, count * sizeof(float));
     free(weights);
     return hash;
 }
@@ -41,8 +29,8 @@ size_t target_sidecar_parameter_count(const TargetSidecar* sidecar) {
 uint64_t target_sidecar_fingerprint(const TargetSidecar* sidecar) {
     if (!sidecar || !sidecar->weights) return 0;
     uint64_t metadata[3] = {sidecar->parent_fingerprint, sidecar->hidden_dim, sidecar->contextual != 0};
-    uint64_t hash = fingerprint_bytes(UINT64_C(14695981039346656037), metadata, sizeof(metadata));
-    return fingerprint_bytes(hash, sidecar->weights, target_sidecar_parameter_count(sidecar) * sizeof(float));
+    uint64_t hash = artifact_fingerprint_bytes(UINT64_C(14695981039346656037), metadata, sizeof(metadata));
+    return artifact_fingerprint_bytes(hash, sidecar->weights, target_sidecar_parameter_count(sidecar) * sizeof(float));
 }
 
 TargetSidecar* target_sidecar_create(const GruModel* parent) {
@@ -213,30 +201,11 @@ int target_sidecar_supports(const Observation* observation, const ParsedRequest*
     return target_sidecar_support_reason(observation, request, choice) == NULL;
 }
 
-static int publish_file(const char* temporary, const char* path) {
-#ifdef _WIN32
-    return MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    return rename(temporary, path) == 0;
-#endif
-}
-
-static int finish_file(FILE* file) {
-    int ok = fflush(file) == 0;
-#ifdef _WIN32
-    if (ok) ok = _commit(_fileno(file)) == 0;
-#else
-    if (ok) ok = fsync(fileno(file)) == 0;
-#endif
-    if (fclose(file) != 0) ok = 0;
-    return ok;
-}
-
 int target_sidecar_save(const TargetSidecar* s, const char* path) {
     if (!s || !s->weights || !path || !*path) return 0;
     char temporary[4096];
     uint32_t dimensions = (uint32_t)s->hidden_dim;
-    uint64_t checksum = fingerprint_bytes(UINT64_C(14695981039346656037), s->weights,
+    uint64_t checksum = artifact_fingerprint_bytes(UINT64_C(14695981039346656037), s->weights,
         target_sidecar_parameter_count(s) * sizeof(float));
     FILE* file;
     int ok;
@@ -246,8 +215,8 @@ int target_sidecar_save(const TargetSidecar* s, const char* path) {
     ok = fwrite(s->contextual ? "PGTARGTC1" : "PGTARGET1", 1, 9, file) == 9 && fwrite(&dimensions, 4, 1, file) == 1 &&
         fwrite(&s->parent_fingerprint, 8, 1, file) == 1 && fwrite(&checksum, 8, 1, file) == 1 &&
         fwrite(s->weights, sizeof(float), target_sidecar_parameter_count(s), file) == target_sidecar_parameter_count(s);
-    if (!finish_file(file)) ok = 0;
-    return ok && publish_file(temporary, path);
+    if (!artifact_finish_file(file)) ok = 0;
+    return ok && artifact_publish_file(temporary, path);
 }
 
 TargetSidecar* target_sidecar_load(const char* path, const GruModel* parent) {
@@ -272,7 +241,7 @@ TargetSidecar* target_sidecar_load(const char* path, const GruModel* parent) {
         fread(s->weights, sizeof(float), target_sidecar_parameter_count(s), file) == target_sidecar_parameter_count(s) &&
         fgetc(file) == EOF;
     if (file) fclose(file);
-    if (ok) ok = checksum == fingerprint_bytes(UINT64_C(14695981039346656037), s->weights,
+    if (ok) ok = checksum == artifact_fingerprint_bytes(UINT64_C(14695981039346656037), s->weights,
         target_sidecar_parameter_count(s) * sizeof(float));
     if (ok) for (i = 0; i < target_sidecar_parameter_count(s); ++i) if (!isfinite(s->weights[i])) ok = 0;
     if (!ok) { target_sidecar_free(s); return NULL; }
@@ -427,7 +396,7 @@ static int fit_target_sidecar(const char* dataset, const GruModel* parent, const
         after.nll < before.nll ? "" : "\"holdout_nll_did_not_improve\"",
         !(after.nll < before.nll) && after.correct < before.correct ? "," : "",
         after.correct >= before.correct ? "" : "\"holdout_accuracy_decreased\"");
-    ok = finish_file(json) && publish_file(temporary, report);
+    ok = artifact_finish_file(json) && artifact_publish_file(temporary, report);
 cleanup:
     if (file) fclose(file);
     free(examples); free(hidden); free(gradient); free(first); free(second); free(best_weights);

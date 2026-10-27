@@ -2098,7 +2098,7 @@ int gru_action_head_accumulate_hidden(GruActionHeadOptimizer* optimizer, const f
 int gru_action_head_apply_adam(GruActionHeadOptimizer* optimizer, float learning_rate,
     float beta1, float beta2, float epsilon, float gradient_clip
 ) {
-    if (!optimizer || !isfinite(learning_rate) || learning_rate <= 0 ||
+    if (!optimizer || optimizer->step == SIZE_MAX || !isfinite(learning_rate) || learning_rate <= 0 ||
             !isfinite(beta1) || beta1 < 0 || beta1 >= 1 || !isfinite(beta2) || beta2 < 0 || beta2 >= 1 ||
             !isfinite(epsilon) || epsilon <= 0 || !isfinite(gradient_clip) || gradient_clip < 0) return 0;
     if (!optimizer->samples) return 1;
@@ -2135,6 +2135,45 @@ int gru_action_head_apply_adam(GruActionHeadOptimizer* optimizer, float learning
     optimizer->samples = 0;
     memset(optimizer->gradient, 0, optimizer->count * sizeof(float));
     sync_flat_heads_from_factorized(optimizer->model);
+    return 1;
+}
+
+const GruModel* gru_action_head_optimizer_model(const GruActionHeadOptimizer* optimizer) {
+    return optimizer ? optimizer->model : NULL;
+}
+
+size_t gru_action_head_optimizer_state_count(const GruActionHeadOptimizer* optimizer) {
+    return optimizer ? optimizer->count : 0;
+}
+
+static int action_moments_valid(const float* first, const float* second, size_t count, uint64_t step) {
+    size_t i;
+    if (!first || !second || step >= SIZE_MAX) return 0;
+    for (i = 0; i < count; ++i)
+        if (!isfinite(first[i]) || !isfinite(second[i]) || second[i] < 0 ||
+                (!step && (first[i] != 0 || second[i] != 0))) return 0;
+    return 1;
+}
+
+int gru_action_head_optimizer_export_state(const GruActionHeadOptimizer* optimizer,
+    float* first, float* second, size_t count, uint64_t* step
+) {
+    if (!optimizer || !first || !second || !step || optimizer->samples || count != optimizer->count ||
+            !action_moments_valid(optimizer->first, optimizer->second, count, optimizer->step)) return 0;
+    memcpy(first, optimizer->first, count * sizeof(float));
+    memcpy(second, optimizer->second, count * sizeof(float));
+    *step = optimizer->step;
+    return 1;
+}
+
+int gru_action_head_optimizer_import_state(GruActionHeadOptimizer* optimizer,
+    const float* first, const float* second, size_t count, uint64_t step
+) {
+    if (!optimizer || optimizer->samples || optimizer->step || count != optimizer->count ||
+            !action_moments_valid(first, second, count, step)) return 0;
+    memcpy(optimizer->first, first, count * sizeof(float));
+    memcpy(optimizer->second, second, count * sizeof(float));
+    optimizer->step = (size_t)step;
     return 1;
 }
 

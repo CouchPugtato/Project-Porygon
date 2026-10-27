@@ -408,6 +408,61 @@ publication stay outside the generic battle loop. No training, optimizer,
 research checkpoint, deployed executable or root README changed. Action-only
 optimizer persistence and scoped learning integration remain the next gate.
 
+## Action-only optimizer state (run 0319)
+
+`action_optimizer_state_save` and `action_optimizer_state_load` persist the
+dedicated `GruActionHeadOptimizer`, separately from existing model checkpoints.
+There is no new trainer command, checkpoint layout, or learning run. The new
+native-format file uses magic `PGACTOPT1` and stores a format/ABI tag, model
+dimensions, moment count, reference/actor parameter fingerprints, the trusted
+64-character behavior-bundle SHA256 pin, Adam update count, both moment arrays,
+and a checksum over all metadata and moments. Like the existing native
+fingerprints, this checksum detects corruption; it is not cryptographic
+authentication. Manifest/file SHA256 verification remains the Node launcher's
+responsibility. The caller must supply its trusted pin, not trust one read
+from the optimizer file itself.
+
+Saving is allowed only after a completed optimizer update, with no pending
+minibatch. A refused save leaves any existing completed file unchanged. The
+writer flushes/syncs a sibling `.tmp` and atomically publishes it; the caller
+must serialize writers to a given path. Loading ignores uncommitted temporary
+output and requires exact actor/reference fingerprints, compatible frozen
+parameters, matching dimensions and bundle pin, finite moments, nonnegative
+second moments, a valid counter, a correct checksum and no trailing bytes.
+Zero-step state must have zero moments. The loader creates fresh optimizer
+state; it never changes actor weights or consumes RNG. Failed loads discard
+the new state rather than partly overwriting a live optimizer.
+
+Save the actor checkpoint separately and keep it paired with this state file.
+These two files are not a single multi-file transaction: a mismatched pair
+after interruption fails validation rather than silently resuming with stale
+moments. The bundle pin identifies the fixed behavior experiment, while the
+actor fingerprint identifies the current updated actor saved alongside it.
+Learning rate, Adam betas/epsilon, clipping, dataset position and RNG/sampling
+state remain caller-owned. Exact continuation requires the same future inputs
+and update settings; full trainer-level recovery is not implemented here.
+
+The deterministic regression saves after three two-sample updates, reloads
+both an actual model checkpoint and optimizer file, then continues through
+update nine. Joint turns, both single-slot orders, switch/Tera actions and a
+zero-advantage update with existing momentum are covered. Every resumed
+parameter, first/second moment and update count matches the uninterrupted path
+byte-for-byte; recurrent, entity, target and value parameters stay frozen.
+Wrong bundle/reference, stale actor, pending minibatch, malformed dimensions,
+truncation, checksum damage, trailing bytes and valid-checksum invalid moments
+are rejected. Temporary-file leftovers do not replace a completed primary.
+
+Persistence lives in `action_optimizer_state.c`, not in main or a new Python
+wrapper. Its file synchronization, atomic replacement and native fingerprint
+helper are shared with sidecar publication through `artifact_io.c`; existing
+sidecar bytes and fingerprint algorithms are unchanged. The regression has a
+dedicated small test file invoked by the reconstruction suite. All three native
+suites and 106 JavaScript tests pass. Research checkpoints, the sidecar and the
+deployed executable are unchanged; the local build was rebuilt only for tests.
+The frozen executable used by run 0318 still exists, so its old bundle pin does
+not need to be changed. Next: scoped learner integration and its training-state
+recovery tests before any learning pilot. Records remain PPO-ineligible.
+
 The run 0313 serial smoke compared six matched cases on both deployed and local
 builds (12 games, seed 31301): sampled targets, whole-turn argmax, and slot-local
 argmax, each on both sides against random. All completed without rejections;
