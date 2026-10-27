@@ -51,6 +51,8 @@ set(SHOWDOWN_CLIENT_SOURCES
 	src/tactical_policy.c
 	src/policy_decoding.c
 	src/tactical_audit.c
+	src/target_sidecar.c
+	src/target_labels.c
 	src/counterfactual_data.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c
@@ -84,6 +86,7 @@ add_executable(showdown_tactical_tests
     src/tactical_policy.c
     src/policy_decoding.c
     src/tactical_audit.c
+    src/target_labels.c
     src/action_mapper.c
     src/request_parser.c
     src/action_semantics.c
@@ -103,6 +106,8 @@ set(SHOWDOWN_RECONSTRUCTION_TEST_SOURCES
 	src/tactical_policy.c
 	src/policy_decoding.c
 	src/tactical_audit.c
+	src/target_sidecar.c
+	src/target_labels.c
 	src/counterfactual_data.c
 	src/policy_evaluation.c
 	src/learning_diagnostics.c

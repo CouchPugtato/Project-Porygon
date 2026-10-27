@@ -8,6 +8,7 @@
 #include "policy_evaluation.h"
 #include "validation_split.h"
 #include "request_failure_fixtures.h"
+#include "target_sidecar.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -938,7 +939,11 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
     float hidden[8];
     int next_rng = 0, mode, ok = assert_true(model != NULL, "create passive runtime audit fixture");
     if (!ok) return 0;
-    for (mode = 0; mode < 3; ++mode) {
+    TargetSidecar* initial_targets = target_sidecar_create(model);
+    if (!assert_true(initial_targets && target_sidecar_save(initial_targets, "test_runtime_targets.tmp"),
+            "create unchanged live target sidecar")) return 0;
+    target_sidecar_free(initial_targets);
+    for (mode = 0; mode < 5; ++mode) {
         FILE* output = tmpfile();
         RuntimeMessage terminal;
         char line[4096];
@@ -952,6 +957,13 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
             !env_runtime_enable_tactical_teacher(&runtime) && !env_runtime_enable_greedy_inference(&runtime) &&
             !env_runtime_enable_tactical_audit(&runtime) && !env_runtime_set_counterfactual_intervention(&runtime, 0, 0),
             "Target intervention blocks other evaluation overrides");
+        if (mode == 3) ok &= assert_true(env_runtime_enable_target_labels(&runtime) &&
+            !env_runtime_enable_tactical_teacher(&runtime) && !env_runtime_enable_greedy_inference(&runtime) &&
+            !env_runtime_enable_tactical_targets(&runtime) && !env_runtime_enable_tactical_audit(&runtime) &&
+            !env_runtime_set_counterfactual_intervention(&runtime, 0, 0), "Passive target labels block behavior overrides");
+        if (mode == 4) ok &= assert_true(env_runtime_enable_target_sidecar(&runtime, "test_runtime_targets.tmp") &&
+            !env_runtime_enable_target_labels(&runtime) && !env_runtime_enable_tactical_targets(&runtime) &&
+            !env_runtime_enable_greedy_inference(&runtime), "Learned targeting excludes teacher and other decoders");
         srand(28001);
         ok &= assert_true(send_counterfactual_test_state(&runtime, output), "emit sampled action with passive audit");
         if (runtime.count) {
@@ -1009,6 +1021,7 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
         env_runtime_free(&runtime);
         fclose(output);
     }
+    remove("test_runtime_targets.tmp");
     gru_model_destroy(model);
     return ok;
 }
@@ -6425,7 +6438,89 @@ static int test_selected_action_semantics_include_move_roles(void) {
     return ok;
 }
 
+static int test_move_conditioned_target_sidecar(void) {
+    GruModel* parent = gru_model_create(4, 8, OBS_NUM_ACTIONS);
+    TargetSidecar* sidecar = target_sidecar_create(parent);
+    FactorizedPolicySnapshot policy;
+    float hidden[8] = {.2f, -.1f, .4f}, prediction[4];
+    unsigned char mask[OBS_NUM_ACTIONS];
+    uint64_t fingerprint = target_parent_fingerprint(parent);
+    size_t count = target_sidecar_parameter_count(sidecar), j;
+    float* gradient = calloc(count, sizeof(float));
+    int move, epoch;
+    memset(mask, 1, sizeof(mask));
+    if (!assert_true(sidecar && gradient && gru_model_evaluate_policy_snapshot(parent, hidden, mask, 1, &policy, NULL),
+            "initialize frozen target sidecar")) return 0;
+    for (move = 0; move < 4; ++move) {
+        target_sidecar_predict(sidecar, hidden, 0, move, 15, prediction);
+        if (!assert_true(memcmp(prediction, policy.slot0_target_policy, sizeof(prediction)) == 0,
+                "each move starts at the original target distribution")) return 0;
+    }
+    for (epoch = 0; epoch < 100; ++epoch) {
+        memset(gradient, 0, count * sizeof(float));
+        target_sidecar_gradient(sidecar, hidden, 0, 0, 3, 1, gradient);
+        target_sidecar_gradient(sidecar, hidden, 0, 1, 3, 2, gradient);
+        for (j = 0; j < count; ++j) sidecar->weights[j] -= .1f * gradient[j];
+    }
+    target_sidecar_predict(sidecar, hidden, 0, 0, 3, prediction);
+    if (!assert_true(prediction[0] > .9f && prediction[2] == 0 && prediction[3] == 0,
+            "first move learns its legal preferred target")) return 0;
+    target_sidecar_predict(sidecar, hidden, 0, 1, 3, prediction);
+    if (!assert_true(prediction[1] > .9f && target_parent_fingerprint(parent) == fingerprint,
+            "another move learns the opposite target without changing the parent")) return 0;
+    if (!assert_true(target_sidecar_save(sidecar, "test_target_sidecar.tmp"), "save target sidecar")) return 0;
+    TargetSidecar* loaded = target_sidecar_load("test_target_sidecar.tmp", parent);
+    if (!assert_true(loaded && memcmp(loaded->weights, sidecar->weights, count * sizeof(float)) == 0,
+            "load exact parent-bound target sidecar")) return 0;
+    GruModel* other = gru_model_create(4, 8, OBS_NUM_ACTIONS);
+    if (!assert_true(!target_sidecar_load("test_target_sidecar.tmp", other), "reject another parent")) return 0;
+    FILE* damaged = fopen("test_target_sidecar.tmp", "r+b");
+    if (!assert_true(damaged != NULL, "open sidecar corruption fixture")) return 0;
+    fseek(damaged, -1, SEEK_END); fputc(0x7f, damaged); fclose(damaged);
+    if (!assert_true(!target_sidecar_load("test_target_sidecar.tmp", parent), "reject corrupted target weights")) return 0;
+    damaged = fopen("test_target_sidecar.tmp", "wb");
+    if (!assert_true(damaged != NULL, "open sidecar truncation fixture")) return 0;
+    fputs("PGTARGET1", damaged); fclose(damaged);
+    if (!assert_true(!target_sidecar_load("test_target_sidecar.tmp", parent), "reject truncated target sidecar")) return 0;
+    remove("test_target_sidecar.tmp");
+    FILE* dataset = fopen("test_target_labels.tmp", "wb");
+    uint32_t dimensions = 8, examples = 500;
+    if (!assert_true(dataset != NULL, "open target fit fixture")) return 0;
+    fwrite("PGTLABEL1", 1, 9, dataset); fwrite(&dimensions, 4, 1, dataset);
+    fwrite(&examples, 4, 1, dataset); fwrite(&fingerprint, 8, 1, dataset);
+    for (j = 0; j < examples; ++j) {
+        unsigned char fields[5] = {j % 5 == 0, 0, j % 2, 3, j % 2 ? 2 : 1};
+        fwrite(fields, 1, 5, dataset); fwrite(hidden, sizeof(float), 8, dataset);
+    }
+    fclose(dataset);
+    if (!assert_true(target_sidecar_fit("test_target_labels.tmp", parent, "test_target_fit.tmp", "test_target_report.tmp"),
+            "fit move-conditioned targets with the bounded Adam path")) return 0;
+    TargetSidecar* fitted = target_sidecar_load("test_target_fit.tmp", parent);
+    if (!assert_true(fitted && target_parent_fingerprint(parent) == fingerprint,
+            "held-out Adam fit passes and preserves parent parameters")) return 0;
+    target_sidecar_free(fitted);
+    remove("test_target_fit.tmp");
+    dataset = fopen("test_target_labels.tmp", "wb");
+    if (!assert_true(dataset != NULL, "open target fit rejection fixture")) return 0;
+    fwrite("PGTLABEL1", 1, 9, dataset); fwrite(&dimensions, 4, 1, dataset);
+    fwrite(&examples, 4, 1, dataset); fwrite(&fingerprint, 8, 1, dataset);
+    for (j = 0; j < examples; ++j) {
+        unsigned char fields[5] = {j >= 400, 0, 0, 3, j >= 400 ? 2 : 1};
+        fwrite(fields, 1, 5, dataset); fwrite(hidden, sizeof(float), 8, dataset);
+    }
+    fclose(dataset);
+    if (!assert_true(target_sidecar_fit("test_target_labels.tmp", parent, "test_target_fit.tmp", "test_target_report.tmp"),
+            "a failed holdout gate still writes a diagnostic")) return 0;
+    FILE* forbidden = fopen("test_target_fit.tmp", "rb");
+    if (!assert_true(forbidden == NULL, "failed holdout gate cannot publish a target sidecar")) return 0;
+    remove("test_target_labels.tmp"); remove("test_target_report.tmp");
+    gru_model_destroy(other); target_sidecar_free(loaded); target_sidecar_free(sidecar);
+    free(gradient); gru_model_destroy(parent);
+    return 1;
+}
+
 int main(int argc, char** argv) {
+    if (!test_move_conditioned_target_sidecar()) return 1;
     if (!id_tables_init()) {
         fprintf(stderr, "failed to initialize id tables\n");
         return 1;

@@ -6,6 +6,7 @@ const {aggregateGames, hashFile, playGame} = require('./tactical_teacher_smoke')
 const {acquireRunLock, createResourceGate, writeJsonAtomic} = require('./counterfactual_rollout');
 const {publishReplay, verifyReplays} = require('./tactical_demonstrations');
 const {summarizeDecisions} = require('./tactical_decision_audit');
+const {publishLabels, readLabels} = require('./target_learning');
 const ROOT = path.resolve(__dirname, '..');
 const OPPONENTS = ['parent', 'random'];
 const SUPPORTED_OPPONENTS = [...OPPONENTS, 'pilot', 'sampled'];
@@ -78,6 +79,17 @@ function validateResume(saved, identity, config) {
                 !Number.isFinite(game.duration_seconds) || game.duration_seconds < 0)
             throw new Error('saved benchmark records do not match the deterministic schedule');
         if (game.status === 'completed') {
+            if (config.target_sidecar && (game.policy_tag !== 'target-sidecar-v1' ||
+                    game.learned_targets?.training_eligible !== false ||
+                    !Number.isSafeInteger(game.learned_targets.target_decisions) || game.learned_targets.target_decisions <= 0 ||
+                    !Number.isSafeInteger(game.learned_targets.learned_target_decisions) || game.learned_targets.learned_target_decisions < 0 ||
+                    game.learned_targets.learned_target_decisions > game.learned_targets.target_decisions))
+                throw new Error('saved game lacks learned target accounting');
+            if (!config.target_sidecar && game.learned_targets) throw new Error('learned targets cannot resume as plain inference');
+            if (config.collect_target_labels && (game.policy_tag !== 'target-labels-v1' || (isValid(game) && !game.target_labels)))
+                throw new Error('saved game lacks accepted target labels');
+            if (!config.collect_target_labels && (game.target_labels || game.policy_tag === 'target-labels-v1'))
+                throw new Error('target collection cannot resume as ordinary evaluation');
             if (config.tactical_targets && (game.policy_tag !== 'tactical-targets-v1' ||
                     game.target_intervention?.training_eligible !== false ||
                     !Number.isSafeInteger(game.target_intervention.target_decisions) || game.target_intervention.target_decisions <= 0 ||
@@ -117,6 +129,14 @@ async function loadSaved(filename) {
 }
 
 function validateConfig(config) {
+    if (config.target_sidecar !== undefined && (typeof config.target_sidecar !== 'string' || !config.target_sidecar.trim() ||
+            config.tactical_teacher !== false || config.tactical_targets || config.collect_target_labels || config.decision_audit ||
+            config.collect_demonstrations || (config.candidate_inference_policy || 'sample') !== 'sample'))
+        throw new Error('learned target evaluation excludes teacher labels and inference overrides');
+    if (config.collect_target_labels !== undefined && (typeof config.collect_target_labels !== 'boolean' ||
+            (config.collect_target_labels && (config.tactical_teacher !== false || config.collect_demonstrations ||
+                config.tactical_targets || config.decision_audit || (config.candidate_inference_policy || 'sample') !== 'sample'))))
+        throw new Error('target collection requires unchanged sampled student play');
     if ((config.collect_demonstrations !== undefined && typeof config.collect_demonstrations !== 'boolean') ||
             (config.tactical_targets !== undefined && typeof config.tactical_targets !== 'boolean') ||
             (config.tactical_targets && (config.tactical_teacher !== false || config.collect_demonstrations ||
@@ -160,7 +180,7 @@ async function main(argv = process.argv.slice(2)) {
     validateConfig(config);
     const targetGames = 2 * config.games_per_side * (config.opponents || OPPONENTS).length;
     const sources = ['tools/tactical_teacher_benchmark.js', 'tools/tactical_teacher_smoke.js',
-        'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'tools/tactical_decision_audit.js',
+        'tools/counterfactual_rollout.js', 'tools/tactical_demonstrations.js', 'tools/tactical_decision_audit.js', 'tools/target_learning.js',
         'external/pokemon-showdown/dist/sim/battle.js',
         'external/pokemon-showdown/dist/sim/battle-stream.js',
         'external/pokemon-showdown/dist/sim/tools/random-player-ai.js'];
@@ -171,6 +191,17 @@ async function main(argv = process.argv.slice(2)) {
             [source, await hashFile(path.join(ROOT, source))])))};
     if (config.opponents?.includes('pilot'))
         identity.pilot_checkpoint_sha256 = await hashFile(path.resolve(ROOT, config.pilot_checkpoint));
+    if (config.target_sidecar) {
+        const sidecar = path.resolve(ROOT, config.target_sidecar);
+        const metadataPath = `${sidecar}.meta.json`, reportPath = path.join(path.dirname(sidecar), 'target_fit.json');
+        const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+        const report = JSON.parse(await fs.readFile(reportPath, 'utf8'));
+        if (!report.passed || !report.sidecar_published || metadata.parent_sha256 !== identity.candidate_checkpoint_sha256 ||
+                metadata.sidecar_sha256 !== await hashFile(sidecar) || metadata.fit_report_sha256 !== await hashFile(reportPath))
+            throw new Error('learned target sidecar lacks a passing fit or its parent/artifacts changed');
+        identity.target_sidecar = {sha256: metadata.sidecar_sha256, metadata_sha256: await hashFile(metadataPath),
+            fit_report_sha256: metadata.fit_report_sha256};
+    }
     const directory = path.join(ROOT, 'matches/runs', name);
     await fs.mkdir(directory, {recursive: true});
     const lock = await acquireRunLock(directory);
@@ -179,6 +210,7 @@ async function main(argv = process.argv.slice(2)) {
         const prior = await loadSaved(filename);
         const games = prior ? validateResume(prior, identity, config) : [];
         if (config.collect_demonstrations) await verifyReplays(directory, games, isValid);
+        if (config.collect_target_labels) for (const game of games.filter(isValid)) await readLabels(directory, game.target_labels);
         const gate = createResourceGate({maxSystemMemoryPercent: config.max_system_memory_percent,
             maxSystemCpuPercent: config.max_system_cpu_percent, resourceCheckSeconds: config.resource_check_seconds,
             launchStaggerMilliseconds: config.launch_stagger_ms});
@@ -213,13 +245,17 @@ async function main(argv = process.argv.slice(2)) {
                     `attempt=${Math.floor(next.index / 2) + 1}/${config.max_attempts_per_side}`);
                 await gate.waitForLaunch();
                 const replay = [];
-                const battleConfig = config.collect_demonstrations && next.opponent === 'random' ?
+                const collecting = config.collect_demonstrations || config.collect_target_labels;
+                const battleConfig = collecting && next.opponent === 'random' ?
                     {...config, seed: config.seed + 10000000} : config;
                 const game = await playGame(sim, battleConfig, next.index, {opponent: next.opponent,
-                    matchedTeams: !config.collect_demonstrations,
+                    matchedTeams: !collecting,
                     recordTeacher: config.collect_demonstrations ? line => replay.push(line) : null});
                 if (config.collect_demonstrations && isValid(game))
                     game.demonstration = await publishReplay(directory, next.opponent, next.index, replay, game);
+                if (config.collect_target_labels && isValid(game))
+                    game.target_labels = await publishLabels(directory, game, next.opponent, next.index);
+                delete game.target_examples;
                 games.push({...game, ...next, duration_seconds: (Date.now() - start) / 1000});
                 await publish('in_progress');
                 const results = summarize(games, config.opponents);

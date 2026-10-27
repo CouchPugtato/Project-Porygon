@@ -10,6 +10,7 @@ const {
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const {createDecisionAudit} = require('./tactical_decision_audit');
+const {createTargetCollector} = require('./target_learning');
 
 async function hashFile(filename) {
     const hash = crypto.createHash('sha256');
@@ -87,7 +88,9 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
         side === candidateSide && config.tactical_teacher !== false, side === candidateSide ? recordTeacher : null,
         side === candidateSide ? (config.candidate_inference_policy || 'sample') : 'sample',
         side === candidateSide && config.decision_audit === true,
-        side === candidateSide && config.tactical_targets === true));
+        side === candidateSide && config.tactical_targets === true,
+        {labels: side === candidateSide && config.collect_target_labels === true,
+            sidecar: side === candidateSide && config.target_sidecar ? path.resolve(REPO_ROOT, config.target_sidecar) : null}));
 }
 
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
@@ -100,7 +103,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
     const battle = new sim.BattleStream();
     const streams = sim.getPlayerStreams(battle);
     const seeds = battleSeeds(config.seed, index, matchedTeams);
-    const audit = config.decision_audit ? createDecisionAudit() : null;
+    const audit = config.collect_target_labels ? createTargetCollector() : config.decision_audit ? createDecisionAudit() : null;
     const observe = audit ? line => { audit.observe(line); if (recordTeacher) recordTeacher(line); } : recordTeacher;
     const agents = createBattleAgents(config, seeds, teacherSide, opponent, observe);
     let timeout;
@@ -142,7 +145,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
                 choice_rejections: [...first.choiceRejections, ...second.choiceRejections],
             };
             if (config.tactical_teacher !== false) aggregateGames([game]);
-            if (audit) game.decision_audit = audit.finish(teacher.episode);
+            if (audit) game[config.collect_target_labels ? 'target_examples' : 'decision_audit'] = audit.finish(teacher.episode);
             if (config.tactical_targets) {
                 const report = teacher.episode;
                 if (report.policy_tag !== 'tactical-targets-v1' || report.training_eligible !== false ||
@@ -151,6 +154,15 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
                         report.retargeted_decisions > report.target_decisions)
                     throw new Error('invalid evaluation-only target intervention terminal record');
                 game.target_intervention = report;
+            }
+            if (config.target_sidecar) {
+                const report = teacher.episode;
+                if (report.policy_tag !== 'target-sidecar-v1' || report.training_eligible !== false ||
+                        !Number.isSafeInteger(report.target_decisions) || report.target_decisions <= 0 ||
+                        !Number.isSafeInteger(report.learned_target_decisions) || report.learned_target_decisions < 0 ||
+                        report.learned_target_decisions > report.target_decisions)
+                    throw new Error('invalid evaluation-only learned target terminal record');
+                game.learned_targets = report;
             }
             return game;
         })();

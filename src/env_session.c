@@ -5,6 +5,8 @@
 #include "request_parser.h"
 #include "tactical_policy.h"
 #include "tactical_audit.h"
+#include "target_labels.h"
+#include "target_sidecar.h"
 #include "policy_decoding.h"
 
 #include <math.h>
@@ -479,14 +481,14 @@ int env_runtime_set_counterfactual_intervention(
     int decision_index,
     int action_rank
 ) {
-    if (!runtime || runtime->tactical_teacher || runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets || decision_index < 0 || action_rank < 0) return 0;
+    if (!runtime || runtime->target_sidecar || runtime->target_labels || runtime->tactical_teacher || runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets || decision_index < 0 || action_rank < 0) return 0;
     runtime->counterfactual_decision_index = decision_index;
     runtime->counterfactual_action_rank = action_rank;
     return 1;
 }
 
 int env_runtime_enable_tactical_teacher(EnvRuntime* runtime) {
-    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets ||
+    if (!runtime || runtime->target_sidecar || runtime->target_labels || runtime->replay_only || runtime->count > 0 || runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets ||
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->tactical_teacher = 1;
     snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "tactical-eval-v1");
@@ -494,7 +496,7 @@ int env_runtime_enable_tactical_teacher(EnvRuntime* runtime) {
 }
 
 int env_runtime_enable_greedy_inference(EnvRuntime* runtime) {
-    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher || runtime->tactical_targets ||
+    if (!runtime || runtime->target_sidecar || runtime->target_labels || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher || runtime->tactical_targets ||
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->greedy_inference = 1;
     snprintf(runtime->policy_tag, sizeof(runtime->policy_tag), "greedy-eval-v1");
@@ -502,14 +504,14 @@ int env_runtime_enable_greedy_inference(EnvRuntime* runtime) {
 }
 
 int env_runtime_enable_tactical_audit(EnvRuntime* runtime) {
-    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher || runtime->tactical_targets ||
+    if (!runtime || runtime->target_sidecar || runtime->target_labels || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher || runtime->tactical_targets ||
             runtime->counterfactual_decision_index >= 0) return 0;
     runtime->tactical_audit = 1;
     return 1;
 }
 
 int env_runtime_enable_tactical_targets(EnvRuntime* runtime) {
-    if (!runtime || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher ||
+    if (!runtime || runtime->target_sidecar || runtime->target_labels || runtime->replay_only || runtime->count > 0 || runtime->tactical_teacher ||
             runtime->greedy_inference || runtime->tactical_audit || runtime->counterfactual_decision_index >= 0) return 0;
     runtime->tactical_targets = 1;
     return 1;
@@ -524,7 +526,36 @@ void env_runtime_free(EnvRuntime* runtime) {
         free_session(&runtime->sessions[i]);
     }
     free(runtime->sessions);
+    target_sidecar_free(runtime->target_sidecar);
     memset(runtime, 0, sizeof(*runtime));
+}
+
+int env_runtime_enable_target_labels(EnvRuntime* runtime) {
+    if (!runtime || runtime->target_sidecar || runtime->replay_only || runtime->count || runtime->tactical_teacher ||
+            runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets ||
+            runtime->counterfactual_decision_index >= 0) return 0;
+    runtime->target_parent_fingerprint = target_parent_fingerprint(runtime->model);
+    if (!runtime->target_parent_fingerprint) return 0;
+    runtime->target_labels = 1;
+    return 1;
+}
+
+int env_runtime_enable_target_sidecar(EnvRuntime* runtime, const char* path) {
+    if (!runtime || runtime->target_sidecar || runtime->target_labels || runtime->replay_only || runtime->count ||
+            runtime->tactical_teacher || runtime->greedy_inference || runtime->tactical_audit || runtime->tactical_targets ||
+            runtime->counterfactual_decision_index >= 0) return 0;
+    runtime->target_sidecar = target_sidecar_load(path, runtime->model);
+    return runtime->target_sidecar != NULL;
+}
+
+static void prepare_target_policy(EnvRuntime* runtime, EnvSession* session,
+    const FactorizedActionChoice* choice, int slot, const float* original, float* policy
+) {
+    int move = slot ? choice->slot1_move_index : choice->slot0_move_index;
+    memcpy(policy, original, 4 * sizeof(float));
+    if (runtime->target_sidecar && target_sidecar_supports(&session->observation, &session->parsed_request, choice) &&
+            target_sidecar_predict(runtime->target_sidecar, session->hidden_state, slot, move, 15, policy))
+        session->pending_learned_targets = 1;
 }
 
 static int evaluate_supported_tactical_choice(
@@ -538,6 +569,7 @@ static int evaluate_supported_tactical_choice(
 
 static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     FactorizedPolicySnapshot policy;
+    float original_targets[2][4];
     float* slot0_kind_policy = policy.slot0_kind_policy;
     float* slot0_move_policy = policy.slot0_move_policy;
     float* slot0_switch_policy = policy.slot0_switch_policy;
@@ -623,6 +655,9 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             joint_mask[i] = joint_policy[i] > 0.0f ? 1 : 0;
         }
     }
+    memcpy(original_targets[0], slot0_target_policy, sizeof(original_targets[0]));
+    memcpy(original_targets[1], slot1_target_policy, sizeof(original_targets[1]));
+    session->pending_learned_targets = 0;
     for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
         pair_policy[i] = slot0_kind_policy[0] * slot0_move_policy[i] * (slot0_mask[i] ? slot0_tera_policy[0] : 0.0f);
         pair_policy[4 + i] = slot0_kind_policy[0] * slot0_move_policy[i] * (slot0_mask[4 + i] ? slot0_tera_policy[1] : 0.0f);
@@ -652,6 +687,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             if (sampled_choice.slot0_target_mask != 0u) {
                 unsigned char target_mask[FACTORIZED_TARGET_DIM];
                 factorized_target_mask_to_array(sampled_choice.slot0_target_mask, target_mask);
+                prepare_target_policy(runtime, session, &sampled_choice, 0, original_targets[0], slot0_target_policy);
                 sampled_choice.slot0_target_index = (unsigned char)sample_small_masked(
                     slot0_target_policy, target_mask, FACTORIZED_TARGET_DIM);
             }
@@ -662,6 +698,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             if (sampled_choice.slot1_target_mask != 0u) {
                 unsigned char target_mask[FACTORIZED_TARGET_DIM];
                 factorized_target_mask_to_array(sampled_choice.slot1_target_mask, target_mask);
+                prepare_target_policy(runtime, session, &sampled_choice, 1, original_targets[1], slot1_target_policy);
                 sampled_choice.slot1_target_index = (unsigned char)sample_small_masked(
                     slot1_target_policy, target_mask, FACTORIZED_TARGET_DIM);
             }
@@ -681,6 +718,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             if (sampled_choice.slot0_target_mask != 0u) {
                 unsigned char target_mask[FACTORIZED_TARGET_DIM];
                 factorized_target_mask_to_array(sampled_choice.slot0_target_mask, target_mask);
+                prepare_target_policy(runtime, session, &sampled_choice, 0, original_targets[0], slot0_target_policy);
                 sampled_choice.slot0_target_index = (unsigned char)sample_small_masked(slot0_target_policy, target_mask, FACTORIZED_TARGET_DIM);
             }
         } else {
@@ -704,6 +742,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             if (sampled_choice.slot1_target_mask != 0u) {
                 unsigned char target_mask[FACTORIZED_TARGET_DIM];
                 factorized_target_mask_to_array(sampled_choice.slot1_target_mask, target_mask);
+                prepare_target_policy(runtime, session, &sampled_choice, 1, original_targets[1], slot1_target_policy);
                 sampled_choice.slot1_target_index = (unsigned char)sample_small_masked(slot1_target_policy, target_mask, FACTORIZED_TARGET_DIM);
             }
         } else {
@@ -794,6 +833,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             if (session->pending_factorized_choice.slot0_target_mask != 0u) {
                 unsigned char target_mask[FACTORIZED_TARGET_DIM];
                 factorized_target_mask_to_array(session->pending_factorized_choice.slot0_target_mask, target_mask);
+                prepare_target_policy(runtime, session, &session->pending_factorized_choice, 0, original_targets[0], slot0_target_policy);
                 session->pending_factorized_choice.slot0_target_index = (unsigned char)sample_small_masked(
                     slot0_target_policy, target_mask, FACTORIZED_TARGET_DIM);
             }
@@ -807,6 +847,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             if (session->pending_factorized_choice.slot1_target_mask != 0u) {
                 unsigned char target_mask[FACTORIZED_TARGET_DIM];
                 factorized_target_mask_to_array(session->pending_factorized_choice.slot1_target_mask, target_mask);
+                prepare_target_policy(runtime, session, &session->pending_factorized_choice, 1, original_targets[1], slot1_target_policy);
                 session->pending_factorized_choice.slot1_target_index = (unsigned char)sample_small_masked(
                     slot1_target_policy, target_mask, FACTORIZED_TARGET_DIM);
             }
@@ -917,6 +958,15 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
                 tactical_decision.evaluation.score, tactical_decision.evaluation.opponent_power,
                 tactical_decision.evaluation.friendly_power);
             fputs("}}", out);
+        } else if (runtime->target_sidecar) {
+            fprintf(out, "%.*s,\"training_eligible\":false,\"learned_targets\":%s}", (int)strlen(json) - 1, json,
+                session->pending_learned_targets ? "true" : "false");
+        } else if (runtime->target_labels) {
+            fprintf(out, "%.*s,\"training_eligible\":false,\"target_labels\":", (int)strlen(json) - 1, json);
+            target_labels_write(out, &session->observation, &session->parsed_request,
+                &session->pending_factorized_choice, session->hidden_state, gru_model_hidden_dim(runtime->model),
+                runtime->target_parent_fingerprint);
+            fputc('}', out);
         } else if (runtime->tactical_targets) {
             fprintf(out, "%.*s,\"training_eligible\":false,\"target_intervention\":{\"applied\":%s,"
                 "\"sampled_command\":\"%s\"}}", (int)strlen(json) - 1, json,
@@ -1084,6 +1134,15 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                         "\"tactical_forced_switches\":%zu,\"tactical_fallbacks\":%zu}\n",
                         session->battle_id, session->tactical_attempts, session->tactical_applied,
                         session->tactical_forced_switches, session->tactical_fallbacks);
+                } else if (runtime->target_sidecar) {
+                    fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
+                        "\"policy_tag\":\"target-sidecar-v1\",\"training_eligible\":false,"
+                        "\"target_decisions\":%zu,\"learned_target_decisions\":%zu}\n",
+                        session->battle_id, session->decision_count, session->learned_target_decisions);
+                } else if (runtime->target_labels) {
+                    fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
+                        "\"policy_tag\":\"target-labels-v1\",\"training_eligible\":false,\"label_decisions\":%zu}\n",
+                        session->battle_id, session->decision_count);
                 } else if (runtime->tactical_targets) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
                         "\"policy_tag\":\"tactical-targets-v1\",\"training_eligible\":false,"
@@ -1169,6 +1228,7 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 session->episode.old_values[session->episode.count - 1] = session->pending_old_value;
                 session->decision_count += 1u;
                 if (runtime->tactical_targets && session->pending_retargeted) ++session->retargeted_decisions;
+                if (runtime->target_sidecar && session->pending_learned_targets) ++session->learned_target_decisions;
                 session->pending_action = -1;
                 session->pending_action2 = -1;
                 session->pending_counterfactual = 0;

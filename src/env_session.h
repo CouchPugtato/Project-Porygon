@@ -8,6 +8,7 @@
 #include "raw_battle_state.h"
 #include "replay_io.h"
 #include "runtime_protocol.h"
+#include "target_sidecar.h"
 
 #include <stdio.h>
 
@@ -56,6 +57,8 @@ typedef struct {
     size_t tactical_fallbacks;
     size_t retargeted_decisions;
     int pending_retargeted;
+    int pending_learned_targets;
+    size_t learned_target_decisions;
     int pending_counterfactual;
     int pending_counterfactual_rank;
     float pending_old_log_prob;
@@ -81,6 +84,9 @@ typedef struct {
     int greedy_inference;
     int tactical_audit;
     int tactical_targets;
+    int target_labels;
+    TargetSidecar* target_sidecar;
+    uint64_t target_parent_fingerprint;
     size_t accepted_label_direct_count;
     size_t accepted_label_reconstructed_count;
     size_t accepted_label_failed_count;
@@ -104,6 +110,8 @@ int env_runtime_enable_tactical_teacher(EnvRuntime* runtime);
 int env_runtime_enable_greedy_inference(EnvRuntime* runtime);
 int env_runtime_enable_tactical_audit(EnvRuntime* runtime);
 int env_runtime_enable_tactical_targets(EnvRuntime* runtime);
+int env_runtime_enable_target_labels(EnvRuntime* runtime);
+int env_runtime_enable_target_sidecar(EnvRuntime* runtime, const char* path);
 void env_runtime_free(EnvRuntime* runtime);
 int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, FILE* out);
 

@@ -1247,3 +1247,52 @@ switch. Its target check now applies the revival rule before excluding active
 positions. These repairs do not change checkpoint layout or the targeting
 intervention rule. Existing confirmation artifacts describe the older runtime;
 do not merge later games into those frozen runs after rebuilding.
+
+### Move-conditioned target learning
+
+The bounded experiment in `docs/project_direction.txt` freezes the 1,000-battle
+student and fits a separate target head for each active slot and selected move
+slot. The main checkpoint, recurrence, action selection, Tera and value heads
+remain unchanged. Sidecars are optional and parent-bound; this is not PPO data.
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0285_target_learning_collection --config .\config\experimental\target_learning_collection.json
+node .\tools\target_learning.js run_0285_target_learning_collection models/runs/run_0286_move_conditioned_targets
+```
+
+Collection uses unchanged sampled student play in 500 distinct battles, half
+against parent and half against random. Only accepted choices in valid games
+contribute cached recurrent states and informative teacher target labels.
+Losses are retained. Unsupported turns are omitted; equally preferred targets
+share their label mass. Per-battle files are checksummed and checked on resume.
+
+The fit uses a fixed whole-battle 20% holdout, deterministic SHA-256 ordering,
+Adam at 0.001, batches of 64 examples, at most ten epochs and three stale epochs
+of patience. The lowest held-out target NLL selects the epoch. Publication
+requires lower held-out NLL, non-decreasing tie-aware accuracy, finite outputs
+and unchanged parent parameters. A failed gate stops the experiment before
+gameplay; it does not trigger another learning-rate or architecture sweep.
+
+The native fitting command accepts the prepared binary cache directly:
+`showdown_client --fit-target-sidecar dataset.bin parent.chk sidecar.bin report.json`.
+The JavaScript wrapper records the source summary, exact parent/executable and
+dataset hashes, split seed and counts. No ordinary checkpoint is overwritten.
+These held-out metrics measure target imitation, not playing strength.
+
+Run 0286 stopped at this gate: validation NLL improved from 0.693295 to
+0.632879, but tie-aware accuracy moved from 739/1,025 to 737/1,025. Epoch 6
+was selected by NLL and stopping occurred after epoch 9. No sidecar was
+published and the conditional three-mode gameplay screen was not run. A fixed-
+settings diagnostic replay reproduced these metrics and records all eight
+slot/move breakdowns in
+`models/diagnostics/run_0286_target_gate_replay/target_fit.json`. Do not select
+another observed epoch or relax the gate to turn this result into a pass.
+
+An approved learned-target screen can use `target_sidecar` in the existing
+benchmark config, alongside `tactical_teacher: false` and sampled inference.
+The runner requires a passing fit report and checksummed metadata binding the
+sidecar to the candidate checkpoint. It rejects teacher/target overrides,
+label collection and other decoders in this mode. Native direct evaluation is
+`showdown_client --battle-agent parent.chk --target-sidecar sidecar.bin`;
+these episodes remain ineligible for PPO. None of this changes the default
+policy or treats the failed run as deployable.

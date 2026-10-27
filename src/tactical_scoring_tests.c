@@ -2,6 +2,7 @@
 #include "tactical_policy.h"
 #include "policy_decoding.h"
 #include "tactical_audit.h"
+#include "target_labels.h"
 #include "action_semantics.h"
 
 #include <math.h>
@@ -505,6 +506,35 @@ static int test_target_only_intervention(void) {
     return ok;
 }
 
+static int test_passive_target_labels(void) {
+    Observation observation;
+    ParsedRequest request;
+    FactorizedActionChoice choice, before;
+    TargetLabels labels;
+    int ok = decision_fixture(&observation, &request);
+    factorized_action_choice_from_flat_actions(&choice, 0, 14);
+    choice.slot0_target_mask = build_move_target_mask(&request, 0, 0);
+    choice.slot1_target_mask = build_move_target_mask(&request, 1, 0);
+    choice.slot0_target_index = choice.slot1_target_index = FACTORIZED_TARGET_FOE_LEFT;
+    before = choice;
+    ok &= check(target_labels_collect(&observation, &request, &choice, &labels) > 0 &&
+        labels.best[0] == FACTORIZED_TARGET_BIT(FACTORIZED_TARGET_FOE_LEFT) &&
+        (labels.legal[0] & 12) == 12 && memcmp(&choice, &before, sizeof(choice)) == 0,
+        "Passive target labels include an already optimal action without changing it");
+    observation.opp_team[5] = observation.opp_team[4];
+    observation.opp_team[5].active_slot = 2;
+    ok &= check(target_labels_collect(&observation, &request, &choice, &labels) > 0 && labels.best[0] == 12,
+        "Equally useful foes are both positive labels, rather than arbitrary mistakes");
+    choice.slot0_use_tera = 1;
+    ok &= check(target_labels_collect(&observation, &request, &choice, &labels) == 0,
+        "Unsupported mixed Tera turns provide no target labels");
+    choice.slot0_use_tera = 0;
+    request.forced_switch_any = 1;
+    ok &= check(target_labels_collect(&observation, &request, &choice, &labels) == 0,
+        "Forced replacements produce no target training examples");
+    return ok;
+}
+
 int main(void) {
     if (!check(id_tables_init(), "load vocabulary and move metadata")) return 1;
     if (!test_target_matchups() || !test_accuracy_and_stab() ||
@@ -517,7 +547,7 @@ int main(void) {
             !test_selector_respects_traps_wait_and_finite_scores() ||
             !test_all_adjacent_parser_and_legacy_encoding() ||
             !test_greedy_full_turn_probability() || !test_greedy_single_slot_and_forced_switches() ||
-            !test_passive_decision_audit() || !test_target_only_intervention()) return 1;
+            !test_passive_decision_audit() || !test_target_only_intervention() || !test_passive_target_labels()) return 1;
     puts("tactical scoring tests passed");
     return 0;
 }

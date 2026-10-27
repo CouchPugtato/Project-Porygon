@@ -186,7 +186,12 @@ function continuationSeed(base, attempt, repeat) {
 }
 
 class AgentProcess {
-    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null, inferencePolicy = 'sample', tacticalAudit = false, tacticalTargets = false) {
+    constructor(checkpoint, inferenceSeedValue, intervention, ompThreads, tacticalTeacher = false, onSend = null, inferencePolicy = 'sample', tacticalAudit = false, tacticalTargets = false, targetOptions = {}) {
+        if (targetOptions.labels && (tacticalTeacher || intervention || tacticalAudit || tacticalTargets || inferencePolicy !== 'sample'))
+            throw new Error('target labels require unchanged sampled play');
+        if (targetOptions.sidecar && (targetOptions.labels || tacticalTeacher || intervention || tacticalAudit || tacticalTargets || inferencePolicy !== 'sample'))
+            throw new Error('learned targets exclude teacher labels and inference overrides');
+        this.targetOptions = targetOptions;
         if (!['sample', 'greedy'].includes(inferencePolicy) || (inferencePolicy === 'greedy' && (tacticalTeacher || intervention)))
             throw new Error('greedy inference is evaluation-only and excludes tactical/counterfactual overrides');
         if (tacticalAudit && (tacticalTeacher || intervention))
@@ -219,6 +224,8 @@ class AgentProcess {
         if (this.inferencePolicy === 'greedy') args.push('--inference-policy', 'greedy');
         if (this.tacticalAudit) args.push('--tactical-audit', '1');
         if (this.tacticalTargets) args.push('--tactical-targets', '1');
+        if (this.targetOptions.labels) args.push('--target-labels', '1');
+        if (this.targetOptions.sidecar) args.push('--target-sidecar', this.targetOptions.sidecar);
         if (this.intervention) {
             args.push(
                 '--counterfactual-decision', String(this.intervention.decisionIndex),
@@ -253,6 +260,10 @@ class AgentProcess {
             }
         });
         const ready = await this.nextMessage('ready');
+        if (this.targetOptions.sidecar && (ready.capabilities?.target_sidecar !== true || ready.capabilities?.training !== false))
+            throw new Error('runtime does not advertise evaluation-only learned targets; rebuild the client');
+        if (this.targetOptions.labels && (ready.capabilities?.target_labels !== true || ready.capabilities?.training !== false))
+            throw new Error('runtime does not advertise passive target labels; rebuild the client');
         if (this.tacticalTargets && (ready.capabilities?.tactical_targets !== true || ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise evaluation-only target intervention; rebuild the client');
         if (this.tacticalAudit && (ready.capabilities?.tactical_audit !== true || ready.capabilities?.training !== false))

@@ -439,6 +439,8 @@ size_t gru_model_pre_joint_parameter_count(const GruModel* model);
 size_t gru_model_pre_target_parameter_count(const GruModel* model);
 size_t gru_model_legacy_parameter_count(const GruModel* model);
 int gru_model_export_parameters(const GruModel* model, float* out, size_t count);
+/* Four target rows, each hidden_dim weights followed by its bias. */
+int gru_model_export_target_head(const GruModel* model, int slot, float* out, size_t count);
 int gru_model_import_parameters(GruModel* model, const float* in, size_t count);
 
 #endif

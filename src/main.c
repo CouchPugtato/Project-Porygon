@@ -9,6 +9,7 @@
 #include "observation.h"
 #include "runtime_protocol.h"
 #include "validation_split.h"
+#include "target_sidecar.h"
 #include <errno.h>
 #include <math.h>
 #include <stdlib.h>
@@ -2332,7 +2333,9 @@ static int run_runtime_mode(
     int tactical_teacher,
     const char* inference_policy,
     int tactical_audit,
-    int tactical_targets
+    int tactical_targets,
+    int target_labels,
+    const char* target_sidecar_path
 ) {
     GruModel* model = NULL;
     TrainerCheckpointState state;
@@ -2345,6 +2348,18 @@ static int run_runtime_mode(
     const char* replay_path = getenv("PORYGON_REPLAY_PATH");
     EnvRewardMode reward_mode;
     int greedy_inference = inference_policy && strcmp(inference_policy, "greedy") == 0;
+
+    if (target_sidecar_path && (tactical_teacher || tactical_audit || tactical_targets || target_labels ||
+            greedy_inference || counterfactual_decision_index >= 0 || !checkpoint_path || !*checkpoint_path)) {
+        fprintf(stderr, "[runtime] target sidecar requires a checkpoint and plain sampled inference\n");
+        return 1;
+    }
+
+    if (target_labels && (tactical_teacher || tactical_audit || tactical_targets || greedy_inference ||
+            counterfactual_decision_index >= 0 || !checkpoint_path || !*checkpoint_path)) {
+        fprintf(stderr, "[runtime] target labels require a checkpoint and plain sampled inference\n");
+        return 1;
+    }
 
     if (tactical_targets && (tactical_teacher || tactical_audit || greedy_inference || counterfactual_decision_index >= 0)) {
         fprintf(stderr, "[runtime] tactical targets require plain sampled inference\n");
@@ -2446,7 +2461,26 @@ static int run_runtime_mode(
         free(resolved_checkpoint_path);
         return 1;
     }
-    if (tactical_targets) snprintf(json, sizeof(json),
+    if (target_labels && !env_runtime_enable_target_labels(&runtime)) {
+        env_runtime_free(&runtime);
+        if (replay_file) fclose(replay_file);
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
+        return 1;
+    }
+    if (target_sidecar_path && !env_runtime_enable_target_sidecar(&runtime, target_sidecar_path)) {
+        fprintf(stderr, "[runtime] target sidecar is corrupt or does not match the parent checkpoint\n");
+        env_runtime_free(&runtime);
+        if (replay_file) fclose(replay_file);
+        gru_model_destroy(model);
+        free(resolved_checkpoint_path);
+        return 1;
+    }
+    if (target_sidecar_path) snprintf(json, sizeof(json),
+        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_sidecar\":true}}");
+    else if (target_labels) snprintf(json, sizeof(json),
+        "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"target_labels\":true}}");
+    else if (tactical_targets) snprintf(json, sizeof(json),
         "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"tactical_targets\":true}}");
     else if (tactical_audit) snprintf(json, sizeof(json),
         "{\"type\":\"ready\",\"capabilities\":{\"doubles\":true,\"training\":false,\"tactical_audit\":true,\"inference_policy\":\"%s\"}}",
@@ -4776,6 +4810,8 @@ static int showdown_client_main(int argc, char** argv) {
     const char* inference_policy_name = parse_string_flag(argc, argv, "--inference-policy", "sample");
     int tactical_audit = parse_bool01_flag(argc, argv, "--tactical-audit", 0);
     int tactical_targets = parse_bool01_flag(argc, argv, "--tactical-targets", 0);
+    int target_labels = parse_bool01_flag(argc, argv, "--target-labels", 0);
+    const char* target_sidecar_path = parse_string_flag(argc, argv, "--target-sidecar", NULL);
     int counterfactual_decision_index = parse_int_flag(
         argc, argv, "--counterfactual-decision", -1);
     int counterfactual_action_rank = parse_int_flag(
@@ -4789,7 +4825,7 @@ static int showdown_client_main(int argc, char** argv) {
     int ppo_command = argc >= 2 && strcmp(argv[1], "--train-live-ppo") == 0;
     int awr_command = argc >= 2 && strcmp(argv[1], "--train-live-awr") == 0;
     int training_or_eval_mode = 0;
-    if ((tactical_audit || tactical_targets || strcmp(inference_policy_name, "sample") != 0) &&
+    if ((tactical_audit || tactical_targets || target_labels || target_sidecar_path || strcmp(inference_policy_name, "sample") != 0) &&
             !(argc >= 2 && (strcmp(argv[1], "--battle-agent") == 0 || strcmp(argv[1], "--runtime") == 0))) {
         fprintf(stderr, "[runtime] non-sampling inference and tactical auditing require --battle-agent/--runtime mode\n");
         return 1;
@@ -5056,7 +5092,9 @@ static int showdown_client_main(int argc, char** argv) {
             tactical_teacher,
             inference_policy_name,
             tactical_audit,
-            tactical_targets);
+            tactical_targets,
+            target_labels,
+            target_sidecar_path);
     }
     if (argc >= 4 && overfit_command) {
         return run_supervised_overfit_check(
@@ -5492,7 +5530,9 @@ static int showdown_client_main(int argc, char** argv) {
         "  Runtime decoding: --inference-policy sample|greedy (default sample; greedy is evaluation-only)\n"
         "  Passive decision audit: --tactical-audit 1 (evaluation-only; does not change choices)\n"
         "  Target-only intervention: --tactical-targets 1 (evaluation-only; sampled actions stay fixed)\n"
-        "  showdown_client --battle-agent [checkpoint] [--tactical-teacher 0|1] [--inference-seed N] [--counterfactual-decision N --counterfactual-rank N] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
+        "  showdown_client --battle-agent [checkpoint] [--tactical-teacher 0|1] [--target-labels 0|1] [--inference-seed N] [--counterfactual-decision N --counterfactual-rank N] [--reward-mode terminal|dense_additive] [--dense-additive-hp-swing-weight F] [--dense-additive-faint-swing-weight F] [--dense-additive-reward-clip F]\n"
+        "  showdown_client --fit-target-sidecar dataset.bin parent.chk sidecar.bin report.json\n"
+        "  showdown_client --battle-agent parent.chk --target-sidecar sidecar.bin [--inference-seed N]\n"
         "  showdown_client --train-supervised <replay.jsonl> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N] [--aux-checkpoints 0|1] [--supervised-profile 0|1]\n"
         "  showdown_client --train-supervised-manifest <paths.txt> <checkpoint.bin> [--epochs N] [--learning-rate F] [--supervised-optimizer sgd|adam] [--validation-seed N]\n"
         "  showdown_client --check-supervised-overfit <replay.jsonl> <report.json> [--epochs N] [--learning-rate F] [--seed N] [--supervised-optimizer sgd|adam]\n"
@@ -5521,6 +5561,15 @@ static int showdown_client_main(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 6 && strcmp(argv[1], "--fit-target-sidecar") == 0) {
+        TrainerCheckpointState state = {0};
+        CheckpointLoadResult result = {0};
+        GruModel* parent = load_current_checkpoint(argv[3], &state, &result);
+        if (!parent) { report_checkpoint_load_failure("[target-fit] parent", argv[3], &result); return 1; }
+        int ok = target_sidecar_fit(argv[2], parent, argv[4], argv[5]);
+        gru_model_destroy(parent);
+        return ok ? 0 : 1;
+    }
     char** config_args = NULL;
     char** merged_argv = NULL;
     int config_argc = 0;

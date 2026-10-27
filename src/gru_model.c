@@ -2175,6 +2175,21 @@ void gru_model_destroy(GruModel* model) {
     free(model);
 }
 
+int gru_model_export_target_head(const GruModel* model, int slot, float* out, size_t count) {
+    const Matrix* head;
+    const float* bias;
+    size_t row;
+    if (!model || !out || slot < 0 || slot > 1 || count != 4 * (model->hidden_dim + 1)) return 0;
+    head = slot ? &model->slot1_target_head : &model->slot0_target_head;
+    bias = slot ? model->slot1_target_bias : model->slot0_target_bias;
+    for (row = 0; row < 4; ++row) {
+        memcpy(out + row * (model->hidden_dim + 1), head->data + row * model->hidden_dim,
+            model->hidden_dim * sizeof(float));
+        out[row * (model->hidden_dim + 1) + model->hidden_dim] = bias[row];
+    }
+    return 1;
+}
+
 size_t gru_model_input_dim(const GruModel* model) {
     return model ? model->input_dim : 0;
 }
