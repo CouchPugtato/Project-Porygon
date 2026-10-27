@@ -32,6 +32,9 @@ int target_sidecar_supports(const Observation* observation, const ParsedRequest*
 /* NULL means supported; otherwise the first existing eligibility restriction. */
 const char* target_sidecar_support_reason(const Observation* observation, const ParsedRequest* request,
     const FactorizedActionChoice* choice);
+/* Local move eligibility with whole-turn visibility and Tera safeguards. */
+const char* target_sidecar_slot_support_reason(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, int slot);
 double target_sidecar_gradient(const TargetSidecar* sidecar, const float* hidden,
     int slot, int move, unsigned char legal, unsigned char best, float* gradient);
 int target_sidecar_save(const TargetSidecar* sidecar, const char* path);

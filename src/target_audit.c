@@ -5,15 +5,15 @@
 #include <math.h>
 
 void target_audit_write(FILE* out, const Observation* observation, const ParsedRequest* request,
-    const FactorizedActionChoice* choice, int turn, int learned_used
+    const FactorizedActionChoice* choice, int turn, unsigned char learned_slots, int slot_local
 ) {
     TacticalAudit audit;
     const char* reason = target_sidecar_support_reason(observation, request, choice);
-    int comparable = !reason && tactical_audit_targets(observation, request, choice, &audit) &&
+    int comparable = !reason && tactical_diagnostic_targets(observation, request, choice, &audit) &&
         !audit.selected.unscored_moves && audit.retargeted_available;
     int slot;
-    fprintf(out, "{\"version\":1,\"turn\":%d,\"learned_used\":%s,\"support_reason\":\"%s\",\"comparable\":%s,",
-        turn, learned_used ? "true" : "false", reason ? reason : "supported", comparable ? "true" : "false");
+    fprintf(out, "{\"version\":%d,\"turn\":%d,\"learned_used\":%s,\"support_reason\":\"%s\",\"comparable\":%s,",
+        slot_local ? 3 : 2, turn, learned_slots ? "true" : "false", reason ? reason : "supported", comparable ? "true" : "false");
     if (comparable) fprintf(out, "\"selected_score\":%.9g,\"reference_score\":%.9g,\"gap\":%.9g,",
         audit.selected.score, audit.retargeted.evaluation.score, fmaxf(0, audit.retargeted.evaluation.score - audit.selected.score));
     else fputs("\"selected_score\":null,\"reference_score\":null,\"gap\":null,", out);
@@ -23,15 +23,18 @@ void target_audit_write(FILE* out, const Observation* observation, const ParsedR
         int kind = slot ? choice->slot1_kind : choice->slot0_kind;
         int selected = slot ? choice->slot1_target_index : choice->slot0_target_index;
         unsigned char legal = slot ? choice->slot1_target_mask : choice->slot0_target_mask;
+        const char* slot_reason = slot_local ? target_sidecar_slot_support_reason(observation, request, choice, slot) : reason;
         float scores[4] = {0}, best = -FLT_MAX;
         unsigned char best_mask = 0;
-        int target, scored = comparable && has && kind == FACTORIZED_ACTION_MOVE && legal;
+        int target, scored = (slot_local ? !slot_reason : comparable) && has && kind == FACTORIZED_ACTION_MOVE && legal;
         if (scored) for (target = 0; target < 4; ++target) if (legal & (1 << target)) {
             FactorizedActionChoice changed = *choice;
             TacticalChoiceEvaluation evaluation;
             if (slot) changed.slot1_target_index = (unsigned char)target;
             else changed.slot0_target_index = (unsigned char)target;
-            if (!tactical_evaluate_power(observation, request, &changed, &evaluation, NULL) || evaluation.unscored_moves) {
+            int evaluated = slot_local ? tactical_diagnostic_slot_power(observation, request, &changed, slot, &evaluation) :
+                tactical_diagnostic_power(observation, request, &changed, &evaluation, NULL);
+            if (!evaluated || evaluation.unscored_moves) {
                 scored = 0; break;
             }
             scores[target] = evaluation.score;
@@ -53,6 +56,12 @@ void target_audit_write(FILE* out, const Observation* observation, const ParsedR
             target_context_collect(observation, request, choice, slot, &context);
             target_context_write(out, &context);
         } else fputs("null", out);
+        if (slot_local) {
+            int move = slot ? choice->slot1_move_index : choice->slot0_move_index;
+            fprintf(out, ",\"support_reason\":\"%s\",\"learned_used\":%s,\"request_target_kind\":%d",
+                slot_reason ? slot_reason : "supported", (learned_slots & (1u << slot)) ? "true" : "false",
+                has && kind == FACTORIZED_ACTION_MOVE ? request->active[slot].move_target[move] : REQUEST_TARGET_UNKNOWN);
+        }
         fputc('}', out);
     }
     fputs("]}", out);

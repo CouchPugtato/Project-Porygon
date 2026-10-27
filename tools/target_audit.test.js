@@ -1,6 +1,6 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
-const {createTargetAudit, summarizeTargetAudit, validateTargetAudit} = require('./target_audit');
+const {createTargetAudit, summarizeTargetAudit, validateTargetAudit, rescoreRetainedTargetAudit} = require('./target_audit');
 const {validateConfig, validateResume, nextGame} = require('./tactical_teacher_benchmark');
 const {createBattleAgents, battleSeeds} = require('./tactical_teacher_smoke');
 
@@ -70,5 +70,70 @@ test('Showdown retargets a fainted foe location to the sole surviving foe in dou
         const attacker = battle.p1.active[0], survivor = battle.p2.active[1];
         assert.equal(battle.getTarget(attacker, 'psychic', 1), survivor);
         assert.equal(battle.getTarget(attacker, 'psychic', 2), survivor);
+        const ally = battle.p1.active[1];
+        ally.fainted = true; ally.hp = 0;
+        assert.equal(battle.getTarget(attacker, 'psychic', -2), ally,
+            'A fainted ally does not redirect an ordinary attack to a foe');
+        assert.equal(battle.getTarget(attacker, 'helpinghand', -2), ally,
+            'An ally-only move keeps the fainted ally target');
+        assert.equal(battle.getTarget(attacker, 'acupressure', -2), attacker,
+            'An ally-or-self move falls back to self in generation nine');
     } finally { battle.destroy(); }
+});
+
+test('retained rescoring abstains on absent alternatives without replacing original metrics', () => {
+    const safe = decision(), missing = decision();
+    Object.assign(missing.slots[0].context.targets[3], {present: false,
+        type1_id: 0, type2_id: 0, type1_known_mode: 0, type2_known_mode: 0});
+    const games = [{target_audit: [safe, missing, unsupported()]}], before = JSON.stringify(games);
+    const result = rescoreRetainedTargetAudit(games);
+    assert.equal(result.retained_decisions, 1); assert.equal(result.unresolved_decisions, 1);
+    assert.equal(result.originally_unscored_decisions, 1); assert.equal(result.corrected_cached_decisions, 0);
+    assert.equal(result.retained.joint_gap_sum, 60); assert.equal(JSON.stringify(games), before);
+    const fresh = decision(); fresh.version = 2; validateTargetAudit(fresh);
+});
+
+function localDecision() {
+    const d = unsupported();
+    Object.assign(d, {version: 3, learned_used: true});
+    Object.assign(d.slots[0], decision().slots[0], {support_reason: 'supported', learned_used: true, request_target_kind: 1});
+    Object.assign(d.slots[1], {kind: 1, legal: 1, context: structuredClone(d.slots[0].context),
+        support_reason: 'status_move', learned_used: false, request_target_kind: 6});
+    return d;
+}
+
+test('slot-local audit grades the attack without inventing a joint or status-move score', () => {
+    const d = localDecision(), s = summarizeTargetAudit([{target_audit: [d]}]);
+    assert.equal(s.comparable_decisions, 0); assert.equal(s.joint_gap_sum, 0);
+    assert.equal(s.supported_target_opportunities, 1); assert.equal(s.slot_coverage_rate, 1);
+    assert.equal(s.informative_slots, 1); assert.equal(s.disagreements, 1);
+    assert.equal(s.newly_supported_slot_opportunities, 1); assert.equal(s.newly_supported_slot_gap_sum, 60);
+    assert.equal(s.learned_slots, 1); assert.equal(s.slot_examples[0].newly_supported, true);
+    const malformed = structuredClone(d); malformed.slots[1].learned_used = true;
+    assert.throws(() => validateTargetAudit(malformed), /eligibility/);
+    const audit = createTargetAudit(), action = {request_id: 1, command: '/choose move 1 1, move 1', training_eligible: false, target_audit: d};
+    audit.propose(action); audit.observe(JSON.stringify({...action, type: 'decision_accepted'}));
+    const terminal = {policy_tag: 'target-context-slot-local-argmax-v1', target_decoder: 'argmax', target_slot_local: true,
+        training_eligible: false, target_audit: true, target_decisions: 1, learned_target_decisions: 1};
+    assert.equal(audit.finish(terminal).length, 1);
+    assert.throws(() => audit.finish({...terminal, target_slot_local: false}), /accounting/);
+});
+
+test('slot-local audit uses a distinct policy identity and routes only the candidate', () => {
+    const config = require('../config/experimental/target_policy_slot_local_audit.json');
+    validateConfig(config);
+    assert.equal(config.games_per_side * config.opponents.length * 2, 100);
+    assert.notEqual(config.seed, require('../config/experimental/target_policy_audit.json').seed);
+    for (const side of [0, 1]) {
+        const agents = createBattleAgents(config, battleSeeds(config.seed, side, false), side, 'parent', null);
+        assert.equal(agents[side].targetOptions.slotLocal, true);
+        assert.equal(agents[1 - side].targetOptions.slotLocal, false);
+    }
+    assert.throws(() => validateConfig({...config, context_target_evaluation: false}), /slot-local/);
+    const identity = {config}, game = {...nextGame(config, []), status: 'completed', duration_seconds: 1, policy_mode: 'neural', coverage: null,
+        result: {result: 'win'}, choice_rejections: [], policy_tag: 'target-context-slot-local-argmax-v1', target_audit: [localDecision()],
+        learned_targets: {training_eligible: false, target_decoder: 'argmax', target_slot_local: true, target_audit: true,
+            target_decisions: 1, learned_target_decisions: 1}};
+    assert.deepEqual(validateResume({identity, games: [game]}, identity, config), [game]);
+    assert.throws(() => validateResume({identity, games: [{...game, learned_targets: {...game.learned_targets, target_slot_local: false}}]}, identity, config), /accounting/);
 });

@@ -555,6 +555,12 @@ int env_runtime_enable_target_argmax(EnvRuntime* runtime) {
     return 1;
 }
 
+int env_runtime_enable_target_slot_local(EnvRuntime* runtime) {
+    if (!runtime || runtime->count || !runtime->target_sidecar || !runtime->target_sidecar->contextual) return 0;
+    runtime->target_slot_local = 1;
+    return 1;
+}
+
 int env_runtime_enable_target_audit(EnvRuntime* runtime) {
     if (!runtime || runtime->count || !runtime->target_argmax || !runtime->target_sidecar) return 0;
     runtime->target_audit = 1;
@@ -566,7 +572,9 @@ static int prepare_target_policy(EnvRuntime* runtime, EnvSession* session,
 ) {
     int move = slot ? choice->slot1_move_index : choice->slot0_move_index;
     memcpy(policy, original, 4 * sizeof(float));
-    if (runtime->target_sidecar && target_sidecar_supports(&session->observation, &session->parsed_request, choice)) {
+    if (runtime->target_sidecar && (runtime->target_slot_local ?
+            !target_sidecar_slot_support_reason(&session->observation, &session->parsed_request, choice, slot) :
+            target_sidecar_supports(&session->observation, &session->parsed_request, choice))) {
         int applied;
         if (runtime->target_sidecar->contextual) {
             TargetContext context;
@@ -574,7 +582,11 @@ static int prepare_target_policy(EnvRuntime* runtime, EnvSession* session,
             unsigned char legal = build_move_target_mask(&session->parsed_request, slot, move);
             applied = target_sidecar_predict_context(runtime->target_sidecar, session->hidden_state, slot, move, legal, &context, policy);
         } else applied = target_sidecar_predict(runtime->target_sidecar, session->hidden_state, slot, move, 15, policy);
-        if (applied) { session->pending_learned_targets = 1; return 1; }
+        if (applied) {
+            session->pending_learned_targets = 1;
+            session->pending_learned_target_slots |= (unsigned char)(1u << slot);
+            return 1;
+        }
         else memcpy(policy, original, 4 * sizeof(float));
     }
     return 0;
@@ -698,6 +710,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
     memcpy(original_targets[0], slot0_target_policy, sizeof(original_targets[0]));
     memcpy(original_targets[1], slot1_target_policy, sizeof(original_targets[1]));
     session->pending_learned_targets = 0;
+    session->pending_learned_target_slots = 0;
     for (i = 0; i < FACTORIZED_MOVE_DIM; ++i) {
         pair_policy[i] = slot0_kind_policy[0] * slot0_move_policy[i] * (slot0_mask[i] ? slot0_tera_policy[0] : 0.0f);
         pair_policy[4 + i] = slot0_kind_policy[0] * slot0_move_policy[i] * (slot0_mask[4 + i] ? slot0_tera_policy[1] : 0.0f);
@@ -862,6 +875,8 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
         int sampled_action1 = -1;
         factorized_action_choice_to_flat_actions(&sampled_choice, &sampled_action0, &sampled_action1);
         factorized_action_choice_from_flat_actions(&session->pending_factorized_choice, action, action2);
+        if (action != sampled_action0) session->pending_learned_target_slots &= (unsigned char)~1u;
+        if (action2 != sampled_action1) session->pending_learned_target_slots &= (unsigned char)~2u;
         if (action >= 0 && action == sampled_action0) {
             session->pending_factorized_choice.slot0_target_index = sampled_choice.slot0_target_index;
             session->pending_factorized_choice.slot0_target_mask = sampled_choice.slot0_target_mask;
@@ -889,6 +904,7 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             }
         }
     }
+    session->pending_learned_targets = session->pending_learned_target_slots != 0;
     session->pending_retargeted = 0;
     if (runtime->tactical_targets) {
         if (!factorized_choice_to_command(&session->parsed_request, &session->pending_factorized_choice,
@@ -1000,7 +1016,8 @@ static int write_action(EnvRuntime* runtime, EnvSession* session, FILE* out) {
             if (runtime->target_audit) {
                 fputs(",\"target_audit\":", out);
                 target_audit_write(out, &session->observation, &session->parsed_request,
-                    &session->pending_factorized_choice, session->raw_state.turn_number, session->pending_learned_targets);
+                    &session->pending_factorized_choice, session->raw_state.turn_number,
+                    session->pending_learned_target_slots, runtime->target_slot_local);
             }
             fputc('}', out);
         } else if (runtime->target_labels) {
@@ -1179,10 +1196,12 @@ int env_runtime_handle_message(EnvRuntime* runtime, const RuntimeMessage* msg, F
                 } else if (runtime->target_sidecar) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","
                         "\"policy_tag\":\"%s\",\"training_eligible\":false,"
-                        "\"target_decoder\":\"%s\",\"target_audit\":%s,\"target_decisions\":%zu,\"learned_target_decisions\":%zu}\n",
-                        session->battle_id, runtime->target_argmax ? "target-context-argmax-v1" :
+                        "\"target_decoder\":\"%s\",\"target_audit\":%s,\"target_slot_local\":%s,\"target_decisions\":%zu,\"learned_target_decisions\":%zu}\n",
+                        session->battle_id, runtime->target_slot_local ?
+                            (runtime->target_argmax ? "target-context-slot-local-argmax-v1" : "target-context-slot-local-v1") : runtime->target_argmax ? "target-context-argmax-v1" :
                             (runtime->target_sidecar->contextual ? "target-context-v1" : "target-sidecar-v1"),
                         runtime->target_argmax ? "argmax" : "sample", runtime->target_audit ? "true" : "false",
+                        runtime->target_slot_local ? "true" : "false",
                         session->decision_count, session->learned_target_decisions);
                 } else if (runtime->target_labels) {
                     fprintf(out, "{\"type\":\"episode_complete\",\"battle_id\":\"%s\","

@@ -96,7 +96,8 @@ function createBattleAgents(config, seeds, candidateSide, opponent, recordTeache
             sidecar: side === candidateSide && config.target_sidecar ? path.resolve(REPO_ROOT, config.target_sidecar) : null,
             contextual: side === candidateSide && config.context_target_evaluation === true,
             decoder: side === candidateSide ? (config.target_decoder || 'sample') : 'sample',
-            audit: side === candidateSide && config.target_audit === true}));
+            audit: side === candidateSide && config.target_audit === true,
+            slotLocal: side === candidateSide && config.target_slot_local === true}));
 }
 
 async function playGame(sim, config, index, {opponent = 'parent', matchedTeams = false, recordTeacher = null} = {}) {
@@ -164,7 +165,8 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
             if (config.target_sidecar) {
                 const report = teacher.episode;
                 if (report.policy_tag !== targetPolicyTag(config) ||
-                        (report.target_decoder || 'sample') !== (config.target_decoder || 'sample') || report.training_eligible !== false ||
+                        (report.target_decoder || 'sample') !== (config.target_decoder || 'sample') ||
+                        !!report.target_slot_local !== !!config.target_slot_local || report.training_eligible !== false ||
                         !Number.isSafeInteger(report.target_decisions) || report.target_decisions <= 0 ||
                         !Number.isSafeInteger(report.learned_target_decisions) || report.learned_target_decisions < 0 ||
                         report.learned_target_decisions > report.target_decisions)

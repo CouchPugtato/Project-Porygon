@@ -585,6 +585,53 @@ static int test_target_argmax(void) {
     return ok;
 }
 
+static int test_diagnostic_retargeting(void) {
+    Observation observation, before;
+    ParsedRequest request, original;
+    FactorizedActionChoice choice, original_choice, survivor;
+    TacticalChoiceEvaluation legacy, corrected, expected;
+    TacticalAudit audit;
+    int ok = decision_fixture(&observation, &request);
+    factorized_action_choice_from_flat_actions(&choice, 0, -1);
+    choice.slot0_target_mask = 12;
+    choice.slot0_target_index = FACTORIZED_TARGET_FOE_LEFT;
+    observation.opp_team[4].fainted = 1;
+    before = observation; original = request; original_choice = choice;
+    survivor = choice; survivor.slot0_target_index = FACTORIZED_TARGET_FOE_RIGHT;
+    ok &= check(tactical_evaluate_power(&observation, &request, &choice, &legacy, NULL) && legacy.score == 0 &&
+        tactical_diagnostic_power(&observation, &request, &choice, &corrected, NULL) &&
+        tactical_evaluate_power(&observation, &request, &survivor, &expected, NULL) &&
+        corrected.score == expected.score && corrected.score > 0,
+        "Diagnostic foe retargeting matches the survivor without changing legacy live scoring");
+    ok &= check(memcmp(&before, &observation, sizeof(before)) == 0 &&
+        memcmp(&original, &request, sizeof(original)) == 0 &&
+        memcmp(&original_choice, &choice, sizeof(choice)) == 0, "Diagnostic resolution is non-mutating");
+    factorized_action_choice_from_flat_actions(&survivor, 0, 14);
+    survivor.slot0_target_index = survivor.slot1_target_index = FACTORIZED_TARGET_FOE_LEFT;
+    ok &= check(tactical_diagnostic_targets(&observation, &request, &survivor, &audit) &&
+        audit.retargeted_available && audit.selected.score == audit.retargeted.evaluation.score,
+        "Two attacks at the fainted foe have no diagnostic gap versus the surviving foe");
+    observation.opp_team[5].fainted = 1;
+    ok &= check(!tactical_diagnostic_power(&observation, &request, &choice, &corrected, NULL),
+        "Diagnostic abstains with no known living foe");
+    observation.opp_team[5].fainted = 0;
+    request.active[0].move_target[0] = REQUEST_TARGET_UNKNOWN;
+    ok &= check(!tactical_diagnostic_power(&observation, &request, &choice, &corrected, NULL) || corrected.unscored_moves,
+        "Unknown target kinds cannot imply automatic retargeting");
+    observation.self_team[1].fainted = 1;
+    choice.slot0_target_index = FACTORIZED_TARGET_ALLY;
+    request.active[0].move_target[0] = REQUEST_TARGET_ADJACENT_ALLY;
+    ok &= check(tactical_diagnostic_power(&observation, &request, &choice, &corrected, NULL) && corrected.score == 0,
+        "A fainted ally-only target never redirects to a foe");
+    request.active[0].move_target[0] = REQUEST_TARGET_ADJACENT_ALLY_OR_SELF;
+    survivor = choice; survivor.slot0_target_index = FACTORIZED_TARGET_SELF;
+    ok &= check(tactical_diagnostic_power(&observation, &request, &choice, &corrected, NULL) &&
+        tactical_evaluate_power(&observation, &request, &survivor, &expected, NULL) &&
+        corrected.score == expected.score && corrected.friendly_power > 0,
+        "Generation-nine ally-or-self diagnostic falls back to self");
+    return ok;
+}
+
 int main(void) {
     if (!check(id_tables_init(), "load vocabulary and move metadata")) return 1;
     if (!test_target_matchups() || !test_accuracy_and_stab() ||
@@ -598,7 +645,7 @@ int main(void) {
             !test_all_adjacent_parser_and_legacy_encoding() ||
             !test_greedy_full_turn_probability() || !test_greedy_single_slot_and_forced_switches() ||
             !test_passive_decision_audit() || !test_target_only_intervention() || !test_passive_target_labels() ||
-            !test_visible_target_context() || !test_target_argmax()) return 1;
+            !test_visible_target_context() || !test_target_argmax() || !test_diagnostic_retargeting()) return 1;
     puts("tactical scoring tests passed");
     return 0;
 }

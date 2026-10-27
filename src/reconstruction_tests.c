@@ -708,7 +708,7 @@ static int test_runtime_request_session_not_forced_doubles(void) {
     return 1;
 }
 
-static int send_counterfactual_test_state(EnvRuntime* runtime, FILE* output) {
+static int send_counterfactual_test_request(EnvRuntime* runtime, FILE* output, const char* override) {
     const char* request_payload =
         "{\"active\":["
         "{\"moves\":[{\"id\":\"protect\",\"pp\":16,\"maxpp\":16,\"target\":\"self\",\"disabled\":false},{\"id\":\"tackle\",\"pp\":35,\"maxpp\":35,\"target\":\"normal\",\"disabled\":false}],\"trapped\":false},"
@@ -743,8 +743,12 @@ static int send_counterfactual_test_state(EnvRuntime* runtime, FILE* output) {
     strcpy(message.battle_id, "battle-counterfactual-test");
     message.is_doubles = 1;
     message.request_id = 17;
-    strncpy(message.payload, request_payload, sizeof(message.payload) - 1u);
+    strncpy(message.payload, override ? override : request_payload, sizeof(message.payload) - 1u);
     return env_runtime_handle_message(runtime, &message, output);
+}
+
+static int send_counterfactual_test_state(EnvRuntime* runtime, FILE* output) {
+    return send_counterfactual_test_request(runtime, output, NULL);
 }
 
 static int test_runtime_counterfactual_ranks_are_distinct_and_reported(void) {
@@ -1063,7 +1067,7 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
                     (strstr(line, "\"target_intervention\":{") && strstr(line, "\"sampled_command\":"))) &&
                 strstr(line, "\"training_eligible\":false"),
                 "Target intervention retains the original sampled command");
-            if (mode == 7) ok &= assert_true(strstr(line, "\"target_audit\":{") &&
+            if (mode == 7) ok &= assert_true(strstr(line, "\"target_audit\":{\"version\":2,") &&
                 strstr(line, "\"support_reason\":\"supported\"") && strstr(line, "\"target_scores\":["),
                 "passive target audit serializes scored accepted-choice candidates");
             ok &= assert_true(fgets(line, sizeof(line), output) &&
@@ -1082,13 +1086,102 @@ static int test_tactical_audit_preserves_sampled_runtime(void) {
     return ok;
 }
 
+static int test_slot_local_target_runtime(void) {
+    const char* moves[] = {
+        "\"moves\":[{\"id\":\"tackle\",\"pp\":35,\"maxpp\":35,\"target\":\"normal\"}]",
+        "\"moves\":[{\"id\":\"helpinghand\",\"pp\":20,\"maxpp\":20,\"target\":\"adjacentAlly\"}]"
+    };
+    GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    FactorizedActionChoice baseline;
+    float hidden[8];
+    int next_rng = 0, attack_slot, mode, ok = assert_true(model != NULL, "create mixed-turn target fixture");
+    if (!ok) return 0;
+    ok &= save_context_runtime_fixture(model, "test_slot_local_context.tmp");
+    for (attack_slot = 0; attack_slot < 2; ++attack_slot) for (mode = 0; mode < 3; ++mode) {
+        EnvRuntime runtime = {0};
+        FILE* out = tmpfile();
+        char payload[2048], line[4096];
+        if (!out) { ok = 0; break; }
+        snprintf(payload, sizeof(payload), "{\"active\":[{%s},{%s}],\"side\":{\"pokemon\":["
+            "{\"ident\":\"p1: A\",\"details\":\"Sawsbuck, L91, M\",\"condition\":\"100/100\",\"active\":true},"
+            "{\"ident\":\"p1: B\",\"details\":\"Kingambit, L77, M\",\"condition\":\"100/100\",\"active\":true}]}}",
+            moves[attack_slot], moves[1 - attack_slot]);
+        ok &= env_runtime_init(&runtime, model, NULL, 0, ENV_REWARD_TERMINAL, NULL, "fixture.chk");
+        ok &= assert_true(!env_runtime_enable_target_slot_local(&runtime), "slot-local mode requires a contextual sidecar");
+        ok &= env_runtime_enable_target_sidecar(&runtime, "test_slot_local_context.tmp") && env_runtime_enable_target_argmax(&runtime);
+        if (mode) ok &= env_runtime_enable_target_slot_local(&runtime);
+        if (mode == 2) ok &= env_runtime_enable_target_audit(&runtime);
+        srand(30401);
+        ok &= send_counterfactual_test_request(&runtime, out, payload);
+        if (runtime.count) {
+            EnvSession* s = &runtime.sessions[0];
+            FactorizedActionChoice observed = s->pending_factorized_choice;
+            ParsedRequest req = s->parsed_request;
+            Observation obs = s->observation;
+            int partner = 1 - attack_slot;
+            ok &= assert_true(target_sidecar_support_reason(&obs, &req, &observed) != NULL &&
+                !target_sidecar_slot_support_reason(&obs, &req, &observed, attack_slot) &&
+                strcmp(target_sidecar_slot_support_reason(&obs, &req, &observed, partner), "status_move") == 0,
+                "Mixed turn supports only its ordinary attack, on either side");
+            if (!mode) {
+                baseline = observed; memcpy(hidden, s->hidden_state, sizeof(hidden)); next_rng = rand();
+                ok &= assert_true(!s->pending_learned_targets, "legacy whole-turn fallback remains reproducible");
+            } else {
+                TargetContext c;
+                float policy[4];
+                unsigned char legal = attack_slot ? observed.slot1_target_mask : observed.slot0_target_mask;
+                int selected = attack_slot ? observed.slot1_target_index : observed.slot0_target_index;
+                target_context_collect(&obs, &req, &observed, attack_slot, &c);
+                ok &= target_sidecar_predict_context(runtime.target_sidecar, s->hidden_state, attack_slot, 0, legal, &c, policy);
+                ok &= assert_true(s->pending_learned_target_slots == (1u << attack_slot) &&
+                    selected == policy_decode_target_argmax(policy, legal), "Only the supported slot uses its learned legal maximum");
+                if (attack_slot) observed.slot1_target_index = baseline.slot1_target_index;
+                else observed.slot0_target_index = baseline.slot0_target_index;
+                ok &= assert_true(memcmp(&observed, &baseline, sizeof(baseline)) == 0 &&
+                    memcmp(hidden, s->hidden_state, sizeof(hidden)) == 0 && rand() == next_rng,
+                    "Slot-local inference preserves action choices, status target, hidden state and RNG consumption");
+                ok &= assert_true(!env_runtime_enable_target_slot_local(&runtime), "eligibility cannot change during a battle");
+            }
+            FactorizedActionChoice changed = s->pending_factorized_choice;
+            if (partner) changed.slot1_use_tera = 1; else changed.slot0_use_tera = 1;
+            ok &= assert_true(strcmp(target_sidecar_slot_support_reason(&obs, &req, &changed, attack_slot), "tera") == 0,
+                "A partner Tera still blocks local inference");
+            req.side_tera_used[req.active_team_idx[attack_slot]] = 1;
+            ok &= assert_true(strcmp(target_sidecar_slot_support_reason(&obs, &req, &s->pending_factorized_choice, attack_slot), "tera") == 0,
+                "Previously used Tera remains unsupported");
+            req = s->parsed_request; req.forced_switch_any = 1;
+            ok &= assert_true(strcmp(target_sidecar_slot_support_reason(&obs, &req, &observed, attack_slot), "forced_switch") == 0,
+                "Forced replacements keep their fallback");
+            req = s->parsed_request; req.active[partner].move_id[0] = 0;
+            ok &= assert_true(!target_sidecar_slot_support_reason(&obs, &req, &observed, attack_slot) &&
+                strcmp(target_sidecar_slot_support_reason(&obs, &req, &observed, partner), "unknown_move") == 0,
+                "Unknown partner moves do not disable a known attack or become eligible themselves");
+            req.active[attack_slot].move_id[0] = 0;
+            ok &= assert_true(strcmp(target_sidecar_slot_support_reason(&obs, &req, &observed, attack_slot), "unknown_move") == 0,
+                "An unknown attacking move still falls back");
+            req = s->parsed_request; obs.opp_team[0].type1_known_mode = 0;
+            ok &= assert_true(target_sidecar_slot_support_reason(&obs, &req, &observed, attack_slot) != NULL,
+                "Unknown visible types retain the visibility safeguard");
+            if (mode == 2) {
+                rewind(out);
+                ok &= assert_true(fgets(line, sizeof(line), out) && strstr(line, "\"version\":3") &&
+                    strstr(line, "\"comparable\":false") && strstr(line, "\"support_reason\":\"supported\",\"learned_used\":true"),
+                    "Slot audit scores an eligible attack without scoring its status partner");
+            }
+        }
+        env_runtime_free(&runtime); fclose(out);
+    }
+    remove("test_slot_local_context.tmp"); gru_model_destroy(model);
+    return ok;
+}
+
 static int test_runtime_handles_recorded_no_choice_requests(void) {
     const char* payloads[] = {lone_cresselia_request, rabsca_revives_active_request};
     GruModel* model = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
     int fixture, mode, ok = assert_true(model != NULL, "create recorded-request runtime fixture");
     if (!ok) return 0;
     if (!assert_true(save_context_runtime_fixture(model, "test_fallback_context.tmp"), "save context fallback fixture")) return 0;
-    for (fixture = 0; fixture < 2; ++fixture) for (mode = 0; mode < 7; ++mode) {
+    for (fixture = 0; fixture < 2; ++fixture) for (mode = 0; mode < 8; ++mode) {
         EnvRuntime runtime = {0};
         RuntimeMessage message;
         FactorizedActionChoice decoded;
@@ -1101,7 +1194,8 @@ static int test_runtime_handles_recorded_no_choice_requests(void) {
         if (mode == 3) ok &= env_runtime_enable_tactical_targets(&runtime);
         if (mode >= 4) ok &= env_runtime_enable_target_sidecar(&runtime, "test_fallback_context.tmp");
         if (mode >= 5) ok &= env_runtime_enable_target_argmax(&runtime);
-        if (mode == 6) ok &= env_runtime_enable_target_audit(&runtime);
+        if (mode >= 6) ok &= env_runtime_enable_target_audit(&runtime);
+        if (mode == 7) ok &= env_runtime_enable_target_slot_local(&runtime);
         runtime_message_init(&message);
         message.type = RUNTIME_MSG_BATTLE_START;
         strcpy(message.battle_id, "recorded-no-choice");
@@ -6800,6 +6894,7 @@ int main(int argc, char** argv) {
     if (!test_counterfactual_q_overfits_repeated_real_shape_pairs()) return 1;
     if (!test_greedy_runtime_is_evaluation_only()) return 1;
     if (!test_tactical_audit_preserves_sampled_runtime()) return 1;
+    if (!test_slot_local_target_runtime()) return 1;
     if (!test_runtime_handles_recorded_no_choice_requests()) return 1;
     printf("reconstruction tests passed\n");
     return 0;

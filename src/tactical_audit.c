@@ -3,6 +3,83 @@
 
 #include <string.h>
 
+static int present(const ObsPokemon* team, int slot) {
+    int i;
+    for (i = 0; i < OBS_TEAM_SIZE; ++i)
+        if (team[i].active && !team[i].fainted && team[i].active_slot == slot + 1) return 1;
+    return 0;
+}
+
+int tactical_diagnostic_power(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, TacticalChoiceEvaluation* evaluation, void* context
+) {
+    FactorizedActionChoice resolved;
+    int slot;
+    (void)context;
+    if (!observation || !request || !choice || !evaluation) return 0;
+    resolved = *choice;
+    for (slot = 0; slot < 2; ++slot) {
+        int has = slot ? choice->slot1_has_action : choice->slot0_has_action;
+        int kind = slot ? choice->slot1_kind : choice->slot0_kind;
+        int move = slot ? choice->slot1_move_index : choice->slot0_move_index;
+        unsigned char* target = slot ? &resolved.slot1_target_index : &resolved.slot0_target_index;
+        ParsedMoveTarget target_kind;
+        if (!has || kind != FACTORIZED_ACTION_MOVE) continue;
+        target_kind = request->active[slot].move_target[move];
+        if (*target >= FACTORIZED_TARGET_FOE_LEFT &&
+                build_move_target_mask(request, slot, move) &&
+                !present(observation->opp_team, *target - FACTORIZED_TARGET_FOE_LEFT)) {
+            int other = 1 - (*target - FACTORIZED_TARGET_FOE_LEFT);
+            /* This is a current-observation proxy, not a prediction of the board
+             * at execution time. Unknown target kinds and empty boards abstain. */
+            if (!request->is_doubles || !present(observation->opp_team, other) ||
+                    (target_kind != REQUEST_TARGET_NORMAL && target_kind != REQUEST_TARGET_ADJACENT_FOE &&
+                     target_kind != REQUEST_TARGET_ANY)) return 0;
+            *target = (unsigned char)(FACTORIZED_TARGET_FOE_LEFT + other);
+        } else if (*target == FACTORIZED_TARGET_ALLY && target_kind == REQUEST_TARGET_ADJACENT_ALLY_OR_SELF &&
+                !present(observation->self_team, 1 - slot)) {
+            int switching = slot ? choice->slot0_has_action && choice->slot0_kind == FACTORIZED_ACTION_SWITCH :
+                choice->slot1_has_action && choice->slot1_kind == FACTORIZED_ACTION_SWITCH;
+            if (!switching) *target = FACTORIZED_TARGET_SELF;
+        }
+    }
+    return tactical_evaluate_power(observation, request, &resolved, evaluation, NULL);
+}
+
+int tactical_diagnostic_slot_power(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, int slot, TacticalChoiceEvaluation* evaluation
+) {
+    FactorizedActionChoice isolated = *choice;
+    /* Preserve an incoming partner switch when scoring friendly damage, but
+     * do not assign a made-up score to the partner's unsupported status move. */
+    if (slot == 0 && isolated.slot1_kind != FACTORIZED_ACTION_SWITCH) isolated.slot1_has_action = 0;
+    if (slot == 1 && isolated.slot0_kind != FACTORIZED_ACTION_SWITCH) isolated.slot0_has_action = 0;
+    return tactical_diagnostic_power(observation, request, &isolated, evaluation, NULL);
+}
+
+static int evaluate_diagnostic_targets(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, TacticalChoiceEvaluation* evaluation, void* context
+) {
+    const int* selected = context;
+    int actions[2];
+    return factorized_action_choice_to_flat_actions(choice, &actions[0], &actions[1]) &&
+        actions[0] == selected[0] && actions[1] == selected[1] &&
+        tactical_diagnostic_power(observation, request, choice, evaluation, NULL) && !evaluation->unscored_moves;
+}
+
+int tactical_diagnostic_targets(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, TacticalAudit* audit
+) {
+    int actions[2];
+    if (!observation || !request || !choice || !audit) return 0;
+    memset(audit, 0, sizeof(*audit));
+    if (!factorized_action_choice_to_flat_actions(choice, &actions[0], &actions[1]) ||
+            !tactical_diagnostic_power(observation, request, choice, &audit->selected, NULL)) return 0;
+    audit->retargeted_available = tactical_select_choice(observation, request,
+        evaluate_diagnostic_targets, actions, &audit->retargeted);
+    return 1;
+}
+
 static int evaluate_teacher(const Observation* observation, const ParsedRequest* request,
     const FactorizedActionChoice* choice, TacticalChoiceEvaluation* evaluation, void* context
 ) {

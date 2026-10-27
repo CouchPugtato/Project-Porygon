@@ -128,6 +128,8 @@ async function exportContext(comparisonDirectory, parentPath, outputDirectory) {
 }
 
 function targetPolicyTag(config) {
+    if (config.target_slot_local) return config.target_decoder === 'argmax' ?
+        'target-context-slot-local-argmax-v1' : 'target-context-slot-local-v1';
     if (config.target_decoder === 'argmax') return 'target-context-argmax-v1';
     return config.context_target_evaluation ? 'target-context-v1' : 'target-sidecar-v1';
 }

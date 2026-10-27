@@ -1572,6 +1572,83 @@ effects. The complete report preserves raw metrics and this secondary view:
 
 Native regressions prove passive actions, hidden state and RNG match unaudited
 inference. All native suites and 75 JavaScript tests pass. Weights, teacher
-rules and decoding remain unchanged. Next proposal: repair the diagnostic
-scorer's auto-retarget equivalence first; assess slot-local coverage separately
-after that. Neither change nor further training is authorized by this audit.
+rules and decoding remain unchanged.
+
+### Diagnostic retargeting correction
+
+Passive target records now use version 2 scoring. For ordinary doubles attacks,
+an observed-absent foe location resolves to the sole observed living foe.
+Fainted ally-only targets do not redirect to a foe; ally-or-self targets fall
+back to self when no partner or incoming switch is present. Unknown target
+kinds and empty foe boards cannot establish this equivalence. These are
+current-observation effective-power scores, not execution-time predictions.
+Live teacher selection, heuristic overrides, training labels and weights are
+unchanged; only the passive target audit calls the new scorer.
+
+Inspect a retained summary without overwriting it:
+
+```powershell
+node .\tools\target_audit.js .\matches\runs\run_0303_target_policy_audit\run_0303_target_policy_audit_summary.json
+```
+
+Run_0303 lacks the request target kinds and confirmed fainted state needed to
+correct absent-location cases. The conservative retained view keeps 573
+comparable decisions, leaves 69 unresolved and excludes 1,314 originally
+unscored decisions. It contains 918 informative slots, 85 disagreements and
+90.74% heuristic agreement, with an effective-power gap of 6,567.9375. This is
+a partial subset, not corrected full-audit performance or a strength claim.
+No cached score was changed. The separate report is
+`models/diagnostics/run_0303_target_policy_audit_rescore.json`; the original
+summary and analysis remain intact. All three native suites and 76 JavaScript
+tests pass, including simulator foe-retarget and fainted-ally regressions.
+
+### Slot-local targeting audit
+
+The approved follow-up adds opt-in `--target-slot-local 1` for contextual
+sidecars. It checks the selected attack's metadata independently of its
+partner's status/unsupported move. Forced replacements, unknown visible types
+and Tera on either selected move still block learned targeting. Status targets
+retain their original decoder. Without this flag, whole-turn eligibility is
+unchanged. The new policy tag is `target-context-slot-local-argmax-v1` when
+using target argmax; sample decoding has its own slot-local tag.
+
+The config is `config/experimental/target_policy_slot_local_audit.json`:
+
+```powershell
+node .\tools\tactical_teacher_benchmark.js --run-name run_0304_target_policy_slot_local_audit --config config/experimental/target_policy_slot_local_audit.json
+```
+
+This completed run collected 100 valid games, zero exclusions/rejected choices,
+and 2,013 accepted decisions in 84.8 seconds of recorded runtime. On the same
+observed states and selected actions, whole-turn eligibility would cover
+680/1,371 targeting opportunities (49.6%); slot-local eligibility covers
+1,218/1,371 (88.8%). Of 1,941 multi-target slots, 1,654 are supported (85.2%).
+The remaining slot restrictions are 169 status moves, 41 unsupported move
+metadata, 58 unknown visible types and 19 Tera cases.
+
+Version 3 audit records retain the whole-turn support reason and joint score
+when available, but grade each supported attack separately. Their per-slot
+scores include only that attack, retaining an incoming ally switch for friendly
+damage. Unsupported partner actions receive no invented score. Each slot
+records its eligibility, actual learned use and request target kind. Do not
+interpret these scores as full-turn values or sum joint and slot gaps together.
+Versions 1 and 2 remain readable and are not rewritten.
+
+There are 1,618 informative slots with 141 disagreements (91.3% heuristic
+agreement). Newly supported slots contribute 537 informative cases with 41
+disagreements (92.4% agreement). These are current-board heuristic comparisons,
+not execution-time damage or win effects. The 538 newly eligible opportunities
+were previously blocked by partner status moves (511), unsupported metadata
+(22) or target kinds (5).
+
+The candidate scored 32/50 against parent and 37/50 against random. Those are
+small descriptive results without a matched control, not evidence that this
+change caused a strength gain. No weights were trained or promoted. The run
+used serial battles, one thread per agent and 65% CPU/memory launch gates
+(not OS-enforced caps). Native suites and all 78 JavaScript tests pass, including
+mixed turns in both slot orders, action/hidden/RNG preservation, Tera/visibility
+guards, recorded Helping Hand/revival fallbacks and resume identity checks.
+
+Report: `models/diagnostics/run_0304_target_policy_slot_local_audit.json`.
+Next proposal: a fresh matched strength screen against whole-turn targeting
+and the unchanged student. Further experiments require separate approval.

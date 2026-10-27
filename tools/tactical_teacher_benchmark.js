@@ -88,6 +88,7 @@ function validateResume(saved, identity, config) {
                     throw new Error('saved target audit has inconsistent terminal accounting');
             } else if (game.target_audit || game.learned_targets?.target_audit) throw new Error('audited play cannot resume as an unaudited run');
             if (config.target_sidecar && (game.policy_tag !== targetPolicyTag(config) ||
+                    !!game.learned_targets?.target_slot_local !== !!config.target_slot_local ||
                     (game.learned_targets?.target_decoder || 'sample') !== (config.target_decoder || 'sample') ||
                     game.learned_targets?.training_eligible !== false ||
                     !Number.isSafeInteger(game.learned_targets.target_decisions) || game.learned_targets.target_decisions <= 0 ||
@@ -138,6 +139,9 @@ async function loadSaved(filename) {
 }
 
 function validateConfig(config) {
+    if (config.target_slot_local !== undefined && (typeof config.target_slot_local !== 'boolean' ||
+            (config.target_slot_local && (!config.target_sidecar || !config.context_target_evaluation))))
+        throw new Error('slot-local targeting requires contextual evaluation');
     if (config.target_audit !== undefined && (typeof config.target_audit !== 'boolean' ||
             (config.target_audit && (!config.context_target_evaluation || !config.target_sidecar || config.target_decoder !== 'argmax'))))
         throw new Error('passive target audit requires contextual argmax evaluation');

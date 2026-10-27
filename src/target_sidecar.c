@@ -133,10 +133,8 @@ double target_sidecar_gradient(const TargetSidecar* s, const float* hidden,
     return target_sidecar_backward(s, hidden, slot, move, legal, best, policy, gradient);
 }
 
-const char* target_sidecar_support_reason(const Observation* observation, const ParsedRequest* request,
-    const FactorizedActionChoice* choice
-) {
-    int slot, i;
+static const char* visibility_reason(const Observation* observation, const ParsedRequest* request) {
+    int i;
     if (request->forced_switch_any) return "forced_switch";
     for (i = 0; i < OBS_TEAM_SIZE; ++i) {
         const ObsPokemon* teams[2] = {&observation->self_team[i], &observation->opp_team[i]};
@@ -147,25 +145,59 @@ const char* target_sidecar_support_reason(const Observation* observation, const 
                     p->type1_id <= 0 || p->type1_id >= OBS_NUM_TYPES || p->type2_id < 0 || p->type2_id >= OBS_NUM_TYPES)) return "unknown_visible_types";
         }
     }
+    return NULL;
+}
+
+static const char* move_support_reason(const ParsedRequest* request, const FactorizedActionChoice* choice, int slot) {
+    int has_action = slot ? choice->slot1_has_action : choice->slot0_has_action;
+    int kind = slot ? choice->slot1_kind : choice->slot0_kind;
+    int move = slot ? choice->slot1_move_index : choice->slot0_move_index;
+    int tera = slot ? choice->slot1_use_tera : choice->slot0_use_tera;
+    MoveSemanticMetadata metadata;
+    if (!has_action || kind != FACTORIZED_ACTION_MOVE) return "not_move";
+    int id = request->active[slot].move_id[move];
+    if (tera || (request->active_team_idx_known[slot] && request->side_tera_used[request->active_team_idx[slot]])) return "tera";
+    if (!move_semantics_from_id(id, &metadata)) return "unknown_move";
+    if (!metadata.damaging) return "status_move";
+    if (metadata.base_power <= 0 ||
+            (metadata.category != 2 && metadata.category != 3) || metadata.accuracy <= 0 || metadata.accuracy > 100 ||
+            move_type_from_id(id) <= 0) return "unsupported_move_metadata";
+    if (!build_move_target_mask(request, slot, move) &&
+            request->active[slot].move_target[move] != REQUEST_TARGET_ALL_ADJACENT &&
+            request->active[slot].move_target[move] != REQUEST_TARGET_ALL_ADJACENT_FOES) return "unsupported_target_kind";
+    return NULL;
+}
+
+const char* target_sidecar_support_reason(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice
+) {
+    const char* reason = visibility_reason(observation, request);
+    int slot;
+    if (reason) return reason;
     for (slot = 0; slot < 2; ++slot) {
-        int has_action = slot ? choice->slot1_has_action : choice->slot0_has_action;
+        int has = slot ? choice->slot1_has_action : choice->slot0_has_action;
         int kind = slot ? choice->slot1_kind : choice->slot0_kind;
-        int move = slot ? choice->slot1_move_index : choice->slot0_move_index;
-        int tera = slot ? choice->slot1_use_tera : choice->slot0_use_tera;
-        MoveSemanticMetadata metadata;
-        if (!has_action || kind != FACTORIZED_ACTION_MOVE) continue;
-        int id = request->active[slot].move_id[move];
-        if (tera || (request->active_team_idx_known[slot] && request->side_tera_used[request->active_team_idx[slot]])) return "tera";
-        if (!move_semantics_from_id(id, &metadata)) return "unknown_move";
-        if (!metadata.damaging) return "status_move";
-        if (metadata.base_power <= 0 ||
-                (metadata.category != 2 && metadata.category != 3) || metadata.accuracy <= 0 || metadata.accuracy > 100 ||
-                move_type_from_id(id) <= 0) return "unsupported_move_metadata";
-        if (!build_move_target_mask(request, slot, move) &&
-                request->active[slot].move_target[move] != REQUEST_TARGET_ALL_ADJACENT &&
-                request->active[slot].move_target[move] != REQUEST_TARGET_ALL_ADJACENT_FOES) return "unsupported_target_kind";
+        if (has && kind == FACTORIZED_ACTION_MOVE && (reason = move_support_reason(request, choice, slot))) return reason;
     }
     return NULL;
+}
+
+const char* target_sidecar_slot_support_reason(const Observation* observation, const ParsedRequest* request,
+    const FactorizedActionChoice* choice, int slot
+) {
+    const char* reason = visibility_reason(observation, request);
+    int other;
+    if (reason) return reason;
+    /* Tera can change an ally target's typing. Keep that restriction across
+     * both selected moves even though status/metadata eligibility is local. */
+    for (other = 0; other < 2; ++other) {
+        int has = other ? choice->slot1_has_action : choice->slot0_has_action;
+        int kind = other ? choice->slot1_kind : choice->slot0_kind;
+        int tera = other ? choice->slot1_use_tera : choice->slot0_use_tera;
+        if (has && kind == FACTORIZED_ACTION_MOVE && (tera || (request->active_team_idx_known[other] &&
+                request->side_tera_used[request->active_team_idx[other]]))) return "tera";
+    }
+    return move_support_reason(request, choice, slot);
 }
 
 int target_sidecar_supports(const Observation* observation, const ParsedRequest* request,

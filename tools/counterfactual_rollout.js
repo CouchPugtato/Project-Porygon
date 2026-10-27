@@ -196,6 +196,8 @@ class AgentProcess {
             throw new Error('target labels require unchanged sampled play');
         if (targetOptions.sidecar && (targetOptions.labels || tacticalTeacher || intervention || tacticalAudit || tacticalTargets || inferencePolicy !== 'sample'))
             throw new Error('learned targets exclude teacher labels and inference overrides');
+        if (targetOptions.slotLocal && (!targetOptions.sidecar || !targetOptions.contextual))
+            throw new Error('slot-local targeting requires contextual evaluation');
         this.targetOptions = targetOptions;
         if (!['sample', 'greedy'].includes(inferencePolicy) || (inferencePolicy === 'greedy' && (tacticalTeacher || intervention)))
             throw new Error('greedy inference is evaluation-only and excludes tactical/counterfactual overrides');
@@ -233,6 +235,7 @@ class AgentProcess {
         if (this.targetOptions.sidecar) args.push('--target-sidecar', this.targetOptions.sidecar);
         if (this.targetOptions.decoder === 'argmax') args.push('--target-decoder', 'argmax');
         if (this.targetOptions.audit) args.push('--target-audit', '1');
+        if (this.targetOptions.slotLocal) args.push('--target-slot-local', '1');
         if (this.intervention) {
             args.push(
                 '--counterfactual-decision', String(this.intervention.decisionIndex),
@@ -275,6 +278,8 @@ class AgentProcess {
             throw new Error('runtime target decoder differs from the configured evaluation mode');
         if (this.targetOptions.audit && ready.capabilities?.target_audit !== true)
             throw new Error('runtime does not advertise passive target auditing');
+        if (!!ready.capabilities?.target_slot_local !== !!this.targetOptions.slotLocal)
+            throw new Error('runtime target eligibility differs from the configured evaluation mode');
         if (this.targetOptions.labels && (ready.capabilities?.target_labels !== true || ready.capabilities?.training !== false))
             throw new Error('runtime does not advertise passive target labels; rebuild the client');
         if (this.targetOptions.contextVersion === 1 && ready.capabilities?.target_context_version !== 1)
