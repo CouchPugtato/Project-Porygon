@@ -2,7 +2,7 @@
 
 const {Dex} = require('../external/pokemon-showdown/dist/sim/dex');
 const {FORMAT} = require('./position_simulator');
-const {openingActions, ordinaryActions} = require('./opening_actions');
+const {openingActions, ordinaryActions, ownSwitchActions} = require('./opening_actions');
 
 const CORE = ['focus_1', 'focus_2', 'defense', 'switch_0', 'switch_1', 'split_targets'];
 
@@ -84,4 +84,8 @@ function proposeOrdinaryTurns(view, count, rng, mode = 'coverage') {
     return selectProposals(view, ordinaryActions(view).turns, count, rng, mode);
 }
 
-module.exports = {proposeOpeningTurns, proposeOrdinaryTurns};
+function proposeOwnSwitchTurns(view, count, rng, mode = 'coverage') {
+    return selectProposals(view, ownSwitchActions(view).turns, count, rng, mode);
+}
+
+module.exports = {proposeOpeningTurns, proposeOrdinaryTurns, proposeOwnSwitchTurns};

@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {searchMoveHistory} = require('./move_history_search');
-const {ordinaryActions, checkWorldChoice} = require('./opening_actions');
+const {ordinaryActions, ownSwitchActions, checkWorldChoice} = require('./opening_actions');
 const {compareOrdinaryTurns} = require('./opening_search');
 const {capturePosition, playerObservation, restorePosition} = require('./position_simulator');
 const {constructMoveHistoryWorld} = require('./move_history_world');
@@ -31,9 +31,9 @@ for (const spec of [
         assert.equal(result.fallback_required, false); assert.equal(result.fixture_worlds, false);
         assert.equal(result.nodes, result.reconstruction_nodes + result.search_nodes);
         assert(result.nodes <= OPTIONS.max_nodes);
-        const pool = ordinaryActions(history.observations.at(-1)).turns;
+        const pool = ownSwitchActions(history.observations.at(-1)).turns;
         assert(pool.some(turn => turn.command === result.selected_command));
-        assert(!/switch|terastallize/.test(result.selected_command));
+        assert(!/terastallize/.test(result.selected_command));
         assert(result.candidates.filter(row => row.status === 'completed').every(row => row.worlds.length === 2));
         assert.deepEqual(history, before);
     } finally { battle.destroy(); }

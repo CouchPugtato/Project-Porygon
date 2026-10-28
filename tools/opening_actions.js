@@ -7,7 +7,7 @@ const {observeBeliefs} = require('./belief_state');
 const {restorePosition, playerObservation} = require('./position_simulator');
 const {isOrdinaryMove} = require('./ordinary_moves');
 
-function moveRequestActions(view, openingOnly) {
+function moveRequestActions(view, openingOnly, allowSwitches = openingOnly) {
     const beliefs = observeBeliefs(view);
     const request = view.request, roster = request?.side?.pokemon;
     const active = roster?.filter(mon => mon.active);
@@ -41,7 +41,7 @@ function moveRequestActions(view, openingOnly) {
                 }
             }
         }
-        if (openingOnly && !entry.trapped) roster.forEach((mon, i) => {
+        if (allowSwitches && !entry.trapped) roster.forEach((mon, i) => {
             if (!mon.active && !/(^0\b|\bfnt\b)/.test(mon.condition))
                 options.push({command: `switch ${i + 1}`, kind: 'switch', switch: i + 1, tera: false});
         });
@@ -77,5 +77,6 @@ function checkWorldChoice(position, view, command, randomness) {
 
 function openingActions(view) { return moveRequestActions(view, true); }
 function ordinaryActions(view) { return moveRequestActions(view, false); }
+function ownSwitchActions(view) { return moveRequestActions(view, false, true); }
 
-module.exports = {openingActions, ordinaryActions, checkWorldChoice};
+module.exports = {openingActions, ordinaryActions, ownSwitchActions, checkWorldChoice};

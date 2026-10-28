@@ -4,7 +4,7 @@ const {performance} = require('node:perf_hooks');
 const {isDeepStrictEqual} = require('node:util');
 const {createHash} = require('node:crypto');
 const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
-const {openingActions, ordinaryActions, checkWorldChoice} = require('./opening_actions');
+const {openingActions, ordinaryActions, ownSwitchActions, checkWorldChoice} = require('./opening_actions');
 const {constructOpeningWorld} = require('./opening_world');
 const {proposeOpeningTurns} = require('./opening_proposals');
 const {restorePosition, playerObservation, advancePosition} = require('./position_simulator');
@@ -46,7 +46,7 @@ function scoreLeaf(position, perspective, initialMaterial, initialTurn, randomne
 }
 
 // hypothetical backend without live battle inputs in player facing search
-async function compareTurns(view, worlds, commands, options, gate, enumerate) {
+async function compareTurns(view, worlds, commands, options, gate, enumerate, enumerateOpponent = enumerate) {
     const settings = searchSettings(options), started = performance.now();
     const pool = new Set(enumerate(view).turns.map(turn => turn.command));
     if (!Array.isArray(worlds) || !worlds.length || worlds.length > settings.worlds ||
@@ -76,7 +76,7 @@ async function compareTurns(view, worlds, commands, options, gate, enumerate) {
                 throw new Error('every search world must reproduce the same player observation');
             const opponent = view.side === 'p1' ? 'p2' : 'p1';
             const opponentView = playerObservation(battle, opponent);
-            const opponentPool = new Set(enumerate(opponentView).turns.map(turn => turn.command));
+            const opponentPool = new Set(enumerateOpponent(opponentView).turns.map(turn => turn.command));
             if (!Array.isArray(world.responses) || !world.responses.length ||
                     world.responses.length > settings.responses || new Set(world.responses).size !== world.responses.length ||
                     world.responses.some(command => !opponentPool.has(command)))
@@ -180,4 +180,8 @@ function compareOrdinaryTurns(view, worlds, commands, options, gate) {
     return compareTurns(view, worlds, commands, options, gate, ordinaryActions);
 }
 
-module.exports = {searchOpening, compareOpeningTurns, compareOrdinaryTurns, searchSettings};
+function compareOwnSwitchTurns(view, worlds, commands, options, gate) {
+    return compareTurns(view, worlds, commands, options, gate, ownSwitchActions, ordinaryActions);
+}
+
+module.exports = {searchOpening, compareOpeningTurns, compareOrdinaryTurns, compareOwnSwitchTurns, searchSettings};

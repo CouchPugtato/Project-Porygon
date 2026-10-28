@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const {performance} = require('node:perf_hooks');
 const {searchMoveHistory} = require('./move_history_search');
-const {ordinaryActions} = require('./opening_actions');
+const {ownSwitchActions} = require('./opening_actions');
 const {historyFixture} = require('./fixtures/move_history');
 const {loadedSetGenerators, publishExperiment} = require('./position_simulator_experiment');
 
@@ -42,7 +42,7 @@ async function runHistorySearchExperiment(gate) {
                 assert.equal(result.root_turn, history.observations.at(-1).turn);
                 assert.equal(result.nodes, result.reconstruction_nodes + result.search_nodes);
                 assert(result.nodes <= SETTINGS.max_nodes);
-                assert(ordinaryActions(history.observations.at(-1)).turns.some(turn => turn.command === result.selected_command));
+                assert(ownSwitchActions(history.observations.at(-1)).turns.some(turn => turn.command === result.selected_command));
                 assert.deepEqual(history, before);
                 report.cases.push({name: spec.name, passed: true, result});
             } finally { battle.destroy(); }
@@ -77,7 +77,7 @@ async function runHistorySearchExperiment(gate) {
         report.loaded_set_generator_modules = loadedSetGenerators();
         assert.deepEqual(report.loaded_set_generator_modules, []);
         report.limitations = ['Nine ordinary moves only and at most three completed historical turns.',
-            'No switch, Tera, pivot or replacement policy and no live player deployment.',
+            'Own voluntary switches only with no opposing switch, Tera, pivot or replacement policy.',
             'Caller retains the baseline player on reconstruction or search abstention.',
             'No strength claim from these controlled legality and isolation checks.'];
         report.status = 'completed'; report.passed = true;

@@ -13,7 +13,7 @@ const {isOrdinaryMove} = require('./ordinary_moves');
 
 const EVENTS = new Set(['', 't:', 'turn', 'move', '-damage', '-heal', '-status', '-curestatus',
     '-activate', '-singleturn', '-fail', '-immune', '-supereffective', '-resisted', '-crit', '-miss',
-    'cant', 'upkeep', 'message']);
+    'cant', 'upkeep', 'message', 'switch']);
 
 function replaySteps(history) {
     if (!history || Object.keys(history).length !== 2 || !Array.isArray(history.observations) ||
@@ -35,10 +35,19 @@ function replaySteps(history) {
         if (!i) continue;
         const previous = observations[i - 1];
         if (previous.log.some((line, j) => view.log[j] !== line)) issue('history_prefix_mismatch');
-        const segment = view.log.slice(previous.log.length), commands = [null, null];
+        const segment = view.log.slice(previous.log.length), commands = [null, null], switches = new Map();
         for (const line of segment) {
             const parts = line.split('|'), event = parts[1];
             if (!EVENTS.has(event)) issue(`unsupported_event_${event}`);
+            if (event === 'switch') {
+                const actor = /^(p[12])([ab]): (.+)$/.exec(parts[2]);
+                if (!actor || actor[1] !== initial.side) issue('opponent_switch_not_supported');
+                else {
+                    const slot = actor[2] === 'a' ? 0 : 1;
+                    if (switches.has(slot)) issue('multiple_switches_for_own_slot');
+                    switches.set(slot, `${actor[1]}: ${actor[3]}`);
+                }
+            }
             if (event === 'move') {
                 const move = toID(parts[3]);
                 if (!isOrdinaryMove(move) || parts.some(part => part.startsWith('[from]')))
@@ -60,11 +69,27 @@ function replaySteps(history) {
         if (commands.some(command => !command)) issue('opponent_action_not_observed');
         const own = history.own_choices[i - 1];
         if (typeof own !== 'string' || own.split(',').length !== 2) issue('complete_own_moves_required');
-        else for (const [slot, command] of own.split(',').entries()) {
-            const match = /^move ([a-z0-9]+)(?: (-?[12]))?$/.exec(command.trim());
-            const moves = previous.request?.active?.[slot]?.moves || [];
-            const id = match && (/^\d+$/.test(match[1]) ? moves[Number(match[1]) - 1]?.id : toID(match[1]));
-            if (!id || !isOrdinaryMove(id)) issue('unsupported_own_command');
+        else {
+            const destinations = new Set();
+            for (const [slot, command] of own.split(',').entries()) {
+                const change = /^switch ([1-6])$/.exec(command.trim());
+                if (change) {
+                    // destinations refer to the roster order at this decision
+                    // switch back positions can differ from the opening roster
+                    const destination = Number(change[1]), mon = previous.request?.side?.pokemon?.[destination - 1];
+                    if (!mon || mon.active || /(^0\b|\bfnt\b)/.test(mon.condition) ||
+                            previous.request?.active?.[slot]?.trapped || destinations.has(destination))
+                        issue('invalid_own_switch_destination');
+                    if (!mon || switches.get(slot) !== mon.ident) issue('own_switch_evidence_mismatch');
+                    destinations.add(destination); switches.delete(slot);
+                    continue;
+                }
+                const match = /^move ([a-z0-9]+)(?: (-?[12]))?$/.exec(command.trim());
+                const moves = previous.request?.active?.[slot]?.moves || [];
+                const id = match && (/^\d+$/.test(match[1]) ? moves[Number(match[1]) - 1]?.id : toID(match[1]));
+                if (!id || !isOrdinaryMove(id)) issue('unsupported_own_command');
+            }
+            if (switches.size) issue('uncommanded_own_switch');
         }
         steps.push({choices: {[initial.side]: own, [opponent]: commands.join(', ')}, expected: view});
     }
@@ -89,7 +114,7 @@ function constructMoveHistoryWorld(history, options = {}) {
         information_sha256: observeBeliefs(latest).information_sha256,
         assumptions: ['Accepted worlds reproduce every supplied player observation without state patching.',
             'Rule based proposals and matching chance samples are not a calibrated posterior.',
-            'Only the explicit ordinary move subset is supported; unknown opposing actions require abstention.']};
+            'Only ordinary moves and accepted own voluntary switches are supported; unknown opposing actions require abstention.']};
     if (result.unsupported.length) return result;
     const proposalRng = new PRNG(settings.seed.join(',')), chanceRng = new PRNG(settings.chance_seed.join(','));
     const seedOf = rng => Array.from({length: 4}, () => rng.random(65536));
