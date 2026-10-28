@@ -33,14 +33,17 @@ static GruModel* copy_model(const GruModel* model) {
     free(parameters); return copy;
 }
 
-static int write_pack(const ActionLearningRecord* rows, size_t cursor, size_t updates, size_t invocation) {
+static int write_pack(const ActionLearningRecord* rows, size_t cursor, size_t updates, size_t invocation, int ppo) {
     FILE* file = fopen("test_action_learner_input.tmp", "wb");
     if (!file) return 0;
-    uint32_t header[10] = {0x01020304, 8, 6, (uint32_t)cursor, (uint32_t)updates, 3, (uint32_t)invocation, 2};
+    uint32_t header[12] = {0x01020304, 8, 6, (uint32_t)cursor, (uint32_t)updates, 3, (uint32_t)invocation, 2};
     float learning_rate = .00001f, limit = .02f;
     memcpy(header + 8, &learning_rate, 4); memcpy(header + 9, &limit, 4);
+    header[10] = ppo ? ACTION_PPO_FROZEN_VALUE : 0;
+    float epsilon = .01f; memcpy(header + 11, &epsilon, 4);
     char pin[64]; memset(pin, 'a', 64);
-    int ok = fwrite("PGACTREC1", 1, 9, file) == 9 && fwrite(header, 4, 10, file) == 10 && fwrite(pin, 1, 64, file) == 64;
+    size_t words = ppo ? 12 : 10;
+    int ok = fwrite(ppo ? "PGACTREC2" : "PGACTREC1", 1, 9, file) == 9 && fwrite(header, 4, words, file) == words && fwrite(pin, 1, 64, file) == 64;
     for (size_t i = 0; ok && i < 6; ++i) {
         const FactorizedActionChoice* c = &rows[i].choice;
         unsigned char choice[14] = {c->slot0_has_action, c->slot0_kind, c->slot0_move_index, c->slot0_switch_index,
@@ -54,7 +57,7 @@ static int write_pack(const ActionLearningRecord* rows, size_t cursor, size_t up
     return ok;
 }
 
-int test_action_record_learner(void) {
+static int test_action_record_learner_mode(int ppo) {
     srand(32001);
     GruModel* behavior = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
     GruModel *whole = NULL, *partial = NULL, *loaded = NULL;
@@ -79,10 +82,16 @@ int test_action_record_learner(void) {
         rows[i].behavior_log_probability = record_log(behavior, rows + i);
     }
     ActionLearningOptions options = {1, 1, 1, .0001f, .05f};
+    options.objective = ppo ? ACTION_PPO_FROZEN_VALUE : ACTION_RETURN_DIAGNOSTIC; options.ppo_clip_epsilon = .01f;
     for (size_t i = 0; ok && i < 6; ++i) {
         GruModel* actor = copy_model(behavior);
         GruActionHeadOptimizer* optimizer = gru_action_head_optimizer_create(actor);
         ActionLearningProgress progress = {0};
+        if (ppo) {
+            ActionPpoSurrogate initial;
+            ok &= check(action_record_ppo_surrogate(record_log(actor, rows + i), rows[i].behavior_log_probability, 1, .01, &initial) &&
+                initial.ratio == 1, "Joint/single-slot PPO initialization replays full-turn likelihoods at ratio one");
+        }
         ok &= actor && optimizer && action_record_learn(behavior, behavior, actor, &optimizer, rows + i, 1, &options, &progress);
         double after = record_log(actor, rows + i);
         ok &= check(progress.cursor == 1 && progress.updates == 1 && !progress.guard_stopped &&
@@ -95,6 +104,7 @@ int test_action_record_learner(void) {
     whole_opt = gru_action_head_optimizer_create(whole); partial_opt = gru_action_head_optimizer_create(partial);
     ActionLearningProgress full = {0}, paused = {0};
     options = (ActionLearningOptions){2, 3, 3, .00001f, .02f};
+    options.objective = ppo ? ACTION_PPO_FROZEN_VALUE : ACTION_RETURN_DIAGNOSTIC; options.ppo_clip_epsilon = .01f;
     ok &= whole && partial && whole_opt && partial_opt &&
         action_record_learn(behavior, behavior, whole, &whole_opt, rows, 6, &options, &full);
     options.invocation_updates = 1;
@@ -120,6 +130,10 @@ int test_action_record_learner(void) {
             paused.cursor == full.cursor && paused.updates == full.updates && paused.max_abs_log_ratio == full.max_abs_log_ratio,
             "Saved actor/optimizer plus record cursor reproduce uninterrupted diagnostic updates exactly");
         ok &= check(!gru_model_action_head_compatibility_reason(behavior, loaded), "Resumed diagnostic leaves representation, targets and value frozen");
+        ok &= check(paused.ratio_min == full.ratio_min && paused.ratio_max == full.ratio_max &&
+            paused.mean_advantage == full.mean_advantage && paused.mean_value == full.mean_value &&
+            paused.surrogate_mean == full.surrogate_mean && paused.clipped_fraction == full.clipped_fraction,
+            "PPO baseline, ratio, surrogate and clipping metrics match exactly after resume");
     }
     free(a); free(b);
     {
@@ -127,6 +141,7 @@ int test_action_record_learner(void) {
         GruActionHeadOptimizer* optimizer = gru_action_head_optimizer_create(actor);
         ActionLearningProgress progress = {0};
         options = (ActionLearningOptions){1, 1, 1, .0001f, 1e-10f};
+        options.objective = ppo ? ACTION_PPO_FROZEN_VALUE : ACTION_RETURN_DIAGNOSTIC; options.ppo_clip_epsilon = .01f;
         ok &= action_record_learn(behavior, behavior, actor, &optimizer, rows, 6, &options, &progress);
         size_t n = gru_model_parameter_count(actor);
         float *before = malloc(n * sizeof(float)), *after = malloc(n * sizeof(float));
@@ -147,16 +162,17 @@ int test_action_record_learner(void) {
         GruActionHeadOptimizer* optimizer = gru_action_head_optimizer_create(actor);
         ActionLearningProgress progress = {0};
         options = (ActionLearningOptions){1, 1, 1, .00001f, .02f};
+        options.objective = ppo ? ACTION_PPO_FROZEN_VALUE : ACTION_RETURN_DIAGNOSTIC; options.ppo_clip_epsilon = .01f;
         ok &= check(!action_record_learn(behavior, behavior, actor, &optimizer, invalid, 6, &options, &progress),
             "Every behavior likelihood is checked before a diagnostic update, including records beyond the first minibatch");
         gru_action_head_optimizer_free(optimizer); gru_model_destroy(actor);
     }
     if (ok) {
-        ok &= checkpoint_save("test_action_learner_behavior.tmp", behavior, &state) && write_pack(rows, 0, 0, 1);
+        ok &= checkpoint_save("test_action_learner_behavior.tmp", behavior, &state) && write_pack(rows, 0, 0, 1, ppo);
         char* args[] = {"test", "--diagnose-action-records", "test_action_learner_input.tmp", "test_action_learner_behavior.tmp",
             "test_action_learner_behavior.tmp", "-", "-", "test_action_learner_cli_partial"};
         ok &= check(action_record_learner_cli(8, args) == 0, "Packed diagnostic CLI runs only the requested bounded update");
-        ok &= write_pack(rows, 2, 1, 2);
+        ok &= write_pack(rows, 2, 1, 2, ppo);
         args[5] = "test_action_learner_cli_partial.chk"; args[6] = "test_action_learner_cli_partial.opt";
         args[7] = "test_action_learner_cli_resumed";
         ok &= check(action_record_learner_cli(8, args) == 0, "Packed diagnostic CLI restores the actor, optimizer and record cursor");
@@ -174,4 +190,107 @@ int test_action_record_learner(void) {
     gru_action_head_optimizer_free(whole_opt); gru_action_head_optimizer_free(partial_opt); gru_action_head_optimizer_free(loaded_opt);
     gru_model_destroy(behavior); gru_model_destroy(whole); gru_model_destroy(partial); gru_model_destroy(loaded);
     return ok;
+}
+
+static int test_ppo_surrogate(void) {
+    int ok = 1;
+    const double ratios[] = {.5, .8, 1, 1.2, 2};
+    for (int sign = -1; sign <= 1; ++sign) for (size_t i = 0; i < 5; ++i) {
+        const double advantage = 2 * sign, old_log = -2, current = old_log + log(ratios[i]), h = 1e-6;
+        ActionPpoSurrogate term, plus, minus;
+        ok &= action_record_ppo_surrogate(current, old_log, advantage, .1, &term) &&
+            action_record_ppo_surrogate(current + h, old_log, advantage, .1, &plus) &&
+            action_record_ppo_surrogate(current - h, old_log, advantage, .1, &minus);
+        int clipped = (sign > 0 && ratios[i] > 1.1) || (sign < 0 && ratios[i] < .9);
+        double expected = clipped ? 0 : ratios[i] * advantage;
+        ok &= check(term.clipped == clipped && fabs(term.ratio - ratios[i]) < 1e-12 &&
+            fabs(term.log_probability_gradient - expected) < 1e-12 &&
+            fabs((plus.surrogate - minus.surrogate) / (2 * h) - expected) < 1e-7,
+            "PPO clipped surrogate derivative matches finite differences for both signs and corrective branches");
+        if (i == 2) ok &= check(term.ratio == 1 && term.log_probability_gradient == advantage, "Unchanged full-turn behavior starts at ratio one");
+    }
+    ActionPpoSurrogate term;
+    ok &= check(!action_record_ppo_surrogate(NAN, -2, 1, .1, &term) &&
+        !action_record_ppo_surrogate(0, -1000, 1, .1, &term) &&
+        !action_record_ppo_surrogate(-1000, 0, 1, .1, &term) &&
+        !action_record_ppo_surrogate(-2, -2, 1, 0, &term), "Invalid PPO ratios are rejected rather than floored or clamped");
+    return ok;
+}
+
+static int test_ppo_baseline_and_clipping(void) {
+    int ok = 1;
+    srand(32101);
+    GruModel* original = gru_model_create(observation_flat_size(), 8, OBS_NUM_ACTIONS);
+    size_t count = gru_model_parameter_count(original);
+    float* parameters = malloc(count * sizeof(float));
+    float* after = malloc(count * sizeof(float));
+    if (!original || !parameters || !after) { gru_model_destroy(original); free(parameters); free(after); return 0; }
+    for (int sign = -1; ok && sign <= 1; sign += 2) {
+        GruModel* behavior = copy_model(original);
+        ok &= gru_model_export_parameters(behavior, parameters, count);
+        parameters[count - 1] = sign * .5f;
+        ok &= gru_model_import_parameters(behavior, parameters, count);
+        GruModel* actor = copy_model(behavior);
+        GruActionHeadOptimizer* optimizer = gru_action_head_optimizer_create(actor);
+        float hidden[8] = {0};
+        ActionLearningRecord row = {0}; row.hidden = hidden; memset(row.legal, 1, 28);
+        factorized_action_choice_from_flat_actions(&row.choice, 0, 15);
+        row.behavior_log_probability = record_log(behavior, &row); // Draw return is zero.
+        ActionLearningOptions options = {1, 1, 1, .0001f, .05f, ACTION_PPO_FROZEN_VALUE, .01f};
+        ActionLearningProgress progress = {0};
+        ok &= action_record_learn(behavior, behavior, actor, &optimizer, &row, 1, &options, &progress);
+        double current = record_log(actor, &row);
+        ok &= check(progress.mean_value == sign * .5 && progress.mean_advantage == -sign * .5 &&
+            (sign > 0 ? current < row.behavior_log_probability : current > row.behavior_log_probability) &&
+            !gru_model_action_head_compatibility_reason(behavior, actor),
+            "Frozen value baseline, not reward sign alone, determines PPO direction and remains unchanged");
+        gru_action_head_optimizer_free(optimizer); gru_model_destroy(actor); gru_model_destroy(behavior);
+    }
+    // With a fresh ratio-one first update, the next identical record hits the
+    // plateau. Compare to an explicit zero-gradient update: Adam momentum may
+    // still move weights, so unchanged parameters would be the wrong assertion.
+    for (int mode = 0; ok && mode < 3; ++mode) {
+        GruModel* actor = copy_model(original);
+        GruActionHeadOptimizer* optimizer = gru_action_head_optimizer_create(actor);
+        float hidden[8] = {0};
+        ActionLearningRecord rows[2] = {{0}};
+        for (size_t i = 0; i < 2; ++i) {
+            rows[i].hidden = hidden; memset(rows[i].legal, 1, 28);
+            factorized_action_choice_from_flat_actions(&rows[i].choice, 0, 15);
+            rows[i].terminal_return = mode == 1 || (mode == 2 && i == 1) ? -1 : 1;
+            rows[i].behavior_log_probability = record_log(original, rows + i);
+        }
+        ActionLearningOptions options = {1, 2, 1, .0001f, .05f, ACTION_PPO_FROZEN_VALUE, .000001f};
+        ActionLearningProgress progress = {0};
+        ok &= action_record_learn(original, original, actor, &optimizer, rows, 2, &options, &progress);
+        GruModel* control = copy_model(actor);
+        GruActionHeadOptimizer* control_opt = gru_action_head_optimizer_create(control);
+        size_t moments = gru_action_head_optimizer_state_count(optimizer);
+        float* state = malloc(4 * moments * sizeof(float)); uint64_t step = 0, control_step = 0;
+        if (!state) { ok = 0; gru_action_head_optimizer_free(control_opt); gru_model_destroy(control); gru_action_head_optimizer_free(optimizer); gru_model_destroy(actor); break; }
+        ok &= gru_action_head_optimizer_export_state(optimizer, state, state + moments, moments, &step) &&
+            gru_action_head_optimizer_import_state(control_opt, state, state + moments, moments, step);
+        double current = record_log(actor, rows + 1);
+        ActionPpoSurrogate term;
+        ok &= action_record_ppo_surrogate(current, rows[1].behavior_log_probability, rows[1].terminal_return, options.ppo_clip_epsilon, &term);
+        ok &= check(mode == 2 ? !term.clipped && fabs(term.log_probability_gradient) > 1 : term.clipped && term.log_probability_gradient == 0,
+            "Only improvement-side PPO branches clip; corrective updates retain the importance ratio");
+        ok &= gru_action_head_accumulate_hidden(control_opt, hidden, rows[1].legal, &rows[1].choice, (float)term.log_probability_gradient) &&
+            gru_action_head_apply_adam(control_opt, options.learning_rate, .9f, .999f, 1e-8f, 1) &&
+            action_record_learn(original, original, actor, &optimizer, rows, 2, &options, &progress) &&
+            gru_model_export_parameters(actor, parameters, count) && gru_model_export_parameters(control, after, count) &&
+            gru_action_head_optimizer_export_state(optimizer, state, state + moments, moments, &step) &&
+            gru_action_head_optimizer_export_state(control_opt, state + 2 * moments, state + 3 * moments, moments, &control_step);
+        ok &= check(!memcmp(parameters, after, count * sizeof(float)) && !memcmp(state, state + 2 * moments, 2 * moments * sizeof(float)) &&
+            step == 2 && control_step == 2, "Native PPO clipping/importance weighting matches the expected gradients and Adam moments exactly");
+        free(state); gru_action_head_optimizer_free(control_opt); gru_model_destroy(control);
+        gru_action_head_optimizer_free(optimizer); gru_model_destroy(actor);
+    }
+    free(parameters); free(after); gru_model_destroy(original);
+    return ok;
+}
+
+int test_action_record_learner(void) {
+    return test_ppo_surrogate() && test_action_record_learner_mode(0) &&
+        test_action_record_learner_mode(1) && test_ppo_baseline_and_clipping();
 }

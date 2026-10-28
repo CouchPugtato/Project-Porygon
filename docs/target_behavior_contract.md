@@ -553,6 +553,75 @@ updates, no learning pilot or collection ran, and no deployed model changed.
 The next decision is the objective and evaluation design for a bounded learning
 pilot—not an unapproved scale-up of this diagnostic objective.
 
+## Clipped PPO objective with a frozen baseline (run 0321)
+
+The bounded learner now has an explicit `ppo_frozen_value_v1` mode. Add both
+`"objective": "ppo_frozen_value_v1"` and `"ppo_clip_epsilon": 0.01` to an
+approved diagnostic config to select it. Epsilon must be positive and at most
+0.2. Old configs remain the run 0320 signed-return diagnostic; they are not
+silently upgraded to PPO. The new mode uses the distinct `PGACTREC2` internal
+pack, and objective/epsilon are part of the immutable resume identity.
+
+For each accepted record, the fixed advantage is the undiscounted terminal
+return minus `V_behavior(hidden)`. The value prediction comes from the frozen
+behavior actor, not a newly fitted critic or the changing action heads. There
+is no GAE, advantage normalization, critic loss, discounting or repeated epoch
+in this bounded step. Targeting, representation and value parameters remain
+frozen, and no broader trainer optimizer is used.
+
+The ratio is `exp(current_full_turn_logp - saved_behavior_full_turn_logp)`.
+Current full-turn log likelihood combines the updated legal action likelihood
+with the replay-verified fixed conditional target likelihood. These target
+terms cancel in the ratio because state, chosen action, target rule and target
+parameters stay fixed; they are still checked against the original full-turn
+likelihood before updates. No probability floor or arbitrary log-ratio clamp
+is introduced. Unsupported/non-finite likelihoods are refused.
+
+The maximized surrogate is `min(ratio * A, clip(ratio, 1-eps, 1+eps) * A)`.
+Its coefficient on the log-policy gradient is `ratio * A`, except that it is
+zero above the upper ratio bound for positive advantages or below the lower
+bound for negative advantages. Corrective directions remain active outside
+the interval. This follows equation 7 in Schulman et al.,
+[Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347).
+The new helper uses unfloored double-precision full-turn log likelihoods; it
+does not route through or change the older trainer's float/floored-log path.
+
+PPO clipping is not a hard parameter freeze: existing Adam momentum and other
+records can still move weights. The separate all-record drift guard continues
+to reject an oversized proposed update and restore actor, moments and cursor.
+Its maximum absolute log-ratio cap remains 0.05. If epsilon is larger than
+`exp(guard_limit)-1`, that guard can bind before positive-side clipping; the
+native tests deliberately use a smaller epsilon to exercise clipping itself.
+Clipping does not replace the guard, and the guard is not an exact-policy KL
+bound. All previous 128-record/eight-total-update and resource caps remain.
+
+Reports identify the objective and include current ratio minimum/maximum,
+mean frozen value, mean advantage, mean clipped surrogate and `clipped_fraction`.
+These are evaluated over all selected records at the admitted actor state.
+The fraction counts samples on the flat improvement-side branch, not every
+ratio outside the symmetric interval. At the exact clipping kink the helper
+uses the unclipped one-sided derivative. Zero-advantage samples have zero
+objective gradient. Resume recomputes the fixed baseline and metrics in the
+same record order, preserving exact deterministic continuation.
+
+Tests compare analytical surrogate gradients with finite differences for both
+advantage signs, initial ratio one, zero advantage, both plateau branches and
+unclipped corrective branches. Native optimizer tests compare clipped updates
+with explicit zero-gradient Adam controls and corrective updates with the
+expected ratio-weighted controls, including moment arrays. Draw fixtures with
+positive/negative value biases prove that the baseline can reverse update
+direction while the critic stays frozen. Joint/single-slot signed-direction,
+guard rollback and actual packed native checkpoint/resume tests pass in both
+legacy and PPO modes. Node tests refuse missing clip settings, legacy native
+output under a PPO config, or changed objective/epsilon on resume.
+
+All three native suites and 114 JavaScript tests pass. Only synthetic tests ran;
+research records, checkpoints, sidecar and deployment remain unchanged. The
+ordinary trainer still cannot consume these ineligible artifacts, so their
+`ppo_ready`/`training_eligible` flags remain false. A fresh-data pilot and its
+fixed evaluation plan require separate approval; implementing the surrogate
+does not demonstrate a win-rate gain or authorize a larger experiment.
+
 The run 0313 serial smoke compared six matched cases on both deployed and local
 builds (12 games, seed 31301): sampled targets, whole-turn argmax, and slot-local
 argmax, each on both sides against random. All completed without rejections;

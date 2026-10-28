@@ -57,8 +57,11 @@ function executor({fail = false, guard = false, seen = []} = {}) {
         await fs.writeFile(path.join(stage, 'actor.chk'), `actor:${next}`);
         if (fail) throw new Error('simulated crash after actor write');
         await fs.writeFile(path.join(stage, 'actor.opt'), `moments:${next}`);
-        return {diagnostic: 'action_record_learner', training_eligible: false, ppo_ready: false,
+        const result = {diagnostic: 'action_record_learner', training_eligible: false, ppo_ready: false,
             cursor: next, updates: next, guard_stopped: guard, max_abs_log_ratio: .001 * next};
+        if (input.subarray(0, 9).toString() === 'PGACTREC2') Object.assign(result, {objective: 'ppo_frozen_value_v1',
+            ratio_min: 1, ratio_max: 1 + .001 * next, mean_advantage: .5, mean_value: .5, surrogate_mean: .5, clipped_fraction: 0});
+        return result;
     };
 }
 
@@ -128,4 +131,40 @@ test('changed dataset/settings, corrupted generations and guard stops cannot sil
     const stopped = await runDiagnostic(f.config, f.bundle, data, guarded, id, 1, executor({guard: true}));
     assert.equal(stopped.progress.cursor, 0); assert.equal(stopped.progress.guard_stopped, true);
     assert.deepEqual(await runDiagnostic(f.config, f.bundle, data, guarded, id, 1, async () => { throw Error('must not retry stopped update'); }), stopped);
+});
+
+test('PPO requires explicit objective/clip settings and packs a distinct native version', async t => {
+    const f = await fixture(t), config = {...f.config, objective: 'ppo_frozen_value_v1', ppo_clip_epsilon: .01};
+    validateConfig(config);
+    for (const change of [{ppo_clip_epsilon: 0}, {ppo_clip_epsilon: .3}, {ppo_clip_epsilon: NaN},
+        {objective: 'unknown'}, {objective: undefined}]) assert.throws(() => validateConfig({...config, ...change}));
+    const missing = {...config}; delete missing.ppo_clip_epsilon;
+    assert.throws(() => validateConfig(missing));
+    const data = await prepareRecords(config, f.bundle, replay);
+    const bytes = packRecords(data, config, {cursor: 0, updates: 0}, 1);
+    assert.equal(bytes.subarray(0, 9).toString(), 'PGACTREC2');
+    assert.equal(bytes.readUInt32LE(49), 1);
+    assert.equal(bytes.readFloatLE(53), Math.fround(.01));
+    assert.equal(bytes.subarray(57, 121).toString(), f.bundle.sha256);
+    assert.equal(bytes.readUInt32LE(121), 0x80000000);
+});
+
+test('PPO resume binds clip/objective settings and requires matching native metrics before commit', async t => {
+    const f = await fixture(t), config = {...f.config, objective: 'ppo_frozen_value_v1', ppo_clip_epsilon: .01};
+    const data = await prepareRecords(config, f.bundle, replay), id = identity(config, data);
+    await runDiagnostic(config, f.bundle, data, f.output, id, 2, executor());
+    const pointer = await fs.readFile(path.join(f.output, 'current.json'), 'utf8');
+    const legacy = executor();
+    await assert.rejects(runDiagnostic(config, f.bundle, data, f.output, id, 2, async args => {
+        const result = await legacy(args); result.objective = 'terminal_return_score_function_v1'; return result;
+    }), /PPO metrics\/objective/);
+    assert.equal(await fs.readFile(path.join(f.output, 'current.json'), 'utf8'), pointer);
+    const changed = {...config, ppo_clip_epsilon: .02};
+    await assert.rejects(runDiagnostic(changed, f.bundle, data, f.output, identity(changed, data), 2, executor()), /inputs\/settings changed/);
+    await assert.rejects(runDiagnostic(f.config, f.bundle, data, f.output, identity(f.config, data), 2, executor()), /inputs\/settings changed/);
+    const resumed = await runDiagnostic(config, f.bundle, data, f.output, id, 2, executor());
+    const other = path.join(f.directory, 'ppo-whole'); await fs.mkdir(other);
+    const whole = await runDiagnostic(config, f.bundle, data, other, id, 4, executor());
+    assert.deepEqual(whole.progress, resumed.progress);
+    assert.equal(whole.files['actor.chk'], resumed.files['actor.chk']); assert.equal(whole.files['actor.opt'], resumed.files['actor.opt']);
 });

@@ -14,18 +14,31 @@ typedef struct {
 typedef struct {
     size_t minibatch, max_updates, invocation_updates;
     float learning_rate, max_abs_log_ratio;
+    enum { ACTION_RETURN_DIAGNOSTIC = 0, ACTION_PPO_FROZEN_VALUE = 1 } objective;
+    float ppo_clip_epsilon;
 } ActionLearningOptions;
+
+typedef struct {
+    double ratio, surrogate, log_probability_gradient;
+    int clipped;
+} ActionPpoSurrogate;
+
+/* Unfloored double-precision full-turn likelihoods. Gradient is with respect
+ * to current log probability, holding the advantage and behavior fixed. */
+int action_record_ppo_surrogate(double current_log, double behavior_log, double advantage,
+    double epsilon, ActionPpoSurrogate* result);
 
 typedef struct {
     size_t cursor, updates;
     int guard_stopped;
     double max_abs_log_ratio;
     double rejected_abs_log_ratio;
+    double ratio_min, ratio_max, mean_advantage, mean_value, surrogate_mean, clipped_fraction;
 } ActionLearningProgress;
 
-/* Diagnostic terminal-return score-function updates only. Frozen hidden/target
- * conditionals must already have passed complete behavior-bundle replay. No
- * PPO, value learning, shuffling or repeated dataset epochs are implemented. */
+/* Frozen hidden/target conditionals must have passed complete bundle replay.
+ * PPO mode uses undiscounted terminal returns minus frozen behavior values.
+ * Neither mode learns values, shuffles or repeats dataset epochs. */
 int action_record_learn(const GruModel* reference, const GruModel* behavior, GruModel* actor,
     GruActionHeadOptimizer** optimizer, const ActionLearningRecord* records, size_t count,
     const ActionLearningOptions* options, ActionLearningProgress* progress);

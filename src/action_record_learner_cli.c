@@ -11,14 +11,16 @@ int action_record_learner_cli(int argc, char** argv) {
     if (argc != 8) { fputs("action-record diagnostic expects batch/reference/behavior/actor/optimizer/output-prefix\n", stderr); return 1; }
     FILE* file = fopen(argv[2], "rb");
     char magic[9], pin[65] = {0}, path[4096];
-    uint32_t header[10];
+    uint32_t header[12] = {0};
     GruModel *reference = NULL, *behavior = NULL, *actor = NULL;
     GruActionHeadOptimizer* optimizer = NULL;
     ActionLearningRecord* rows = NULL;
     float* hidden = NULL;
-    int ok = file && fread(magic, 1, 9, file) == 9 && !memcmp(magic, "PGACTREC1", 9) &&
+    int ok = file && fread(magic, 1, 9, file) == 9 && (!memcmp(magic, "PGACTREC1", 9) || !memcmp(magic, "PGACTREC2", 9)) &&
         fread(header, sizeof(uint32_t), 10, file) == 10 && header[0] == 0x01020304 &&
-        header[1] > 0 && header[1] <= 4096 && header[2] > 0 && header[2] <= 128 && fread(pin, 1, 64, file) == 64;
+        header[1] > 0 && header[1] <= 4096 && header[2] > 0 && header[2] <= 128;
+    if (ok && !memcmp(magic, "PGACTREC2", 9)) ok = fread(header + 10, sizeof(uint32_t), 2, file) == 2 && header[10] == ACTION_PPO_FROZEN_VALUE;
+    if (ok) ok = fread(pin, 1, 64, file) == 64;
     if (!ok) goto done;
     rows = calloc(header[2], sizeof(*rows)); hidden = malloc(header[1] * header[2] * sizeof(float));
     if (!rows || !hidden) { ok = 0; goto done; }
@@ -47,6 +49,8 @@ int action_record_learner_cli(int argc, char** argv) {
     ActionLearningOptions options = {header[7], header[5], header[6], 0, 0};
     memcpy(&options.learning_rate, header + 8, sizeof(float));
     memcpy(&options.max_abs_log_ratio, header + 9, sizeof(float));
+    options.objective = header[10];
+    memcpy(&options.ppo_clip_epsilon, header + 11, sizeof(float));
     ActionLearningProgress progress = {header[3], header[4], 0, 0};
     ok = optimizer && action_record_learn(reference, behavior, actor, &optimizer, rows, header[2], &options, &progress);
     if (!ok) goto done;
@@ -56,8 +60,11 @@ int action_record_learner_cli(int argc, char** argv) {
     if (snprintf(path, sizeof(path), "%s.opt", argv[7]) >= (int)sizeof(path)) { ok = 0; goto done; }
     ok = ok && action_optimizer_state_save(path, optimizer, reference, pin, NULL);
     if (ok) printf("{\"diagnostic\":\"action_record_learner\",\"training_eligible\":false,\"ppo_ready\":false,"
-        "\"cursor\":%zu,\"updates\":%zu,\"guard_stopped\":%s,\"max_abs_log_ratio\":%.17g,\"rejected_abs_log_ratio\":%.17g}\n",
-        progress.cursor, progress.updates, progress.guard_stopped ? "true" : "false", progress.max_abs_log_ratio, progress.rejected_abs_log_ratio);
+        "\"objective\":\"%s\",\"cursor\":%zu,\"updates\":%zu,\"guard_stopped\":%s,\"max_abs_log_ratio\":%.17g,\"rejected_abs_log_ratio\":%.17g,"
+        "\"ratio_min\":%.17g,\"ratio_max\":%.17g,\"mean_advantage\":%.17g,\"mean_value\":%.17g,\"surrogate_mean\":%.17g,\"clipped_fraction\":%.17g}\n",
+        options.objective == ACTION_PPO_FROZEN_VALUE ? "ppo_frozen_value_v1" : "terminal_return_score_function_v1",
+        progress.cursor, progress.updates, progress.guard_stopped ? "true" : "false", progress.max_abs_log_ratio, progress.rejected_abs_log_ratio,
+        progress.ratio_min, progress.ratio_max, progress.mean_advantage, progress.mean_value, progress.surrogate_mean, progress.clipped_fraction);
 done:
     if (file) fclose(file);
     if (!ok) fputs("action-record diagnostic rejected its input or update; no generation committed\n", stderr);

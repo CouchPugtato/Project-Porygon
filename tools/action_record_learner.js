@@ -16,6 +16,7 @@ const FORMAT = 'porygon-action-record-learner-v1';
 
 function validateConfig(c) {
     const keys = ['run_name', 'manifest', 'manifest_sha256', 'sources', 'record_limit', 'minibatch', 'max_updates', 'learning_rate', 'max_abs_log_ratio'];
+    if (c?.objective === 'ppo_frozen_value_v1') keys.push('objective', 'ppo_clip_epsilon');
     if (!c || Object.keys(c).length !== keys.length || keys.some(k => !Object.hasOwn(c, k)) ||
         typeof c.run_name !== 'string' || !/^[A-Za-z0-9_-]+$/.test(c.run_name) || typeof c.manifest !== 'string' ||
         !/^[a-f0-9]{64}$/.test(c.manifest_sha256) || !Array.isArray(c.sources) || !c.sources.length || c.sources.length > 6 ||
@@ -26,6 +27,8 @@ function validateConfig(c) {
         !Number.isFinite(c.learning_rate) || c.learning_rate <= 0 || c.learning_rate > .0001 ||
         !Number.isFinite(c.max_abs_log_ratio) || c.max_abs_log_ratio <= 0 || c.max_abs_log_ratio > .05)
         throw new Error('invalid bounded action-record diagnostic config');
+    if (c.objective === 'ppo_frozen_value_v1' && (!Number.isFinite(c.ppo_clip_epsilon) || c.ppo_clip_epsilon <= 0 || c.ppo_clip_epsilon > .2))
+        throw new Error('invalid bounded PPO clip epsilon');
 }
 
 async function prepareRecords(config, bundle, replay = replayArtifact) {
@@ -67,14 +70,16 @@ async function prepareRecords(config, bundle, replay = replayArtifact) {
 
 function packRecords(data, config, progress, invocationUpdates) {
     const {rows, hiddenDim} = data;
+    const ppo = config.objective === 'ppo_frozen_value_v1', headerBytes = ppo ? 121 : 113;
     const stride = hiddenDim * 4 + 28 + 14 + 4 + 16;
-    const bytes = Buffer.alloc(113 + stride * rows.length);
-    bytes.write('PGACTREC1');
+    const bytes = Buffer.alloc(headerBytes + stride * rows.length);
+    bytes.write(ppo ? 'PGACTREC2' : 'PGACTREC1');
     [0x01020304, hiddenDim, rows.length, progress.cursor, progress.updates, config.max_updates,
         invocationUpdates, config.minibatch].forEach((n, i) => bytes.writeUInt32LE(n, 9 + 4 * i));
     bytes.writeFloatLE(config.learning_rate, 41); bytes.writeFloatLE(config.max_abs_log_ratio, 45);
-    bytes.write(config.manifest_sha256, 49);
-    let offset = 113;
+    if (ppo) { bytes.writeUInt32LE(1, 49); bytes.writeFloatLE(config.ppo_clip_epsilon, 53); }
+    bytes.write(config.manifest_sha256, ppo ? 57 : 49);
+    let offset = headerBytes;
     for (const {record: r, terminal_return} of rows) {
         const bits = Buffer.from(r.hidden_f32_hex, 'hex');
         for (let h = 0; h < hiddenDim; ++h) { bytes.writeUInt32LE(bits.readUInt32BE(4 * h), offset); offset += 4; }
@@ -148,6 +153,10 @@ async function runDiagnostic(config, bundle, data, directory, identity, invocati
         const stage = await fs.mkdtemp(path.join(directory, '.pending-'));
         await fs.writeFile(path.join(stage, 'input.bin'), packRecords(data, config, progress, invocationUpdates));
         const result = await execute({bundle, previous, stage, executable: EXECUTABLE, executableSha256: identity.executable_sha256});
+        if (config.objective === 'ppo_frozen_value_v1' && (result.objective !== config.objective ||
+            ![result.ratio_min, result.ratio_max, result.mean_advantage, result.mean_value, result.surrogate_mean, result.clipped_fraction].every(Number.isFinite) ||
+            result.ratio_min <= 0 || result.ratio_max < result.ratio_min || result.clipped_fraction < 0 || result.clipped_fraction > 1))
+            throw new Error('native learner returned invalid PPO metrics/objective');
         if (result.diagnostic !== 'action_record_learner' || result.training_eligible !== false || result.ppo_ready !== false ||
             !Number.isInteger(result.updates) || result.updates < progress.updates || result.updates > Math.min(config.max_updates, progress.updates + invocationUpdates) ||
             result.cursor !== Math.min(result.updates * config.minibatch, data.rows.length) ||
@@ -181,7 +190,7 @@ async function main(argv) {
         'tools/target_record_collection.js', 'tools/counterfactual_rollout.js'];
     const identity = {config, dataset_sha256: hash(data), executable_sha256: await hashFile(EXECUTABLE),
         source_sha256: Object.fromEntries(await Promise.all(sources.map(async name => [name, await hashFile(path.join(ROOT, name))]))),
-        objective: 'terminal_return_score_function_v1', order: 'source_then_record', rng: 'unused'};
+        objective: config.objective || 'terminal_return_score_function_v1', order: 'source_then_record', rng: 'unused'};
     const directory = path.join(ROOT, 'models/diagnostics', config.run_name);
     await fs.mkdir(directory, {recursive: true});
     const state = await runDiagnostic(config, bundle, data, directory, identity, argv[3] === undefined ? 8 : Number(argv[3]));
