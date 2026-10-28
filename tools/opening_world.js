@@ -26,8 +26,8 @@ function recoverOwnSet(entry, validator) {
     const context = {trunc: dex.trunc, dex, ruleTable: validator.ruleTable};
     const target = {hp: Number(hp[2]), ...entry.stats};
     const natures = ['Serious', ...dex.natures.all().map(n => n.name).filter(n => n !== 'Serious')];
-    // Requests reveal final base stats, not the original IV/EV/nature tuple.
-    // Find one legal stat-equivalent tuple; never pretend it is the true tuple.
+    // visible final stats rather than the original investment tuple
+    // one legal equivalent build without claiming recovery of the true build
     for (const nature of natures) {
         set.nature = nature;
         set.ivs = Object.fromEntries(STATS.map(stat => [stat, 0]));
@@ -70,12 +70,16 @@ function openingUnsupported(view, beliefs) {
     return reasons;
 }
 
-function constructOpeningWorld(view, {seed, chance_seed, attempts = 16} = {}) {
+function buildOpeningWorld(view, {seed, chance_seed, attempts = 16} = {}, moveEvidence) {
     const validSeed = s => Array.isArray(s) && s.length === 4 &&
         s.every(n => Number.isInteger(n) && n >= 0 && n <= 65535);
     if (!validSeed(seed) || !validSeed(chance_seed) || !Number.isInteger(attempts) || attempts < 1 || attempts > 32)
         throw new Error('opening worlds require independent proposal/chance seeds and at most 32 attempts');
     const beliefs = observeBeliefs(view);
+    if (moveEvidence) for (const known of beliefs.opponent.pokemon) {
+        const later = moveEvidence.opponent.pokemon.find(mon => mon.key === known.key);
+        if (later) known.moves = [...new Set([...known.moves, ...later.moves])].sort();
+    }
     const result = {version: 1, kind: 'opening_hypothetical_world', scope: 'initial_move_request',
         information_sha256: beliefs.information_sha256, proposal_seed: [...seed], chance_seed: [...chance_seed],
         supported: false, simulation_ready: false, search_ready: false, training_eligible: false,
@@ -86,8 +90,8 @@ function constructOpeningWorld(view, {seed, chance_seed, attempts = 16} = {}) {
             'Opening startup is simulated; exact player projection must match before acceptance.']};
     if (result.unsupported.length) return result;
     const setValidator = new TeamValidator(FORMAT);
-    // Disable only random-team delivery for validation, retaining the same
-    // format rules. Never call validateTeam on the generator-backed format.
+    // random team delivery disabled while retaining native format rules
+    // explicit team validation without invoking a set generator
     const teamValidator = new TeamValidator({...setValidator.format, team: undefined});
     const own = [];
     for (const entry of view.request.side.pokemon) {
@@ -139,4 +143,21 @@ function constructOpeningWorld(view, {seed, chance_seed, attempts = 16} = {}) {
     return result;
 }
 
-module.exports = {recoverOwnSet, constructOpeningWorld};
+function constructOpeningWorld(view, options) {
+    return buildOpeningWorld(view, options);
+}
+
+function constructReplayOpening(initialView, latestView, options) {
+    const latest = observeBeliefs(latestView);
+    observeBeliefs(initialView);
+    if (latestView.side !== initialView.side || latestView.turn <= initialView.turn || latest.issues.length ||
+            initialView.log.some((line, i) => latestView.log[i] !== line))
+        throw new Error('replay opening requires later evidence extending the initial player observation');
+    // past revealed moves used only for reconstruction at the later decision
+    // unchanged opening actor interface without access to future evidence
+    const result = buildOpeningWorld(initialView, options, latest);
+    return {...result, scope: 'opening_conditioned_on_later_replay_evidence',
+        evidence_information_sha256: latest.information_sha256};
+}
+
+module.exports = {recoverOwnSet, constructOpeningWorld, constructReplayOpening};
