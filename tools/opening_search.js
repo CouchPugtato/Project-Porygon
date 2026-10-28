@@ -4,7 +4,7 @@ const {performance} = require('node:perf_hooks');
 const {isDeepStrictEqual} = require('node:util');
 const {createHash} = require('node:crypto');
 const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
-const {openingActions, checkWorldChoice} = require('./opening_actions');
+const {openingActions, ordinaryActions, checkWorldChoice} = require('./opening_actions');
 const {constructOpeningWorld} = require('./opening_world');
 const {proposeOpeningTurns} = require('./opening_proposals');
 const {restorePosition, playerObservation, advancePosition} = require('./position_simulator');
@@ -34,35 +34,35 @@ function material(battle, perspective) {
     return sideScore(own) - sideScore(own.foe);
 }
 
-function scoreLeaf(position, perspective, initialMaterial, randomness) {
+function scoreLeaf(position, perspective, initialMaterial, initialTurn, randomness) {
     const battle = restorePosition(position, randomness);
     try {
         if (battle.ended) return {supported: true, score: !battle.winner ? 0 :
             battle.winner === battle.getSide(perspective).name ? 100 : -100};
-        if (battle.turn <= 1 && !(battle.requestState === 'switch' && battle.queue.list.length === 0))
+        if (battle.turn <= initialTurn && !(battle.requestState === 'switch' && battle.queue.list.length === 0))
             return {supported: false, reason: 'unfinished_turn_requires_continuation'};
         return {supported: true, score: material(battle, perspective) - initialMaterial};
     } finally { battle.destroy(); }
 }
 
-// Backend-only interface. Fixture snapshots are allowed here for mechanics tests;
-// the player-facing searchOpening function never accepts a live battle or snapshot.
-async function compareOpeningTurns(view, worlds, commands, options, gate) {
+// hypothetical backend without live battle inputs in player facing search
+async function compareTurns(view, worlds, commands, options, gate, enumerate) {
     const settings = searchSettings(options), started = performance.now();
-    const pool = new Set(openingActions(view).turns.map(turn => turn.command));
+    const pool = new Set(enumerate(view).turns.map(turn => turn.command));
     if (!Array.isArray(worlds) || !worlds.length || worlds.length > settings.worlds ||
             !Array.isArray(commands) || !commands.length || commands.length > settings.candidates ||
             new Set(commands).size !== commands.length || commands.some(command => !pool.has(command)))
         throw new Error('supply bounded worlds and distinct observation-generated candidate commands');
     const rng = new PRNG(settings.seed.join(','));
-    // Key samples by response identity, not column position: proposal ablations
-    // and chunked reference comparisons must share the same chance streams.
+    // response keyed chance streams shared across proposal ablations
+    // stable samples when reference comparisons use different column chunks
     const chanceSeeds = worlds.map((world, i) => world.responses?.map(response =>
         Array.from({length: settings.chance_samples}, (_, sample) => {
             const bytes = createHash('sha256').update(JSON.stringify([settings.seed, i, response, sample])).digest();
             return Array.from({length: 4}, (_, word) => bytes.readUInt16BE(word * 2));
         })));
-    const result = {version: 1, scope: 'opening_hypothetical_matchups', supported: false,
+    const result = {version: 1, scope: enumerate === openingActions ? 'opening_hypothetical_matchups' :
+        'ordinary_hypothetical_matchups', root_turn: view.turn, supported: false,
         selected_command: null, settings, nodes: 0, budget_exhausted: false, candidates: [],
         objective: 'uniform_world_mean_of_worst_response_chance_mean',
         leaf_score: 'opponent_minus_own_hp_fraction_loss_plus_2_per_net_faint; terminal_win_loss_100',
@@ -76,7 +76,7 @@ async function compareOpeningTurns(view, worlds, commands, options, gate) {
                 throw new Error('every search world must reproduce the same player observation');
             const opponent = view.side === 'p1' ? 'p2' : 'p1';
             const opponentView = playerObservation(battle, opponent);
-            const opponentPool = new Set(openingActions(opponentView).turns.map(turn => turn.command));
+            const opponentPool = new Set(enumerate(opponentView).turns.map(turn => turn.command));
             if (!Array.isArray(world.responses) || !world.responses.length ||
                     world.responses.length > settings.responses || new Set(world.responses).size !== world.responses.length ||
                     world.responses.some(command => !opponentPool.has(command)))
@@ -115,7 +115,7 @@ async function compareOpeningTurns(view, worlds, commands, options, gate) {
                     const randomness = {mode: 'sample', seed};
                     const next = advancePosition(world.position,
                         {[view.side]: command, [world.opponent]: response}, randomness);
-                    const leaf = scoreLeaf(next.position, view.side, world.initialMaterial, randomness);
+                    const leaf = scoreLeaf(next.position, view.side, world.initialMaterial, view.turn, randomness);
                     if (!leaf.supported) { row.status = 'unsupported_continuation'; row.reason = leaf.reason; break; }
                     scores.push(leaf.score);
                 }
@@ -172,4 +172,12 @@ async function searchOpening(view, options, gate) {
             'HP/fainting scores omit positional and long-term value; they are not win probabilities.']};
 }
 
-module.exports = {searchOpening, compareOpeningTurns};
+function compareOpeningTurns(view, worlds, commands, options, gate) {
+    return compareTurns(view, worlds, commands, options, gate, openingActions);
+}
+
+function compareOrdinaryTurns(view, worlds, commands, options, gate) {
+    return compareTurns(view, worlds, commands, options, gate, ordinaryActions);
+}
+
+module.exports = {searchOpening, compareOpeningTurns, compareOrdinaryTurns, searchSettings};

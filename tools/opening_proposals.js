@@ -2,7 +2,7 @@
 
 const {Dex} = require('../external/pokemon-showdown/dist/sim/dex');
 const {FORMAT} = require('./position_simulator');
-const {openingActions} = require('./opening_actions');
+const {openingActions, ordinaryActions} = require('./opening_actions');
 
 const CORE = ['focus_1', 'focus_2', 'defense', 'switch_0', 'switch_1', 'split_targets'];
 
@@ -12,6 +12,7 @@ function describeTurn(view, turn) {
     const targets = [];
     for (const [slot, action] of turn.actions.entries()) {
         if (action.kind === 'switch') { features.add(`switch_${slot}`); targets.push([]); continue; }
+        if (action.kind === 'pass') { targets.push([]); continue; }
         const request = view.request.active[slot].moves[action.move - 1];
         const move = dex.moves.get(request.id);
         features.add(`move_${slot}_${action.move}`);
@@ -37,11 +38,11 @@ function describeTurn(view, turn) {
     return {turn, features, preference: -100 * friendlyFire - 10 * tera + attacks};
 }
 
-function proposeOpeningTurns(view, count, rng, mode = 'coverage') {
+function selectProposals(view, turns, count, rng, mode) {
     if (!Number.isInteger(count) || count < 1 || count > 32 || !['coverage', 'uniform'].includes(mode))
         throw new Error('opening proposals require 1..32 choices and coverage or uniform mode');
-    const pool = openingActions(view).turns.map(turn => describeTurn(view, turn));
-    // Both modes consume the same randomness, keeping world construction matched.
+    const pool = turns.map(turn => describeTurn(view, turn));
+    // matched proposal randomness across both selection modes
     for (let i = pool.length - 1; i > 0; --i) {
         const j = rng.random(i + 1); [pool[i], pool[j]] = [pool[j], pool[i]];
     }
@@ -64,7 +65,7 @@ function proposeOpeningTurns(view, count, rng, mode = 'coverage') {
             remaining.sort((a, b) => novelty(b) - novelty(a) || b.preference - a.preference);
             add(remaining[0]);
         }
-        // This slot can select any remaining legal turn, including ally damage.
+        // unrestricted remaining legal turn for exploration including ally damage
         if (exploration) add(pool.find(entry => !selected.includes(entry)));
     }
     const available = new Set(pool.flatMap(entry => [...entry.features]));
@@ -75,4 +76,12 @@ function proposeOpeningTurns(view, count, rng, mode = 'coverage') {
             features: [...covered].sort(), exploratory_choices: exploration}};
 }
 
-module.exports = {proposeOpeningTurns};
+function proposeOpeningTurns(view, count, rng, mode = 'coverage') {
+    return selectProposals(view, openingActions(view).turns, count, rng, mode);
+}
+
+function proposeOrdinaryTurns(view, count, rng, mode = 'coverage') {
+    return selectProposals(view, ordinaryActions(view).turns, count, rng, mode);
+}
+
+module.exports = {proposeOpeningTurns, proposeOrdinaryTurns};

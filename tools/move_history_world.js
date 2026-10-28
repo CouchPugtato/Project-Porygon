@@ -9,10 +9,8 @@ const {BattleActions} = require('../external/pokemon-showdown/dist/sim/battle-ac
 const {FORMAT, advancePosition} = require('./position_simulator');
 const {observeBeliefs} = require('./belief_state');
 const {constructReplayOpening} = require('./opening_world');
+const {isOrdinaryMove} = require('./ordinary_moves');
 
-// explicit mechanics subset rather than a competitive move prior
-const MOVES = new Set(['tackle', 'quickattack', 'watergun', 'thunderbolt', 'flamethrower',
-    'protect', 'thunderwave', 'willowisp', 'poisongas']);
 const EVENTS = new Set(['', 't:', 'turn', 'move', '-damage', '-heal', '-status', '-curestatus',
     '-activate', '-singleturn', '-fail', '-immune', '-supereffective', '-resisted', '-crit', '-miss',
     'cant', 'upkeep', 'message']);
@@ -43,7 +41,7 @@ function replaySteps(history) {
             if (!EVENTS.has(event)) issue(`unsupported_event_${event}`);
             if (event === 'move') {
                 const move = toID(parts[3]);
-                if (!MOVES.has(move) || parts.some(part => part.startsWith('[from]')))
+                if (!isOrdinaryMove(move) || parts.some(part => part.startsWith('[from]')))
                     issue('unsupported_move_mechanics');
                 const actor = /^(p[12])([ab]): /.exec(parts[2]);
                 if (actor?.[1] !== opponent) continue;
@@ -66,7 +64,7 @@ function replaySteps(history) {
             const match = /^move ([a-z0-9]+)(?: (-?[12]))?$/.exec(command.trim());
             const moves = previous.request?.active?.[slot]?.moves || [];
             const id = match && (/^\d+$/.test(match[1]) ? moves[Number(match[1]) - 1]?.id : toID(match[1]));
-            if (!id || !MOVES.has(id)) issue('unsupported_own_command');
+            if (!id || !isOrdinaryMove(id)) issue('unsupported_own_command');
         }
         steps.push({choices: {[initial.side]: own, [opponent]: commands.join(', ')}, expected: view});
     }
