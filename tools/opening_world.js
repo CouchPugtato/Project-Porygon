@@ -160,7 +160,8 @@ function constructOpeningWorld(view, options) {
 function constructReplayOpening(initialView, latestView, options) {
     const latest = observeBeliefs(latestView);
     observeBeliefs(initialView);
-    if (latestView.side !== initialView.side || latestView.turn <= initialView.turn || latest.issues.length ||
+    if (latestView.side !== initialView.side || latestView.turn < initialView.turn || latest.issues.length ||
+            latestView.turn === initialView.turn && latestView.log.length <= initialView.log.length ||
             initialView.log.some((line, i) => latestView.log[i] !== line))
         throw new Error('replay opening requires later evidence extending the initial player observation');
     // past revealed moves used only for reconstruction at the later decision

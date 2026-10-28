@@ -5,7 +5,9 @@ const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {constructMoveHistoryWorld, replaySteps} = require('./move_history_world');
 const {proposeOwnSwitchTurns} = require('./opening_proposals');
 const {compareSwitchTurns, searchSettings} = require('./opening_search');
-const {restorePosition, playerObservation} = require('./position_simulator');
+const {restorePosition, playerObservation, pendingSides} = require('./position_simulator');
+const {replacementActions, isPostKnockoutReplacement} = require('./replacement_actions');
+const {checkWorldChoice} = require('./opening_actions');
 
 async function searchMoveHistory(history, options, gate) {
     const settings = searchSettings(options), replay = replaySteps(history), started = performance.now();
@@ -19,9 +21,14 @@ async function searchMoveHistory(history, options, gate) {
         reason, unsupported, settings, reconstruction_nodes: reconstructionNodes, search_nodes: 0,
         nodes: reconstructionNodes, proposals, training_eligible: false, strength_claim: false,
         elapsed_seconds: (performance.now() - started) / 1000});
+    if (view.ended) return {...stop('battle_ended'), terminal: true, fallback_required: false};
+    if (view.phase === 'switch' && view.request?.wait)
+        return {...stop('waiting_for_opponent_replacement'), waiting: true, fallback_required: false};
     if (replay.unsupported.length) return stop('unsupported_move_history', replay.unsupported);
+    const replacing = view.phase === 'switch';
     let candidates;
-    try { candidates = proposeOwnSwitchTurns(view, settings.candidates, rng, settings.proposal_mode); }
+    try { candidates = replacing ? replacementActions(view) :
+        proposeOwnSwitchTurns(view, settings.candidates, rng, settings.proposal_mode); }
     catch (error) {
         if (!/move action space outside supported bound/.test(error.message)) throw error;
         return stop('no_supported_ordinary_moves');
@@ -40,6 +47,12 @@ async function searchMoveHistory(history, options, gate) {
         if (!world.supported) return stop('history_world_construction_failed', world.unsupported);
         const battle = restorePosition(world.position, {mode: 'sample', seed: seedOf()});
         try {
+            if (replacing) {
+                if (!isPostKnockoutReplacement(battle) || !pendingSides(battle).includes(view.side))
+                    return stop('unsupported_midturn_replacement');
+                worlds.push({position: world.position});
+                continue;
+            }
             const other = view.side === 'p1' ? 'p2' : 'p1';
             const proposal = proposeOwnSwitchTurns(playerObservation(battle, other), settings.responses, rng,
                 settings.response_proposal_mode);
@@ -52,6 +65,19 @@ async function searchMoveHistory(history, options, gate) {
     const comparisonTime = remainingTime();
     if (comparisonTime < 1 || reconstructionNodes >= settings.max_nodes)
         return stop('construction_budget_exhausted');
+    if (replacing) {
+        // legal replacement incumbent without inventing a strategic ranking
+        for (const turn of candidates.turns) {
+            if (remainingTime() < 1) return stop('replacement_validation_budget_exhausted');
+            if (worlds.every(world => checkWorldChoice(world.position, view, turn.command,
+                {mode: 'sample', seed: seedOf()}).accepted))
+                return {...stop(null), supported: true, fallback_required: false, selected_command: turn.command,
+                    decision_phase: 'replacement', ranked: false, selection_method: 'legal_replacement_incumbent',
+                    legal_choice_count: candidates.turns.length,
+                    limitation: 'Legal selection only without strategic replacement value estimation.'};
+        }
+        return stop('no_consistent_replacement');
+    }
     // one shared transition budget for history fitting and forward comparisons
     const result = await compareSwitchTurns(view, worlds, candidates.commands,
         {...settings, max_nodes: settings.max_nodes - reconstructionNodes, max_elapsed_ms: comparisonTime}, gate);
@@ -60,7 +86,7 @@ async function searchMoveHistory(history, options, gate) {
         fallback_required: !result.supported, proposals, candidate_coverage: candidates.coverage,
         response_coverage: worlds.map(world => world.proposal.coverage),
         elapsed_seconds: (performance.now() - started) / 1000,
-        limitations: ['Ordinary moves and voluntary switches only; no Tera, pivot or replacement policy.',
+        limitations: ['Ordinary moves, voluntary switches and legal replacement incumbents only; no Tera or pivot policy.',
             'Accepted worlds match history but are not a calibrated posterior.',
             'Only one future turn is scored with the existing HP and fainting heuristic.',
             'No command is returned until a candidate has been compared across every sampled world.',

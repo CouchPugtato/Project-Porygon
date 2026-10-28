@@ -6,20 +6,66 @@ const {createHash} = require('node:crypto');
 const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {Dex, toID} = require('../external/pokemon-showdown/dist/sim/dex');
 const {BattleActions} = require('../external/pokemon-showdown/dist/sim/battle-actions');
-const {FORMAT, advancePosition, restorePosition} = require('./position_simulator');
+const {FORMAT, advancePosition, restorePosition, pendingSides} = require('./position_simulator');
 const {observeBeliefs} = require('./belief_state');
 const {constructReplayOpening} = require('./opening_world');
 const {isOrdinaryMove} = require('./ordinary_moves');
+const {replacementActions, isPostKnockoutReplacement} = require('./replacement_actions');
 
 const EVENTS = new Set(['', 't:', 'turn', 'move', '-damage', '-heal', '-status', '-curestatus',
     '-activate', '-singleturn', '-fail', '-immune', '-supereffective', '-resisted', '-crit', '-miss',
-    'cant', 'upkeep', 'message', 'switch']);
+    'cant', 'upkeep', 'message', 'switch', 'faint', 'win', 'tie']);
+
+function validateOwnReplacement(previous, own, switches, issue) {
+    if (previous.request?.wait) {
+        // no synthetic pass command for a player without a pending request
+        if (own !== null) issue('waiting_player_must_not_submit_a_choice');
+        if (switches.size) issue('unexpected_own_replacement');
+        return;
+    }
+    let pool = [];
+    try { pool = replacementActions(previous).turns; } catch { issue('unsupported_replacement_request'); }
+    const command = typeof own === 'string' ? own.split(',').map(part => part.trim()).join(', ') : '';
+    if (!pool.some(turn => turn.command === command)) issue('invalid_own_replacement');
+    for (const [slot, part] of command.split(', ').entries()) {
+        if (!part.startsWith('switch ')) continue;
+        const mon = previous.request.side.pokemon[Number(part.slice(7)) - 1];
+        if (switches.get(slot) !== mon?.ident) issue('own_switch_evidence_mismatch');
+        switches.delete(slot);
+    }
+    if (switches.size) issue('uncommanded_own_switch');
+}
+
+function validateOwnMoveTurn(previous, own, switches, faintedOwn, ownMoved, issue) {
+    if (typeof own !== 'string' || own.split(',').length !== 2) { issue('complete_own_moves_required'); return; }
+    const destinations = new Set(), active = previous.request?.side?.pokemon?.filter(mon => mon.active);
+    for (const [slot, command] of own.split(',').entries()) {
+        const change = /^switch ([1-6])$/.exec(command.trim());
+        if (change) {
+            // destinations refer to the current roster rather than opening positions
+            const destination = Number(change[1]), mon = previous.request?.side?.pokemon?.[destination - 1];
+            if (!mon || mon.active || /(^0\b|\bfnt\b)/.test(mon.condition) ||
+                    previous.request?.active?.[slot]?.trapped || destinations.has(destination))
+                issue('invalid_own_switch_destination');
+            if (!mon || switches.get(slot) !== mon.ident) issue('own_switch_evidence_mismatch');
+            destinations.add(destination); switches.delete(slot);
+            continue;
+        }
+        if (command.trim() === 'pass' && active?.[slot]?.condition === '0 fnt') continue;
+        const match = /^move ([a-z0-9]+)(?: (-?[12]))?$/.exec(command.trim());
+        const moves = previous.request?.active?.[slot]?.moves || [];
+        const id = match && (/^\d+$/.test(match[1]) ? moves[Number(match[1]) - 1]?.id : toID(match[1]));
+        const cancelled = faintedOwn.has(active?.[slot]?.ident) && !ownMoved.has(slot);
+        if (!id || !isOrdinaryMove(id) && !cancelled) issue('unsupported_own_command');
+    }
+    if (switches.size) issue('uncommanded_own_switch');
+}
 
 function replaySteps(history) {
     if (!history || Object.keys(history).length !== 2 || !Array.isArray(history.observations) ||
             !Array.isArray(history.own_choices) || history.observations.length < 2 ||
-            history.observations.length > 4 || history.own_choices.length !== history.observations.length - 1)
-        throw new Error('supply two to four observations and one accepted own command per completed turn');
+            history.observations.length > 7 || history.own_choices.length !== history.observations.length - 1)
+        throw new Error('supply two to seven observations and one own command or wait marker per boundary');
     const observations = history.observations;
     const beliefs = observations.map(view => observeBeliefs(view));
     const unsupported = [], steps = [], dex = Dex.forFormat(FORMAT);
@@ -28,18 +74,28 @@ function replaySteps(history) {
     if (initial.turn !== 1) issue('opening_observation_required');
     const opponent = initial.side === 'p1' ? 'p2' : 'p1';
     for (const [i, view] of observations.entries()) {
-        if (view.side !== initial.side || view.phase !== 'move' || view.ended ||
-                view.turn !== i + 1 || !Array.isArray(view.request?.active) || view.request.active.length !== 2)
-            issue('consecutive_two_active_move_requests_required');
+        if (view.side !== initial.side || !['move', 'switch', 'ended'].includes(view.phase) ||
+                view.turn < 1 || view.turn > 4 || view.ended && i !== observations.length - 1 ||
+                view.phase === 'move' && (!Array.isArray(view.request?.active) || view.request.active.length !== 2))
+            issue('unsupported_decision_boundary');
+        if (view.phase === 'switch' && !view.request?.wait) {
+            try { replacementActions(view); } catch { issue('unsupported_pivot_or_replacement_request'); }
+        }
         if (beliefs[i].issues.length) issue('unsupported_observation_evidence');
         if (!i) continue;
         const previous = observations[i - 1];
+        if (previous.phase === 'ended' || view.turn < previous.turn || view.turn > previous.turn + 1 ||
+                previous.phase === 'switch' && view.phase === 'switch') issue('unsupported_boundary_transition');
         if (previous.log.some((line, j) => view.log[j] !== line)) issue('history_prefix_mismatch');
         const segment = view.log.slice(previous.log.length), commands = [null, null], switches = new Map();
-        const opposingDestinations = new Set();
+        const opposingDestinations = new Set(), faintedOpponents = new Set(), faintedOwn = new Set(), ownMoved = new Set();
         for (const line of segment) {
             const parts = line.split('|'), event = parts[1];
             if (!EVENTS.has(event)) issue(`unsupported_event_${event}`);
+            if (event === 'faint' && parts[2]?.startsWith(opponent))
+                faintedOpponents.add(parts[2].replace(/^(p[12])[ab]: /, '$1: '));
+            if (event === 'faint' && parts[2]?.startsWith(initial.side))
+                faintedOwn.add(parts[2].replace(/^(p[12])[ab]: /, '$1: '));
             if (event === 'switch') {
                 const actor = /^(p[12])([ab]): (.+)$/.exec(parts[2]);
                 if (!actor) issue('ambiguous_switch_identity');
@@ -63,6 +119,7 @@ function replaySteps(history) {
                 if (!isOrdinaryMove(move) || parts.some(part => part.startsWith('[from]')))
                     issue('unsupported_move_mechanics');
                 const actor = /^(p[12])([ab]): /.exec(parts[2]);
+                if (actor?.[1] === initial.side) ownMoved.add(actor[2] === 'a' ? 0 : 1);
                 if (actor?.[1] !== opponent) continue;
                 const slot = actor[2] === 'a' ? 0 : 1;
                 if (commands[slot]) issue('multiple_actions_for_opponent_slot');
@@ -76,51 +133,57 @@ function replaySteps(history) {
                 commands[slot] = `move ${move}${target}`;
             }
         }
-        if (commands.some(command => !command)) issue('opponent_action_not_observed');
-        const own = history.own_choices[i - 1];
-        if (typeof own !== 'string' || own.split(',').length !== 2) issue('complete_own_moves_required');
-        else {
-            const destinations = new Set();
-            for (const [slot, command] of own.split(',').entries()) {
-                const change = /^switch ([1-6])$/.exec(command.trim());
-                if (change) {
-                    // destinations refer to the roster order at this decision
-                    // switch back positions can differ from the opening roster
-                    const destination = Number(change[1]), mon = previous.request?.side?.pokemon?.[destination - 1];
-                    if (!mon || mon.active || /(^0\b|\bfnt\b)/.test(mon.condition) ||
-                            previous.request?.active?.[slot]?.trapped || destinations.has(destination))
-                        issue('invalid_own_switch_destination');
-                    if (!mon || switches.get(slot) !== mon.ident) issue('own_switch_evidence_mismatch');
-                    destinations.add(destination); switches.delete(slot);
-                    continue;
-                }
-                const match = /^move ([a-z0-9]+)(?: (-?[12]))?$/.exec(command.trim());
-                const moves = previous.request?.active?.[slot]?.moves || [];
-                const id = match && (/^\d+$/.test(match[1]) ? moves[Number(match[1]) - 1]?.id : toID(match[1]));
-                if (!id || !isOrdinaryMove(id)) issue('unsupported_own_command');
-            }
-            if (switches.size) issue('uncommanded_own_switch');
+        if (previous.phase === 'move') for (let slot = 0; slot < 2; ++slot) {
+            if (commands[slot]) continue;
+            const ident = beliefs[i - 1].opponent.active[slot === 0 ? 'a' : 'b'];
+            const known = beliefs[i - 1].opponent.pokemon.find(mon => mon.key === ident);
+            if (known?.fainted) commands[slot] = 'pass';
+            else if (faintedOpponents.has(ident)) commands[slot] = {unobserved_faint_action: true};
+            else issue('opponent_action_not_observed');
         }
-        steps.push({own_side: initial.side, own_command: own, opponent, opponent_actions: commands, expected: view});
+        const own = history.own_choices[i - 1];
+        if (previous.phase === 'switch') validateOwnReplacement(previous, own, switches, issue);
+        else validateOwnMoveTurn(previous, own, switches, faintedOwn, ownMoved, issue);
+        steps.push({own_side: initial.side, own_command: own, opponent, opponent_actions: commands,
+            phase: previous.phase, expected: view});
     }
     return {steps, unsupported};
 }
 
 function resolveReplayChoices(position, step, randomness) {
-    if (step.opponent_actions.every(action => typeof action === 'string'))
+    if (step.phase === 'move' && step.opponent_actions.every(action => typeof action === 'string'))
         return {[step.own_side]: step.own_command, [step.opponent]: step.opponent_actions.join(', ')};
     const battle = restorePosition(position, randomness);
     try {
         const side = battle.getSide(step.opponent);
-        const commands = step.opponent_actions.map(action => {
+        const pending = pendingSides(battle);
+        if (step.phase === 'switch' && !isPostKnockoutReplacement(battle))
+            throw new Error('unsupported midturn replacement in replay hypothesis');
+        const commands = step.opponent_actions.map((action, slot) => {
+            if (!action && step.phase === 'switch') return 'pass';
             if (typeof action === 'string') return action;
+            if (action.unobserved_faint_action) {
+                // hidden cancelled choices remain hypotheses without asserted move evidence
+                const mon = side.active[slot], moves = mon.getMoveRequestData().moves;
+                const index = moves.findIndex(move => !move.disabled && move.pp !== 0 &&
+                    battle.dex.moves.get(move.id).priority <= 0);
+                if (index < 0) throw new Error('no supported cancelled choice in replay hypothesis');
+                const move = moves[index];
+                const target = BattleActions.prototype.targetTypeChoices(move.target) ?
+                    [1, 2, -1, -2].find(loc => battle.validTargetLoc(loc, mon, move.target)) : 0;
+                if (target === undefined) throw new Error('no supported cancelled choice in replay hypothesis');
+                return `move ${index + 1}${target ? ` ${target}` : ''}`;
+            }
             // observed identity resolved against this hypothetical roster only
             // no inference of the real hidden party order
             const index = side.pokemon.findIndex(mon => mon.fullname === action.switch_ident);
             if (index < 0) throw new Error('replay hypothesis missing observed switch identity');
             return `switch ${index + 1}`;
         });
-        return {[step.own_side]: step.own_command, [step.opponent]: commands.join(', ')};
+        const choices = {};
+        if (pending.includes(step.own_side)) choices[step.own_side] = step.own_command;
+        if (pending.includes(step.opponent)) choices[step.opponent] = commands.join(', ');
+        return choices;
     } finally { battle.destroy(); }
 }
 
@@ -142,7 +205,8 @@ function constructMoveHistoryWorld(history, options = {}) {
         information_sha256: observeBeliefs(latest).information_sha256,
         assumptions: ['Accepted worlds reproduce every supplied player observation without state patching.',
             'Rule based proposals and matching chance samples are not a calibrated posterior.',
-            'Ordinary moves and observed voluntary switches are supported; unknown opposing actions require abstention.']};
+            'Ordinary moves, voluntary switches and post knockout replacements only; midturn pivots remain unsupported.',
+            'Unexecuted opposing choices cancelled by fainting are hypotheses rather than revealed moves.']};
     if (result.unsupported.length) return result;
     const proposalRng = new PRNG(settings.seed.join(',')), chanceRng = new PRNG(settings.chance_seed.join(','));
     const seedOf = rng => Array.from({length: 4}, () => rng.random(65536));
@@ -165,11 +229,19 @@ function constructMoveHistoryWorld(history, options = {}) {
                     next = advancePosition(position, choices, randomness);
                 }
                 catch (error) {
-                    if (!/\[(?:Invalid|Unavailable) choice\]|incomplete choice/.test(error.message)) throw error;
+                    if (!/\[(?:Invalid|Unavailable) choice\]|incomplete choice|unsupported midturn replacement|no supported cancelled choice/.test(error.message)) throw error;
                     reject('choice_rejected_in_hypothesis'); matched = false; break;
                 }
                 if (!isDeepStrictEqual(next.observations[initial.side], step.expected)) {
                     reject('observation_mismatch'); matched = false; break;
+                }
+                if (next.phase === 'switch') {
+                    const boundary = restorePosition(next.position, {mode: 'sample', seed: settings.chance_seed});
+                    try {
+                        if (!isPostKnockoutReplacement(boundary)) {
+                            reject('unsupported_midturn_replacement'); matched = false; break;
+                        }
+                    } finally { boundary.destroy(); }
                 }
                 position = next.position;
             }
