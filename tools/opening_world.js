@@ -76,14 +76,24 @@ function buildOpeningWorld(view, {seed, chance_seed, attempts = 16} = {}, moveEv
     if (!validSeed(seed) || !validSeed(chance_seed) || !Number.isInteger(attempts) || attempts < 1 || attempts > 32)
         throw new Error('opening worlds require independent proposal/chance seeds and at most 32 attempts');
     const beliefs = observeBeliefs(view);
-    if (moveEvidence) for (const known of beliefs.opponent.pokemon) {
-        const later = moveEvidence.opponent.pokemon.find(mon => mon.key === known.key);
-        if (later) known.moves = [...new Set([...known.moves, ...later.moves])].sort();
+    const openingIssues = openingUnsupported(view, beliefs);
+    if (moveEvidence) {
+        for (const later of moveEvidence.opponent.pokemon) {
+            const known = beliefs.opponent.pokemon.find(mon => mon.key === later.key);
+            if (known) known.moves = [...new Set([...known.moves, ...later.moves])].sort();
+            else {
+                // later revealed reserves present from the opening in replay worlds
+                // sampled unrevealed builds rather than copied hidden sets
+                beliefs.opponent.pokemon.push(structuredClone(later));
+            }
+        }
+        beliefs.opponent.unrevealed_count = Math.max(0,
+            beliefs.opponent.team_size - beliefs.opponent.pokemon.length);
     }
     const result = {version: 1, kind: 'opening_hypothetical_world', scope: 'initial_move_request',
         information_sha256: beliefs.information_sha256, proposal_seed: [...seed], chance_seed: [...chance_seed],
         supported: false, simulation_ready: false, search_ready: false, training_eligible: false,
-        position: null, attempts: 0, rejected: {}, unsupported: openingUnsupported(view, beliefs),
+        position: null, attempts: 0, rejected: {}, unsupported: openingIssues,
         assumptions: ['Rule-based roster proposals are not calibrated hidden-state probabilities.',
             'Unknown reserves use legal species and levels, not random-generator frequencies.',
             'Own stats use one legal equivalent IV/EV/nature tuple, not a recovered true build.',

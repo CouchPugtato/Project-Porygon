@@ -6,7 +6,7 @@ const {createHash} = require('node:crypto');
 const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {Dex, toID} = require('../external/pokemon-showdown/dist/sim/dex');
 const {BattleActions} = require('../external/pokemon-showdown/dist/sim/battle-actions');
-const {FORMAT, advancePosition} = require('./position_simulator');
+const {FORMAT, advancePosition, restorePosition} = require('./position_simulator');
 const {observeBeliefs} = require('./belief_state');
 const {constructReplayOpening} = require('./opening_world');
 const {isOrdinaryMove} = require('./ordinary_moves');
@@ -36,12 +36,22 @@ function replaySteps(history) {
         const previous = observations[i - 1];
         if (previous.log.some((line, j) => view.log[j] !== line)) issue('history_prefix_mismatch');
         const segment = view.log.slice(previous.log.length), commands = [null, null], switches = new Map();
+        const opposingDestinations = new Set();
         for (const line of segment) {
             const parts = line.split('|'), event = parts[1];
             if (!EVENTS.has(event)) issue(`unsupported_event_${event}`);
             if (event === 'switch') {
                 const actor = /^(p[12])([ab]): (.+)$/.exec(parts[2]);
-                if (!actor || actor[1] !== initial.side) issue('opponent_switch_not_supported');
+                if (!actor) issue('ambiguous_switch_identity');
+                else if (actor[1] === opponent) {
+                    const slot = actor[2] === 'a' ? 0 : 1, ident = `${actor[1]}: ${actor[3]}`;
+                    const earlier = beliefs[i - 1].opponent;
+                    if (Object.values(earlier.active).includes(ident) || opposingDestinations.has(ident) ||
+                            earlier.pokemon.some(mon => mon.key === ident && mon.fainted))
+                        issue('invalid_observed_opponent_switch');
+                    if (commands[slot]) issue('multiple_actions_for_opponent_slot');
+                    commands[slot] = {switch_ident: ident}; opposingDestinations.add(ident);
+                }
                 else {
                     const slot = actor[2] === 'a' ? 0 : 1;
                     if (switches.has(slot)) issue('multiple_switches_for_own_slot');
@@ -55,7 +65,7 @@ function replaySteps(history) {
                 const actor = /^(p[12])([ab]): /.exec(parts[2]);
                 if (actor?.[1] !== opponent) continue;
                 const slot = actor[2] === 'a' ? 0 : 1;
-                if (commands[slot]) issue('multiple_moves_for_opponent_slot');
+                if (commands[slot]) issue('multiple_actions_for_opponent_slot');
                 const targetType = dex.moves.get(move).target;
                 let target = '';
                 if (BattleActions.prototype.targetTypeChoices(targetType)) {
@@ -91,9 +101,27 @@ function replaySteps(history) {
             }
             if (switches.size) issue('uncommanded_own_switch');
         }
-        steps.push({choices: {[initial.side]: own, [opponent]: commands.join(', ')}, expected: view});
+        steps.push({own_side: initial.side, own_command: own, opponent, opponent_actions: commands, expected: view});
     }
     return {steps, unsupported};
+}
+
+function resolveReplayChoices(position, step, randomness) {
+    if (step.opponent_actions.every(action => typeof action === 'string'))
+        return {[step.own_side]: step.own_command, [step.opponent]: step.opponent_actions.join(', ')};
+    const battle = restorePosition(position, randomness);
+    try {
+        const side = battle.getSide(step.opponent);
+        const commands = step.opponent_actions.map(action => {
+            if (typeof action === 'string') return action;
+            // observed identity resolved against this hypothetical roster only
+            // no inference of the real hidden party order
+            const index = side.pokemon.findIndex(mon => mon.fullname === action.switch_ident);
+            if (index < 0) throw new Error('replay hypothesis missing observed switch identity');
+            return `switch ${index + 1}`;
+        });
+        return {[step.own_side]: step.own_command, [step.opponent]: commands.join(', ')};
+    } finally { battle.destroy(); }
 }
 
 function constructMoveHistoryWorld(history, options = {}) {
@@ -114,7 +142,7 @@ function constructMoveHistoryWorld(history, options = {}) {
         information_sha256: observeBeliefs(latest).information_sha256,
         assumptions: ['Accepted worlds reproduce every supplied player observation without state patching.',
             'Rule based proposals and matching chance samples are not a calibrated posterior.',
-            'Only ordinary moves and accepted own voluntary switches are supported; unknown opposing actions require abstention.']};
+            'Ordinary moves and observed voluntary switches are supported; unknown opposing actions require abstention.']};
     if (result.unsupported.length) return result;
     const proposalRng = new PRNG(settings.seed.join(',')), chanceRng = new PRNG(settings.chance_seed.join(','));
     const seedOf = rng => Array.from({length: 4}, () => rng.random(65536));
@@ -131,7 +159,11 @@ function constructMoveHistoryWorld(history, options = {}) {
                 if (exhausted()) { matched = false; break; }
                 ++result.nodes;
                 let next;
-                try { next = advancePosition(position, step.choices, {mode: 'sample', seed: seedOf(chanceRng)}); }
+                try {
+                    const randomness = {mode: 'sample', seed: seedOf(chanceRng)};
+                    const choices = resolveReplayChoices(position, step, randomness);
+                    next = advancePosition(position, choices, randomness);
+                }
                 catch (error) {
                     if (!/\[(?:Invalid|Unavailable) choice\]|incomplete choice/.test(error.message)) throw error;
                     reject('choice_rejected_in_hypothesis'); matched = false; break;

@@ -3,8 +3,8 @@
 const {performance} = require('node:perf_hooks');
 const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {constructMoveHistoryWorld, replaySteps} = require('./move_history_world');
-const {proposeOrdinaryTurns, proposeOwnSwitchTurns} = require('./opening_proposals');
-const {compareOwnSwitchTurns, searchSettings} = require('./opening_search');
+const {proposeOwnSwitchTurns} = require('./opening_proposals');
+const {compareSwitchTurns, searchSettings} = require('./opening_search');
 const {restorePosition, playerObservation} = require('./position_simulator');
 
 async function searchMoveHistory(history, options, gate) {
@@ -41,7 +41,7 @@ async function searchMoveHistory(history, options, gate) {
         const battle = restorePosition(world.position, {mode: 'sample', seed: seedOf()});
         try {
             const other = view.side === 'p1' ? 'p2' : 'p1';
-            const proposal = proposeOrdinaryTurns(playerObservation(battle, other), settings.responses, rng,
+            const proposal = proposeOwnSwitchTurns(playerObservation(battle, other), settings.responses, rng,
                 settings.response_proposal_mode);
             worlds.push({position: world.position, responses: proposal.commands, proposal});
         } catch (error) {
@@ -53,14 +53,14 @@ async function searchMoveHistory(history, options, gate) {
     if (comparisonTime < 1 || reconstructionNodes >= settings.max_nodes)
         return stop('construction_budget_exhausted');
     // one shared transition budget for history fitting and forward comparisons
-    const result = await compareOwnSwitchTurns(view, worlds, candidates.commands,
+    const result = await compareSwitchTurns(view, worlds, candidates.commands,
         {...settings, max_nodes: settings.max_nodes - reconstructionNodes, max_elapsed_ms: comparisonTime}, gate);
     return {...result, scope: 'observation_only_move_history_search', settings,
         reconstruction_nodes: reconstructionNodes, search_nodes: result.nodes, nodes: reconstructionNodes + result.nodes,
         fallback_required: !result.supported, proposals, candidate_coverage: candidates.coverage,
         response_coverage: worlds.map(world => world.proposal.coverage),
         elapsed_seconds: (performance.now() - started) / 1000,
-        limitations: ['Ordinary moves and own voluntary switches only; no opposing switches, Tera, pivot or replacement policy.',
+        limitations: ['Ordinary moves and voluntary switches only; no Tera, pivot or replacement policy.',
             'Accepted worlds match history but are not a calibrated posterior.',
             'Only one future turn is scored with the existing HP and fainting heuristic.',
             'No command is returned until a candidate has been compared across every sampled world.',

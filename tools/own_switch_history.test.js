@@ -62,7 +62,7 @@ test('switch proposals respect current roster positions and reject duplicate des
     } finally { battle.destroy(); }
 });
 
-test('opponent switches and mismatched own switch evidence abstain before replay', () => {
+test('forced opposing switches and mismatched own switch evidence abstain before replay', () => {
     const {battle, history} = ownSwitchFixture(ownSwitchSpecs()[0]);
     try {
         const duplicate = structuredClone(history); duplicate.own_choices[0] = 'switch 3, switch 3';
@@ -77,9 +77,11 @@ test('opponent switches and mismatched own switch evidence abstain before replay
     } finally { battle.destroy(); }
     const opposing = historyFixture({turns: [{p1: 'move 2, move 2', p2: 'switch 3, move 2'}]});
     try {
+        opposing.history.observations[1].log = opposing.history.observations[1].log.map(line =>
+            line.startsWith('|switch|p2a: Clefable|') ? line.replace('|switch|', '|drag|') : line);
         const result = constructMoveHistoryWorld(opposing.history, WORLD);
         assert.equal(result.supported, false); assert.equal(result.nodes, 0);
-        assert(result.unsupported.includes('opponent_switch_not_supported'));
+        assert(result.unsupported.includes('unsupported_event_drag'));
     } finally { opposing.battle.destroy(); }
 });
 

@@ -89,14 +89,15 @@ async function runOwnSwitchExperiment(gate) {
         } finally { base.battle.destroy(); }
         const opposing = historyFixture({turns: [{p1: 'move 2, move 2', p2: 'switch 3, move 2'}]});
         try {
+            opposing.history.observations[1].log = opposing.history.observations[1].log.map(line =>
+                line.startsWith('|switch|p2a: Clefable|') ? line.replace('|switch|', '|drag|') : line);
             const result = constructMoveHistoryWorld(opposing.history, WORLD);
-            assert.equal(result.supported, false); assert(result.unsupported.includes('opponent_switch_not_supported'));
+            assert.equal(result.supported, false); assert(result.unsupported.includes('unsupported_event_drag'));
             ++report.expected_abstentions;
         } finally { opposing.battle.destroy(); }
         report.loaded_set_generator_modules = loadedSetGenerators();
         assert.deepEqual(report.loaded_set_generator_modules, []);
-        report.limitations = ['No opponent switch, forced replacement, pivot or Tera reconstruction.',
-            'Own switches are evaluated against move only opposing responses.',
+        report.limitations = ['No forced replacement, pivot or Tera reconstruction.',
             'World conditional trap rejections are not proof of actual hidden trapping.',
             'No live deployment or strength claim from these fixtures.'];
         report.status = 'completed'; report.passed = true;

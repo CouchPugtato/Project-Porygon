@@ -184,4 +184,8 @@ function compareOwnSwitchTurns(view, worlds, commands, options, gate) {
     return compareTurns(view, worlds, commands, options, gate, ownSwitchActions, ordinaryActions);
 }
 
-module.exports = {searchOpening, compareOpeningTurns, compareOrdinaryTurns, compareOwnSwitchTurns, searchSettings};
+function compareSwitchTurns(view, worlds, commands, options, gate) {
+    return compareTurns(view, worlds, commands, options, gate, ownSwitchActions);
+}
+
+module.exports = {searchOpening, compareOpeningTurns, compareOrdinaryTurns, compareOwnSwitchTurns, compareSwitchTurns, searchSettings};

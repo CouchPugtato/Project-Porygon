@@ -22,7 +22,7 @@ function publicHealth(condition) {
     const match = /^(\d+)\/100(?: (brn|par|slp|frz|psn|tox))?$/.exec(condition || '');
     if (!match || Number(match[1]) < 1 || Number(match[1]) > 100) return null;
     const percent = Number(match[1]);
-    // Gen 9 uses ceil(percent), except a damaged Pokemon cannot display 100.
+    // rounded up percentages except a damaged pokemon cannot display full health
     return {display: condition, lower: percent === 100 ? 1 : (percent - 1) / 100,
         upper: percent >= 99 ? 1 : percent / 100, lower_inclusive: percent === 100,
         upper_inclusive: percent !== 99, fainted: false, status: match[2] || ''};
@@ -139,8 +139,8 @@ function sampleStats(rng) {
         const available = STATS.filter(stat => evs[stat] < 252);
         evs[available[rng.random(available.length)]] += 4;
     }
-    // An odd EV avoids Showdown's omitted-EV/level-50 intent warnings without
-    // changing a stat. This is not a claim about a random generator's spreads.
+    // odd investment to satisfy native intent checks without changing stats
+    // no assumption about investment frequencies in generated teams
     ++evs[STATS.find(stat => evs[stat] < 252)];
     return {ivs, evs};
 }
@@ -198,6 +198,8 @@ function sampleRevealedSets(beliefs, {seed, samples = 16, attempts_per_set = 32,
     for (let i = 0; i < samples; ++i) {
         const sets = [], selectedPools = [...pools];
         const usedSpecies = new Set(pools.map(p => p.species.baseSpecies));
+        const usedKeys = new Set(pools.map(p => p.evidence.key));
+        let placeholder = 1;
         for (let j = 0; include_unrevealed && j < beliefs.opponent.unrevealed_count; ++j) {
             const candidates = legalSpecies.filter(s => !usedSpecies.has(s.baseSpecies));
             if (!candidates.length) {
@@ -206,7 +208,11 @@ function sampleRevealedSets(beliefs, {seed, samples = 16, attempts_per_set = 32,
                 return result;
             }
             const species = pick(candidates); usedSpecies.add(species.baseSpecies);
-            const evidence = {key: `${beliefs.opponent.side}: Unrevealed ${j + 1}`,
+            // synthetic reserve identities distinct from observed nicknames
+            while (usedKeys.has(`${beliefs.opponent.side}: Unrevealed ${placeholder}`)) ++placeholder;
+            const key = `${beliefs.opponent.side}: Unrevealed ${placeholder++}`;
+            usedKeys.add(key);
+            const evidence = {key,
                 species: species.id, level: rng.random(1, 101), gender: '', moves: [],
                 ability: null, item: null, tera_type: null};
             selectedPools.push(poolFor(evidence));
