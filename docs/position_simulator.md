@@ -71,6 +71,8 @@ Timings have explicit units. The report records loaded simulator/adapter hashes
 and rejects loaded random-team/set-generation modules. This is not a complete
 audit of arbitrary file reads or provenance of historical model weights.
 
-Next gate: observation-based hypothetical world construction without published
-sets, followed by a shallow simultaneous-choice planner. Neither is implemented
-or claimed ready by a successful fixture report.
+The observation/fact and set-sampling boundary is documented in
+[belief_state.md](belief_state.md). An initial-turn-only world constructor is
+documented in [opening_world.md](opening_world.md). Later-turn construction and
+a shallow simultaneous-choice planner remain gates; neither is claimed ready
+by a successful fixture report.

@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const {Battle} = require('../../external/pokemon-showdown/dist/sim/battle');
 const {State} = require('../../external/pokemon-showdown/dist/sim/state');
+const {Dex} = require('../../external/pokemon-showdown/dist/sim/dex');
 const {FORMAT, capturePosition, restorePosition, playerObservation, advancePosition} = require('../position_simulator');
 
 const REPLAY = Object.freeze({mode: 'fixture-replay'});
@@ -11,7 +12,7 @@ const SELF_BUFFS = 'move 3, move 3';
 // Hand-authored mechanics fixtures, not competitive builds or sampled set lists.
 function teams() {
     const pokemon = (species, ability, moves, teraType) => ({species, ability, moves,
-        teraType, level: 100, gender: 'M', nature: 'Serious', item: ''});
+        teraType, level: 100, gender: Dex.species.get(species).gender || 'M', nature: 'Serious', item: ''});
     return [
         [pokemon('Pikachu', 'Static', ['thunderbolt', 'thunder', 'helpinghand', 'protect'], 'Electric'),
             pokemon('Blastoise', 'Torrent', ['watergun', 'protect', 'surf', 'flipturn'], 'Water'),
@@ -20,6 +21,10 @@ function teams() {
             pokemon('Bronzong', 'Levitate', ['tackle', 'protect', 'irondefense', 'trickroom'], 'Steel'),
             pokemon('Clefable', 'Magic Guard', ['moonblast', 'protect', 'helpinghand', 'thunderwave'], 'Fairy')],
     ];
+}
+
+function sixPokemon(selected) {
+    const [a, b] = teams(); selected[0].push(...b); selected[1].push(...a);
 }
 
 function createFixture({seed = [322, 1, 0, 1], changeTeams, prepare} = {}) {
@@ -46,6 +51,29 @@ function summary(position) {
             active: battle.sides.map(side => side.active.map(p => p && ({species: p.species.id,
                 hp: p.hp, maxhp: p.maxhp, tera: p.terastallized,
                 pp: p.moveSlots.map(move => move.pp)})))};
+    } finally { battle.destroy(); }
+}
+
+function openingFixtureChoices(position, seed) {
+    const battle = restorePosition(position, {mode: 'sample', seed});
+    try {
+        assert.equal(battle.turn, 1);
+        assert.equal(battle.requestState, 'move');
+        const choices = {};
+        for (const side of battle.sides) {
+            side.autoChoose();
+            choices[side.id] = side.getChoice().split(',').map((command, index) => {
+                const action = side.choice.actions[index];
+                const request = side.activeRequest.active[index].moves.find(m => m.id === action.moveid);
+                if (action.choice !== 'move' || action.targetLoc ||
+                        !['normal', 'any', 'adjacentFoe', 'adjacentAlly', 'adjacentAllyOrSelf'].includes(request?.target))
+                    return command.trim();
+                const target = [1, 2, -1, -2].find(loc => battle.validTargetLoc(loc, action.pokemon, request.target));
+                assert(target !== undefined, 'fixture auto-choice has no legal target');
+                return `${command.trim()} ${target}`;
+            }).join(', ');
+        }
+        return choices;
     } finally { battle.destroy(); }
 }
 
@@ -160,4 +188,5 @@ const scenarios = [
         verify(result) { assert.equal(result.ended, true); assert.equal(result.winner, 'FixtureA'); }},
 ];
 
-module.exports = {REPLAY, SELF_BUFFS, teams, createFixture, comparable, summary, checkReplay, scenarios};
+module.exports = {REPLAY, SELF_BUFFS, teams, createFixture, comparable, summary, checkReplay, scenarios,
+    openingFixtureChoices, sixPokemon};

@@ -23,11 +23,11 @@ function loadedSetGenerators() {
         /[\\/](?:random-battles|random-teams)(?:[\\/.])/.test(file));
 }
 
-async function sourceIdentity() {
+async function sourceIdentity(extraSources = []) {
     const files = [...Object.keys(require.cache).filter(file => file.startsWith(SIMULATOR + path.sep)),
         ...['tools/position_simulator.js', 'tools/position_simulator.test.js',
             'tools/position_simulator_experiment.js', 'tools/fixtures/position_simulator.js',
-            'tools/counterfactual_rollout.js', 'tools/tactical_teacher_smoke.js']
+            'tools/counterfactual_rollout.js', 'tools/tactical_teacher_smoke.js', ...extraSources]
             .map(file => path.join(ROOT, file))];
     const hashes = {};
     for (const filename of [...new Set(files)].sort())
@@ -104,29 +104,34 @@ async function runExperiment(gate) {
                 note: 'restore, validate choices, simulate, capture and project; excludes independent reference and resource waits'};
         }
     }
-    report.identity = await sourceIdentity();
     return report;
 }
 
-async function main(argv) {
-    if (argv.length !== 2 || argv[0] !== '--run-name' || !/^run_\d+_[a-z0-9_]+$/.test(argv[1]))
-        throw new Error('usage: node tools/position_simulator_experiment.js --run-name run_NNNN_name');
-    const directory = path.join(ROOT, 'models', 'diagnostics', argv[1]);
+async function publishExperiment(runName, execute = runExperiment, extraSources = []) {
+    if (!/^run_\d+_[a-z0-9_]+$/.test(runName)) throw new Error('expected run_NNNN_name');
+    const directory = path.join(ROOT, 'models', 'diagnostics', runName);
     await fs.mkdir(directory, {recursive: true});
     const lock = await acquireRunLock(directory);
     try {
         const filename = path.join(directory, 'report.json');
         try { await fs.stat(filename); throw new Error('report already exists; use a new run name'); }
         catch (error) { if (error.code !== 'ENOENT') throw error; }
-        const report = await runExperiment(createResourceGate(RESOURCE_SETTINGS));
-        report.run_name = argv[1];
+        const report = await execute(createResourceGate(RESOURCE_SETTINGS));
+        report.run_name = runName;
+        report.identity = await sourceIdentity(extraSources);
         await writeJsonAtomic(filename, report);
-        console.log(`[position-simulator] passed=${report.passed} report=${filename}`);
+        console.log(`[${report.diagnostic}] passed=${report.passed} report=${filename}`);
         if (!report.passed) throw new Error(report.failure);
     } finally { await lock.release(); }
+}
+
+async function main(argv) {
+    if (argv.length !== 2 || argv[0] !== '--run-name')
+        throw new Error('usage: node tools/position_simulator_experiment.js --run-name run_NNNN_name');
+    return publishExperiment(argv[1]);
 }
 
 if (require.main === module) main(process.argv.slice(2)).catch(error => {
     console.error(`[position-simulator] ${error.stack || error.message}`); process.exitCode = 1;
 });
-module.exports = {loadedSetGenerators, runExperiment};
+module.exports = {loadedSetGenerators, runExperiment, publishExperiment};
