@@ -33,7 +33,8 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
         budget_exhausted: false, comparison_complete: false, settings, decision_phase: view.phase,
         objective: 'uniform_world_mean_of_worst_response_chance_mean',
         leaf_score: 'hp_fraction_plus_two_per_survivor_delta_terminal_plus_or_minus_100',
-        calibrated_beliefs: false, training_eligible: false, strength_claim: false};
+        calibrated_beliefs: false, training_eligible: false, strength_claim: false,
+        capacity_wait_ms: 0, budget_stage: null};
     result.fixture_worlds = worlds.some(position => position.origin === 'fixture');
     const finish = reason => ({...result, reason, fallback_required: !result.supported,
         elapsed_seconds: (performance.now() - started) / 1000});
@@ -62,8 +63,18 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
     async function transition(position, choices, seed) {
         const key = JSON.stringify([position.state_json, choices, seed]);
         if (cache.has(key)) { ++result.cache_hits; return cache.get(key); }
-        if (result.nodes % 16 === 0) await gate?.waitForLaunch();
-        if (exhausted()) { result.budget_exhausted = true; return null; }
+        let waited = false;
+        if (result.nodes % 16 === 0 && gate) {
+            const waitStarted = performance.now();
+            await (gate.waitForCapacity?.() ?? gate.waitForLaunch?.());
+            result.capacity_wait_ms += performance.now() - waitStarted; waited = true;
+        }
+        if (exhausted()) {
+            result.budget_exhausted = true;
+            result.budget_stage = result.nodes >= settings.max_nodes ? 'node_limit' :
+                waited ? 'capacity_check_or_elapsed_limit' : 'elapsed_limit';
+            return null;
+        }
         ++result.nodes;
         try {
             const next = advancePosition(position, choices, {mode: 'sample', seed});
@@ -75,7 +86,10 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
     }
     async function continuation(position, baseline, depth, seed) {
         if (depth > 6 || exhausted()) {
-            if (exhausted()) result.budget_exhausted = true;
+            if (exhausted()) {
+                result.budget_exhausted = true;
+                result.budget_stage = result.nodes >= settings.max_nodes ? 'node_limit' : 'elapsed_limit';
+            }
             return null;
         }
         const chance = new PRNG(seed.join(','));

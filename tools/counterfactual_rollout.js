@@ -1452,40 +1452,39 @@ function createResourceGate(options) {
     let nextLaunchAt = 0;
     let lastPauseLogAt = 0;
 
-    return {
-        async waitForLaunch() {
-            const previous = queue;
-            let release;
-            queue = new Promise(resolve => { release = resolve; });
-            await previous;
-            try {
-                while (true) {
-                    const currentCpuTimes = cpuTimes();
-                    const cpuPercent = cpuPercentBetween(
-                        previousCpuTimes, currentCpuTimes);
-                    const memoryPercent = memoryUsedPercent();
-                    previousCpuTimes = currentCpuTimes;
-                    if (memoryPercent <= options.maxSystemMemoryPercent &&
-                            cpuPercent <= options.maxSystemCpuPercent) break;
-                    const now = Date.now();
-                    if (now - lastPauseLogAt >= 10000) {
-                        console.log(
-                            `[counterfactual] resource pause memory=${memoryPercent.toFixed(1)}%/` +
-                            `${options.maxSystemMemoryPercent}% cpu=${cpuPercent.toFixed(1)}%/` +
-                            `${options.maxSystemCpuPercent}%`
-                        );
-                        lastPauseLogAt = now;
-                    }
-                    await delay(options.resourceCheckSeconds * 1000);
+    async function wait(staggerLaunch) {
+        const previous = queue;
+        let release;
+        queue = new Promise(resolve => { release = resolve; });
+        await previous;
+        try {
+            while (true) {
+                const currentCpuTimes = cpuTimes();
+                const cpuPercent = cpuPercentBetween(previousCpuTimes, currentCpuTimes);
+                const memoryPercent = memoryUsedPercent();
+                previousCpuTimes = currentCpuTimes;
+                if (memoryPercent <= options.maxSystemMemoryPercent &&
+                        cpuPercent <= options.maxSystemCpuPercent) break;
+                const now = Date.now();
+                if (now - lastPauseLogAt >= 10000) {
+                    console.log(
+                        `[counterfactual] resource pause memory=${memoryPercent.toFixed(1)}%/` +
+                        `${options.maxSystemMemoryPercent}% cpu=${cpuPercent.toFixed(1)}%/` +
+                        `${options.maxSystemCpuPercent}%`
+                    );
+                    lastPauseLogAt = now;
                 }
+                await delay(options.resourceCheckSeconds * 1000);
+            }
+            // existing process work needs capacity checks without a new launch delay
+            if (staggerLaunch) {
                 const stagger = nextLaunchAt - Date.now();
                 if (stagger > 0) await delay(stagger);
                 nextLaunchAt = Date.now() + options.launchStaggerMilliseconds;
-            } finally {
-                release();
             }
-        },
-    };
+        } finally { release(); }
+    }
+    return {waitForLaunch: () => wait(true), waitForCapacity: () => wait(false)};
 }
 
 function limitUtf8(text, maximumBytes) {

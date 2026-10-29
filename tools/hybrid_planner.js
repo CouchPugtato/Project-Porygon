@@ -12,14 +12,14 @@ class HybridPlanner {
         this.fallback = fallback;
         this.gate = gate;
         this.stats = {decisions: 0, searched: 0, fallbacks: 0, waiting: 0, terminal: 0, reasons: {}, nodes: 0,
-            belief_rejections: {}};
+            belief_rejections: {}, search_failures: {}};
         this.memo = null;
     }
 
     async decide(view, acceptedOwn = null) {
         if (acceptedOwn === null && this.memo?.key === JSON.stringify(view))
             return structuredClone(this.memo.decision);
-        await this.gate?.waitForLaunch();
+        await (this.gate?.waitForCapacity?.() ?? this.gate?.waitForLaunch?.());
         const belief = this.beliefs.update(view, acceptedOwn);
         for (const [kind, count] of Object.entries(belief.rejections || {}))
             this.stats.belief_rejections[kind] = (this.stats.belief_rejections[kind] || 0) + count;
@@ -44,6 +44,10 @@ class HybridPlanner {
             return decision;
         }
         const reason = search?.reason || belief.reason;
+        if (search) {
+            const stage = search.budget_stage || search.reason;
+            this.stats.search_failures[stage] = (this.stats.search_failures[stage] || 0) + 1;
+        }
         ++this.stats.fallbacks;
         this.stats.reasons[reason] = (this.stats.reasons[reason] || 0) + 1;
         // fallback receives only the same player projection rather than a simulator handle
