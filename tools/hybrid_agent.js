@@ -43,7 +43,8 @@ class HybridAgent {
     async nextMessage(type) {
         const message = await this.baseline.nextMessage(type);
         if (type === 'episode_complete') return {...message, policy_tag: 'hybrid-search-eval-v1',
-            training_eligible: false, hybrid_coverage: structuredClone(this.planner.stats)};
+            training_eligible: false, hybrid_baseline_episode: message,
+            hybrid_coverage: structuredClone(this.planner.stats)};
         if (type !== 'action') return message;
         this.action = message;
         const decision = await this.planner.decide(this.view, this.rejected || this.acceptedOwn);

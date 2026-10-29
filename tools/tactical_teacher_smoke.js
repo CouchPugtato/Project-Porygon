@@ -11,7 +11,7 @@ const {
 const REPO_ROOT = path.resolve(__dirname, '..');
 const {createDecisionAudit} = require('./tactical_decision_audit');
 const {createTargetCollector} = require('./target_learning');
-const {targetPolicyTag} = require('./target_context');
+const {validateTargetEpisode} = require('./target_context');
 const {createTargetAudit} = require('./target_audit');
 
 async function hashFile(filename) {
@@ -44,8 +44,8 @@ function aggregateGames(games) {
 
 async function closeGame(streams, agents) {
     agents.forEach(agent => agent.terminate());
-    // Showdown's writeEnd checks atEOF; destroy() resolves the read stream a
-    // second time after a completed battle and throws before results are saved.
+    // input already closed after a completed battle
+    // avoiding a second stream completion before results are saved
     const cleanup = await Promise.allSettled([
         Promise.resolve().then(() => streams.omniscient.writeEnd()),
         ...agents.map(agent => Promise.resolve().then(() => agent.close())),
@@ -125,8 +125,8 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
                     driveRandom(stream, seeds.random));
             const drain = (async () => { for await (const chunk of streams.omniscient) { void chunk; } })();
             const results = Promise.all([...players, drain]);
-            // Attach rejection handling before the first simulator write can
-            // trigger a player error. The awaited result still reports it below.
+            // early rejection handling before simulator writes can trigger a player error
+            // awaited results still preserve the original failure
             results.catch(() => {});
             await streams.omniscient.write(
                 `>start ${JSON.stringify({formatid: config.format, seed: seeds.battle})}\n` +
@@ -164,15 +164,7 @@ async function playGame(sim, config, index, {opponent = 'parent', matchedTeams =
                 game.target_intervention = report;
             }
             if (config.target_sidecar) {
-                const report = teacher.episode;
-                if (report.policy_tag !== targetPolicyTag(config) ||
-                        (report.target_decoder || 'sample') !== (config.target_decoder || 'sample') ||
-                        !!report.target_slot_local !== !!config.target_slot_local || report.training_eligible !== false ||
-                        !Number.isSafeInteger(report.target_decisions) || report.target_decisions <= 0 ||
-                        !Number.isSafeInteger(report.learned_target_decisions) || report.learned_target_decisions < 0 ||
-                        report.learned_target_decisions > report.target_decisions)
-                    throw new Error('invalid evaluation-only learned target terminal record');
-                game.learned_targets = report;
+                game.learned_targets = validateTargetEpisode(teacher.episode, config);
             }
             return game;
         })();

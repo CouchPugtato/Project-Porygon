@@ -134,4 +134,18 @@ function targetPolicyTag(config) {
     return config.context_target_evaluation ? 'target-context-v1' : 'target-sidecar-v1';
 }
 
-module.exports = {validateContext, writeContext, compareContext, verifyReproduction, exportContext, contextFitEligible, targetPolicyTag};
+function validateTargetEpisode(episode, config) {
+    const report = episode.policy_tag === 'hybrid-search-eval-v1' && episode.training_eligible === false ?
+        episode.hybrid_baseline_episode : episode;
+    if (!report || report.policy_tag !== targetPolicyTag(config) ||
+            (report.target_decoder || 'sample') !== (config.target_decoder || 'sample') ||
+            !!report.target_slot_local !== !!config.target_slot_local || report.training_eligible !== false ||
+            !Number.isSafeInteger(report.target_decisions) || report.target_decisions <= 0 ||
+            !Number.isSafeInteger(report.learned_target_decisions) || report.learned_target_decisions < 0 ||
+            report.learned_target_decisions > report.target_decisions)
+        throw new Error('invalid evaluation-only learned target terminal record');
+    return report;
+}
+
+module.exports = {validateContext, writeContext, compareContext, verifyReproduction, exportContext, contextFitEligible,
+    targetPolicyTag, validateTargetEpisode};

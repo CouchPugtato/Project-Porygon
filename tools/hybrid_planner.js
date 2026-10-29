@@ -3,16 +3,21 @@
 const {PlannerBeliefs} = require('./planner_beliefs');
 const {searchBeliefWorlds, plannerSettings} = require('./planner_search');
 const {UnsupportedPlannerRequest} = require('./planner_actions');
+const {isDeepStrictEqual} = require('node:util');
+const {fitJointTransition, jointSettings} = require('./planner_joint_constraints');
 
 class HybridPlanner {
-    constructor({seed, beliefs = {}, search = {}}, fallback, gate) {
+    constructor({seed, beliefs = {}, search = {}, reconstruction = null}, fallback, gate) {
         if (typeof fallback !== 'function') throw new Error('an observation only fallback player is required');
         this.beliefs = new PlannerBeliefs({...beliefs, seed});
         this.search = plannerSettings({...search, seed});
         this.fallback = fallback;
         this.gate = gate;
+        this.reconstruction = reconstruction ? jointSettings({...reconstruction, seed}) : null;
+        this.reconstructionAttempted = false;
         this.stats = {decisions: 0, searched: 0, fallbacks: 0, waiting: 0, terminal: 0, reasons: {}, nodes: 0,
-            belief_rejections: {}, search_failures: {}};
+            belief_rejections: {}, search_failures: {}, reconstruction_attempts: 0, reconstructed_particles: 0,
+            reconstruction_nodes: 0, reconstruction_seconds: 0, searches_from_joint_reconstruction: 0};
         this.memo = null;
     }
 
@@ -20,7 +25,26 @@ class HybridPlanner {
         if (acceptedOwn === null && this.memo?.key === JSON.stringify(view))
             return structuredClone(this.memo.decision);
         await (this.gate?.waitForCapacity?.() ?? this.gate?.waitForLaunch?.());
-        const belief = this.beliefs.update(view, acceptedOwn);
+        let belief = this.beliefs.update(view, acceptedOwn);
+        const failure = this.beliefs.firstFailure;
+        if (this.reconstruction && !this.reconstructionAttempted && !belief.supported &&
+                failure?.history?.observations.length === 2 && this.beliefs.history.observations.length === 2 &&
+                isDeepStrictEqual(failure.simulation_trace?.expected, view)) {
+            this.reconstructionAttempted = true; ++this.stats.reconstruction_attempts;
+            const fitted = await fitJointTransition(failure, this.gate, this.reconstruction);
+            this.stats.reconstruction_nodes += fitted.proposals || 0;
+            this.stats.reconstruction_seconds += fitted.elapsed_seconds || 0;
+            if (fitted.validation_gate_passed) {
+                // only independently replayed complete projections enter the exact belief pool
+                // later boundaries still pass the normal full history validation path
+                this.beliefs.worlds = fitted.witnesses.map(witness => witness.position);
+                this.stats.reconstructed_particles += this.beliefs.worlds.length;
+                belief = this.beliefs.last = {...belief, supported: true, reason: null,
+                    particles: this.beliefs.worlds.length, rebuilt: this.beliefs.worlds.length,
+                    nodes: belief.nodes + fitted.proposals,
+                    elapsed_seconds: belief.elapsed_seconds + fitted.elapsed_seconds, joint_reconstructed: true};
+            }
+        }
         for (const [kind, count] of Object.entries(belief.rejections || {}))
             this.stats.belief_rejections[kind] = (this.stats.belief_rejections[kind] || 0) + count;
         if (view.ended || view.request?.wait) {
@@ -39,6 +63,7 @@ class HybridPlanner {
         this.stats.nodes += belief.nodes + (search?.nodes || 0);
         if (search?.supported) {
             ++this.stats.searched;
+            if (belief.joint_reconstructed) ++this.stats.searches_from_joint_reconstruction;
             const decision = {command: search.selected_command, source: 'search', belief, search};
             this.memo = {key: JSON.stringify(view), decision: structuredClone(decision)};
             return decision;

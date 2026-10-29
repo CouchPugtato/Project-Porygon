@@ -6,6 +6,7 @@ const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {TeamValidator} = require('../external/pokemon-showdown/dist/sim/team-validator');
 const {observeBeliefs, sampleRevealedSets} = require('./belief_state');
 const {FORMAT, capturePosition, playerObservation} = require('./position_simulator');
+const {validateHypotheticalSet, validateHypotheticalTeam} = require('./hypothesis_legality');
 
 const STATS = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
 
@@ -51,7 +52,7 @@ function recoverOwnSet(entry, validator) {
         if (!fits || Object.values(set.evs).reduce((a, b) => a + b, 0) > 508) continue;
         ++set.evs[STATS.find(stat => set.evs[stat] < 252)];
         const candidate = structuredClone(set);
-        if (!validator.validateSet(candidate, {})) return candidate;
+        if (!validateHypotheticalSet(candidate)) return candidate;
     }
     return null;
 }
@@ -106,9 +107,6 @@ function buildOpeningWorld(view, {seed, chance_seed, attempts = 16, proposal_set
             'Opening startup is simulated; exact player projection must match before acceptance.']};
     if (result.unsupported.length) return result;
     const setValidator = new TeamValidator(FORMAT);
-    // random team delivery disabled while retaining native format rules
-    // explicit team validation without invoking a set generator
-    const teamValidator = new TeamValidator({...setValidator.format, team: undefined});
     const own = [];
     for (const entry of view.request.side.pokemon) {
         const set = recoverOwnSet(entry, setValidator);
@@ -146,7 +144,9 @@ function buildOpeningWorld(view, {seed, chance_seed, attempts = 16, proposal_set
             return {...structuredClone(hypothesis.set), name: key.slice(4)};
         });
         const teams = view.side === 'p1' ? [structuredClone(own), opponent] : [opponent, structuredClone(own)];
-        if (teams.some(team => teamValidator.validateTeam(team))) { reject('team_legality'); continue; }
+        if (teams.some(team => team.some(set => validateHypotheticalSet(set)) || validateHypotheticalTeam(team))) {
+            reject('team_legality'); continue;
+        }
         let battle;
         try {
             battle = new Battle({formatid: FORMAT, seed: nextSeed(chanceRng).join(','), strictChoices: true,

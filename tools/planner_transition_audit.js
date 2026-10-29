@@ -11,6 +11,9 @@ const {observedResponses, nextSeed, choiceFailure} = require('./planner_beliefs'
 const {mismatchEvidence} = require('./planner_evidence');
 const {publishExperiment} = require('./position_simulator_experiment');
 const {recordHash} = require('./hybrid_benchmark');
+const {firstDamageFeasibility} = require('./planner_damage_feasibility');
+const {auditDefensiveProposals} = require('./planner_stat_constraints');
+const {fitJointTransition} = require('./planner_joint_constraints');
 
 async function auditTransition(failure, gate, {samples = 128, max_elapsed_ms = 2000} = {}) {
     if (!Number.isInteger(samples) || samples < 1 || samples > 256 || !Number.isInteger(max_elapsed_ms) ||
@@ -45,6 +48,7 @@ async function auditTransition(failure, gate, {samples = 128, max_elapsed_ms = 2
         recorded_pair_inferred: inferred.includes(trace.choices[opponent] || null),
         initial_mismatch: mismatchEvidence(trace.actual, trace.expected), closest_mismatch: null,
         training_eligible: false, strength_claim: false};
+    report.first_damage_feasibility = firstDamageFeasibility(trace);
     const rng = new PRNG('343,1,2,3');
     for (let sample = 0; sample < samples; ++sample) {
         if (sample % 16 === 0) await (gate?.waitForCapacity?.() ?? gate?.waitForLaunch?.());
@@ -79,17 +83,23 @@ async function main(argv) {
                 assert.equal(game.record_hash, recordHash(game), 'captured benchmark record integrity changed');
                 assert.equal(game.first_belief_failure?.simulation_trace?.position?.origin, 'belief-sample');
                 const result = await auditTransition(game.first_belief_failure, gate);
+                result.defensive_proposal_audit = await auditDefensiveProposals(game.first_belief_failure, gate);
+                result.joint_proposal_audit = await fitJointTransition(game.first_belief_failure, gate);
                 report.cases.push({side: game.teacher_side, ...result});
                 assert(result.exact_branch_replay && result.synthetic_inference_control);
             }
             assert(report.cases.length > 0); report.passed = true;
+            report.verified_joint_cases = report.cases.filter(result => result.joint_proposal_audit.validation_gate_passed).length;
+            report.reconstruction_gate_passed = report.verified_joint_cases === report.cases.length;
         } catch (error) { report.failure = error.stack || error.message; }
         report.limitations = ['Captured snapshots contain sampled hypotheses rather than actual opposing hidden state.',
-            'The audit holds the sampled build and command pair fixed while changing chance seeds.',
+            'The chance subaudit fixes the build and choices while the joint subaudit proposes legal hidden stats.',
             'Failure to match within this budget is not proof that no consistent hidden state exists.',
             'No observations are normalized away or patched to force a match.'];
         return report;
-    }, ['tools/planner_transition_audit.js', 'tools/hybrid_benchmark.js', 'tools/planner_beliefs.js', 'tools/planner_evidence.js',
+    }, ['tools/planner_transition_audit.js', 'tools/planner_damage_feasibility.js', 'tools/planner_stat_constraints.js',
+        'tools/planner_joint_constraints.js', 'tools/hypothesis_legality.js',
+        'tools/opening_world.js', 'tools/hybrid_benchmark.js', 'tools/planner_beliefs.js', 'tools/planner_evidence.js',
         'tools/belief_state.js', 'tools/planner_actions.js', 'tools/opening_actions.js',
         path.relative(path.resolve(__dirname, '..'), filename)]);
 }

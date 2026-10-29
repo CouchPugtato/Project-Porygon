@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const {TeamValidator} = require('../external/pokemon-showdown/dist/sim/team-validator');
 const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {toID} = require('../external/pokemon-showdown/dist/sim/dex');
+const {validateHypotheticalSet} = require('./hypothesis_legality');
 
 const FORMAT = 'gen9randomdoublesbattle';
 const STATS = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
@@ -133,6 +134,12 @@ function observeBeliefs(view) {
 
 function sampleStats(rng) {
     const ivs = Object.fromEntries(STATS.map(stat => [stat, rng.random(32)]));
+    // some native acquisition rules require several perfect inherited stats
+    // mix those legal regions with unrestricted proposals without a set catalog
+    const region = rng.random(4), perfect = [...STATS];
+    for (let i = 0; i < (region === 0 ? 6 : region === 1 ? 3 : 0); ++i) {
+        const index = rng.random(perfect.length); ivs[perfect.splice(index, 1)[0]] = 31;
+    }
     const evs = Object.fromEntries(STATS.map(stat => [stat, 0]));
     const budget = rng.random(128);
     for (let i = 0; i < budget; ++i) {
@@ -232,7 +239,7 @@ function sampleRevealedSets(beliefs, {seed, samples = 16, attempts_per_set = 32,
                     item: evidence.item === null ? pick(items) : evidence.item.current,
                     teraType: evidence.tera_type || pick(types), moves,
                     nature: pick(natures), ...sampleStats(rng)};
-                const problems = validator.validateSet(set, {});
+                const problems = validateHypotheticalSet(set);
                 if (!problems) { accepted = set; break; }
             }
             if (!accepted) {

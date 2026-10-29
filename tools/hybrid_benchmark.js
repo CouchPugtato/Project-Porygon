@@ -11,15 +11,20 @@ const {summarize, isValid} = require('./tactical_teacher_benchmark');
 const {HybridAgent} = require('./hybrid_agent');
 const {plannerSettings} = require('./planner_search');
 const {PlannerBeliefs} = require('./planner_beliefs');
+const {contextFitEligible} = require('./target_context');
+const {jointSettings} = require('./planner_joint_constraints');
 
 const ROOT = path.resolve(__dirname, '..');
 const SOURCES = ['hybrid_benchmark.js', 'hybrid_agent.js', 'hybrid_planner.js', 'planner_beliefs.js',
     'planner_evidence.js', 'planner_recovery.js', 'planner_search.js', 'planner_matrix.js', 'planner_value.js',
     'planner_actions.js', 'opening_world.js', 'opening_actions.js', 'opening_proposals.js', 'belief_state.js',
     'position_simulator.js', 'replacement_actions.js', 'counterfactual_rollout.js', 'tactical_teacher_smoke.js',
-    'tactical_teacher_benchmark.js'];
+    'tactical_teacher_benchmark.js', 'target_context.js', 'planner_joint_constraints.js', 'hypothesis_legality.js'];
 
 function validateBenchmark(config) {
+    if (config.target_sidecar && (!config.candidate_checkpoint || config.context_target_evaluation !== true ||
+            config.target_decoder !== 'argmax' || config.target_slot_local !== true))
+        throw new Error('hybrid targeting requires the confirmed student and slot local contextual evaluation mode');
     if (config.format !== 'gen9randomdoublesbattle' || config.agent_omp_threads !== 1 ||
             !Number.isInteger(config.games_per_side) || config.games_per_side < 1 || config.games_per_side > 1000 ||
             !Number.isInteger(config.seed) || config.seed < 1 || config.seed > 2147480000 ||
@@ -38,6 +43,7 @@ function validateBenchmark(config) {
         if (!/^[a-z0-9_]+$/.test(profile.name) || typeof profile.baseline !== 'boolean') throw new Error('invalid profile');
         plannerSettings({...profile.search, seed: [1, 2, 3, 4]});
         new PlannerBeliefs({...profile.beliefs, seed: [1, 2, 3, 4]});
+        if (profile.reconstruction) jointSettings(profile.reconstruction);
     }
     return config;
 }
@@ -63,7 +69,8 @@ async function runLiveGame(sim, config, profile, job, gate) {
                     path.resolve(ROOT, config.checkpoint), seeds.inference[1 - side], null, 1, true);
                 if (!profile.baseline) {
                     const seed = [config.seed & 65535, job.index + 1, 11, 12];
-                    wrapper = new HybridAgent(agents[side], {seed, beliefs: profile.beliefs, search: profile.search}, gate);
+                    wrapper = new HybridAgent(agents[side], {seed, beliefs: profile.beliefs, search: profile.search,
+                        reconstruction: profile.reconstruction}, gate);
                     agents[side] = wrapper;
                 }
                 return agents;
@@ -129,13 +136,21 @@ function validateLiveResume(saved, identity, jobs) {
 async function main(argv) {
     const args = {};
     for (let i = 0; i < argv.length; i += 2) {
-        if (!['--run-name', '--config', '--smoke'].includes(argv[i]) || !argv[i + 1]) throw new Error('expected named argument pairs');
+        if (!['--run-name', '--config', '--smoke', '--seed', '--joint-reconstruction'].includes(argv[i]) || !argv[i + 1])
+            throw new Error('expected named argument pairs');
         args[argv[i]] = argv[i + 1];
     }
     if (!/^run_\d+_[a-z0-9_]+$/.test(args['--run-name'] || '') ||
-            args['--smoke'] !== undefined && !['0', '1'].includes(args['--smoke'])) throw new Error('invalid run name or smoke flag');
-    const config = validateBenchmark(JSON.parse(await fs.readFile(path.resolve(ROOT,
-        args['--config'] || 'config/experimental/hybrid_benchmark.json'), 'utf8')));
+            args['--smoke'] !== undefined && !['0', '1'].includes(args['--smoke']) ||
+            args['--joint-reconstruction'] !== undefined && !['0', '1'].includes(args['--joint-reconstruction']))
+        throw new Error('invalid run name or experiment flag');
+    const config = JSON.parse(await fs.readFile(path.resolve(ROOT,
+        args['--config'] || 'config/experimental/hybrid_benchmark.json'), 'utf8'));
+    if (args['--seed'] !== undefined) config.seed = Number(args['--seed']);
+    if (args['--joint-reconstruction'] !== undefined) for (const profile of config.profiles)
+        if (!profile.baseline) profile.reconstruction = args['--joint-reconstruction'] === '1' ?
+            {max_nodes: 2048, max_elapsed_ms: 5000, seeds: 16, particles: 2} : null;
+    validateBenchmark(config);
     const smoke = args['--smoke'] === '1', jobs = schedule(config, smoke);
     if (smoke) config.battle_timeout_seconds = Math.min(30, config.battle_timeout_seconds);
     const directory = path.join(ROOT, 'matches/runs', args['--run-name']);
@@ -144,6 +159,19 @@ async function main(argv) {
     try {
         const identity = {config, smoke, executable: await hashFile(path.join(ROOT, 'build-fresh/showdown_client.exe')),
             checkpoint: await hashFile(path.resolve(ROOT, config.checkpoint)), sources: {}};
+        identity.candidate_checkpoint = await hashFile(path.resolve(ROOT, config.candidate_checkpoint || config.checkpoint));
+        if (config.target_sidecar) {
+            const sidecar = path.resolve(ROOT, config.target_sidecar), metadataPath = `${sidecar}.meta.json`;
+            const reportPath = path.join(path.dirname(sidecar), 'context_export.json');
+            const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+            const fitReport = JSON.parse(await fs.readFile(reportPath, 'utf8'));
+            identity.target_sidecar = {sha256: await hashFile(sidecar), metadata_sha256: await hashFile(metadataPath),
+                fit_report_sha256: await hashFile(reportPath)};
+            if (!contextFitEligible(metadata, fitReport) || metadata.parent_sha256 !== identity.candidate_checkpoint ||
+                    metadata.sidecar_sha256 !== identity.target_sidecar.sha256 ||
+                    metadata.fit_report_sha256 !== identity.target_sidecar.fit_report_sha256)
+                throw new Error('confirmed fallback provenance or evaluation eligibility changed');
+        }
         for (const source of SOURCES) identity.sources[source] = await hashFile(path.join(__dirname, source));
         // environment set generation isolated from observation only planner inputs
         const sim = require('../external/pokemon-showdown/dist/sim');
