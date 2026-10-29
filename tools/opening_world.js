@@ -80,7 +80,11 @@ function buildOpeningWorld(view, {seed, chance_seed, attempts = 16} = {}, moveEv
     if (moveEvidence) {
         for (const later of moveEvidence.opponent.pokemon) {
             const known = beliefs.opponent.pokemon.find(mon => mon.key === later.key);
-            if (known) known.moves = [...new Set([...known.moves, ...later.moves])].sort();
+            if (known) {
+                known.moves = [...new Set([...known.moves, ...later.moves])].sort();
+                // revealed tera type constrains replay proposals rather than earlier decisions
+                known.tera_type = later.tera_type;
+            }
             else {
                 // later revealed reserves present from the opening in replay worlds
                 // sampled unrevealed builds rather than copied hidden sets

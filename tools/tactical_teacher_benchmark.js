@@ -42,7 +42,7 @@ function summarize(games, opponents = OPPONENTS) {
         };
         results[opponent] = {...tally(records), sides: Object.fromEntries(['a', 'b'].map(side =>
             [side, tally(records.filter(game => game.teacher_side === side))])),
-        coverage: records.some(game => game.policy_mode === 'neural') ? null : aggregateGames(records.filter(isValid)),
+        coverage: records.some(game => ['neural', 'hybrid'].includes(game.policy_mode)) ? null : aggregateGames(records.filter(isValid)),
         choice_rejections: records.reduce((sum, game) => sum + (game.choice_rejections?.length || 0), 0)};
         if (records.some(game => game.target_intervention)) {
             const valid = records.filter(isValid);

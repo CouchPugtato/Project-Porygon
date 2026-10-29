@@ -62,8 +62,8 @@ async function runExperiment(gate) {
             const sampleStarted = performance.now();
             const result = advancePosition(parent, choices, {mode: 'sample', seed});
             durations.push(performance.now() - sampleStarted);
-            // Independent uninterrupted construction checks that sampled branch
-            // restoration agrees with Showdown, not just with a second adapter call.
+            // independent uninterrupted construction for sampled branches
+            // native reference rather than a second adapter call
             const reference = createFixture();
             try {
                 reference.prng = new PRNG(seed.join(','));
@@ -116,7 +116,8 @@ async function publishExperiment(runName, execute = runExperiment, extraSources 
         const filename = path.join(directory, 'report.json');
         try { await fs.stat(filename); throw new Error('report already exists; use a new run name'); }
         catch (error) { if (error.code !== 'ENOENT') throw error; }
-        const report = await execute(createResourceGate(RESOURCE_SETTINGS));
+        const context = {directory, identity: await sourceIdentity(extraSources)};
+        const report = await execute(createResourceGate(RESOURCE_SETTINGS), context);
         report.run_name = runName;
         report.identity = await sourceIdentity(extraSources);
         await writeJsonAtomic(filename, report);

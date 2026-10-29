@@ -88,4 +88,4 @@ function proposeOwnSwitchTurns(view, count, rng, mode = 'coverage') {
     return selectProposals(view, ownSwitchActions(view).turns, count, rng, mode);
 }
 
-module.exports = {proposeOpeningTurns, proposeOrdinaryTurns, proposeOwnSwitchTurns};
+module.exports = {proposeOpeningTurns, proposeOrdinaryTurns, proposeOwnSwitchTurns, selectProposals};

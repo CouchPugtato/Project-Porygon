@@ -1,0 +1,20 @@
+{
+  "games": 4,
+  "seed": 33401,
+  "max_boundaries": 160,
+  "experiment_budget_seconds": 60,
+  "beliefs": {
+    "particles": 1,
+    "max_nodes": 32,
+    "max_elapsed_ms": 75,
+    "max_boundaries": 160
+  },
+  "search": {
+    "candidates": 4,
+    "responses": 2,
+    "chance_samples": 1,
+    "continuation_choices": 1,
+    "max_nodes": 32,
+    "max_elapsed_ms": 100
+  }
+}

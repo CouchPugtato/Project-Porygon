@@ -7,7 +7,7 @@ const {observeBeliefs} = require('./belief_state');
 const {restorePosition, playerObservation} = require('./position_simulator');
 const {isOrdinaryMove} = require('./ordinary_moves');
 
-function moveRequestActions(view, openingOnly, allowSwitches = openingOnly) {
+function moveRequestActions(view, openingOnly, allowSwitches = openingOnly, expanded = false) {
     const beliefs = observeBeliefs(view);
     const request = view.request, roster = request?.side?.pokemon;
     const active = roster?.filter(mon => mon.active);
@@ -30,12 +30,12 @@ function moveRequestActions(view, openingOnly, allowSwitches = openingOnly) {
         const source = {getLocOf: () => -(index + 1)};
         const geometry = {activePerHalf: 2, gameType: 'doubles'};
         for (const [moveIndex, move] of entry.moves.entries()) {
-            if (move.disabled || move.pp === 0 || !openingOnly && !isOrdinaryMove(move.id)) continue;
+            if (move.disabled || move.pp === 0 || !openingOnly && !expanded && !isOrdinaryMove(move.id)) continue;
             const targets = BattleActions.prototype.targetTypeChoices(move.target) ?
                 [1, 2, -1, -2].filter(loc => Battle.prototype.validTargetLoc.call(geometry, loc, source, move.target) &&
                     (openingOnly || loc > 0 || active[-loc - 1].condition !== '0 fnt')) : [0];
             for (const target of targets) {
-                for (const tera of openingOnly && entry.canTerastallize ? [false, true] : [false]) {
+                for (const tera of (openingOnly || expanded) && entry.canTerastallize ? [false, true] : [false]) {
                     options.push({command: `move ${moveIndex + 1}${target ? ` ${target}` : ''}${tera ? ' terastallize' : ''}`,
                         kind: 'move', move: moveIndex + 1, target, tera});
                 }
@@ -78,5 +78,6 @@ function checkWorldChoice(position, view, command, randomness) {
 function openingActions(view) { return moveRequestActions(view, true); }
 function ordinaryActions(view) { return moveRequestActions(view, false); }
 function ownSwitchActions(view) { return moveRequestActions(view, false, true); }
+function expandedMoveActions(view) { return moveRequestActions(view, false, true, true); }
 
-module.exports = {openingActions, ordinaryActions, ownSwitchActions, checkWorldChoice};
+module.exports = {openingActions, ordinaryActions, ownSwitchActions, expandedMoveActions, checkWorldChoice};
