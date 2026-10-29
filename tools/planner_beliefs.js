@@ -6,8 +6,10 @@ const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {toID} = require('../external/pokemon-showdown/dist/sim/dex');
 const {observeBeliefs} = require('./belief_state');
 const {constructOpeningWorld, constructReplayOpening} = require('./opening_world');
-const {restorePosition, playerObservation, pendingSides, advancePosition} = require('./position_simulator');
+const {restorePosition, playerObservation, pendingSides, advancePosition, capturePosition} = require('./position_simulator');
 const {decisionActions, UnsupportedPlannerRequest} = require('./planner_actions');
+const {mismatchEvidence, recordRejection, revealedConstraints} = require('./planner_evidence');
+const {mutateProposal} = require('./planner_recovery');
 
 function nextSeed(rng) { return Array.from({length: 4}, () => rng.random(65536)); }
 
@@ -52,10 +54,26 @@ function propagateWorld(position, before, own, after, rng, budget, attempts = 8)
         if (!isDeepStrictEqual(playerObservation(branch, before.side), before))
             throw new Error('belief parent does not match the previous observation');
         pending = pendingSides(branch);
+        if (own && typeof own === 'object' && typeof own.rejected === 'string') {
+            if (!budget.available()) return null;
+            budget.consume();
+            branch.strictChoices = false;
+            const accepted = branch.choose(before.side, own.rejected);
+            if (!accepted && isDeepStrictEqual(playerObservation(branch, before.side), after))
+                return capturePosition(branch, position.origin);
+            recordRejection(budget.diagnostics, 'rejected_choice_disclosure_mismatch'); return null;
+        }
         if (pending.includes(before.side) !== (typeof own === 'string'))
             throw new Error('accepted own command required only for a pending player');
+        if (budget.filter_evidence) {
+            const conflict = revealedConstraints(branch, after);
+            if (conflict) { recordRejection(budget.diagnostics, conflict); return null; }
+        }
         try { responses = observedResponses(branch, before, after); }
-        catch (error) { if (error instanceof UnsupportedPlannerRequest) return null; throw error; }
+        catch (error) {
+            if (error instanceof UnsupportedPlannerRequest) { recordRejection(budget.diagnostics, 'unsupported_request'); return null; }
+            throw error;
+        }
     } finally { branch.destroy(); }
     for (let attempt = 0; responses.length && attempt < attempts && budget.available(); ++attempt) {
         const response = responses[attempt % responses.length];
@@ -65,26 +83,34 @@ function propagateWorld(position, before, own, after, rng, budget, attempts = 8)
         budget.consume();
         let result;
         try { result = advancePosition(position, choices, {mode: 'sample', seed: nextSeed(rng)}); }
-        catch (error) { if (choiceFailure(error)) continue; throw error; }
+        catch (error) { if (choiceFailure(error)) { recordRejection(budget.diagnostics, 'choice_rejected'); continue; } throw error; }
         // matching the entire projection includes pp queues field effects and private updates
         if (isDeepStrictEqual(result.observations[before.side], after)) return result.position;
+        const mismatch = mismatchEvidence(result.observations[before.side], after);
+        recordRejection(budget.diagnostics, mismatch.kind);
+        budget.consider?.(mismatch);
     }
+    if (!responses.length) recordRejection(budget.diagnostics, 'observed_response_not_in_hypothesis');
+    if (!budget.available()) recordRejection(budget.diagnostics, 'replay_budget_exhausted');
     return null;
 }
 
 class PlannerBeliefs {
     constructor(options) {
-        this.settings = {particles: 2, max_nodes: 256, max_elapsed_ms: 2000, max_boundaries: 128, ...options};
+        this.settings = {particles: 2, max_nodes: 256, max_elapsed_ms: 2000, max_boundaries: 128,
+            filter_evidence: true, recovery: false, ...options};
         const limits = {particles: 4, max_nodes: 1024, max_elapsed_ms: 10000, max_boundaries: 512};
         if (!Array.isArray(this.settings.seed) || this.settings.seed.length !== 4 ||
                 this.settings.seed.some(n => !Number.isInteger(n) || n < 0 || n > 65535) ||
-                Object.keys(this.settings).some(key => key !== 'seed' && !Object.hasOwn(limits, key)) ||
+                ['filter_evidence', 'recovery'].some(key => typeof this.settings[key] !== 'boolean') ||
+                Object.keys(this.settings).some(key => !['seed', 'filter_evidence', 'recovery'].includes(key) && !Object.hasOwn(limits, key)) ||
                 Object.entries(limits).some(([key, max]) => !Number.isInteger(this.settings[key]) ||
                     this.settings[key] < 1 || this.settings[key] > max)) throw new Error('invalid bounded belief settings');
         this.rng = new PRNG(this.settings.seed.join(','));
         this.history = {observations: [], own_choices: []};
         this.worlds = [];
         this.last = null;
+        this.bestProposal = null;
     }
 
     update(view, acceptedOwn = null) {
@@ -96,10 +122,12 @@ class PlannerBeliefs {
         if (previous && isDeepStrictEqual(previous, view)) return this.last;
         const started = performance.now();
         let nodes = 0;
+        const rejections = {};
         const budget = {available: () => nodes < this.settings.max_nodes &&
-            performance.now() - started < this.settings.max_elapsed_ms, consume: () => ++nodes};
+            performance.now() - started < this.settings.max_elapsed_ms, consume: () => ++nodes,
+            diagnostics: rejections, filter_evidence: this.settings.filter_evidence};
         const report = {supported: false, particles: 0, retained: 0, rebuilt: 0, nodes: 0,
-            calibrated: false, reason: null, training_eligible: false};
+            calibrated: false, reason: null, training_eligible: false, rejections};
         if (this.history.observations.length >= this.settings.max_boundaries ||
                 Buffer.byteLength(JSON.stringify(this.history)) + Buffer.byteLength(JSON.stringify(view)) > 16 * 1024 ** 2) {
             this.worlds = []; return this.last = {...report, reason: 'history_capacity_exhausted'};
@@ -116,21 +144,49 @@ class PlannerBeliefs {
             if (next) { survivors.push(next); ++report.retained; }
         }
         // replenish from revealed history without patching inconsistent surviving states
-        for (let attempt = 0; survivors.length < this.settings.particles && attempt < 16 && budget.available(); ++attempt) {
+        let bestDistance = Infinity;
+        for (let attempt = 0; survivors.length < this.settings.particles && attempt < 64 && budget.available(); ++attempt) {
             budget.consume();
             const settings = {seed: nextSeed(this.rng), chance_seed: nextSeed(this.rng), attempts: 1};
+            if (this.settings.recovery && this.bestProposal && attempt % 2) {
+                const proposal = mutateProposal(this.bestProposal, this.rng);
+                for (const known of facts.opponent.pokemon) {
+                    const entry = proposal.find(p => p.key === known.key);
+                    if (!entry) continue;
+                    entry.set.moves = [...new Set([...known.moves, ...entry.set.moves])].slice(0, 4);
+                    if (known.tera_type) entry.set.teraType = known.tera_type;
+                    if (known.ability) entry.set.ability = known.ability;
+                    if (known.item) entry.set.item = known.item.last_revealed;
+                }
+                settings.proposal_sets = proposal;
+            }
             const opening = previous ? constructReplayOpening(this.history.observations[0], view, settings) :
                 constructOpeningWorld(view, settings);
-            if (!opening.supported) continue;
+            if (!opening.supported) {
+                for (const [kind, count] of Object.entries(opening.rejected))
+                    rejections[kind] = (rejections[kind] || 0) + count;
+                continue;
+            }
             let position = opening.position;
-            for (let i = 1; position && i < this.history.observations.length; ++i)
+            for (let i = 1; position && i < this.history.observations.length; ++i) {
+                budget.consider = mismatch => {
+                    const distance = (this.history.observations.length - i) * 10000 + mismatch.distance;
+                    if (distance < bestDistance) {
+                        bestDistance = distance; this.bestProposal = structuredClone(opening.opponent_hypotheses);
+                    }
+                };
                 position = propagateWorld(position, this.history.observations[i - 1],
                     this.history.own_choices[i - 1], this.history.observations[i], this.rng, budget);
-            if (position) { survivors.push(position); ++report.rebuilt; }
+            }
+            if (position) {
+                survivors.push(position); ++report.rebuilt;
+                this.bestProposal = structuredClone(opening.opponent_hypotheses);
+            }
         }
         this.worlds = survivors;
         return this.last = {...report, supported: survivors.length > 0, particles: survivors.length, nodes,
             reason: survivors.length ? null : 'no_observation_consistent_world',
+            budget_exhausted: !budget.available(),
             elapsed_seconds: (performance.now() - started) / 1000};
     }
 }

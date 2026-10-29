@@ -1,0 +1,21 @@
+{
+  "checkpoint": "models/runs/run_0093_current_arch_full/current_arch_full.chk",
+  "format": "gen9randomdoublesbattle",
+  "games_per_side": 25,
+  "seed": 33801,
+  "agent_omp_threads": 1,
+  "battle_timeout_seconds": 120,
+  "max_system_memory_percent": 65,
+  "max_system_cpu_percent": 65,
+  "resource_check_seconds": 2,
+  "launch_stagger_ms": 500,
+  "opponents": ["random", "parent", "tactical"],
+  "profiles": [
+    {"name": "baseline", "baseline": true},
+    {"name": "pure_low", "baseline": false, "beliefs": {"particles": 1, "max_nodes": 64, "max_elapsed_ms": 100}, "search": {"candidates": 4, "responses": 2, "chance_samples": 1, "max_nodes": 32, "max_elapsed_ms": 100, "evaluator": "positional", "adaptive": true}},
+    {"name": "pure_high", "baseline": false, "beliefs": {"particles": 2, "max_nodes": 256, "max_elapsed_ms": 500}, "search": {"candidates": 8, "responses": 3, "chance_samples": 2, "max_nodes": 256, "max_elapsed_ms": 500, "evaluator": "positional", "strategy": "pure", "depth_turns": 1, "adaptive": true}},
+    {"name": "mixed_high", "baseline": false, "beliefs": {"particles": 2, "max_nodes": 256, "max_elapsed_ms": 500}, "search": {"candidates": 8, "responses": 3, "chance_samples": 2, "max_nodes": 256, "max_elapsed_ms": 500, "evaluator": "positional", "strategy": "mixed", "depth_turns": 1, "adaptive": true}},
+    {"name": "mixed_deep", "baseline": false, "beliefs": {"particles": 2, "max_nodes": 256, "max_elapsed_ms": 500}, "search": {"candidates": 8, "responses": 3, "chance_samples": 2, "max_nodes": 256, "max_elapsed_ms": 500, "evaluator": "positional", "strategy": "mixed", "depth_turns": 2, "adaptive": true}},
+    {"name": "recovery_high", "baseline": false, "beliefs": {"particles": 2, "max_nodes": 256, "max_elapsed_ms": 500, "recovery": true}, "search": {"candidates": 8, "responses": 3, "chance_samples": 2, "max_nodes": 256, "max_elapsed_ms": 500, "evaluator": "positional", "strategy": "pure", "depth_turns": 1, "adaptive": true}}
+  ]
+}

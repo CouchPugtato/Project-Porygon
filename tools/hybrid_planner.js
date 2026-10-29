@@ -11,12 +11,18 @@ class HybridPlanner {
         this.search = plannerSettings({...search, seed});
         this.fallback = fallback;
         this.gate = gate;
-        this.stats = {decisions: 0, searched: 0, fallbacks: 0, waiting: 0, terminal: 0, reasons: {}, nodes: 0};
+        this.stats = {decisions: 0, searched: 0, fallbacks: 0, waiting: 0, terminal: 0, reasons: {}, nodes: 0,
+            belief_rejections: {}};
+        this.memo = null;
     }
 
     async decide(view, acceptedOwn = null) {
+        if (acceptedOwn === null && this.memo?.key === JSON.stringify(view))
+            return structuredClone(this.memo.decision);
         await this.gate?.waitForLaunch();
         const belief = this.beliefs.update(view, acceptedOwn);
+        for (const [kind, count] of Object.entries(belief.rejections || {}))
+            this.stats.belief_rejections[kind] = (this.stats.belief_rejections[kind] || 0) + count;
         if (view.ended || view.request?.wait) {
             ++this.stats[view.ended ? 'terminal' : 'waiting'];
             return {command: null, source: view.ended ? 'terminal' : 'waiting', belief};
@@ -33,7 +39,9 @@ class HybridPlanner {
         this.stats.nodes += belief.nodes + (search?.nodes || 0);
         if (search?.supported) {
             ++this.stats.searched;
-            return {command: search.selected_command, source: 'search', belief, search};
+            const decision = {command: search.selected_command, source: 'search', belief, search};
+            this.memo = {key: JSON.stringify(view), decision: structuredClone(decision)};
+            return decision;
         }
         const reason = search?.reason || belief.reason;
         ++this.stats.fallbacks;

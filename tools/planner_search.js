@@ -6,21 +6,20 @@ const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {restorePosition, playerObservation, pendingSides, advancePosition} = require('./position_simulator');
 const {selectCommands, UnsupportedPlannerRequest} = require('./planner_actions');
 const {nextSeed, choiceFailure} = require('./planner_beliefs');
-
-function material(battle, perspective) {
-    const score = side => side.pokemon.reduce((sum, mon) => sum + mon.hp / mon.maxhp + (mon.hp ? 2 : 0), 0);
-    const own = battle.getSide(perspective);
-    return score(own) - score(own.foe);
-}
+const {evaluatePosition} = require('./planner_value');
+const {solveBeliefGame} = require('./planner_matrix');
 
 function plannerSettings(options) {
     const settings = {candidates: 8, responses: 3, chance_samples: 2, continuation_choices: 2,
-        max_nodes: 256, max_elapsed_ms: 2000, ...options};
+        max_nodes: 256, max_elapsed_ms: 2000, depth_turns: 1, evaluator: 'material',
+        strategy: 'pure', adaptive: false, ...options};
     const limits = {candidates: 32, responses: 8, chance_samples: 8, continuation_choices: 4,
-        max_nodes: 1024, max_elapsed_ms: 20000};
+        max_nodes: 1024, max_elapsed_ms: 20000, depth_turns: 3};
     if (!Array.isArray(settings.seed) || settings.seed.length !== 4 ||
             settings.seed.some(n => !Number.isInteger(n) || n < 0 || n > 65535) ||
-            Object.keys(settings).some(key => key !== 'seed' && !Object.hasOwn(limits, key)) ||
+            !['material', 'positional'].includes(settings.evaluator) || !['pure', 'mixed'].includes(settings.strategy) ||
+            typeof settings.adaptive !== 'boolean' ||
+            Object.keys(settings).some(key => !['seed', 'evaluator', 'strategy', 'adaptive'].includes(key) && !Object.hasOwn(limits, key)) ||
             Object.entries(limits).some(([key, max]) => !Number.isInteger(settings[key]) ||
                 settings[key] < 1 || settings[key] > max)) throw new Error('invalid bounded planner settings');
     return settings;
@@ -45,23 +44,33 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
     const randomness = () => ({mode: 'sample', seed: nextSeed(rng)});
     const commands = selectCommands(view, settings.candidates, rng);
     const other = view.side === 'p1' ? 'p2' : 'p1';
-    const targetTurn = view.turn + (view.phase === 'switch' ? 2 : 1);
+    const targetTurn = view.turn + settings.depth_turns + (view.phase === 'switch' ? 1 : 0);
+    const cache = new Map();
+    let cacheBytes = 0;
+    result.cache_hits = 0;
     const prepared = worlds.map(position => {
         const battle = restorePosition(position, randomness());
         try {
             if (!isDeepStrictEqual(playerObservation(battle, view.side), view))
                 throw new Error('planner worlds must match the supplied observation');
             const opponentView = playerObservation(battle, other);
-            return {position, baseline: material(battle, view.side),
+            return {position, baseline: evaluatePosition(battle, view.side, settings.evaluator),
                 responses: pendingSides(battle).includes(other) ?
                     selectCommands(opponentView, settings.responses, rng) : [null]};
         } finally { battle.destroy(); }
     });
     async function transition(position, choices, seed) {
+        const key = JSON.stringify([position.state_json, choices, seed]);
+        if (cache.has(key)) { ++result.cache_hits; return cache.get(key); }
         if (result.nodes % 16 === 0) await gate?.waitForLaunch();
         if (exhausted()) { result.budget_exhausted = true; return null; }
         ++result.nodes;
-        try { return advancePosition(position, choices, {mode: 'sample', seed}); }
+        try {
+            const next = advancePosition(position, choices, {mode: 'sample', seed});
+            const bytes = Buffer.byteLength(key) + 4 * Buffer.byteLength(next.position.state_json);
+            if (cacheBytes + bytes <= 4 * 1024 ** 2) { cache.set(key, next); cacheBytes += bytes; }
+            return next;
+        }
         catch (error) { if (choiceFailure(error)) return null; throw error; }
     }
     async function continuation(position, baseline, depth, seed) {
@@ -77,7 +86,7 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
         try {
             if (battle.ended) return !battle.winner ? 0 : battle.winner === battle.getSide(view.side).name ? 100 : -100;
             if (battle.requestState === 'move' && battle.turn >= targetTurn)
-                return material(battle, view.side) - baseline;
+                return evaluatePosition(battle, view.side, settings.evaluator) - baseline;
             const pending = pendingSides(battle);
             own = pending.includes(view.side) ? selectCommands(playerObservation(battle, view.side),
                 settings.continuation_choices, new PRNG(seed.join(','))) : [null];
@@ -109,7 +118,7 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
     const seeds = prepared.map(world => world.responses.map(() =>
         Array.from({length: settings.chance_samples}, () => nextSeed(rng))));
     for (const command of commands) {
-        const row = {command, status: 'running', score: null, worlds: []};
+        const row = {command, status: 'running', score: null, worlds: [], payoffs: []};
         result.candidates.push(row);
         for (const [i, world] of prepared.entries()) {
             const responseScores = [];
@@ -129,6 +138,7 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
             if (row.status !== 'running') break;
             if (!responseScores.length) { row.status = 'incomplete_or_rejected'; break; }
             row.worlds.push(Math.min(...responseScores));
+            row.payoffs.push(responseScores);
         }
         if (row.status === 'running') {
             row.status = 'completed'; row.score = row.worlds.reduce((a, b) => a + b, 0) / worlds.length;
@@ -137,8 +147,25 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
             }
         }
         if (result.budget_exhausted) break;
+        if (settings.adaptive && result.candidates.length >= 4) {
+            const complete = result.candidates.filter(candidate => candidate.status === 'completed').map(candidate => candidate.score).sort((a, b) => b - a);
+            if (complete.length >= 2 && complete[0] - complete[1] >= 3) {
+                result.adaptive_stop = 'large_heuristic_margin_not_statistical_confidence'; break;
+            }
+        }
     }
-    result.comparison_complete = !result.budget_exhausted && result.candidates.every(row => row.status === 'completed');
+    if (settings.strategy === 'mixed' && result.supported) {
+        const complete = result.candidates.filter(row => row.status === 'completed');
+        const matrices = prepared.map((_, world) => complete.map(row => row.payoffs[world]));
+        result.mixture = solveBeliefGame(matrices);
+        result.mixture.commands = complete.map(row => row.command);
+        let sample = rng.random();
+        const index = result.mixture.policy.findIndex(probability => (sample -= probability) <= 0);
+        result.selected_command = complete[index < 0 ? complete.length - 1 : index].command;
+        result.selected_score = result.mixture.lower;
+        result.objective = 'finite_sampled_belief_game_regret_matching';
+    }
+    result.comparison_complete = result.candidates.length === commands.length && !result.budget_exhausted && result.candidates.every(row => row.status === 'completed');
     return finish(result.supported ? null : 'no_completed_candidate');
 }
 

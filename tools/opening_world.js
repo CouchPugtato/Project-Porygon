@@ -70,7 +70,7 @@ function openingUnsupported(view, beliefs) {
     return reasons;
 }
 
-function buildOpeningWorld(view, {seed, chance_seed, attempts = 16} = {}, moveEvidence) {
+function buildOpeningWorld(view, {seed, chance_seed, attempts = 16, proposal_sets = null} = {}, moveEvidence) {
     const validSeed = s => Array.isArray(s) && s.length === 4 &&
         s.every(n => Number.isInteger(n) && n >= 0 && n <= 65535);
     if (!validSeed(seed) || !validSeed(chance_seed) || !Number.isInteger(attempts) || attempts < 1 || attempts > 32)
@@ -84,6 +84,8 @@ function buildOpeningWorld(view, {seed, chance_seed, attempts = 16} = {}, moveEv
                 known.moves = [...new Set([...known.moves, ...later.moves])].sort();
                 // revealed tera type constrains replay proposals rather than earlier decisions
                 known.tera_type = later.tera_type;
+                known.ability = later.ability || known.ability;
+                if (later.item) known.item = {current: later.item.last_revealed, last_revealed: later.item.last_revealed};
             }
             else {
                 // later revealed reserves present from the opening in replay worlds
@@ -128,10 +130,15 @@ function buildOpeningWorld(view, {seed, chance_seed, attempts = 16} = {}, moveEv
     const reject = reason => { result.rejected[reason] = (result.rejected[reason] || 0) + 1; };
     for (let i = 0; i < attempts; ++i) {
         ++result.attempts;
-        const sampled = sampleRevealedSets(beliefs,
+        const sampled = proposal_sets ? {particles: [{sets: structuredClone(proposal_sets)}]} : sampleRevealedSets(beliefs,
             {seed: nextSeed(proposalRng), samples: 1, attempts_per_set: 16, include_unrevealed: true});
         if (!sampled.particles.length) { reject('roster_proposal_failed'); continue; }
         const hypotheses = sampled.particles[0].sets;
+        if (beliefs.opponent.pokemon.some(mon => !hypotheses.some(h => h.key === mon.key &&
+                mon.moves.every(move => h.set.moves.includes(move)) &&
+                (!mon.tera_type || h.set.teraType.toLowerCase() === mon.tera_type)))) {
+            reject('proposal_evidence_conflict'); continue;
+        }
         const order = [beliefs.opponent.active.a, beliefs.opponent.active.b,
             ...hypotheses.map(p => p.key).filter(key => !Object.values(beliefs.opponent.active).includes(key))];
         const opponent = order.map(key => {

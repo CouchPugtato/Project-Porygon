@@ -404,6 +404,7 @@ async function drivePlayer(stream, agent, battleId, playerName, format, beforeCh
             }
             if (line.startsWith('|request|')) {
                 const request = JSON.parse(line.slice('|request|'.length));
+                if (request) await agent.observeRequest?.(request);
                 if (!request || request.wait) continue;
                 if (rejectedChoice) {
                     const slots = trapDisclosureSlots(rejectedChoice.request, rejectedChoice.rejection, request);
@@ -494,7 +495,7 @@ async function runBranch(
                 streams.p2, opponent, battleId, opponentName, options.format);
             const drain = (async () => {
                 for await (const _chunk of streams.omniscient) {
-                    // Draining prevents the simulator's output buffer from becoming the bottleneck.
+                    // draining the simulator output buffer
                 }
             })();
             const spec = {formatid: options.format, seed: seedTuple(options.seed, attempt, 0)};
@@ -538,7 +539,7 @@ async function runBranch(
         try {
             await streams.omniscient.writeEnd();
         } catch (_) {
-            // A completed BattleStream has already closed its input.
+            // input already closed after a completed battle stream
         }
         await Promise.all([candidate.close(), opponent.close()]);
     }
@@ -901,8 +902,8 @@ function choiceRejectionReason(message) {
 }
 
 function trapDisclosureSlots(previous, rejection, updated) {
-    // Showdown deliberately hides some traps until a switch is attempted.
-    // Verify its public same-phase update; never infer an opponent's ability.
+    // some traps hidden until a switch attempt
+    // public same phase update without inferring an opposing ability
     if (!rejection.message?.startsWith('|error|[Unavailable choice]') ||
             choiceRejectionReason(rejection.message) !== 'trapped_switch' || updated?.update !== true ||
             !Array.isArray(previous?.active) || !Array.isArray(updated.active) ||
