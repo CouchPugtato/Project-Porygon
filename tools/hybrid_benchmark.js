@@ -70,7 +70,8 @@ async function runLiveGame(sim, config, profile, job, gate) {
             }});
     return {...game, opponent: job.opponent, profile: profile.name, policy_mode: profile.baseline ? 'neural' : 'hybrid',
         training_eligible: false, elapsed_seconds: (performance.now() - started) / 1000,
-        hybrid_coverage: wrapper ? structuredClone(wrapper.planner.stats) : null};
+        hybrid_coverage: wrapper ? structuredClone(wrapper.planner.stats) : null,
+        first_belief_failure: wrapper ? structuredClone(wrapper.planner.beliefs.firstFailure) : null};
 }
 
 function compareProfiles(games, config) {

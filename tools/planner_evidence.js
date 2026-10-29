@@ -11,7 +11,11 @@ function mismatchEvidence(actual, expected) {
     const events = [observed, simulated].map(line => line.split('|')[1]);
     let kind = 'dynamic_state_mismatch';
     if (events.includes('switch')) kind = 'reserve_or_switch_mismatch';
-    else if (events.includes('move')) kind = 'move_or_speed_order_mismatch';
+    else if (events.includes('move')) {
+        const a = observed.split('|'), b = simulated.split('|');
+        kind = a[1] === 'move' && b[1] === 'move' && a[2] === b[2] && a[3] === b[3] ?
+            'move_target_or_chance_mismatch' : 'move_or_speed_order_mismatch';
+    }
     else if (events.some(event => ['-damage', '-heal', '-crit', '-miss'].includes(event))) kind = 'damage_or_chance_mismatch';
     else if (isDeepStrictEqual(actual.log, expected.log)) kind = 'private_request_or_hidden_stats_mismatch';
     // distance guides proposals only and never relaxes exact world acceptance

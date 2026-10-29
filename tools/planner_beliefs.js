@@ -67,7 +67,10 @@ function propagateWorld(position, before, own, after, rng, budget, attempts = 8)
             throw new Error('accepted own command required only for a pending player');
         if (budget.filter_evidence) {
             const conflict = revealedConstraints(branch, after);
-            if (conflict) { recordRejection(budget.diagnostics, conflict); return null; }
+            if (conflict) {
+                recordRejection(budget.diagnostics, conflict);
+                budget.trace?.({stage: 'evidence_filter', reason: conflict, position}); return null;
+            }
         }
         try { responses = observedResponses(branch, before, after); }
         catch (error) {
@@ -82,15 +85,21 @@ function propagateWorld(position, before, own, after, rng, budget, attempts = 8)
         if (pending.includes(opponent)) choices[opponent] = response;
         budget.consume();
         let result;
-        try { result = advancePosition(position, choices, {mode: 'sample', seed: nextSeed(rng)}); }
+        const seed = nextSeed(rng);
+        try { result = advancePosition(position, choices, {mode: 'sample', seed}); }
         catch (error) { if (choiceFailure(error)) { recordRejection(budget.diagnostics, 'choice_rejected'); continue; } throw error; }
         // matching the entire projection includes pp queues field effects and private updates
         if (isDeepStrictEqual(result.observations[before.side], after)) return result.position;
         const mismatch = mismatchEvidence(result.observations[before.side], after);
         recordRejection(budget.diagnostics, mismatch.kind);
+        budget.trace?.({stage: 'simulation', position, choices, seed, mismatch,
+            expected: after, actual: result.observations[before.side]});
         budget.consider?.(mismatch);
     }
-    if (!responses.length) recordRejection(budget.diagnostics, 'observed_response_not_in_hypothesis');
+    if (!responses.length) {
+        recordRejection(budget.diagnostics, 'observed_response_not_in_hypothesis');
+        budget.trace?.({stage: 'action_inference', reason: 'observed_response_not_in_hypothesis', position});
+    }
     if (!budget.available()) recordRejection(budget.diagnostics, 'replay_budget_exhausted');
     return null;
 }
@@ -111,6 +120,7 @@ class PlannerBeliefs {
         this.worlds = [];
         this.last = null;
         this.bestProposal = null;
+        this.firstFailure = null;
     }
 
     update(view, acceptedOwn = null) {
@@ -123,9 +133,16 @@ class PlannerBeliefs {
         const started = performance.now();
         let nodes = 0;
         const rejections = {};
+        let firstTrace = null;
+        let simulationTrace = null;
         const budget = {available: () => nodes < this.settings.max_nodes &&
             performance.now() - started < this.settings.max_elapsed_ms, consume: () => ++nodes,
-            diagnostics: rejections, filter_evidence: this.settings.filter_evidence};
+            diagnostics: rejections, filter_evidence: this.settings.filter_evidence,
+            trace: trace => {
+                if (!this.firstFailure && !firstTrace) firstTrace = structuredClone(trace);
+                if (!this.firstFailure && !simulationTrace && trace.stage === 'simulation')
+                    simulationTrace = structuredClone(trace);
+            }};
         const report = {supported: false, particles: 0, retained: 0, rebuilt: 0, nodes: 0,
             calibrated: false, reason: null, training_eligible: false, rejections};
         if (this.history.observations.length >= this.settings.max_boundaries ||
@@ -184,6 +201,13 @@ class PlannerBeliefs {
             }
         }
         this.worlds = survivors;
+        if (previous && !survivors.length && !this.firstFailure) {
+            const failure = {version: 1, training_eligible: false, source: 'player_observations_and_sampled_world_only',
+                history: structuredClone(this.history), settings: this.settings, rejections,
+                trace: firstTrace, simulation_trace: simulationTrace};
+            this.firstFailure = Buffer.byteLength(JSON.stringify(failure)) <= 512 * 1024 ? failure :
+                {version: 1, reason: 'failure_capture_size_limit', rejections};
+        }
         return this.last = {...report, supported: survivors.length > 0, particles: survivors.length, nodes,
             reason: survivors.length ? null : 'no_observation_consistent_world',
             budget_exhausted: !budget.available(),
