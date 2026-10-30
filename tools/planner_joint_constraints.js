@@ -98,10 +98,12 @@ function transitionLoss(actual, expected, start) {
 
 function jointSettings(options = {}) {
     const settings = {max_nodes: 2048, max_elapsed_ms: 5000, seeds: 16, particles: 1,
-        max_boundaries: 8, max_attempts: 3, max_total_ms: 10000, persistent: false, mechanics: false, seed: [351, 1, 2, 3], ...options};
+        max_boundaries: 8, max_attempts: 3, max_total_ms: 10000, persistent: false, mechanics: false,
+        move_completion: false, seed: [351, 1, 2, 3], ...options};
     if (Object.keys(settings).some(key => !['max_nodes', 'max_elapsed_ms', 'seeds', 'particles', 'seed',
-        'max_boundaries', 'max_attempts', 'max_total_ms', 'persistent', 'mechanics'].includes(key)) ||
+        'max_boundaries', 'max_attempts', 'max_total_ms', 'persistent', 'mechanics', 'move_completion'].includes(key)) ||
             typeof settings.persistent !== 'boolean' || typeof settings.mechanics !== 'boolean' ||
+            typeof settings.move_completion !== 'boolean' || settings.move_completion && !settings.persistent ||
             !Number.isInteger(settings.max_nodes) || settings.max_nodes < 1 || settings.max_nodes > 8192 ||
             !Number.isInteger(settings.max_elapsed_ms) || settings.max_elapsed_ms < 1 || settings.max_elapsed_ms > 60000 ||
             !Number.isInteger(settings.seeds) || settings.seeds < 1 || settings.seeds > 64 ||

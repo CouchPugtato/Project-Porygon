@@ -7,6 +7,7 @@ const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {advancePosition} = require('./position_simulator');
 const {propagateWorld} = require('./planner_beliefs');
 const {fitJointTransition, jointSettings} = require('./planner_joint_constraints');
+const {completeMoveHistory} = require('./planner_move_completion');
 
 function historyHash(history, count = history.observations.length) {
     return createHash('sha256').update(JSON.stringify({observations: history.observations.slice(0, count),
@@ -80,12 +81,24 @@ class PersistentRecovery {
         const started = performance.now(), parent = beliefs.history.observations.at(-2);
         const report = {boundary: boundary + 1, transition_index: boundary, turn: view.turn, stage: 'chance', verified: false, nodes: 0,
             chance_nodes: 0, fit_nodes: 0, matched_boundaries: 0, reasons: {}, witnesses: [], bank_entries: this.bank.entries.length,
-            roll_diagnostics: [], investment_constraints: []};
+            roll_diagnostics: [], investment_constraints: [], move_nodes: 0, move_completions: []};
         const available = () => performance.now() - started < Math.min(remaining, this.settings.max_elapsed_ms);
+        if (this.settings.move_completion) {
+            const moveStarted = performance.now();
+            const budget = {available: () => available() && performance.now() - moveStarted < 250 && report.move_nodes < 64,
+                consume: () => ++report.move_nodes, wait: () => gate?.waitForCapacity?.() ?? gate?.waitForLaunch?.()};
+            for (const entry of this.bank.entries) {
+                if (!budget.available()) break;
+                const completed = await completeMoveHistory(entry.path, beliefs.history, this.settings.seed, budget);
+                report.move_completions.push({verified: completed.verified, reason: completed.reason, proposals: completed.proposals});
+                if (completed.verified) { report.witnesses.push(...completed.witnesses); report.stage = 'move_completion'; break; }
+            }
+        }
         const chanceStarted = performance.now();
         const chanceAvailable = () => available() && performance.now() - chanceStarted < 250 && report.chance_nodes < 128;
         const context = historyHash(beliefs.history, beliefs.history.observations.length - 1);
         for (const entry of this.bank.entries.filter(entry => entry.boundary === boundary - 1 && entry.context === context)) {
+            if (report.witnesses.length) break;
             await (gate?.waitForCapacity?.() ?? gate?.waitForLaunch?.());
             if (!chanceAvailable()) break;
             let accepted;
@@ -124,7 +137,7 @@ class PersistentRecovery {
         }
         report.verified = report.witnesses.length > 0;
         if (report.verified) report.matched_boundaries = boundary;
-        report.nodes = report.chance_nodes + report.fit_nodes;
+        report.nodes = report.chance_nodes + report.fit_nodes + report.move_nodes;
         report.seconds = (performance.now() - started) / 1000;
         this.seconds += report.seconds; this.nodes += report.nodes;
         return report;

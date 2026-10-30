@@ -10,6 +10,7 @@ const FORMAT = 'gen9randomdoublesbattle';
 const STATS = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
 const CHANGED_MOVES = new Set(['transform', 'mimic', 'sketch', 'metronome', 'copycat',
     'mirrormove', 'naturepower', 'sleeptalk', 'instruct', 'assist', 'mefirst']);
+const SIDE_EVENTS = new Set(['-sidestart', '-sideend', '-sideactivate', '-swapsideconditions']);
 
 function identity(text, opponent) {
     const match = /^(p[12])([ab])?: (.+)$/.exec(text || '');
@@ -43,7 +44,10 @@ function observeBeliefs(view) {
         if (!issues.some(i => i.code === code && i.key === key)) issues.push({code, key});
     };
     for (const line of view.log) {
-        const parts = line.split('|'), event = parts[1], who = identity(parts[2], opponent);
+        const parts = line.split('|'), event = parts[1];
+        // team conditions name the player rather than an active pokemon
+        // source ownership still follows an explicit opposing pokemon when present
+        const who = SIDE_EVENTS.has(event) ? null : identity(parts[2], opponent);
         if (event === 'teamsize' && parts[2] === opponent) {
             const size = Number(parts[3]);
             if (Number.isInteger(size) && size >= 2 && size <= 6) teamSize = size;

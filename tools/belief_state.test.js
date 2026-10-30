@@ -104,6 +104,38 @@ test('effect-source ownership does not assign an opposing item to the damaged pl
     assert.equal(snorlax(beliefs).item.current, 'rockyhelmet');
 }));
 
+test('tailwind screens hazards and side activation name a team rather than an unknown pokemon', () => withView(view => {
+    const beliefs = observeBeliefs(extended(view,
+        '|move|p2b: Bronzong|Reflect|p2b: Bronzong',
+        '|-sidestart|p2: RandomPolicy|move: Reflect',
+        '|-sidestart|p2: RandomPolicy|move: Tailwind',
+        '|-sidestart|p2: RandomPolicy|Spikes',
+        '|-sideend|p2: RandomPolicy|move: Tailwind',
+        '|-sideactivate|p2: RandomPolicy|move: Wide Guard',
+        '|-swapsideconditions|p2: RandomPolicy'));
+    assert.deepEqual(beliefs.issues, []);
+    assert.equal(beliefs.opponent.pokemon.length, 2);
+    assert(!beliefs.opponent.pokemon.some(mon => mon.key === 'p2: RandomPolicy'));
+    assert(beliefs.opponent.pokemon.find(mon => mon.species === 'bronzong').moves.includes('reflect'));
+}));
+
+test('unknown pokemon evidence and deceptive identities still require explicit abstention', () => withView(view => {
+    const unknown = observeBeliefs(extended(view, '|move|p2a: Unknown|Tackle|p1a: Pikachu'));
+    assert(unknown.issues.some(issue => issue.code === 'evidence_before_identity' && issue.key === 'p2: Unknown'));
+    const disguise = observeBeliefs(extended(view, '|replace|p2a: Bronzong|Zoroark-Hisui, L80, M'));
+    assert(disguise.issues.some(issue => issue.code === 'changed_identity_or_ability'));
+}));
+
+test('native reflect activation and expiry do not introduce a fictitious roster identity', () => withView((view, battle) => {
+    assert(battle.choose('p1', 'move 4, move 2'));
+    assert(battle.choose('p2', 'move 3, move 3'));
+    const next = playerObservation(battle, 'p1');
+    assert(next.log.some(line => line.startsWith('|-sidestart|p2: FixtureB|')));
+    assert.deepEqual(observeBeliefs(next).issues, []);
+    const ended = extended(next, '|-sideend|p2: FixtureB|Reflect');
+    assert.deepEqual(observeBeliefs(ended).issues, []);
+}, {changeTeams: teams => { teams[1][1].moves[2] = 'reflect'; }}));
+
 test('new unusual legal evidence regenerates support instead of consulting a set catalog', () => withView(view => {
     const first = observeBeliefs(view), next = observeBeliefs(extended(view,
         '|move|p2a: Snorlax|Belly Drum|p2a: Snorlax'));
