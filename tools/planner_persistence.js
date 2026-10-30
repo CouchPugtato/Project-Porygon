@@ -79,7 +79,8 @@ class PersistentRecovery {
         this.tried.add(boundary);
         const started = performance.now(), parent = beliefs.history.observations.at(-2);
         const report = {boundary: boundary + 1, transition_index: boundary, turn: view.turn, stage: 'chance', verified: false, nodes: 0,
-            chance_nodes: 0, fit_nodes: 0, matched_boundaries: 0, reasons: {}, witnesses: [], bank_entries: this.bank.entries.length};
+            chance_nodes: 0, fit_nodes: 0, matched_boundaries: 0, reasons: {}, witnesses: [], bank_entries: this.bank.entries.length,
+            roll_diagnostics: [], investment_constraints: []};
         const available = () => performance.now() - started < Math.min(remaining, this.settings.max_elapsed_ms);
         const chanceStarted = performance.now();
         const chanceAvailable = () => available() && performance.now() - chanceStarted < 250 && report.chance_nodes < 128;
@@ -113,6 +114,8 @@ class PersistentRecovery {
                 const fitted = await fitJointTransition(failure, gate, {...this.settings,
                     max_elapsed_ms: Math.max(1, Math.floor(index === 0 && roots.length > 1 ? time * 0.75 : time / (roots.length - index)))});
                 report.fit_nodes += fitted.proposals || 0;
+                report.roll_diagnostics.push(...(fitted.roll_diagnostics || []));
+                if (fitted.investment_constraints) report.investment_constraints.push(fitted.investment_constraints);
                 report.matched_boundaries = Math.max(report.matched_boundaries, fitted.matched_boundaries || 0);
                 const reason = fitted.best_mismatch?.kind || fitted.reason || fitted.assessment;
                 report.reasons[reason] = (report.reasons[reason] || 0) + 1;

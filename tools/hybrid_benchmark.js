@@ -23,7 +23,7 @@ const SOURCES = ['hybrid_benchmark.js', 'hybrid_agent.js', 'hybrid_planner.js', 
     'planner_actions.js', 'opening_world.js', 'opening_actions.js', 'opening_proposals.js', 'belief_state.js',
     'position_simulator.js', 'replacement_actions.js', 'counterfactual_rollout.js', 'tactical_teacher_smoke.js',
     'tactical_teacher_benchmark.js', 'target_context.js', 'planner_joint_constraints.js', 'hypothesis_legality.js',
-    'planner_analysis.js', 'hybrid_records.js', 'planner_persistence.js', 'belief_coverage_audit.js'];
+    'planner_analysis.js', 'hybrid_records.js', 'planner_persistence.js', 'belief_coverage_audit.js', 'planner_mechanics.js'];
 
 function validateBenchmark(config) {
     if (config.opponents?.includes('confirmed') && !config.target_sidecar)

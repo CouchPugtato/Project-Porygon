@@ -10,6 +10,7 @@ const {nextSeed, choiceFailure, observedResponses} = require('./planner_beliefs'
 const {observeBeliefs, sampleRevealedSets} = require('./belief_state');
 const {mismatchEvidence} = require('./planner_evidence');
 const {UnsupportedPlannerRequest} = require('./planner_actions');
+const {diagnoseRolls, mechanicalAlternatives, investmentRanges} = require('./planner_mechanics');
 
 function projectionDifferences(actual, expected, path = '', output = []) {
     if (output.length >= 16 || isDeepStrictEqual(actual, expected)) return output;
@@ -33,6 +34,7 @@ function damageVariables(before, after) {
     for (const line of after.log.slice(before.log.length)) {
         const parts = line.split('|');
         if (parts[1] === 'move') { actor = parts[2]; move = Dex.moves.get(parts[3]); }
+        if (parts[1] === '-damage' && parts.includes('[from] Recoil')) add(parts[2], 'hp');
         if (parts[1] !== '-damage' || !move || !['Physical', 'Special'].includes(move.category) ||
                 parts.length !== 4 || move.damage || move.damageCallback || move.overrideOffensiveStat ||
                 move.overrideDefensiveStat || move.overrideOffensivePokemon || move.overrideDefensivePokemon) continue;
@@ -96,9 +98,10 @@ function transitionLoss(actual, expected, start) {
 
 function jointSettings(options = {}) {
     const settings = {max_nodes: 2048, max_elapsed_ms: 5000, seeds: 16, particles: 1,
-        max_boundaries: 8, max_attempts: 3, max_total_ms: 10000, persistent: false, seed: [351, 1, 2, 3], ...options};
+        max_boundaries: 8, max_attempts: 3, max_total_ms: 10000, persistent: false, mechanics: false, seed: [351, 1, 2, 3], ...options};
     if (Object.keys(settings).some(key => !['max_nodes', 'max_elapsed_ms', 'seeds', 'particles', 'seed',
-        'max_boundaries', 'max_attempts', 'max_total_ms', 'persistent'].includes(key)) || typeof settings.persistent !== 'boolean' ||
+        'max_boundaries', 'max_attempts', 'max_total_ms', 'persistent', 'mechanics'].includes(key)) ||
+            typeof settings.persistent !== 'boolean' || typeof settings.mechanics !== 'boolean' ||
             !Number.isInteger(settings.max_nodes) || settings.max_nodes < 1 || settings.max_nodes > 8192 ||
             !Number.isInteger(settings.max_elapsed_ms) || settings.max_elapsed_ms < 1 || settings.max_elapsed_ms > 60000 ||
             !Number.isInteger(settings.seeds) || settings.seeds < 1 || settings.seeds > 64 ||
@@ -169,6 +172,9 @@ async function fitJointTransition(failure, gate, options = {}) {
     const fixedPrefix = observations.slice(1, -1).every((_, i) => failure.replay_steps?.[i]?.seed);
     report.opening_cache_hits = 0; report.prefix_cache_hits = 0;
     let best = null;
+    const beam = [], exactSets = [];
+    report.roll_diagnostics = [];
+    report.mechanical_proposals = 0;
     const available = () => report.proposals < settings.max_nodes && performance.now() - started < settings.max_elapsed_ms;
     async function evaluate(sets, seed) {
         if (!available()) return null;
@@ -188,7 +194,7 @@ async function fitJointTransition(failure, gate, options = {}) {
         }
         if (!opening.supported) return null;
         ++report.startup_matches;
-        let next, position = opening.position, loss = 0, mismatch = null;
+        let next, position = opening.position, loss = 0, mismatch = null, diagnostic = null;
         const steps = [];
         const prefixKey = `${report.seed_attempts}/${key}`, cached = settings.persistent && fixedPrefix && prefixes.get(prefixKey);
         if (cached) {
@@ -219,7 +225,8 @@ async function fitJointTransition(failure, gate, options = {}) {
             loss = transitionLoss(next.observations[before.side], expected, prior.log.length);
             if (loss !== 0) {
                 loss += (observations.length - 1 - i) * 10000;
-                mismatch = {actual: next.observations[before.side], expected, boundary: i}; break;
+                mismatch = {actual: next.observations[before.side], expected, boundary: i};
+                diagnostic = {position, choices, seed: sampledSeed, expected, start: prior.log.length}; break;
             }
             position = next.position;
             if (settings.persistent && fixedPrefix && i === observations.length - 2 && !prefixes.has(prefixKey)) {
@@ -231,7 +238,10 @@ async function fitJointTransition(failure, gate, options = {}) {
                 }
             }
         }
-        const candidate = {sets, seed, position: opening.position, loss, steps};
+        const candidate = {sets, seed, position: opening.position, loss, steps, diagnostic};
+        if (settings.mechanics && !beam.some(entry => isDeepStrictEqual(entry.sets, sets))) {
+            beam.push(candidate); beam.sort((a, b) => a.loss - b.loss); beam.length = Math.min(4, beam.length);
+        }
         if (!best || loss < best.loss) {
             best = candidate; report.best_loss = loss;
             report.matched_boundaries = mismatch ? mismatch.boundary - 1 : observations.length - 1;
@@ -249,6 +259,7 @@ async function fitJointTransition(failure, gate, options = {}) {
                 position = verified.position;
             }
             ++report.exact_transition_matches; report.independently_verified = true;
+            exactSets.push(structuredClone(sets));
             const witness = {opening: opening.position, seed, choices: steps.at(-1).choices, steps,
                 expected: trace.expected, position: verified.position};
             if (!report.witness) report.witness = witness;
@@ -263,6 +274,18 @@ async function fitJointTransition(failure, gate, options = {}) {
         let seed = attempt ? nextSeed(rng) : trace.seed;
         let current = await evaluate(best?.sets || original, seed);
         if (!current) continue;
+        if (settings.mechanics && !complete() && attempt === 0 && current.diagnostic) {
+            const diagnostic = current.diagnostic;
+            const result = await diagnoseRolls(diagnostic.position, diagnostic.choices, diagnostic.seed,
+                diagnostic.expected, {available,
+                    consume: () => { ++report.proposals; ++report.native_replays; },
+                    wait: () => gate?.waitForCapacity?.() ?? gate?.waitForLaunch?.()},
+                (actual, expected) => transitionLoss(actual, expected, diagnostic.start));
+            report.roll_diagnostics.push(result);
+            // even a conditional roll match needs an ordinary independently seeded full replay
+            for (let trial = 0; trial < (result.status === 'conditional_legal_roll_match' ? 32 : 8) &&
+                available() && !complete(); ++trial) await evaluate(current.sets, nextSeed(rng));
+        }
         if (attempt === 0 && observations.length > 2 && !complete()) {
             // retain verified prefix draws while searching new chance outcomes at this boundary
             // this avoids spending an entire stat grid on an incompatible critical or protection draw
@@ -272,6 +295,40 @@ async function fitJointTransition(failure, gate, options = {}) {
                 await evaluate(current.sets, nextSeed(rng));
             }
             if (best && best.loss < current.loss) { current = best; seed = best.seed; }
+        }
+        if (settings.mechanics && available() && !complete()) {
+            const speedFirst = report.best_mismatch?.kind === 'move_or_speed_order_mismatch';
+            const alternatives = mechanicalAlternatives(current.sets, facts, variables, speedFirst);
+            for (const proposal of alternatives) {
+                if (!available() || complete()) break;
+                ++report.mechanical_proposals;
+                const candidate = await evaluate(proposal, seed);
+                if (candidate && candidate.loss < current.loss) current = candidate;
+            }
+            // native replay evaluates speed priority weather boosts and item interactions together
+            // no raw speed inequality is used to exclude a legal build
+            if (speedFirst) for (const variable of variables.filter(variable => variable.stat === 'spe')) {
+                for (const value of [0, 31, 63, 94]) for (const root of [...beam]) {
+                    if (!available() || complete()) break;
+                    const proposal = withInvestment(root.sets, variable, value);
+                    if (!proposal) continue;
+                    const candidate = await evaluate(proposal, seed);
+                    if (candidate && candidate.loss < current.loss) current = candidate;
+                }
+            }
+            // retain alternate joint solutions across hits rather than one coordinate optimum
+            // all boundaries participate in the native loss and every exact solution is replayed again
+            for (const root of [...beam]) for (const hp of variables.filter(variable => variable.stat === 'hp')) {
+                const related = variables.filter(variable => variable.key === hp.key && variable.stat !== 'hp' && variable.stat !== 'spe');
+                for (const health of [0, 31, 63, 94]) for (const bulk of [0, 31, 63, 94]) {
+                    if (!available() || complete()) break;
+                    let proposal = withInvestment(root.sets, hp, health);
+                    for (const variable of related) proposal = proposal && withInvestment(proposal, variable, bulk);
+                    if (!proposal) continue;
+                    const candidate = await evaluate(proposal, seed);
+                    if (candidate && candidate.loss < current.loss) current = candidate;
+                }
+            }
         }
         // hp and defense can sit on a shared knockout plateau
         // cross that plateau with joint proposals before the cheaper coordinate refinement
@@ -308,6 +365,10 @@ async function fitJointTransition(failure, gate, options = {}) {
     report.elapsed_seconds = (performance.now() - started) / 1000;
     report.budget_exhausted = !available();
     report.validation_gate_passed = report.independently_verified;
+    report.investment_constraints = {status: exactSets.length ? 'sampled_exact_witnesses' : 'inconclusive',
+        exhaustive: false, intervals_are_contiguous_feasible_sets: false,
+        ranges: investmentRanges(exactSets, variables),
+        proposal_ranges: investmentRanges(beam.map(entry => entry.sets), variables)};
     report.assessment = report.validation_gate_passed ? 'complete_native_transition_verified' : 'no_exact_transition_within_joint_fit_budget';
     return report;
 }
