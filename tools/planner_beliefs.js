@@ -89,7 +89,9 @@ function propagateWorld(position, before, own, after, rng, budget, attempts = 8)
         try { result = advancePosition(position, choices, {mode: 'sample', seed}); }
         catch (error) { if (choiceFailure(error)) { recordRejection(budget.diagnostics, 'choice_rejected'); continue; } throw error; }
         // matching the entire projection includes pp queues field effects and private updates
-        if (isDeepStrictEqual(result.observations[before.side], after)) return result.position;
+        if (isDeepStrictEqual(result.observations[before.side], after)) {
+            budget.accept?.({seed, choices}); return result.position;
+        }
         const mismatch = mismatchEvidence(result.observations[before.side], after);
         recordRejection(budget.diagnostics, mismatch.kind);
         budget.trace?.({stage: 'simulation', position, choices, seed, mismatch,
@@ -121,6 +123,8 @@ class PlannerBeliefs {
         this.last = null;
         this.bestProposal = null;
         this.firstFailure = null;
+        this.lastFailure = null;
+        this.paths = new Map();
     }
 
     update(view, acceptedOwn = null) {
@@ -131,6 +135,9 @@ class PlannerBeliefs {
         if (!previous && acceptedOwn !== null) throw new Error('opening update cannot include a previous choice');
         if (previous && isDeepStrictEqual(previous, view)) return this.last;
         const started = performance.now();
+        this.lastFailure = null;
+        let activePath = null;
+        const nextPaths = new Map();
         let nodes = 0;
         const rejections = {};
         let firstTrace = null;
@@ -140,8 +147,10 @@ class PlannerBeliefs {
             diagnostics: rejections, filter_evidence: this.settings.filter_evidence,
             trace: trace => {
                 if (!this.firstFailure && !firstTrace) firstTrace = structuredClone(trace);
-                if (!this.firstFailure && !simulationTrace && trace.stage === 'simulation')
+                if (!simulationTrace && trace.stage === 'simulation')
                     simulationTrace = structuredClone(trace);
+            }, accept: step => {
+                if (activePath) activePath = {...activePath, steps: [...activePath.steps, step]};
             }};
         const report = {supported: false, particles: 0, retained: 0, rebuilt: 0, nodes: 0,
             calibrated: false, reason: null, training_eligible: false, rejections};
@@ -157,8 +166,12 @@ class PlannerBeliefs {
         const survivors = [];
         if (previous) for (const position of this.worlds) {
             if (!budget.available()) break;
+            activePath = this.paths.get(position.state_json) || null;
             const next = propagateWorld(position, previous, acceptedOwn, view, this.rng, budget);
-            if (next) { survivors.push(next); ++report.retained; }
+            if (next) {
+                survivors.push(next); ++report.retained;
+                if (activePath) nextPaths.set(next.state_json, activePath);
+            }
         }
         // replenish from revealed history without patching inconsistent surviving states
         let bestDistance = Infinity;
@@ -185,6 +198,7 @@ class PlannerBeliefs {
                 continue;
             }
             let position = opening.position;
+            activePath = {opening: opening.position, steps: []};
             for (let i = 1; position && i < this.history.observations.length; ++i) {
                 budget.consider = mismatch => {
                     const distance = (this.history.observations.length - i) * 10000 + mismatch.distance;
@@ -197,16 +211,19 @@ class PlannerBeliefs {
             }
             if (position) {
                 survivors.push(position); ++report.rebuilt;
+                nextPaths.set(position.state_json, activePath);
                 this.bestProposal = structuredClone(opening.opponent_hypotheses);
             }
         }
         this.worlds = survivors;
-        if (previous && !survivors.length && !this.firstFailure) {
+        this.paths = nextPaths;
+        if (previous && !survivors.length) {
             const failure = {version: 1, training_eligible: false, source: 'player_observations_and_sampled_world_only',
                 history: structuredClone(this.history), settings: this.settings, rejections,
                 trace: firstTrace, simulation_trace: simulationTrace};
-            this.firstFailure = Buffer.byteLength(JSON.stringify(failure)) <= 512 * 1024 ? failure :
+            this.lastFailure = Buffer.byteLength(JSON.stringify(failure)) <= 512 * 1024 ? failure :
                 {version: 1, reason: 'failure_capture_size_limit', rejections};
+            if (!this.firstFailure) this.firstFailure = this.lastFailure;
         }
         return this.last = {...report, supported: survivors.length > 0, particles: survivors.length, nodes,
             reason: survivors.length ? null : 'no_observation_consistent_world',

@@ -14,6 +14,7 @@ const {recordHash} = require('./hybrid_benchmark');
 const {firstDamageFeasibility} = require('./planner_damage_feasibility');
 const {auditDefensiveProposals} = require('./planner_stat_constraints');
 const {fitJointTransition} = require('./planner_joint_constraints');
+const {loadDetails} = require('./hybrid_records');
 
 async function auditTransition(failure, gate, {samples = 128, max_elapsed_ms = 2000} = {}) {
     if (!Number.isInteger(samples) || samples < 1 || samples > 256 || !Number.isInteger(max_elapsed_ms) ||
@@ -81,10 +82,11 @@ async function main(argv) {
         try {
             for (const game of run.games) {
                 assert.equal(game.record_hash, recordHash(game), 'captured benchmark record integrity changed');
-                assert.equal(game.first_belief_failure?.simulation_trace?.position?.origin, 'belief-sample');
-                const result = await auditTransition(game.first_belief_failure, gate);
-                result.defensive_proposal_audit = await auditDefensiveProposals(game.first_belief_failure, gate);
-                result.joint_proposal_audit = await fitJointTransition(game.first_belief_failure, gate);
+                const detailed = await loadDetails(game, path.dirname(filename));
+                assert.equal(detailed.first_belief_failure?.simulation_trace?.position?.origin, 'belief-sample');
+                const result = await auditTransition(detailed.first_belief_failure, gate);
+                result.defensive_proposal_audit = await auditDefensiveProposals(detailed.first_belief_failure, gate);
+                result.joint_proposal_audit = await fitJointTransition(detailed.first_belief_failure, gate);
                 report.cases.push({side: game.teacher_side, ...result});
                 assert(result.exact_branch_replay && result.synthetic_inference_control);
             }

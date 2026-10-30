@@ -10,6 +10,8 @@ class HybridAgent {
         this.view = null;
         this.acceptedOwn = null;
         this.rejected = null;
+        this.analysis = {records: [], omitted: 0, max_records: 64, max_bytes: 256 * 1024};
+        this.analysisBytes = 0;
         this.planner = new HybridPlanner(options, () => this.action.command.replace(/^\/choose\s+/, ''), gate);
     }
 
@@ -48,6 +50,10 @@ class HybridAgent {
         if (type !== 'action') return message;
         this.action = message;
         const decision = await this.planner.decide(this.view, this.rejected || this.acceptedOwn);
+        const bytes = Buffer.byteLength(JSON.stringify(decision.analysis));
+        if (this.analysis.records.length < this.analysis.max_records && this.analysisBytes + bytes <= this.analysis.max_bytes) {
+            this.analysis.records.push(decision.analysis); this.analysisBytes += bytes;
+        } else { ++this.analysis.omitted; }
         this.acceptedOwn = null; this.rejected = null;
         if (decision.command === message.command.replace(/^\/choose\s+/, '')) return {...message, training_eligible: false};
         // native accepted command reconstruction rather than stale baseline action indices

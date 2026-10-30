@@ -4,7 +4,7 @@ const {performance} = require('node:perf_hooks');
 const {isDeepStrictEqual} = require('node:util');
 const {PRNG} = require('../external/pokemon-showdown/dist/sim/prng');
 const {restorePosition, playerObservation, pendingSides, advancePosition} = require('./position_simulator');
-const {selectCommands, UnsupportedPlannerRequest} = require('./planner_actions');
+const {selectCommands, decisionActions, UnsupportedPlannerRequest} = require('./planner_actions');
 const {nextSeed, choiceFailure} = require('./planner_beliefs');
 const {evaluatePosition} = require('./planner_value');
 const {solveBeliefGame} = require('./planner_matrix');
@@ -25,7 +25,7 @@ function plannerSettings(options) {
     return settings;
 }
 
-async function searchBeliefWorlds(view, worlds, options, gate) {
+async function searchBeliefWorlds(view, worlds, options, gate, referenceCommand = null) {
     const settings = plannerSettings(options);
     if (!Array.isArray(worlds) || worlds.length > 4) throw new Error('at most four belief worlds required');
     const started = performance.now(), rng = new PRNG(settings.seed.join(','));
@@ -44,6 +44,15 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
     const exhausted = () => result.nodes >= settings.max_nodes || performance.now() - started >= settings.max_elapsed_ms;
     const randomness = () => ({mode: 'sample', seed: nextSeed(rng)});
     const commands = selectCommands(view, settings.candidates, rng);
+    if (referenceCommand !== null) {
+        if (!decisionActions(view).turns.some(turn => turn.command === referenceCommand))
+            return finish('reference_command_outside_supported_actions');
+        const index = commands.indexOf(referenceCommand);
+        if (index >= 0) commands.splice(index, 1);
+        commands.unshift(referenceCommand);
+        commands.splice(settings.candidates);
+    }
+    result.reference_command = referenceCommand;
     const other = view.side === 'p1' ? 'p2' : 'p1';
     const targetTurn = view.turn + settings.depth_turns + (view.phase === 'switch' ? 1 : 0);
     const cache = new Map();
@@ -56,10 +65,17 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
                 throw new Error('planner worlds must match the supplied observation');
             const opponentView = playerObservation(battle, other);
             return {position, baseline: evaluatePosition(battle, view.side, settings.evaluator),
+                active_identity: JSON.stringify(battle.getSide(other).active.map(mon => mon &&
+                    ({species: mon.species.id, level: mon.level, stats: mon.storedStats, item: mon.item,
+                        ability: mon.ability, tera_type: mon.teraType, tera: mon.terastallized,
+                        moves: mon.moveSlots.map(slot => ({id: slot.id, pp: slot.pp, disabled: slot.disabled}))
+                            .sort((a, b) => a.id.localeCompare(b.id)),
+                        hp: mon.hp, maxhp: mon.maxhp, status: mon.status, boosts: mon.boosts}))),
                 responses: pendingSides(battle).includes(other) ?
                     selectCommands(opponentView, settings.responses, rng) : [null]};
         } finally { battle.destroy(); }
     });
+    result.distinct_active_worlds = new Set(prepared.map(world => world.active_identity)).size;
     async function transition(position, choices, seed) {
         const key = JSON.stringify([position.state_json, choices, seed]);
         if (cache.has(key)) { ++result.cache_hits; return cache.get(key); }
@@ -132,10 +148,11 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
     const seeds = prepared.map(world => world.responses.map(() =>
         Array.from({length: settings.chance_samples}, () => nextSeed(rng))));
     for (const command of commands) {
-        const row = {command, status: 'running', score: null, worlds: [], payoffs: []};
+        const row = {command, status: 'running', score: null, worlds: [], payoffs: [], samples: []};
         result.candidates.push(row);
         for (const [i, world] of prepared.entries()) {
             const responseScores = [];
+            const responseSamples = [];
             for (const [j, response] of world.responses.entries()) {
                 const scores = [];
                 for (const seed of seeds[i][j]) {
@@ -148,11 +165,13 @@ async function searchBeliefWorlds(view, worlds, options, gate) {
                 }
                 if (row.status !== 'running') break;
                 responseScores.push(scores.reduce((sum, score) => sum + score, 0) / scores.length);
+                responseSamples.push(scores);
             }
             if (row.status !== 'running') break;
             if (!responseScores.length) { row.status = 'incomplete_or_rejected'; break; }
             row.worlds.push(Math.min(...responseScores));
             row.payoffs.push(responseScores);
+            row.samples.push(responseSamples);
         }
         if (row.status === 'running') {
             row.status = 'completed'; row.score = row.worlds.reduce((a, b) => a + b, 0) / worlds.length;

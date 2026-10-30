@@ -147,3 +147,83 @@ test('opt in recovery refuses a forged private request and leaves the belief poo
         assert.equal(planner.stats.reconstructed_particles, 0);
     } finally { battle.destroy(); }
 });
+
+test('multi turn joint fitting independently verifies every earlier boundary and rejects a corrupted prefix', async () => {
+    const battle = createHybridFixture();
+    try {
+        const failure = control(battle), trace = failure.simulation_trace;
+        const first = advancePosition(trace.position, trace.choices, {mode: 'sample', seed: SEED});
+        const seed = [367, 4, 5, 6];
+        const last = advancePosition(first.position, trace.choices, {mode: 'sample', seed});
+        failure.opening_position = trace.position;
+        failure.replay_steps = [{choices: trace.choices, seed: SEED}];
+        failure.history.observations.push(last.observations.p1);
+        failure.history.own_choices.push(trace.choices.p1);
+        failure.simulation_trace = {...trace, position: first.position, seed, expected: last.observations.p1};
+        const original = structuredClone(failure);
+        const report = await fitJointTransition(failure, null, {max_nodes: 1, seeds: 1});
+        assert(report.validation_gate_passed); assert.equal(report.matched_boundaries, 2);
+        assert.equal(report.witness.steps.length, 2); assert.deepEqual(failure, original);
+        failure.history.observations[1].request.side.pokemon[0].condition = '999/999';
+        const rejected = await fitJointTransition(failure, null, {max_nodes: 16, seeds: 1});
+        assert.equal(rejected.validation_gate_passed, false); assert.equal(rejected.witness, null);
+        const lastCorrupt = structuredClone(original);
+        lastCorrupt.history.observations[2].request.side.pokemon[0].condition = '999/999';
+        lastCorrupt.simulation_trace.expected = lastCorrupt.history.observations[2];
+        const cached = await fitJointTransition(lastCorrupt, null, {max_nodes: 8, seeds: 1, persistent: true});
+        assert.equal(cached.validation_gate_passed, false);
+        assert(cached.prefix_cache_hits > 0); assert(cached.opening_cache_hits > 0);
+        assert(cached.native_replays <= cached.proposals + 1);
+    } finally { battle.destroy(); }
+});
+
+test('a newly revealed reserve replaces only an unobserved root proposal before full native replay', async () => {
+    const actual = createHybridFixture();
+    const hypothesis = createHybridFixture({changeTeams: teams => {
+        Object.assign(teams[1][2], {species: 'Bulbasaur', name: 'Unrevealed 1', ability: 'Overgrow',
+            moves: ['tackle', 'protect', 'growl', 'vinewhip'], gender: 'M'});
+    }});
+    try {
+        const before = playerObservation(actual, 'p1');
+        assert.deepEqual(before, playerObservation(hypothesis, 'p1'));
+        const position = capturePosition(hypothesis, 'fixture');
+        const choices = {p1: 'move 1 1, move 2', p2: 'switch 3, move 3'};
+        const expected = advancePosition(capturePosition(actual, 'fixture'), choices, {mode: 'sample', seed: SEED}).observations.p1;
+        const failure = {history: {observations: [before, expected], own_choices: [choices.p1]},
+            simulation_trace: {position, choices, expected, seed: SEED}};
+        const original = structuredClone(failure);
+        const report = await fitJointTransition(failure, null, {max_nodes: 512, seeds: 4});
+        assert(report.validation_gate_passed, JSON.stringify({loss: report.best_loss, reason: report.reason}));
+        assert.equal(report.witness.position.origin, 'belief-sample'); assert.deepEqual(failure, original);
+        const decoded = JSON.parse(report.witness.opening.state_json);
+        assert(decoded.sides[1].pokemon.some(mon => mon.set.species === 'Clefable'));
+        assert(!decoded.sides[1].pokemon.some(mon => mon.set.species === 'Bulbasaur'));
+    } finally { actual.destroy(); hypothesis.destroy(); }
+});
+
+test('revealed friendly illusion makes opponent reconstruction abstain instead of aborting the live battle', async () => {
+    const battle = createHybridFixture({changeTeams: teams => {
+        Object.assign(teams[0][0], {species: 'Zoroark-Hisui', ability: 'Illusion', gender: 'M',
+            moves: ['shadowball', 'protect', 'nastyplot', 'flamethrower']});
+        teams[1][0].moves[0] = 'crunch';
+        Object.assign(teams[1][1], {species: 'Regieleki', ability: 'Transistor', gender: 'N',
+            moves: ['thunderbolt', 'protect', 'explosion', 'charge']});
+    }});
+    try {
+        const before = playerObservation(battle, 'p1'), opening = capturePosition(battle, 'fixture');
+        const choices = {p1: 'move 3, move 2', p2: 'move 1 1, move 3'};
+        const first = advancePosition(opening, choices, {mode: 'sample', seed: SEED});
+        assert(first.observations.p1.log.some(line => line.includes('|Illusion')));
+        assert.equal(first.observations.p1.request.wait, true);
+        assert.deepEqual(first.pending_sides, ['p2']);
+        const replacement = {p2: 'pass, switch 3'};
+        const seed = [376, 4, 5, 6], last = advancePosition(first.position, replacement, {mode: 'sample', seed});
+        const failure = {opening_position: opening, replay_steps: [{seed: SEED, choices}],
+            history: {observations: [before, first.observations.p1, last.observations.p1], own_choices: [choices.p1, null]},
+            simulation_trace: {position: first.position, choices: replacement, seed, expected: last.observations.p1}};
+        const original = structuredClone(failure);
+        const report = await fitJointTransition(failure, null, {max_nodes: 4, seeds: 1});
+        assert.equal(report.validation_gate_passed, false); assert(report.unsupported_opponent_requests > 0);
+        assert.equal(report.witness, null); assert.deepEqual(failure, original);
+    } finally { battle.destroy(); }
+});

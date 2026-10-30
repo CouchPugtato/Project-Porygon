@@ -1,0 +1,28 @@
+{
+  "checkpoint": "models/runs/run_0093_current_arch_full/current_arch_full.chk",
+  "candidate_checkpoint": "models/runs/run_0275_tactical_student_1000/tactical_student_dataset_epoch003.chk",
+  "target_sidecar": "models/runs/run_0294_target_context_evaluation/target_context.bin",
+  "context_target_evaluation": true,
+  "target_decoder": "argmax",
+  "target_slot_local": true,
+  "format": "gen9randomdoublesbattle",
+  "games_per_side": 2,
+  "seed": 36801,
+  "agent_omp_threads": 1,
+  "battle_timeout_seconds": 90,
+  "max_system_memory_percent": 65,
+  "max_system_cpu_percent": 65,
+  "resource_check_seconds": 2,
+  "launch_stagger_ms": 750,
+  "opponents": ["random", "confirmed"],
+  "profiles": [
+    {"name": "baseline", "baseline": true},
+    {
+      "name": "guarded", "baseline": false,
+      "beliefs": {"particles": 2, "max_nodes": 64, "max_elapsed_ms": 100},
+      "reconstruction": {"particles": 2, "max_nodes": 1536, "max_elapsed_ms": 2500, "seeds": 12, "max_boundaries": 8, "max_attempts": 3, "max_total_ms": 7500},
+      "search": {"candidates": 4, "responses": 2, "chance_samples": 2, "continuation_choices": 1, "max_nodes": 128, "max_elapsed_ms": 1000, "evaluator": "positional", "strategy": "pure", "adaptive": false},
+      "intervention": {"enabled": true, "min_worlds": 2, "min_chance_samples": 2, "min_mean_gain": 0.1, "min_worst_gain": 0, "require_complete": true}
+    }
+  ]
+}
